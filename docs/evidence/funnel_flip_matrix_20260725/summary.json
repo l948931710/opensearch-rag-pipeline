@@ -1,0 +1,110 @@
+{
+  "n_images": 118,
+  "n_rounds": 5,
+  "funnel1_decided": 41,
+  "funnel1_flips": 0,
+  "post_funnel1": 77,
+  "run_to_run_flips": 4,
+  "keep_discard_flips": 1,
+  "route_only_flips": 3,
+  "cache_comparable": 77,
+  "regime_drift": 5,
+  "drift_detail": [
+    {
+      "doc": "pdf_it_xxh_003",
+      "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p10_img0029.png",
+      "cached": "ROUTE_TO_VECTOR",
+      "today": [
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE"
+      ],
+      "ocr_len": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "doc": "pdf_it_xxh_003",
+      "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p11_img0031.png",
+      "cached": "ROUTE_TO_VECTOR",
+      "today": [
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE"
+      ],
+      "ocr_len": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "doc": "pdf_it_xxh_003",
+      "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p4_img0012.png",
+      "cached": "ROUTE_TO_VECTOR",
+      "today": [
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE"
+      ],
+      "ocr_len": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "doc": "pdf_it_xxh_003",
+      "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p8_img0023.png",
+      "cached": "ROUTE_TO_VECTOR",
+      "today": [
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "ROUTE_TO_VECTOR"
+      ],
+      "ocr_len": [
+        0,
+        0,
+        0,
+        0,
+        7
+      ]
+    },
+    {
+      "doc": "pdf_zs_wi_009",
+      "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p1_img0002.jpeg",
+      "cached": "ROUTE_TO_VECTOR",
+      "today": [
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE",
+        "DISCARD_DECORATIVE"
+      ],
+      "ocr_len": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "_note": "A 方案实测：对同一批 118 张候选图重复调 process_image（不查缓存⇒每次真重掷）5 轮。run_to_run=今天 5 轮之间；regime_drift=缓存旧判决(2026-07-20 写入) vs 今天。"
+}

@@ -11,6 +11,7 @@ ocr_client.py — Qwen-VL OCR 统一客户端
 
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -126,6 +127,11 @@ class OCRResult:
     combined_text: str = ""
     status: str = "DONE"     # DONE / FAILED / SIMULATED / SKIPPED
     error: Optional[str] = None
+    # B5（2026-07-25）：被 max_ocr_pages 上限砍掉、从未 OCR 的页数。此前只打一行 stdout ——
+    # 被砍的页不产生 OCRPageResult，所以既有的 partial_loss_notes（只从 pages 的 FAILED 派生）
+    # 看不见它们：长文档尾部内容不进索引，而 document_version 照常 DONE+INDEXED，
+    # 运维没有任何一条 SQL 能圈出"需要重扫"的对象。
+    skipped_pages: int = 0
 
     @property
     def page_count(self) -> int:
@@ -145,6 +151,38 @@ class OCRResult:
         return blocks
 
 
+def _ocr_page_cache_path() -> str:
+    """A5：绝对路径（对齐 vlm_cache.default_cache_path / embedding_cache）。
+
+    此前是相对路径 `scratch/ocr_page_cache.sqlite3` —— 依赖进程当前工作目录，
+    DataWorks 节点在临时解压目录里跑，缓存会落到一个每次都不同的位置。
+    """
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(project_root, "scratch", "ocr_page_cache.sqlite3")
+
+
+def _make_ocr_page_cache():
+    """构造页级缓存 store（接 OSS 镜像 → 新 pod 冷启动也能暖起来）。
+
+    A5（2026-07-25）：此前 `OSS_MIRROR_KEY = None`（"本地缓存即可；OSS 镜像留给后续需要时开启"），
+    而 DataWorks 每次都是全新 serverless pod、`scratch/` 不随代码包走（build_dataworks_zip 只打
+    opensearch_pipeline/），于是跨运行命中率恒 0 —— 缓存只在单次 run 内有效。三个持久缓存里
+    只有它没接镜像。
+
+    镜像键**不按模型分文件**：缓存键 `_page_cache_key` 已含 ocr_model，无需第二层隔离
+    （这与 embedding_cache 必须按模型+维度分对象不同——那边的键里没有模型）。
+    """
+    from opensearch_pipeline.embedding_cache import SqliteKVStore
+
+    class _OcrPageCache(SqliteKVStore):
+        TABLE = "ocr_page_cache"
+        LABEL = "ocr page cache"
+        OSS_MIRROR_KEY = "processing/cache/ocr_page_cache.sqlite3"
+        MIRROR_ENV = "RAG_OCR_PAGE_CACHE_OSS_MIRROR"
+
+    return _OcrPageCache(_ocr_page_cache_path())
+
+
 class OCRClient:
     """
     OCR 客户端。
@@ -156,16 +194,47 @@ class OCRClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        api_base_url: str = "https://dashscope.aliyuncs.com/api/v1",
-        ocr_model: str = "qwen-vl-max",
-        max_ocr_pages: int = 20,
+        api_base_url: Optional[str] = None,
+        ocr_model: Optional[str] = None,
+        max_ocr_pages: Optional[int] = None,
         simulate: bool = True,
     ):
-        self.api_key = api_key or os.environ.get("DASHSCOPE_API_KEY", "")
-        self.api_base_url = api_base_url
-        self.ocr_model = ocr_model
-        self.max_ocr_pages = max_ocr_pages
+        """省略的参数从 `config.ocr` 取；**显式传值恒优先**。
+
+        2026-07-25：此前 api_key 的回退只读 `DASHSCOPE_API_KEY` **环境变量**，而本仓的密钥
+        在 `RAG_DASHSCOPE_API_KEY`、由 config.py 解析进 `config.ocr.api_key` —— 构造器不看它。
+        于是 `OCRClient(simulate=False)` 会静默拿到**空 key**（全量 401）**外加**错误的默认
+        模型 `qwen-vl-max`（而非配置的 `qwen-vl-ocr-latest`）。两个生产构造点
+        （image_funnel_processor / unified_extractor）都显式传了 config 所以没踩到，
+        但任何临时脚本/诊断都会踩，且失败表现为"密钥无效"，极易误判成密钥过期。
+
+        边界（刻意）：
+          · `api_key=""` 仍表示**显式无 key**，不回退 —— tests/test_real_extractors 等
+            用例正是靠它验"无 key 时的优雅降级"路径；只有 `None`（未传）才回退。
+          · config 不可用时退回原字面量默认值（fail-open，不让配置故障变成构造失败）。
+        """
+        _cfg_ocr = None
+        try:
+            from opensearch_pipeline.config import get_config
+            _cfg_ocr = get_config().ocr
+        except Exception:      # noqa: BLE001 — 配置不可用不该让构造失败
+            _cfg_ocr = None
+
+        def _pick(explicit, attr, literal_default):
+            if explicit is not None:
+                return explicit
+            return getattr(_cfg_ocr, attr, literal_default) if _cfg_ocr else literal_default
+
+        self.api_key = _pick(api_key, "api_key", "") or os.environ.get("DASHSCOPE_API_KEY", "")
+        self.api_base_url = _pick(api_base_url, "api_base_url",
+                                  "https://dashscope.aliyuncs.com/api/v1")
+        self.ocr_model = _pick(ocr_model, "model", "qwen-vl-max")
+        self.max_ocr_pages = _pick(max_ocr_pages, "max_ocr_pages", 20)
         self.simulate = simulate
+        # 真实模式 + 无 key = 必然全量 401。响一声，别让调用方去猜"密钥是不是过期了"。
+        if not simulate and not self.api_key:
+            print("    ⚠️ [ocr] OCRClient 无 API key（simulate=False）——所有调用都会 401。"
+                  "检查 RAG_DASHSCOPE_API_KEY / config.ocr.api_key。", flush=True)
 
     def ocr_pdf(
         self,
@@ -257,9 +326,11 @@ class OCRClient:
                 page_idxs = sorted({p - 1 for p in page_nums if 1 <= p <= n})
             else:
                 page_idxs = list(range(n))
+            _skipped_by_cap = 0
             if len(page_idxs) > self.max_ocr_pages:
                 dropped = len(page_idxs) - self.max_ocr_pages
                 page_idxs = page_idxs[:self.max_ocr_pages]
+                _skipped_by_cap = dropped     # B5：回传给调用方 → partial_loss_notes
                 print(f"    ⚠️ [ocr] capped at max_ocr_pages={self.max_ocr_pages}; "
                       f"{dropped} low-text page(s) left un-OCR'd", flush=True)
 
@@ -305,7 +376,8 @@ class OCRClient:
                 print(f"    ⚠️ [ocr] partial page failure: {len(_failed_pgs)}/{len(pages)} "
                       f"page(s) FAILED (pages {_failed_pgs[:10]}) — kept successful pages; "
                       f"doc will close NEEDS_REVIEW", flush=True)
-            return OCRResult(pages=pages, combined_text=combined, status=agg_status)
+            return OCRResult(pages=pages, combined_text=combined, status=agg_status,
+                             skipped_pages=_skipped_by_cap)
 
         except Exception as e:
             return OCRResult(status="FAILED", error=repr(e))
@@ -317,7 +389,10 @@ class OCRClient:
     # RAG_OCR_PAGE_CACHE=false 关闭；缓存层任何异常都 fail-open 直接调 API。
 
     _page_cache = None
-    _page_cache_lock = None
+    # A5（2026-07-25）：此前是 `_page_cache_lock = None` 且全文件从未使用 —— 文档级抽取并发
+    # （RAG_EXTRACT_CONCURRENCY>1）下多线程会各造一个 store，最终 flush 的那个实例不持有其他
+    # 实例的 _dirty_puts，镜像根本推不出去。改成真锁 + 双检。
+    _page_cache_lock = threading.Lock()
 
     @classmethod
     def _get_page_cache(cls):
@@ -325,18 +400,32 @@ class OCRClient:
             return None
         try:
             if cls._page_cache is None:
-                from opensearch_pipeline.embedding_cache import SqliteKVStore
-
-                class _OcrPageCache(SqliteKVStore):
-                    TABLE = "ocr_page_cache"
-                    LABEL = "ocr page cache"
-                    OSS_MIRROR_KEY = None  # 本地缓存即可；OSS 镜像留给后续需要时开启
-
-                cls._page_cache = _OcrPageCache(
-                    os.path.join("scratch", "ocr_page_cache.sqlite3"))
+                with cls._page_cache_lock:
+                    if cls._page_cache is None:      # 双检：锁外快路径 + 锁内唯一构造
+                        cls._page_cache = _make_ocr_page_cache()
             return cls._page_cache
         except Exception:
             return None
+
+    @classmethod
+    def flush_page_cache_to_oss(cls, max_entries: Optional[int] = None) -> None:
+        """A5：run 收尾把页级缓存裁剪并推 OSS 镜像。fail-open（缓存是 advisory）。
+
+        没有这个调用点时 finalize 永不发生 → _push_oss_mirror 永不触发（底座只从 finalize
+        推），镜像形同虚设。调用点在 node_extract 的 finally，紧挨 flush_vlm_cache_to_oss。
+        """
+        store = cls._page_cache
+        if store is None:
+            return
+        if max_entries is None:
+            try:
+                max_entries = int(os.environ.get("RAG_OCR_PAGE_CACHE_MAX_ENTRIES", "50000"))
+            except ValueError:
+                max_entries = 50000
+        try:
+            store.finalize(max_entries)
+        except Exception as e:
+            print(f"    ⚠️ OCR page cache flush failed (non-fatal): {e}", flush=True)
 
     def _page_cache_key(self, b64_data: str) -> str:
         import hashlib as _h

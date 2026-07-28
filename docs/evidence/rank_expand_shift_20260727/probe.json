@@ -1,0 +1,1476 @@
+{
+ "n": 162,
+ "recall_retrieval": {
+  "@1": 0.8704,
+  "@3": 0.9691,
+  "@5": 0.9753,
+  "@10": 0.9753
+ },
+ "recall_final": {
+  "@1": 0.8704,
+  "@3": 0.9568,
+  "@5": 0.9568,
+  "@10": 0.9568
+ },
+ "n_shifted": 4,
+ "rows": [
+  {
+   "qid": "RAG-01",
+   "query": "员工工作服管理有哪些规定？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 20,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-02",
+   "query": "外来人员公务留宿需要通过什么系统申请？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-03",
+   "query": "私自留宿外来人员的处罚标准是多少？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-04",
+   "query": "公司停车管理规定中涉及哪些部门的停车区域？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-05",
+   "query": "文明宿舍评选奖励多少度电？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-06",
+   "query": "员工入住须知中违规处理分为哪三级？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 19,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-07",
+   "query": "保安巡查记录表需要记录哪些区域？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 23,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-08",
+   "query": "饭卡充值时需要备注什么信息？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 21,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-09",
+   "query": "公司自行车管理规定包含哪些核心内容？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 25,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-10",
+   "query": "厨房制度中食堂卫生管理包含哪些方面？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-11",
+   "query": "A1员工行为管理标准中的行为分类是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-12",
+   "query": "办公区域管理及行为规范中门禁关闭时间是多少？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 29,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-13",
+   "query": "公司正常工作时间是如何规定的？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-14",
+   "query": "员工可以享受哪些类型的假期？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-15",
+   "query": "员工申诉的处理时效有什么要求？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 11,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-16",
+   "query": "公司培训管理包括哪些环节？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-17",
+   "query": "公司每年至少组织多少次应急演习？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 12,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-19",
+   "query": "公司反恐方针是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 18,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-20",
+   "query": "员工代表选举的程序是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-21",
+   "query": "职业病防治管理制度中公司采取哪些预防措施？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-22",
+   "query": "工伤事故管理程序中的事故责任如何划分？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 25,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-23",
+   "query": "劳动合同管理程序中合同期限和试用期如何规定？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-24",
+   "query": "工资管理规定中员工工资由哪些部分构成？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-25",
+   "query": "危险源辨识管理程序采用什么评价方法？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-26",
+   "query": "有限空间作业安全管理制度中作业原则是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-27",
+   "query": "叉车管理制度中叉车作业前需要检查什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 37,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-28",
+   "query": "消防器材设施管理制度中的'四包'是指什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-29",
+   "query": "A13面试和筛选程序中招聘流程分为哪几步？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 17,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "RAG-30",
+   "query": "A36外部培训管理制度中培训费用如何管理？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 16,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-01",
+   "query": "吸烟管理制度",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 22,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-02",
+   "query": "住宿管理规定",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-03",
+   "query": "保安管理制度",
+   "rank_retrieval": 3,
+   "rank_final": 3,
+   "n_final": 22,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-04",
+   "query": "明天公司门口可以停车吗",
+   "rank_retrieval": 2,
+   "rank_final": 2,
+   "n_final": 22,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-05",
+   "query": "用车管理制度流程",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 14,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-06",
+   "query": "自行车管理制度流程",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 39,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-08",
+   "query": "进出厂管理规定",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-09",
+   "query": "饭卡充值流程",
+   "rank_retrieval": 5,
+   "rank_final": 17,
+   "n_final": 21,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-10",
+   "query": "A1员工行为管理标准将员工行为分为哪几类？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-11",
+   "query": "吸烟管理制度中违规吸烟的处罚措施有哪些？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-12",
+   "query": "宿舍管理制度中住宿申请条件有哪些？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-13",
+   "query": "食堂管理制度包含哪些方面的管理？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-14",
+   "query": "外来人员留宿协议书中包含哪些核心条款？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-15",
+   "query": "通知（进出厂规定）中包含哪些治安规定？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-16",
+   "query": "办公区域管理及行为规范中，空调使用温度标准是多少？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-17",
+   "query": "公司自行车领用承诺书包含哪些保管责任条款？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 25,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-18",
+   "query": "新员工住宿安排作业指导书的入住流程是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 21,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-19",
+   "query": "行政部职责范围包含哪些具体职责？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 19,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-20",
+   "query": "家长、子女安全责任协议书中禁止子女进入哪些区域？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 13,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-21",
+   "query": "厨房制度中，食堂卫生管理包含哪些方面？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-22",
+   "query": "食堂工作人员管理制度中，考勤和行为规范如何规定？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-23",
+   "query": "结算水电房费作业指导书中，宿管需要完成哪些步骤？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 23,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-24",
+   "query": "车牌识别一体机客户端作业指导书的主要功能是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 28,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-25",
+   "query": "宿舍水电工的工作范围包含哪些区域？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 16,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-27",
+   "query": "公司禁止使用童工的程序中，发现童工后有哪些补救措施？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-28",
+   "query": "请假制度",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-30",
+   "query": "关于人事，行政制度！",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 18,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-31",
+   "query": "反歧视性管理程序禁止基于哪些因素的歧视？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-32",
+   "query": "员工申诉管理制度中，申诉范围包括哪些？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-33",
+   "query": "厂牌与访客证管理规定中，厂牌补办需要费用吗？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 14,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-34",
+   "query": "员工福利管理标准包含哪些福利项目？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-35",
+   "query": "员工培训管理程序中，培训分为哪些类别？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 12,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-36",
+   "query": "职业病防治管理制度中，公司采取哪些预防措施？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-37",
+   "query": "应急准备和响应预警程序中，应急事件包括哪些类型？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-38",
+   "query": "安全生产消防安全控制程序要求多久进行一次安全检查？",
+   "rank_retrieval": 2,
+   "rank_final": 20,
+   "n_final": 27,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-39",
+   "query": "危险源辨识管理程序采用什么评价方法？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-40",
+   "query": "工伤事故管理程序中的'四不放过'原则是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 17,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-41",
+   "query": "急救程序中，触电事故如何急救？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 25,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-42",
+   "query": "叉车管理制度中，叉车作业前需要检查什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 38,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-43",
+   "query": "行车安全技术操作规程中的'十不吊'是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 25,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-44",
+   "query": "电梯操作管理制度中，电梯故障时如何处理？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 18,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-45",
+   "query": "消防器材设施管理制度中的'四包'是指什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-46",
+   "query": "有限空间作业安全管理制度中，作业原则是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-47",
+   "query": "能量隔离管理规定中，隔离步骤包括哪些？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-48",
+   "query": "反恐政策和任务中，公司反恐方针是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-49",
+   "query": "社会责任体系内审程序多久进行一次？",
+   "rank_retrieval": 2,
+   "rank_final": 2,
+   "n_final": 12,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-50",
+   "query": "A21年龄确认管理制度的目的是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-51",
+   "query": "劳动合同管理程序中，合同期限和试用期如何规定？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-52",
+   "query": "工资管理规定中，员工工资由哪些部分构成？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 14,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-53",
+   "query": "女职工管理程序中，女工享有哪些特殊保护？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-54",
+   "query": "A32对内对外沟通管理程序涉及哪些利益相关方？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 18,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-55",
+   "query": "A35安全保卫政策中，保安需要执行哪些安全检查？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-56",
+   "query": "A38厂务公开制度实施细则中，公开项目包括哪些？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-57",
+   "query": "A44保护员工免遭报复程序中，投诉举报人享有哪些保护？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-58",
+   "query": "A50监控系统管理程序中，录像保存期限是多久？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 12,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-59",
+   "query": "A55垃圾房管理程序中，保安需要执行哪些监控措施？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 11,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-60",
+   "query": "A43货柜车检查程序中的'七点检查法'包括哪些部位？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 33,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-61",
+   "query": "A13面试和筛选程序中，招聘流程分为哪几步？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 17,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-62",
+   "query": "A14员工解雇程序中，解雇情形包括哪些？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-63",
+   "query": "A15背景调查与核实程序中，调查对象包括哪些人员？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 19,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-64",
+   "query": "A36外部培训管理制度中，培训费用如何管理？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 16,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-65",
+   "query": "A39困难职工帮扶制度中，帮扶资金发放需要什么流程？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-66",
+   "query": "A37防止惩戒性管理程序中，禁止哪些行为？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 14,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-67",
+   "query": "A41职工代表大会制度中，职工代表享有哪些职权？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-68",
+   "query": "A42无骚扰与虐待管理规定中，骚扰与虐待的定义是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-69",
+   "query": "A45预约集装箱及货物追踪程序中，货物运输流程包括哪些环节？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 18,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-70",
+   "query": "A46封条管理及封条破损处理程序中，封条破损如何处理？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 18,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-91",
+   "query": "公司对外来人员入厂有哪些安全管理要求？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-92",
+   "query": "新员工从入职到入住宿舍需要经过哪些流程？",
+   "rank_retrieval": 2,
+   "rank_final": 2,
+   "n_final": 20,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-93",
+   "query": "公司针对火灾事故有哪些应急响应措施？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 19,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-94",
+   "query": "员工离职时需要办理哪些手续？",
+   "rank_retrieval": 2,
+   "rank_final": 2,
+   "n_final": 21,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-95",
+   "query": "如果员工在宿舍私留外来人员住宿，会面临哪些处罚？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-96",
+   "query": "公司安全生产管理体系包含哪些核心制度？",
+   "rank_retrieval": 2,
+   "rank_final": 3,
+   "n_final": 17,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-97",
+   "query": "叉车作业的安全管理涉及哪些文件？",
+   "rank_retrieval": 2,
+   "rank_final": 2,
+   "n_final": 30,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-99",
+   "query": "外来施工人员进厂作业需要满足哪些条件？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-100",
+   "query": "公司如何保障女职工和未成年工的权益？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-101",
+   "query": "公司反恐安全体系包含哪些核心程序？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-102",
+   "query": "公司环境管理体系包含哪些核心程序？",
+   "rank_retrieval": 2,
+   "rank_final": 14,
+   "n_final": 22,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-103",
+   "query": "员工携带未成年子女入厂需要签署什么文件？",
+   "rank_retrieval": 2,
+   "rank_final": 2,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-104",
+   "query": "公司如何管理供应商的安全能力？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 18,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-106",
+   "query": "公司员工从入职到离职的全生命周期涉及哪些管理制度？",
+   "rank_retrieval": 3,
+   "rank_final": 3,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-107",
+   "query": "公司应急管理体系包含哪些预案和程序？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 19,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-108",
+   "query": "公司如何确保货物出口运输安全？",
+   "rank_retrieval": 2,
+   "rank_final": 2,
+   "n_final": 18,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-109",
+   "query": "如果发生化学品泄露事故，公司有哪些应急响应措施？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 19,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-110",
+   "query": "公司信息安全管理包含哪些控制程序？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 15,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-112",
+   "query": "公司宿舍管理涉及哪些制度和流程？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 18,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-113",
+   "query": "公司如何防止强迫劳动和人口贩卖？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-114",
+   "query": "公司食堂管理涉及哪些卫生和安全制度？",
+   "rank_retrieval": 2,
+   "rank_final": 2,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "QA-115",
+   "query": "公司车辆管理涉及哪些制度文件？",
+   "rank_retrieval": null,
+   "rank_final": null,
+   "n_final": 19,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-01",
+   "query": "工作服A/B/C类工服分别对应什么标准？",
+   "rank_retrieval": 2,
+   "rank_final": 2,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-02",
+   "query": "私自留宿外来人员的处罚金额是多少？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-03",
+   "query": "文明宿舍评选奖励多少度电？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-04",
+   "query": "新员工办理宿舍入住需要凭什么单据？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 22,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-05",
+   "query": "饭卡充值备注要求是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 21,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-06",
+   "query": "外来人员留宿期限及安全责任条款？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-07",
+   "query": "公司停车管理规定涉及哪些部门区域？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-08",
+   "query": "A1员工行为管理标准中的行为分类？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-09",
+   "query": "公司正常工作时间及加班工资如何计算？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-10",
+   "query": "员工可以享受哪些类型的假期？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-11",
+   "query": "公司发现童工后有哪些补救措施？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-12",
+   "query": "员工申诉的处理时效和委员会构成是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-13",
+   "query": "公司每年至少组织多少次应急演习？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 12,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-15",
+   "query": "危险源辨识采用什么评价方法？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-16",
+   "query": "有限空间作业的原则是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-17",
+   "query": "反恐政策和任务中的方针是什么？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-18",
+   "query": "工伤事故管理程序中的'四不放过'原则？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 17,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-19",
+   "query": "员工福利管理标准包含哪些福利项目？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "SRC-20",
+   "query": "叉车管理制度中的驾驶前检查要求？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 38,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-water_seal",
+   "query": "奶茶杯测水试验，吸管孔怎么密封？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 13,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-water_soak",
+   "query": "奶茶杯测水的泡水和擦干步骤怎么做？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_21",
+   "query": "我想把某个部门合并到另一个部门里去，具体在系统里怎么操作？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 24,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_22",
+   "query": "如果要把一个部门划转到别的部门下面，步骤是怎样的？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 21,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_23",
+   "query": "我要修改一个员工档案里的信息，比如改个手机号，该怎么弄？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 26,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_30",
+   "query": "我想给新供应商做资格审批，从进系统到提交给质检部，具体要点击哪些按钮？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_31",
+   "query": "质检部审批通过后，我怎么把供应商信息正式录入到档案里？后续还要选什么日期？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_32",
+   "query": "如果是计划采购包装辅料，参照生产订单生成采购订单时，关于商检号和数量调整要注意哪些步骤？",
+   "rank_retrieval": null,
+   "rank_final": null,
+   "n_final": 41,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_35",
+   "query": "做计划采购的时候，如果查到有其他商检号的剩余物流，接下来具体要怎么处理物料和订单？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 26,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_36",
+   "query": "供应商资格审批通过后，我在消息中心双击消息进入审批表，接下来要点哪个按钮才能转到填制界面去录入档案？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_37",
+   "query": "在采购订单里，表头的“业务类型”默认是什么？表体里的“无/含税单价”又是从哪里自动取值的？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 24,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_55",
+   "query": "在C01成型机的清扫基准里，清理液压站和管路分别需要多少分钟？",
+   "rank_retrieval": 3,
+   "rank_final": 3,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_56",
+   "query": "片材机每周都要清扫的部件里，哪一个耗时最长，具体要多久？",
+   "rank_retrieval": 2,
+   "rank_final": 2,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_57",
+   "query": "内贴设备中，示波仪点检合格的标准数值是多少？",
+   "rank_retrieval": null,
+   "rank_final": null,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_96",
+   "query": "淳迪拉片机的三辊在开机前应该怎么清洁？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 14,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_97",
+   "query": "阿德沃成型机每周清扫时，上片架滚柱和预热箱表面要用什么擦？",
+   "rank_retrieval": null,
+   "rank_final": null,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_102",
+   "query": "新来的员工刚入职，工服是白送的吗？要是干不满一年就走了，这衣服钱咋算？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_103",
+   "query": "如果我把工装弄坏了导致不能穿，需要我赔钱吗？赔偿金额是按什么标准定的？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 30,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-r120_104",
+   "query": "上班时候没穿工作服要被罚多少钱？如果是参加公司的大活动没按规定穿，又是罚多少？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-itin_step1",
+   "query": "组装电脑的第一步是安装什么部件？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 17,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-itin_socket",
+   "query": "安装CPU之前怎么打开主板上的LGA775插座？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 25,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-itin_steps",
+   "query": "《电脑安装》作业指导书一共分为哪几个步骤？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 19,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-visit_private",
+   "query": "私人拜访的外来人员可以在公司留宿吗？需要办哪些手续？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-visit_official",
+   "query": "公务拜访的客人如何申请客房？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 17,
+   "error": null,
+   "rerank_degraded": null
+  },
+  {
+   "qid": "J-visit_penalty",
+   "query": "私自留宿外来人员会受到什么处罚？",
+   "rank_retrieval": 1,
+   "rank_final": 1,
+   "n_final": 10,
+   "error": null,
+   "rerank_degraded": null
+  }
+ ]
+}

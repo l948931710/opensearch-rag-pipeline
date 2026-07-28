@@ -27,7 +27,12 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 _JOBS = ("reconcile_ha3", "reconcile_oss", "reconcile_raw", "qa_rollup",
-         "queue_aging", "ingest_funnel")
+         "queue_aging", "ingest_funnel",
+         # B10+B11（2026-07-25）：raw/ 对象四桶盘点（自助上传孤儿 / B14 有意拒绝 /
+         # 该注册未注册 / 被准入策略挡掉）。**只读只报数，绝不删**。
+         # ⚠️ 尚未接调度：现网节点只跑 --only reconcile_ha3 reconcile_oss，
+         # 接调度与告警阈值属 C1（先配 webhook 再加探针），此处不宣称监控闭环。
+         "raw_inventory")
 
 
 def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
@@ -55,6 +60,9 @@ def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
     if "ingest_funnel" in sel:
         from opensearch_pipeline.queue_monitor import run_ingest_funnel_check
         out["ingest_funnel"] = run_ingest_funnel_check(alert=alert)
+    if "raw_inventory" in sel:
+        from opensearch_pipeline.raw_inventory import run_raw_inventory
+        out["raw_inventory"] = run_raw_inventory(alert=alert)
     # P2-14：监控链路存活证明（fail-open；schema/018 未 apply 时 no-op）。
     # 心跳随任意子集运行刷新——只要调度还活着，rag_runtime_contract 里就有新鲜时间戳。
     try:

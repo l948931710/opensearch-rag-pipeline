@@ -66,8 +66,76 @@ STRUCTURAL_TYPES = {"procedure_parent", "step_card", "table_chunk", "visual_know
 # Prose types that should end on a sentence boundary (others are legitimately fragmentary).
 PROSE_TYPES = {"text_chunk", "clause_chunk", "faq_chunk", "section_chunk"}
 
+# L6 判定口径的语义版本（2026-07-27 新增）。与 L4 的 `l4_ingestion_evaluator_version`
+# 同款用途：改**尺子**会移动 l6.* 指标，而 `code_commit` 不在 _REGIME_KEYS 里 —— 不进
+# regime 的话，"改了判据"与"管线变好了"在差量网里完全无法区分。改口径必须手工 bump。
+L6_EVALUATOR_VERSION = "2.0.0"   # 2.0.0: mid-sentence 判据加形态豁免（见 _is_prose_like）
+
 # CJK + ASCII sentence terminators (CJK closing quotes/brackets count as terminal too).
 _TERMINAL_CHARS = set("。！？!?．…⋯；;”’）)】」』》〉")
+
+# ── mid-sentence 判据的形态豁免（2026-07-27）──────────────────────────────
+# 旧判据 = "最后一个字符不是终止标点"，对**散文**成立，但 `text_chunk` 实际是"其它"类：
+# 表格行、清单、图片 OCR 合成块、幻灯标题、目录点线大量落在里面，它们本来就不以句号结尾。
+#
+# 实测（220 条散文类 chunk，生产同款路由，`scratch/midsentence_diagnose_20260727.py`）：
+# 命中 91 条中 —— 表格(制表符) 59、清单/表(多行短行) 17、标签 OCR 3、图片 OCR 合成块 4、
+# 幻灯标题 3、目录点线 1、尾部孤立标题 2，**真·句中切断只有 2 条**。
+# 即旧口径 0.4136 里有 **0.4045 是误判**，真值 0.0091（门槛 0.05，本就轻松通过）。
+#
+# ⚠️ 这些是**形态**判据，不是"把不及格的排除掉"：每一条都对应一种"合法地不以句号结尾"
+# 的内容形态。灵敏度不降 —— 上述那 2 条真切断在新口径下仍然命中（有回归测试钉住）。
+_TABULAR_MARKERS = "◆☆■□▲△●○※"
+_HEADING_TAIL_RE = re.compile(
+    r"(?:^|\n)[ \t]*("
+    r"\d+[、.．][^\n]{0,20}"                   # "3、定期保养"
+    r"|\d+\.\d+[^\n]{0,20}"                   # "4.3驾驶规定"
+    r"|[一二三四五六七八九十]+[、.．][^\n]{0,20}"   # "三、职责"
+    r"|\d+\s*[一-龥]{1,12}"                   # "3定义"（编号后无标点，实测存在）
+    r"|[(（][一二三四五六七八九十\d]+[)）][^\n]{0,20}"   # "(五)火场休克的抢救"
+    r")$")
+# 抽取器给每篇加的文档头（`【文档:甘蔗渣产品培训】`）。它是**产出方生成**的标记，
+# 比"文本看起来短"可靠得多，故用它锚定标题块豁免。
+_DOC_TITLE_MARKER_RE = re.compile(r"^\s*【文档[:：][^】]*】\s*")
+
+
+def _is_prose_like(text: str) -> bool:
+    """这段文本是否**真的是散文**（值得用"句末标点"判断边界）。
+
+    返回 False 的都是"合法地不以句号结尾"的形态，不纳入 mid-sentence 统计。
+    """
+    t = text.rstrip()
+    if not t:
+        return False
+    if "\t" in t:                                    # 表格：制表符分隔
+        return False
+    # 空格对齐的表单/签署栏（"编制：〇〇〇    审核：    批准：    日期：…"）——
+    # （示例里的人名以〇替代：本仓为 public repo，真实语料的签署人姓名不入库）
+    # 与制表符版同型，只是用空格对齐，故制表符判据抓不到。判据=末行含 ≥3 个「字段：」。
+    _last_line = (t.split("\n")[-1] if "\n" in t else t)
+    if len(re.findall(r"[一-龥A-Za-z]{2,6}[：:]", _last_line)) >= 3:
+        return False
+    if t[-1] in _TABULAR_MARKERS:                    # 表格：符号标记结尾
+        return False
+    if re.search(r"„{3,}|\.{5,}|…{3,}", t):           # 目录页点线 leader
+        return False
+    if "[图片OCR]" in t or "[图片]" in t:              # 图片 OCR/占位合成块
+        return False
+    lines = [ln for ln in t.split("\n") if ln.strip()]
+    if len(lines) >= 3 and sum(len(ln) < 26 for ln in lines) >= len(lines) * 0.6:
+        return False                                  # 清单/表：多数为短行
+    # 幻灯/文档标题块：整块 = 抽取器加的 `【文档:…】` 头 + 一行短标题。
+    # ⚠️ 这一条**刻意锚在抽取器自己生成的标记上**，而不是"短即标题"。先前写成
+    # `len(t) <= 40 and 不含句内标点` —— 既有测试 test_boundary_midsentence_doc_clustered
+    # 当场证伪：`"这句话没有结束符号被切断"`（12 字、无顿号）会被一并豁免，那是把灵敏度
+    # 也削掉了，不是收窄误判。实测语料里依赖此条的 3 条**全部**带 `【文档:…】` 头
+    # （docs/evidence/midsentence_diagnose_20260727），故按该形态收紧，不留长度猜测。
+    if (_DOC_TITLE_MARKER_RE.match(t) and len(lines) <= 2 and len(t) <= 60
+            and not re.search(r"[、，,；;]", _DOC_TITLE_MARKER_RE.sub("", t))):
+        return False
+    return True
+
+
 # Dangling-reference openers: a chunk starting with one of these, with no section_title to
 # resolve the antecedent, is likely not self-contained.
 _DANGLING_PREFIXES = (
@@ -119,6 +187,7 @@ def family_boundary(chunks: List[Dict]) -> Dict:
     undersize: List[Dict] = []
     token_drift: List[Dict] = []
     midsentence_cases: List[Dict] = []   # for doc-clustered CI (prose types only)
+    trailing_heading_cases: List[Dict] = []   # 尾部孤立标题（2026-07-27 单列）
     orphan_heading_cases: List[Dict] = []
     n_prose = 0
 
@@ -143,14 +212,24 @@ def family_boundary(chunks: List[Dict]) -> Dict:
             token_drift.append({"chunk_id": c.get("chunk_id"), "stored": int(stored),
                                 "recomputed": recomputed})
 
-        # mid-sentence cut — prose types only
+        # mid-sentence cut — prose types only，且必须**形态上真是散文**（见 _is_prose_like）
         if ctype in PROSE_TYPES:
             n_prose += 1
             stripped = text.rstrip()
             last = stripped[-1] if stripped else ""
-            mid = bool(stripped) and last not in _TERMINAL_CHARS
-            midsentence_cases.append({"doc_id": c.get("doc_id"), "v": 1.0 if mid else 0.0,
-                                      "chunk_id": c.get("chunk_id")})
+            if _is_prose_like(text):
+                # 尾部孤立标题（"…\n3、定期保养"）不是"句中切断"，但**是**真边界缺陷 ——
+                # 单列一项，绝不因为收窄口径而把它悄悄丢掉。
+                if _HEADING_TAIL_RE.search(stripped):
+                    trailing_heading_cases.append({"doc_id": c.get("doc_id"), "v": 1.0,
+                                                   "chunk_id": c.get("chunk_id")})
+                else:
+                    trailing_heading_cases.append({"doc_id": c.get("doc_id"), "v": 0.0})
+                    mid = bool(stripped) and last not in _TERMINAL_CHARS
+                    midsentence_cases.append({"doc_id": c.get("doc_id"),
+                                              "v": 1.0 if mid else 0.0,
+                                              "chunk_id": c.get("chunk_id"),
+                                              "tail": stripped[-60:]})
             # orphaned heading: body is only a (structural) heading line with little following body
             body = _norm(text)
             first_line = (text.strip().splitlines() or [""])[0].strip()
@@ -160,6 +239,7 @@ def family_boundary(chunks: List[Dict]) -> Dict:
 
     dist = {t: score_distribution(toks) for t, toks in sorted(by_type_tokens.items())}
     mid_ci = doc_clustered_bootstrap_ci(midsentence_cases, value_key="v") if midsentence_cases else {}
+    th_ci = doc_clustered_bootstrap_ci(trailing_heading_cases, value_key="v") if trailing_heading_cases else {}
     oh_ci = doc_clustered_bootstrap_ci(orphan_heading_cases, value_key="v") if orphan_heading_cases else {}
 
     return {
@@ -177,6 +257,11 @@ def family_boundary(chunks: List[Dict]) -> Dict:
         "midsentence_cut_ci": [_round_nan(mid_ci.get("doc_clustered_ci_lower")),
                                _round_nan(mid_ci.get("doc_clustered_ci_upper"))],
         "midsentence_unique_docs": mid_ci.get("unique_docs"),
+        "midsentence_n_scored": len(midsentence_cases),
+        # 诊断样本：旧实现只给一个率、不给样本，0.5 的读数无从归因（这次就卡在这儿）
+        "midsentence_sample": [m for m in midsentence_cases if m.get("v")][:10],
+        "trailing_heading_rate": _round_nan(th_ci.get("doc_clustered_mean")),
+        "trailing_heading_ci_upper": _round_nan(th_ci.get("doc_clustered_ci_upper")),
         "orphan_heading_rate": _round_nan(oh_ci.get("doc_clustered_mean")),
         "orphan_heading_ci_upper": _round_nan(oh_ci.get("doc_clustered_ci_upper")),
     }

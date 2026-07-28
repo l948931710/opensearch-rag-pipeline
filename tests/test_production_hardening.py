@@ -6,6 +6,7 @@ tests/test_production_hardening.py — Production Hardening pass regression test
 import pytest
 from unittest.mock import MagicMock, patch
 from opensearch_pipeline.chunker import Chunk
+from opensearch_pipeline.reindex_states import RETRY_COUNT_INC_SQL
 from opensearch_pipeline.pipeline_nodes import (
     node_write_chunk_meta,
     node_acquire_index_lock,
@@ -147,7 +148,7 @@ def test_c2_suspected_failure_needs_review(mock_get_db_conn):
                 assert params[2]  # non-empty reason
                 # MUST bump retry_count so the orchestrator's (FAILED AND retry_count<3) re-claim
                 # predicate parks deterministically-broken docs after ≤3 tries (no infinite loop).
-                assert "retry_count = retry_count + 1" in sql, f"{why}: retry_count not incremented"
+                assert RETRY_COUNT_INC_SQL in sql, f"{why}: retry_count not incremented"
         assert seen, f"{why}: expected a status-closure UPDATE"
 
 
@@ -167,7 +168,9 @@ def test_c4_classify_failsafe_bumps_retry_count():
     assert m, "未找到 classify fail-safe 的 document_version FAILED UPDATE"
     block = m.group(0)
     assert "content_process_status = 'FAILED'" in block
-    assert "retry_count = retry_count + 1" in block, "fail-safe FAILED 未自增 retry_count（F-14 回归）"
+    # B1a（2026-07-25）：四个自增点已统一走 reindex_states.RETRY_COUNT_INC_SQL（COALESCE 形式，
+    # 堵 retry_count 可为 NULL 导致的静默楔住）。这里是**源码**断言，故匹配 f-string 占位符。
+    assert "{RETRY_COUNT_INC_SQL}" in block, "fail-safe FAILED 未自增 retry_count（F-14 回归）"
 
 
 # Test C3: QUARANTINE 0-chunk doc keeps EMPTY/DONE (suspected-failure guard must not re-grade it)
@@ -907,7 +910,7 @@ def test_q_stale_stage2_lock_reset_sql(mock_get_db_conn):
     sql = mock_cursor.execute.call_args[0][0]
     assert "IN ('LOADING', 'PROCESSING')" in sql
     assert "INTERVAL 2 HOUR" in sql
-    assert "retry_count = retry_count + 1" in sql
+    assert RETRY_COUNT_INC_SQL in sql
     assert "updated_at = NOW()" in sql
     assert "'FAILED'" in sql
     mock_conn.commit.assert_called_once()
@@ -1062,7 +1065,7 @@ class _LimitCutConn:
 
 @patch("opensearch_pipeline.pipeline_nodes._get_db_conn")
 @patch("opensearch_pipeline.pipeline_nodes._get_opensearch_client")
-@patch("opensearch_pipeline.audit_log.write_audit")
+@patch("opensearch_pipeline.audit_log.write_audit_many")
 def test_t_deactivate_defers_on_limit_boundary_cut(mock_audit, mock_get_client, mock_get_db_conn):
     mock_client = MagicMock(spec=["push_documents"])
     resp = MagicMock()
@@ -1118,7 +1121,11 @@ def test_t_deactivate_defers_on_limit_boundary_cut(mock_audit, mock_get_client, 
     assert any(p[0] == "SUCCESS" and p[1] == "docL" for _, p in status2), (
         f"completed version must be marked SUCCESS on the tail batch, got {status2}"
     )
-    assert mock_audit.call_count == 2, "both retired old rows must emit a DEACTIVATE audit"
+    # A7（2026-07-25）：批量写后调用次数是 1，但**行粒度不变**——两条退役旧行仍各写一行审计。
+    assert mock_audit.call_count == 1, "批量写：每次 deactivate 收尾只发一次审计调用"
+    _audit_rows = mock_audit.call_args[0][0]
+    assert len(_audit_rows) == 2, "both retired old rows must emit a DEACTIVATE audit row"
+    assert {r["action_type"] for r in _audit_rows} == {"DEACTIVATE"}
 
 
 

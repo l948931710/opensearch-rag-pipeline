@@ -2010,6 +2010,13 @@ class KbRegisterResponse(BaseModel):
     status_badge: str = ""
     idempotent: bool = False
     title: str = ""
+    # B9（2026-07-25）：同名（去扩展名）孪生提示。advisory —— **不硬拦**：console 有真人在场，
+    # 静默跳过会被读成"上传失败"。docx↔pdf 这类跨格式孪生按字节 ETag 必然查不出，而
+    # ingest_policy 的 stem 防重此前只被 DataWorks 的 register_new_files 调用，
+    # 真正在用的 console 入口零防线（FL-ZS-WI-005 双注册的复发形态）。
+    stem_twin: str = ""
+    # B14（2026-07-25）：升版时与当前版本字节相同（同 ETag）的源头提示。
+    same_as_current: bool = False
     # 内容查重（按 OSS ETag = 字节级指纹，跨部门）。advisory，不拦上传。
     content_dups: List[KbDupDoc] = Field(default_factory=list)   # 调用者可见范围内的同内容文档
     content_dups_other: int = 0                                   # 可见范围外的同内容文档计数（仅提示存在，不泄露部门/标题）
@@ -2149,6 +2156,49 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
     )
 
 
+def _kb_stem_twin_hint(owner_dept: str, filename: str, doc_id: str) -> str:
+    """B9（2026-07-25）：同 owner_dept、同 stem（去一层扩展名）的既有 active 注册提示。
+
+    为什么 console 需要它：`_kb_content_dups` 的判据是 `v.etag`（OSS 字节指纹），
+    docx↔pdf 这类**跨格式**孪生逐字节必然不同 → 永远查不出；而 `ingest_policy.stem_twin_action`
+    这套同名防重此前只被 `dataworks_nodes/register_new_files.py` 调用，真正在用的 console
+    自助上传入口零防线（FL-ZS-WI-005 被双注册就是这个形态）。
+
+    **advisory 且 fail-open**：只返回提示字符串，绝不拦截 —— console 有真人在场，
+    静默跳过会被读成"上传失败"；归属/退役是运营决策，不该由防重代劳。
+    """
+    try:
+        from opensearch_pipeline.ingest_policy import raw_key_stem
+        stem = raw_key_stem(filename)
+        if not stem:
+            return ""
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # 同部门同 stem 的其它 active 文档（形态照抄 register_new_files 的 JOIN）
+                cur.execute(
+                    f"""
+                    SELECT m.doc_id, m.original_filename
+                    FROM {_kb_db()}.document_meta m
+                    WHERE m.owner_dept = %s AND m.doc_id <> %s
+                      AND LOWER(m.status) = 'active'
+                      AND SUBSTRING_INDEX(m.original_filename, '.', 1) = %s
+                    LIMIT 3
+                    """,
+                    (owner_dept, doc_id, stem))
+                rows = cur.fetchall() or []
+        finally:
+            conn.close()
+        if not rows:
+            return ""
+        listed = "、".join(f"{r[1] or r[0]}" for r in rows)
+        return f"同部门已有同名文档（可能是同一份的不同格式/版本）：{listed}"
+    except Exception as e:      # noqa: BLE001 — advisory，查不出绝不影响上传
+        logger.warning("stem 孪生提示查询失败（忽略）: %s", e)
+        return ""
+
+
 @router.post("/api/kb/register", response_model=KbRegisterResponse)
 def kb_register(req: KbRegisterRequest, request: Request,
                 identity: Optional[Identity] = Depends(current_identity)):
@@ -2194,6 +2244,7 @@ def kb_register(req: KbRegisterRequest, request: Request,
 
     cps = "PENDING_APPROVAL" if requires_approval else "NOT_STARTED"
     appr = "PENDING" if requires_approval else "APPROVED"
+    _same_as_current = False      # B14：升版路径在行锁内比对 ETag 后可能置 True
     action = payload.get("action", "new")
     bucket = cfg.oss.bucket_name
     trace_id = get_request_id()
@@ -2257,6 +2308,22 @@ def kb_register(req: KbRegisterRequest, request: Request,
                     # 纵深防御：升版绝不改可见范围（token 由 upload-url 钦定继承，此处再核一次）
                     if perm != (mrow[1] or perm):
                         raise HTTPException(status_code=403, detail="升版不可改变可见范围")
+                    # B14（2026-07-25）：源头拦截"字节完全相同的重传"。此前要先付一整遍抽取
+                    # （含扫描件页级 OCR）才被 canonical_sha256 的 skip-gate 拦下，而那个 gate
+                    # 还是 flag-gated 的。这里用**已经拿到的** OSS HEAD ETag 与当前版本比对，
+                    # 零额外往返、零抽取。**不复用 _kb_content_dups**：它的 SQL 写死
+                    # `AND m.doc_id <> %s`（跨文档查重），这个场景一条都查不出。
+                    _same_as_current = False
+                    try:
+                        cur.execute(
+                            f"SELECT etag FROM {_kb_db()}.document_version "
+                            "WHERE doc_id=%s AND version_no=%s LIMIT 1",
+                            (doc_id, int(mrow[0] or 1)))
+                        _prev = cur.fetchone()
+                        _same_as_current = bool(etag_val and _prev and _prev[0]
+                                                and str(_prev[0]) == str(etag_val))
+                    except Exception as _e14:   # noqa: BLE001 — advisory，查不出不影响升版
+                        logger.warning("同 ETag 升版检测失败（忽略）: %s", _e14)
                     version_no = int(mrow[0] or 1) + 1
                     cur.execute(f"UPDATE {_kb_db()}.document_meta "
                                 "SET current_version_no=%s, updated_at=NOW() WHERE doc_id=%s",
@@ -2341,14 +2408,21 @@ def kb_register(req: KbRegisterRequest, request: Request,
     # 跨部门内容查重（按 ETag 字节指纹）：advisory，命中也不拦上传——仅在响应里提示，让上传者决定是否退役其一。
     # 升版（同 doc_id 换文件）天然不算重复，故仅新建查；fail-open。
     dups, dups_other = ([], 0)
+    stem_twin = ""
     if action != "version":
         dups, dups_other = _kb_content_dups(etag_val, doc_id, kb)
+        # B9：同名（去扩展名）孪生提示。ETag 是**字节级**指纹，docx↔pdf 转换对必然不命中；
+        # ingest_policy 的 stem 防重此前只在 DataWorks 的 register_new_files 里生效，
+        # 而真正在用的是这条 console 入口。advisory + fail-open，放在 commit 之后。
+        stem_twin = _kb_stem_twin_hint(owner, payload.get("filename") or "", doc_id)
     return KbRegisterResponse(
         doc_id=doc_id, version_no=version_no, content_process_status=cps,
         requires_kb_admin_approval=requires_approval,
         status_badge=_kb_status_badge(cps, None, "active"),
         title=payload.get("title") or "",
         content_dups=dups, content_dups_other=dups_other,
+        stem_twin=stem_twin,
+        same_as_current=_same_as_current,
     )
 
 

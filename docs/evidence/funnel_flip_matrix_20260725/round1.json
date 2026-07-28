@@ -1,0 +1,946 @@
+[
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p1_img0000.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p1_img0001.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 327,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'form_image' → Text Par"
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p1_img0002.jpeg",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 1,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p1_img0003.jpeg",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 73,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p2_img0004.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 207,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'form_image' → Text Par"
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p2_img0005.jpeg",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 69,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p2_img0006.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 196,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p2_img0007.jpeg",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p3_img0008.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p3_img0009.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 174,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p3_img0010.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 227,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'form_image' → Text Par"
+  },
+  {
+    "doc": "pdf_sop",
+    "name": "pdf_sop_p3_img0011.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 170,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0000.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0001.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 188,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'form_image' → Text Par"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0002.png",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 30,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0003.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0004.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0005.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0006.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0007.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0008.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0009.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0010.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0011.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0012.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0013.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0014.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0015.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0016.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0017.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0018.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0019.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0020.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0021.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0022.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0023.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0024.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p1_img0025.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p2_img0026.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 273,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p2_img0027.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 285,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p2_img0028.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 129,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p2_img0029.jpeg",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 117,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0030.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 189,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0031.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0032.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0033.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0034.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0035.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0036.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0037.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0038.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0039.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0040.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_xs_wi_007",
+    "name": "FL-XS-WI-007_p3_img0041.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 297,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p10_img0027.png",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 3,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p10_img0028.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p10_img0029.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p11_img0030.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p11_img0031.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p12_img0032.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p12_img0033.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p13_img0034.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p13_img0035.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p13_img0036.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p14_img0037.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p1_img0000.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p1_img0001.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p1_img0002.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p1_img0003.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p2_img0004.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p2_img0005.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p2_img0006.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p3_img0007.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p3_img0008.png",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 23,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p4_img0009.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p4_img0010.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p4_img0011.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p4_img0012.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p5_img0013.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p5_img0014.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p5_img0015.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p6_img0016.png",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p6_img0017.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p6_img0018.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p7_img0019.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p7_img0020.png",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 1,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p7_img0021.png",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p8_img0022.png",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 3,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p8_img0023.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p8_img0024.png",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p9_img0025.png",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 34,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_it_xxh_003",
+    "name": "it_FL-CW-XXH-003-《电脑安装》作业指导书_p9_img0026.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p1_img0000.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p1_img0001.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 245,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'form_image' → Text Par"
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p1_img0002.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p1_img0003.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 765,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'form_image' → Text Par"
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p1_img0004.jpeg",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 60,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p1_img0005.jpeg",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 116,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p1_img0006.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 274,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p2_img0007.jpeg",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 1,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p2_img0008.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 265,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + VLM Low Relevance → Text Paragraph"
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p2_img0009.jpeg",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 33,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p2_img0010.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 250,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'form_image' → Text Par"
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p3_img0011.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 770,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'form_image' → Text Par"
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p3_img0012.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 742,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'form_image' → Text Par"
+  },
+  {
+    "doc": "pdf_zs_wi_009",
+    "name": "FL-ZS-WI-009《注塑发货拖柜》作业指导书-成品仓管_p3_img0013.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 250,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'visual_knowledge' → Te"
+  },
+  {
+    "doc": "pdf_u8_unapprove",
+    "name": "《U8弃审》作业指导书_p1_img0000.png",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 313,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_u8_unapprove",
+    "name": "《U8弃审》作业指导书_p1_img0001.jpeg",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 1248,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_u8_unapprove",
+    "name": "《U8弃审》作业指导书_p1_img0002.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_u8_unapprove",
+    "name": "《U8弃审》作业指导书_p2_img0003.png",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 315,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_u8_unapprove",
+    "name": "《U8弃审》作业指导书_p2_img0004.png",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 326,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_u8_unapprove",
+    "name": "《U8弃审》作业指导书_p3_img0005.png",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 154,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_u8_unapprove",
+    "name": "《U8弃审》作业指导书_p3_img0006.png",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 294,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'step_screenshot' → Tex"
+  },
+  {
+    "doc": "pdf_travel_subsidy",
+    "name": "《员工路费补贴》作业指导书_p1_img0000.jpeg",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_travel_subsidy",
+    "name": "《员工路费补贴》作业指导书_p1_img0001.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_travel_subsidy",
+    "name": "《员工路费补贴》作业指导书_p1_img0002.png",
+    "status": "DISCARD_DECORATIVE",
+    "ocr_len": 0,
+    "degraded": false,
+    "reason": "Funnel 1: Structural Heuristics Low Resolution/Size/Aspect Ratio"
+  },
+  {
+    "doc": "pdf_travel_subsidy",
+    "name": "《员工路费补贴》作业指导书_p1_img0003.png",
+    "status": "ROUTE_TO_VECTOR",
+    "ocr_len": 68,
+    "degraded": false,
+    "reason": ""
+  },
+  {
+    "doc": "pdf_travel_subsidy",
+    "name": "《员工路费补贴》作业指导书_p1_img0004.png",
+    "status": "ROUTE_TO_TEXT",
+    "ocr_len": 372,
+    "degraded": false,
+    "reason": "Funnel 2+3: High OCR Text + Non-photo category 'form_image' → Text Par"
+  }
+]

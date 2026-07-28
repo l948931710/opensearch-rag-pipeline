@@ -26,6 +26,7 @@ def build_opensearch_bulk_actions(
     chunks: List[Any],
     *,
     max_bulk_size_bytes: int = 1_500_000,
+    materialize: bool = True,
 ) -> List[Dict[str, Any]]:
     """把 chunks 序列化为 OpenSearch bulk NDJSON 批次.
 
@@ -37,11 +38,17 @@ def build_opensearch_bulk_actions(
         chunks: 含 chunk_id + to_opensearch_doc() 的对象(Chunk dataclass 或兼容)
         max_bulk_size_bytes: 单批 payload 字节上限(默认 1.5MB,留生产安全余量)
 
+        materialize: 是否拼出 NDJSON 字符串。False 时 payload=""、切批边界与
+            payload_size **逐字节不变**(两者只由累计的 chunk_payload.encode("utf-8") 决定)。
+            用于 HA3 后端:那条路径消费的是内存 chunk 对象,NDJSON 只被写进 OSS 且全仓
+            无读回方(payload_oss_key 只有写方) —— 见 B15 与 node_push 的 backend guard。
+            标准 OpenSearch 后端**必须** materialize=True:client.bulk 直接消费 payload。
+
     Returns:
         List of batches,每批含:
           - "chunks": List[Chunk]  本批 chunks
-          - "payload": str          NDJSON 字符串(action + doc 行交替)
-          - "payload_size": int     payload UTF-8 字节数
+          - "payload": str          NDJSON 字符串(materialize=False 时为 "")
+          - "payload_size": int     等价 NDJSON 未压缩 UTF-8 字节数(与是否物化无关)
 
     Notes:
         - ensure_ascii=False:中文 chunk_text 保留原文,节省字节(prod 配置一致)
@@ -53,6 +60,16 @@ def build_opensearch_bulk_actions(
     current_lines: List[str] = []
     current_size = 0
 
+    def _flush():
+        # B15：materialize=False 时不拼字符串，但 **切批边界与 payload_size 必须逐字节一致**
+        # —— 两者都由累计的 `chunk_payload.encode("utf-8")` 决定，与是否物化无关。
+        payload = "".join(current_lines) if materialize else ""
+        batches.append({
+            "chunks": list(current_chunks),
+            "payload": payload,
+            "payload_size": len(payload.encode("utf-8")) if materialize else current_size,
+        })
+
     for chunk in chunks:
         action = {"index": {"_id": chunk.chunk_id}}
         doc = chunk.to_opensearch_doc()
@@ -62,26 +79,17 @@ def build_opensearch_bulk_actions(
         chunk_size = len(chunk_payload.encode("utf-8"))
 
         if current_size > 0 and current_size + chunk_size > max_bulk_size_bytes:
-            payload = "".join(current_lines)
-            batches.append({
-                "chunks": current_chunks,
-                "payload": payload,
-                "payload_size": len(payload.encode("utf-8")),
-            })
+            _flush()
             current_chunks = []
             current_lines = []
             current_size = 0
 
         current_chunks.append(chunk)
-        current_lines.append(chunk_payload)
+        if materialize:
+            current_lines.append(chunk_payload)
         current_size += chunk_size
 
     if current_chunks:
-        payload = "".join(current_lines)
-        batches.append({
-            "chunks": current_chunks,
-            "payload": payload,
-            "payload_size": len(payload.encode("utf-8")),
-        })
+        _flush()
 
     return batches

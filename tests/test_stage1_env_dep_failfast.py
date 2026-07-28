@@ -320,3 +320,123 @@ def test_cost_deferred_doc_does_not_wedge_healthy_sibling(monkeypatch, tmp_path)
     ok_sqls = " ".join(s for s, p in store
                        if isinstance(s, str) and p and "DOC_OK" in str(p))
     assert "COMPLETED" in ok_sqls, "健康文档必须照常 COMPLETED 落库"
+
+
+# ── OSS-FETCH 守卫（A2 2026-07-25；与 ENV-DEP/COST-DEFER 同型）────────────────
+# 原件根本没下下来时，抽取仍会跑并产出 0 字 canonical。此前照常写 canonical_json_key +
+# extraction_status='COMPLETED'，而 stage-1 认领谓词要求 keys IS NULL → 这篇文档再也不会
+# 被重捡，一次 OSS 瞬断就把健康文档变成需人工改库才能复活的死件，状态列还谎报 COMPLETED。
+
+class _BoomBucket:
+    """下载必失败的假 bucket（HEAD 也不可用 → 走 _osize=0 的 fail-open 分支）。"""
+
+    def __init__(self, exc=None):
+        self.exc = exc or OSError("connection reset by peer")
+
+    def head_object(self, key):
+        raise RuntimeError("head unavailable")
+
+    def get_object_to_file(self, key, path):
+        raise self.exc
+
+
+class _FakeExtractor:
+    """替身抽取器：不碰真实解析，产出与"下载失败后仍被调用"一致的空结果。"""
+
+    def __init__(self, *a, **kw):
+        self.cost_breaker = None
+
+    def extract(self, task):
+        return _mk_result(doc_id=task["doc_id"], version_no=task["version_no"],
+                          source_key=task.get("raw_key", ""), file_ext=task.get("file_ext", "pdf"))
+
+    @classmethod
+    def flush_vlm_cache_to_oss(cls):
+        return None
+
+
+def test_download_failure_records_fetch_error_sentinel(monkeypatch, tmp_path):
+    """node_extract 的下载 except 必须落显式哨兵（键 = (doc_id, version_no)），
+    否则 node_build_canonical 无从区分"没下下来"与"内容合法为空"。"""
+    import opensearch_pipeline.extraction as extraction_pkg
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(extraction_pkg, "UnifiedExtractor", _FakeExtractor)
+    monkeypatch.setattr(pn, "_get_oss_bucket", lambda ctx: (_BoomBucket(), False))
+    ctx = {"tasks": [{"doc_id": "DOC_NET", "version_no": 2, "file_ext": "pdf",
+                      "raw_key": "raw/prod/手册.pdf", "filename": "手册.pdf"}],
+           "simulate_oss": False, "simulate_api": True, "simulate_db": True}
+    pn.node_extract_text_with_ocr(ctx)
+    assert ("DOC_NET", 2) in ctx["_fetch_errors"]
+    assert "OSError" in ctx["_fetch_errors"][("DOC_NET", 2)]
+    assert len(ctx["extractions"]) == 1     # 抽取照跑（保持既有行为），由守卫兜底
+
+
+def test_fetch_error_doc_withheld_marks_failed_and_raises(monkeypatch, tmp_path):
+    res = _mk_result(doc_id="DOC_NET", version_no=2, file_ext="pdf")
+    ctx, store = _canon_ctx(monkeypatch, tmp_path, [res])
+    ctx["_fetch_errors"] = {("DOC_NET", 2): "OSError: connection reset by peer"}
+    with pytest.raises(RuntimeError, match=r"OSS-FETCH.*DOC_NET"):
+        pn.node_build_canonical(ctx)
+    joined = " ".join(s for s, _p in store if isinstance(s, str))
+    assert "extraction_status='FAILED'" in joined
+    # 空壳绝不写 keys/COMPLETED：keys 保持 NULL → OSS 恢复后 stage-1 自动重捡自愈
+    assert "canonical_json_key" not in joined
+    assert "COMPLETED" not in joined
+    failed_params = [p for s, p in store if isinstance(s, str) and "FAILED" in s]
+    assert failed_params and "[OSS-FETCH]" in str(failed_params[0])
+    assert ctx["canonicals"] == []
+
+
+def test_fetch_error_does_not_wedge_healthy_sibling(monkeypatch, tmp_path):
+    """同批健康文档照常定稿；取件失败文档留痕后收尾统一炸红。"""
+    bad = _mk_result(doc_id="DOC_NET", version_no=2, file_ext="pdf")
+    ok = _mk_result(doc_id="DOC_OK", text="健康文档正文", text_length=6,
+                    warnings=["some benign note"])
+    ctx, store = _canon_ctx(monkeypatch, tmp_path, [bad, ok])
+    ctx["_fetch_errors"] = {("DOC_NET", 2): "OSError: timed out"}
+    with pytest.raises(RuntimeError, match=r"OSS-FETCH"):
+        pn.node_build_canonical(ctx)
+    assert [c["doc_id"] for c in ctx["canonicals"]] == ["DOC_OK"]
+    ok_sqls = " ".join(s for s, p in store
+                       if isinstance(s, str) and p and "DOC_OK" in str(p))
+    assert "COMPLETED" in ok_sqls
+
+
+def test_fetch_error_guard_precedes_env_dep_guard(monkeypatch, tmp_path):
+    """两个守卫同时命中时按根因取更具体的那个：没下下来 ≠ 缺 python 模块。"""
+    res = _mk_result(doc_id="DOC_NET", version_no=2, file_ext="xlsx",
+                     warnings=["Failed to extract Excel file: No module named 'openpyxl'"])
+    ctx, store = _canon_ctx(monkeypatch, tmp_path, [res])
+    ctx["_fetch_errors"] = {("DOC_NET", 2): "OSError: timed out"}
+    with pytest.raises(RuntimeError, match=r"OSS-FETCH"):
+        pn.node_build_canonical(ctx)
+    failed_params = [p for s, p in store if isinstance(s, str) and "FAILED" in s]
+    assert failed_params and "[OSS-FETCH]" in str(failed_params[0])
+    assert "[ENV-DEP]" not in str(failed_params[0])
+
+
+def test_healthy_doc_unaffected_when_another_doc_had_fetch_error(monkeypatch, tmp_path):
+    """哨兵按 (doc_id, version_no) 精确匹配：同 doc_id 的另一个版本不得被误伤。"""
+    res = _mk_result(doc_id="DOC_NET", version_no=3, text="正文", text_length=2)
+    ctx, store = _canon_ctx(monkeypatch, tmp_path, [res])
+    ctx["_fetch_errors"] = {("DOC_NET", 2): "OSError: timed out"}   # v2 失败，v3 健康
+    pn.node_build_canonical(ctx)   # 不 raise
+    joined = " ".join(s for s, _p in store if isinstance(s, str))
+    assert "extraction_status = 'COMPLETED'" in joined
+    assert len(ctx["canonicals"]) == 1
+
+
+def test_fetch_error_guard_raises_in_simulate_db_without_db_write(monkeypatch, tmp_path):
+    res = _mk_result(doc_id="DOC_NET", version_no=2, file_ext="pdf")
+    monkeypatch.chdir(tmp_path)
+
+    def _no_db(**kw):
+        raise AssertionError("simulate_db 下不得开 DB 连接")
+
+    monkeypatch.setattr(pn, "_get_db_conn", _no_db)
+    monkeypatch.setattr(pn, "_get_oss_bucket", lambda ctx: (None, True))
+    ctx = {"extractions": [res], "simulate": True,
+           "_fetch_errors": {("DOC_NET", 2): "OSError: timed out"}}
+    with pytest.raises(RuntimeError, match=r"OSS-FETCH"):
+        pn.node_build_canonical(ctx)
+    assert ctx["canonicals"] == []

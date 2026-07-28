@@ -143,9 +143,19 @@ def test_pending_delete_capability_failure_fail_closed(mock_get_db_conn, monkeyp
 
 @patch("opensearch_pipeline.spot_checker._get_db_conn")
 def test_stranded_capability_failure_fail_closed(mock_get_db_conn, monkeypatch):
-    """A3 同款 fail-closed：候选停留原搁浅态，零写。"""
+    """A3 同款 fail-closed：需要删除的候选停留原搁浅态，零写。
+
+    B8（2026-07-25）：bounded 客户端改为**按需惰性获取**（RDS-only 分支根本不删 HA3，
+    不该被整批拒跑），所以本用例的夹具必须真正走到删除分支 —— 候选要有更旧的 active chunk。
+    """
     from opensearch_pipeline import spot_checker
-    conn, cursor = _make_conn([[("doc1", 2)]])
+    # fetchall 脚本：① 候选行 ② 该 doc 全部 active chunk（当前版本 INDEXED + 一条更旧的）
+    conn, cursor = _make_conn(
+        [[("doc1", 2)], [(11, 2, "INDEXED"), (7, 1, "INDEXED")]],
+        # fetchone 脚本：_lock_doc 的 doc_id 行 + 版本行观测（index_status/updated_at/
+        # status/publish_status/proc_stale_ok）
+        fetchone_results=[("doc1",), ("PROCESSING", "2026-07-25 00:00:00", "active", None, 1)],
+    )
     mock_get_db_conn.return_value = conn
     monkeypatch.setattr(
         spot_checker, "_get_bounded_search_client",
@@ -155,7 +165,10 @@ def test_stranded_capability_failure_fail_closed(mock_get_db_conn, monkeypatch):
 
     assert result["failed"] == 1 and result["total"] == 1
     assert any("fail-closed" in e for e in result["errors"])
-    assert not any("UPDATE" in c[0][0] for c in cursor.execute.call_args_list)
+    # 零写入。判据收紧为「语句以 UPDATE 开头」——惰性取客户端后，发现不可用之前会先取
+    # 行锁（`SELECT ... FOR UPDATE`），那是读锁不是写；真正的零写证据是 commit 未被调用。
+    assert not any(" ".join(str(c[0][0]).split()).upper().startswith("UPDATE")
+                   for c in cursor.execute.call_args_list)
     conn.commit.assert_not_called()
 
 

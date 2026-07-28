@@ -215,10 +215,24 @@ def test_topology_pairing_text_len_diff_rejected():
 
 # ── _parse_arm_env ──
 
-def test_parse_arm_env_simple():
+def test_parse_arm_env_empty_means_no_override():
+    """`off:` → `{}` 的语义是"**不覆盖**任何变量、继承父进程与代码默认"，
+    **不等于把某个开关关掉**。
+
+    这条自 2026-07-25 起有实际后果：`RAG_IMAGE_CONTENT_OVERRIDE` 默认已翻 ON，
+    OFF arm 若仍写 `off:`，两个 arm 都会跑 ON、A/B 静默失真 —— 必须写显式
+    `off:RAG_IMAGE_CONTENT_OVERRIDE=0`（下一条钉死）。
+    """
     name, env = _parse_arm_env("off:")
     assert name == "off"
     assert env == {}
+
+
+def test_parse_arm_env_explicit_off_switch():
+    """默认 ON 的开关，其 OFF arm 必须显式给值。"""
+    name, env = _parse_arm_env("off:RAG_IMAGE_CONTENT_OVERRIDE=0")
+    assert name == "off"
+    assert env == {"RAG_IMAGE_CONTENT_OVERRIDE": "0"}
 
 
 def test_parse_arm_env_one_kv():

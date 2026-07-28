@@ -9,8 +9,18 @@ RC2：混合编号（步骤3 之下出现 3.1/3.2/4.1 条款行）打乱 X.Y ord
      3.2→step_no=0、4.1→ordinal 跳号。修法 = X.Y 主号与当前【显式】主步骤号
      一致时继承主号、Y 记 sub_step_no；纯 X.Y 编号文档不受影响。
 """
+import pytest
+
 from opensearch_pipeline.chunker import DocumentChunker
 from opensearch_pipeline.pipeline_nodes import _inject_image_ref_blocks
+
+
+@pytest.fixture(autouse=True)
+def _default_content_override_off(monkeypatch):
+    """基线姿态 = OFF。该开关 2026-07-25 起默认 ON，不固定的话 RC1/RC2 这些**只测
+    几何与编号继承**的用例会隐式跑在内容覆写下。显式设 "1" 的 Path C/D 用例不受影响
+    （monkeypatch 后设者胜）。"""
+    monkeypatch.setenv("RAG_IMAGE_CONTENT_OVERRIDE", "0")
 
 
 # ──────────────────────────── RC1：图号引用绑定 ────────────────────────────

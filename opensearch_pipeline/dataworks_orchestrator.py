@@ -24,13 +24,17 @@ content_process_status / index_status 认领行，bizdate **从不进入任何 W
 import argparse
 import sys
 import os
+import threading
+import time
 
 # 保证当前目录在 python path 中
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from opensearch_pipeline.config import get_config, load_config
 from opensearch_pipeline.reindex_states import (
+    RETRY_COUNT_INC_SQL,
     STAGE3_CHUNK_RESELECT_INDEX_STATUS,
+    ChunkIndexStatus,
     DocVersionIndexStatus,
     sql_in_list,
 )
@@ -153,6 +157,7 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
         # ══ Stage 2 运行 ══
         dag = build_dag2_canonical_to_chunk()
         has_load_errors = False
+        claimed_ids = []          # B1a：本批认领到的 document_version.id（供收尾残留断言）
         if simulate:
             # 模拟环境：我们需要先运行 Stage 1 DAG 以构造好 canonical 内存结构
             print("[Orchestrator] Preparing simulation context by running Stage 1 first...")
@@ -267,6 +272,11 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                     # 结果按原行序消费，失败回写逻辑保持逐条串行语义不变。
                     prefetched = {}
                     _fetch_conc = _loader_fetch_concurrency()
+                    # A1（2026-07-25）：无条件报 configured/effective —— 该旋钮默认 1 且部署侧
+                    # 零注入，不打日志就无法验证它到底有没有生效。
+                    print(f"    └─ [concurrency] loader-fetch: configured={_fetch_conc} "
+                          f"effective={_fetch_conc if len(rows) > 1 else 1} "
+                          f"(RAG_LOADER_FETCH_CONCURRENCY, rows={len(rows)})")
                     if _fetch_conc > 1 and len(rows) > 1:
                         from concurrent.futures import ThreadPoolExecutor
                         _keys = [r[2] for r in rows]
@@ -300,11 +310,11 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                             print(f"    ⚠️ OSS/Local canonical read failure: {read_error}")
                             if not simulate_db:
                                 try:
-                                    cursor.execute("""
+                                    cursor.execute(f"""
                                         UPDATE document_version
                                         SET content_process_status = 'FAILED',
                                             content_process_error = %s,
-                                            retry_count = retry_count + 1,
+                                            {RETRY_COUNT_INC_SQL},
                                             processed_at = NOW()
                                         WHERE doc_id = %s AND version_no = %s
                                     """, (read_error, doc_id, version_no))
@@ -328,7 +338,6 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                             "ocr_required": ocr_status == "COMPLETED",
                             "ocr_status": ocr_status,
                             "warnings": content_json.get("warnings", []),
-                            "assets": content_json.get("assets", []),
                             # 成本封存标记必须跨 stage 边界回读：stage-1 成本闸拒绝的文档在
                             # canonical JSON 里带 cost_quarantined=True，stage-2 据此跳过切块/索引
                             # (否则 RDS 已封存而索引仍写入 chunk → 裂脑)。
@@ -350,6 +359,12 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                             "canonical_key": canonical_json_key,
                             "canonical_md_key": canonical_md_key,
                         }
+                        # F（2026-07-25）：**保留 assets 的字段存在性**。旧写法
+                        # `content_json.get("assets", [])` 把"canonical 里根本没有该键"
+                        # 抹成空集，会让资产集比对把一次读取/格式异常误判成"整篇图没了"
+                        # 从而伪造全量 removal。缺键就别放这个键，下游按 unknown 处理。
+                        if "assets" in content_json:
+                            canonical_doc["assets"] = content_json["assets"]
                         canonicals.append(canonical_doc)
                         
                     print(f"[Orchestrator] Successfully loaded {len(canonicals)} canonical documents from RDS/OSS.")
@@ -371,7 +386,16 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
         
         if has_load_errors:
             raise RuntimeError("Stage 2 completed but had partial OSS load failures. Failing the DataWorks task.")
-            
+
+        # B1a（2026-07-25）：残留断言 —— 必须在所有 closure 完成之后、打印成功之前。
+        # 堵的出口：0-chunk / explosion 收尾的落库是 fail-open（只 print 不上抛），
+        # 于是 DAG 可以"成功"而这些行仍留在 LOADING/PROCESSING —— 认领谓词不收它们、
+        # 计数谓词也看不见 → 本次运行报绿、行却楔死到 2h 陈旧接管为止。
+        # **纯只读**（不写任何状态，因此不需要所有权证明，无 ABA 面）；
+        # **fail-closed**：查询本身失败也 raise，不沿用可观测探针的 fail-open 风格。
+        if not simulate_db and claimed_ids:
+            _assert_no_claimed_residue(claimed_ids)
+
         print(f"[Orchestrator] Stage 2 successfully completed. Generated {len(result_ctx.get('valid_chunks', []))} valid chunks.")
 
     elif stage == 3:
@@ -604,12 +628,12 @@ def _reset_stale_stage2_locks() -> int:
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 UPDATE document_version
                 SET content_process_status = 'FAILED',
                     content_process_error = CONCAT('[STALE_LOCK_TAKEOVER] was ',
                         content_process_status, ' >2h without progress; reset for retry'),
-                    retry_count = retry_count + 1,
+                    {RETRY_COUNT_INC_SQL},
                     updated_at = NOW()
                 WHERE content_process_status IN ('LOADING', 'PROCESSING')
                   AND status = 'active'
@@ -675,6 +699,293 @@ def _count_pending_rows(stage: int) -> int:
             conn.close()
 
 
+# A3（2026-07-25）：drain 收尾的"不可认领"探针 —— 只读，不改任何状态、不改认领谓词。
+#
+# 为什么需要：_count_pending_rows 的谓词与认领谓词**必须**同源（不一致就会踩
+# ingest_policy.py 的「计得到、领不走 → 无进展守卫永久判死」陷阱），但这同时意味着
+# **被楔住的行对 drain 完全隐形**：
+#   · stage-2 的批次级失败分支不回滚已认领行（对照 stage-3 有逐条回滚），这些行停在
+#     LOADING/PROCESSING —— 既不被重新认领，也不在 stage-2 的计数谓词里；
+#   · 于是下一次运行会打印「drained: 0 pending rows」并 exit 0：**一边报绿，一边有整批
+#     文档楔死**；三次批次级崩溃后 retry_count>=3，该行同时从认领谓词与计数谓词消失，
+#     变成永久绿灯 + 永不入库。
+#
+# 本探针只做可见性，**刻意不改退出码**：现网存量死信/隔离行的基线未知，贸然让它翻红会把
+# 每一次运行都变成红灯（同 C1「先定基线再上告警」的教训）。基线先由这里的报数建立。
+_UNCLAIMABLE_PROBES = {
+    1: [],   # stage-1 认领不写任何状态（这是"装好依赖重跑即全量自愈"的前提），无楔住态
+    2: [
+        ("stage-2 认领中未收口 (LOADING/PROCESSING)",
+         """
+            SELECT COUNT(*) FROM document_version
+            WHERE content_process_status IN ('LOADING','PROCESSING')
+              AND status = 'active'
+              AND canonical_json_key IS NOT NULL
+         """,
+         "并发运行会正常出现；否则=上一次批次级失败未回滚认领行，"
+         "满 2h 后由 _reset_stale_stage2_locks 接管重排"),
+        ("stage-2 死信 (FAILED 且 retry_count>=3)",
+         """
+            SELECT COUNT(*) FROM document_version
+            WHERE content_process_status = 'FAILED'
+              AND retry_count >= 3
+              AND status = 'active'
+              AND canonical_json_key IS NOT NULL
+         """,
+         "已耗尽重试预算，认领谓词与计数谓词都不再包含它们——不查这一行就永远不会有人发现"),
+    ],
+    3: [
+        ("stage-3 毒 chunk 死信 (chunk_meta.index_status=DEAD)",
+         f"""
+            SELECT COUNT(*) FROM chunk_meta
+            WHERE index_status = '{ChunkIndexStatus.DEAD}' AND is_active = 1
+         """,
+         "达 RAG_STAGE3_CHUNK_MAX_RETRIES 上限，不在 loader 重选集内；"
+         "所属文档已置 chunk_status='NEEDS_REVIEW'，需人工复位 NOT_INDEXED + 计数清零"),
+        ("stage-3 版本锁未释放 (index_status=PROCESSING 且未满 2h)",
+         f"""
+            SELECT COUNT(*) FROM document_version
+            WHERE index_status = '{DocVersionIndexStatus.PROCESSING}'
+              AND updated_at >= NOW() - INTERVAL 2 HOUR
+         """,
+         "2h 内的锁按设计不可抢占（正常并发/刚崩溃都会出现）；持续不降即上一轮中断残留"),
+    ],
+}
+
+
+def _probe_unclaimable_rows(stage: int) -> list:
+    """返回 [(label, count, hint), ...]，只统计 count>0 的项。失败 fail-open 返回 []。"""
+    probes = _UNCLAIMABLE_PROBES.get(stage) or []
+    if not probes:
+        return []
+    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+
+    out = []
+    conn = None
+    try:
+        conn = _get_db_conn(select_db=True)
+        with conn.cursor() as cur:
+            for label, sql, hint in probes:
+                try:
+                    cur.execute(sql)
+                    cnt = int(cur.fetchone()[0])
+                except Exception as e:   # 单条探针失败不牵连其余（列/表缺失等）
+                    print(f"[Orchestrator] WARNING: unclaimable probe '{label}' failed: {e}",
+                          file=sys.stderr)
+                    continue
+                if cnt:
+                    out.append((label, cnt, hint))
+    except Exception as e:
+        # 纯可观测性，绝不影响入库结论
+        print(f"[Orchestrator] WARNING: unclaimable probes skipped (non-fatal): {e}",
+              file=sys.stderr)
+        return []
+    finally:
+        if conn:
+            conn.close()
+    return out
+
+
+class DrainTimeBudgetExceeded(RuntimeError):
+    """B12：drain 触到墙钟预算（RAG_DRAIN_MAX_SECONDS）在批次边界中止。
+
+    专用类型而非裸 RuntimeError —— 调用方/监控要能把"跑太久被叫停"与"数据出错"分开。
+    """
+
+
+def _assert_no_claimed_residue(claimed_ids) -> None:
+    """B1a（2026-07-25）：本批认领行不得在"成功"收尾时仍停在 LOADING/PROCESSING。
+
+    为什么需要：0-chunk / chunk-explosion 的状态收尾在落库失败时是 **fail-open**
+    （`_rollback_or_discard` + print，不上抛），于是 DAG 全绿、行却停在处理中态。
+    这类行既不被认领谓词（NOT_STARTED / FAILED&retry<3）收，也不在 pending 计数里 →
+    「一边报绿、一边楔死」，直到 2h 陈旧接管才恢复。
+
+    刻意的两个性质：
+      · **纯只读**：不写任何状态。即时回滚需要 per-claim 所有权证明（本仓有三条转手通道：
+        2h 陈旧接管、reset_for_rechunk、scratch/reset_stuck，且无 claim identity 列），
+        没有它的回滚会踩到接管者 —— 那部分留作 B1b，不在此实现。
+      · **fail-closed**：查询本身失败也 raise。这是安全断言不是可观测探针，查不出来
+        ≠ 没问题。也刻意不加 `status='active'` 过滤：并发退役但未收口的认领行同样要被看见。
+    """
+    from opensearch_pipeline.pipeline_nodes import _get_db_conn
+    ph = ",".join(["%s"] * len(claimed_ids))
+    conn = None
+    try:
+        conn = _get_db_conn(select_db=True)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT id, doc_id, version_no, content_process_status FROM document_version "
+                f"WHERE id IN ({ph}) AND content_process_status IN ('LOADING','PROCESSING')",
+                list(claimed_ids))
+            rows = cur.fetchall() or []
+    except Exception as e:
+        raise RuntimeError(
+            f"Stage 2 residue assertion could not run ({e}). Refusing to report success: "
+            f"unverified claimed rows may be wedged in LOADING/PROCESSING.") from e
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if rows:
+        _shown = "; ".join(f"{r[1]} v{r[2]} (id={r[0]}, {r[3]})" for r in rows[:10])
+        if len(rows) > 10:
+            _shown += f" | ...(+{len(rows) - 10} more)"
+        raise RuntimeError(
+            f"Stage 2 finished but {len(rows)} claimed row(s) are still LOADING/PROCESSING — "
+            f"their terminal state never persisted (0-chunk/explosion closure writes are "
+            f"fail-open). They are invisible to both the claim and the pending-count predicates "
+            f"and will only recover via the 2h stale-lock takeover. Failing the run instead of "
+            f"reporting green: {_shown}")
+
+
+def _stage_lock_name(stage: int, config) -> str:
+    """按 **数据库** 命名空间隔离的锁名。
+
+    MySQL 的 GET_LOCK 名字是**实例级**的：staging 与 prod 若共用同一 RDS 实例，
+    裸 `rag_ingest_stage3` 会让两个环境互相阻塞。加库名后各自独立。
+    """
+    # 两层 getattr：锁名解析绝不能因为配置对象不完整（测试桩 / 降级配置）而抛异常 ——
+    # 那会把一个纯命名操作变成入库路径上的硬失败。真实配置恒有 rds.database。
+    return "rag_ingest:%s:stage%s" % (
+        getattr(getattr(config, "rds", None), "database", "unknown"), stage)
+
+
+class _StageLock:
+    """A12 锁句柄。**不是**裸连接 —— 必须携带所有者信息才能安全可重入。
+
+    · `conn`          持锁的裸连接（no-op 句柄为 None）
+    · `name`          锁名（按库+stage 隔离）
+    · `owner`         取锁线程的 ident —— 同进程**另一线程**不算可重入
+    · `acquired_here` 只有它为 True 的那层才可以 RELEASE/close（嵌套层绝不释放外层锁）
+    """
+
+    __slots__ = ("conn", "name", "owner", "acquired_here")
+
+    def __init__(self, conn, name, owner, acquired_here):
+        self.conn = conn
+        self.name = name
+        self.owner = owner
+        self.acquired_here = acquired_here
+
+
+# 进程内已持有的 stage 锁：{lock_name: _StageLock}。按锁名隔离（同进程持 stage-1 时
+# 绝不能把 stage-2 误判成可重入），注册表本身用一把小锁串行化。
+_HELD_STAGE_LOCKS = {}
+_HELD_LOCKS_GUARD = threading.Lock()
+
+
+def _acquire_stage_lock(stage: int, config, simulate: bool):
+    """A12（2026-07-25）：取 stage 级单实例互斥锁，返回 `_StageLock` 句柄。
+
+    为什么需要：全仓无任何跨进程互斥（`GET_LOCK|flock|fcntl` 零命中）。stage-1 的认领是
+    纯 `SELECT ... LIMIT 100`（有意为之：不写状态 ⇒ 装好依赖重跑即全量自愈），两个实例会
+    领到**同一批**文档，重复付 OCR/VLM；成本熔断器也明确假定单 orchestrator，多实例各算各的。
+    今天生产是人工批、单操作者，所以这是前瞻性防线；一旦挂上调度（与人工批/补数据并行）
+    立刻兑现。
+
+    三态语义（fail-**closed**）：
+      · 1     → 拿到锁，返回连接（必须一直持有到 run 结束：GET_LOCK 是**会话级**的）
+      · 0     → 已有实例在跑，打印后 exit 0（不是错误，不该让 DataWorks 标红）
+      · NULL / 连接失败 / SQL 异常 → **exit 非零**。互斥是并发安全边界，不是辅助能力：
+        取锁不成却继续跑，等于在最需要保护的场景（配置/权限/网络异常）失去保护。
+        GET_LOCK 本身不需要特权，取锁异常基本只可能是"连不上 RDS"——那种情况这轮 run
+        本来也跑不下去，fail-closed 零代价。逃生口是显式 RAG_INGEST_SINGLETON_LOCK=false。
+
+    进程被 kill -9 时锁随连接断开自动释放（会话锁语义），无需陈旧锁处理。
+
+    可重入（B1a 2026-07-25）：本函数**同时**被 `main()`（CLI，须早于 run_start 取锁）与
+    `run_stage_drained()`（三个正式 DataWorks 节点的实际入口，见 stage{1,2,3}_node.py）调用。
+    CLI 路径下后者是前者的嵌套调用 —— 用 (锁名, 线程 ident) 判定可重入并返回
+    `acquired_here=False` 的句柄，嵌套层返回时**不释放外层锁**。同进程另一线程不算可重入
+    （否则两个 drain 会在同一进程并发跑，正是本锁要防的事）。
+
+    ⚠️ 覆盖面如实声明：本锁覆盖 CLI 与三个正式 DataWorks 节点；**不**覆盖直接调用单批
+    `run_stage()` 的遗留脚本（如 scripts/dataworks_stage3_with_cleanup.py），也不覆盖
+    reset_for_rechunk / scratch/reset_stuck 这类主动接管工具。
+    """
+    name = _stage_lock_name(stage, config)
+    if simulate:
+        return _StageLock(None, name, None, False)      # SIM 承诺零外部服务
+    if os.environ.get("RAG_INGEST_SINGLETON_LOCK", "true").strip().lower() in ("0", "false", "no"):
+        print("[Orchestrator] 单实例互斥已显式关闭（RAG_INGEST_SINGLETON_LOCK=false）")
+        return _StageLock(None, name, None, False)
+
+    _me = threading.get_ident()
+    with _HELD_LOCKS_GUARD:
+        _held = _HELD_STAGE_LOCKS.get(name)
+        if _held is not None and _held.owner == _me:
+            # 本线程已持有同名锁 → 嵌套层，不重复 GET_LOCK、不接管释放责任
+            return _StageLock(_held.conn, name, _me, False)
+
+    try:
+        import pymysql
+        rds = config.rds
+        # 裸连接（不走 DBUtils 池）：池化连接归还后可能被复用/重置，会话锁随之释放。
+        # SSL/超时必须显式复用配置——pymysql_ssl_args() 未配 CA 时返回 {"ssl_disabled": True}
+        # （显式明文），同时满足 tests/test_rds_ssl_wiring 对所有 pymysql.connect 位点的扫描门。
+        conn = pymysql.connect(
+            host=rds.host, port=rds.port, user=rds.user, password=rds.password,
+            database=rds.database, charset=rds.charset,
+            connect_timeout=rds.connect_timeout, read_timeout=rds.read_timeout,
+            **rds.pymysql_ssl_args()
+        )
+        with conn.cursor() as cur:
+            cur.execute("SELECT GET_LOCK(%s, 0)", (name,))
+            row = cur.fetchone()
+        got = row[0] if row else None
+    except Exception as e:
+        print(f"[Orchestrator] FATAL: 无法获取单实例互斥锁 '{name}': {e}\n"
+              f"  互斥是并发安全边界，取不到就不跑（要绕开请显式设 "
+              f"RAG_INGEST_SINGLETON_LOCK=false）。", file=sys.stderr)
+        sys.exit(1)
+
+    if got == 1:
+        print(f"[Orchestrator] 已取得单实例互斥锁 '{name}'")
+        handle = _StageLock(conn, name, _me, True)
+        with _HELD_LOCKS_GUARD:
+            _HELD_STAGE_LOCKS[name] = handle
+        return handle
+    try:
+        conn.close()
+    except Exception:
+        pass
+    if got == 0:
+        print(f"[Orchestrator] 另一实例正在跑 stage {stage}（锁 '{name}' 被占）——本次退出，不重复处理。")
+        sys.exit(0)
+    print(f"[Orchestrator] FATAL: GET_LOCK('{name}') 返回 {got!r}（NULL=锁机制异常）——"
+          f"拒绝在无互斥保护下运行。", file=sys.stderr)
+    sys.exit(1)
+
+
+def _release_stage_lock(handle) -> None:
+    """释放锁并关连接。**只有 acquired_here=True 的那层**才真正释放（嵌套层是 no-op）。
+
+    全程 fail-open —— 连接一断锁自然释放，收尾失败不该改变退出码。注册表在 finally 里清除：
+    线程退出后 ident 可被复用，残留条目会让后来的线程被误判成可重入。
+    """
+    if handle is None or not getattr(handle, "acquired_here", False):
+        return
+    try:
+        if handle.conn is not None:
+            with handle.conn.cursor() as cur:
+                cur.execute("SELECT RELEASE_LOCK(%s)", (handle.name,))
+    except Exception as e:
+        print(f"[Orchestrator] WARNING: 释放互斥锁失败（连接关闭时会自动释放）: {e}",
+              file=sys.stderr)
+    finally:
+        with _HELD_LOCKS_GUARD:
+            if _HELD_STAGE_LOCKS.get(handle.name) is handle:
+                del _HELD_STAGE_LOCKS[handle.name]
+        try:
+            if handle.conn is not None:
+                handle.conn.close()
+        except Exception:
+            pass
+
+
 def run_stage_drained(stage: int, bizdate: str, simulate: bool):
     """排空式执行：生产模式下循环调用 run_stage，直到该 stage 没有待处理行（一次调用排空整个语料）。
 
@@ -691,6 +1002,22 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
         run_stage(stage, bizdate, simulate)
         return run_metrics
 
+    # A12 补齐（B1a 2026-07-25）：单实例互斥必须在**这里**取。
+    # 此前只加在 CLI main() 里，而三个正式 DataWorks 节点（stage{1,2,3}_node.py）是直接
+    # `from ... import run_stage_drained` 再调用的 —— 整把锁被绕过，现网路径实际零保护。
+    # CLI 路径下 main() 已在 run_start 之前取过锁，这里按 (锁名, 线程) 判定为嵌套、
+    # 返回 acquired_here=False 的句柄，返回时不释放外层锁。
+    _lock = _acquire_stage_lock(stage, get_config(), simulate)
+    try:
+        return _run_stage_drained_locked(stage, bizdate, simulate, run_metrics,
+                                         accumulate_metrics, extract_run_metrics)
+    finally:
+        _release_stage_lock(_lock)
+
+
+def _run_stage_drained_locked(stage, bizdate, simulate, run_metrics,
+                              accumulate_metrics, extract_run_metrics):
+    """drain 主体（已在 stage 互斥锁保护内）。拆出来只为让锁的 try/finally 覆盖全程。"""
     # P2-10：drain 全程共享一个运行级成本熔断器。此前每批 run_stage 内部新建实例，
     # __init__ 把 _run_total_rmb 归零 → run_budget_rmb 门每批重置，整个 drain 的聚合
     # 花费上界被击穿为 批数×预算。CostBreaker 线程安全（内部 Lock）、无落库副作用
@@ -731,17 +1058,27 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
         # 排期】的 spot-check 会清（漏跑即长期双份/过期召回）。挂进每日 drain 做安全网：**默认 dry-run
         # 只报数**（不做不可逆 HA3 删除，尊重「HA3 删不可逆」的谨慎），仅 RAG_STAGE3_ORPHAN_PURGE=true
         # 时才真删。失败不阻断入库（fail-open，与相邻对账一致）。
-        try:
-            from opensearch_pipeline.ha3_reconcile import reconcile_ha3_orphan_pks
-            _orphan_purge = os.environ.get("RAG_STAGE3_ORPHAN_PURGE", "").lower() in ("true", "1", "yes")
-            orp = reconcile_ha3_orphan_pks(dry_run=not _orphan_purge)
-            if orp.get("stale"):
-                _mode = "purged" if _orphan_purge else "DRY-RUN(设 RAG_STAGE3_ORPHAN_PURGE=true 方真删)"
-                print(f"[Orchestrator] HA3 orphan-PK reconcile [{_mode}]: stale={orp['stale']} "
-                      f"deleted={orp.get('deleted', 0)} errors={len(orp.get('errors', []))}")
-        except Exception as e:
-            print(f"[Orchestrator] WARNING: HA3 orphan-PK reconcile failed (non-fatal): {e}",
-                  file=sys.stderr)
+        # A6（2026-07-25）：未开 RAG_STAGE3_ORPHAN_PURGE 时【整块跳过】，不再空扫。
+        # 理由：reconcile_ha3_orphan_pks 的 dry_run 分支是在**枚举与分类全部完成之后**才 return，
+        # 所以 dry-run 不省任何扫描时间——每轮 stage-3 都会在 drain 之前把 HA3 全 id 空间
+        # （0 → MAX(chunk_meta.id)+headroom，每 500 PK 一桶）枚举一遍，只为产出一行统计；
+        # 耗时随自增 id 高水位线性增长，与本轮实际工作量无关。真删仍需显式开 flag（语义不变）。
+        # 注意：只改这个调用点，不动 ha3_reconcile 内部——其 __main__ 默认 dry-run 是该 CLI 的
+        # 正常用法，spot_checker 也在调。
+        _orphan_purge = os.environ.get("RAG_STAGE3_ORPHAN_PURGE", "").lower() in ("true", "1", "yes")
+        if _orphan_purge:
+            try:
+                from opensearch_pipeline.ha3_reconcile import reconcile_ha3_orphan_pks
+                orp = reconcile_ha3_orphan_pks(dry_run=False)
+                if orp.get("stale"):
+                    print(f"[Orchestrator] HA3 orphan-PK reconcile [purged]: stale={orp['stale']} "
+                          f"deleted={orp.get('deleted', 0)} errors={len(orp.get('errors', []))}")
+            except Exception as e:
+                print(f"[Orchestrator] WARNING: HA3 orphan-PK reconcile failed (non-fatal): {e}",
+                      file=sys.stderr)
+        else:
+            print("[Orchestrator] HA3 orphan-PK reconcile 已跳过"
+                  "（未设 RAG_STAGE3_ORPHAN_PURGE=true；开启才扫描并真删）")
         # Phase D（flag 开）：投影 outbox 定向 drain——decide 端点同事务入队的受影响 doc，逐文档幂等
         # materialize（标脏 chunk_meta + index_status='NOT_INDEXED'），交本轮 drain 推 HA3。这是
         # 「decide 内联 materialize best-effort（抛/skipped_locked 漏标脏）」的【必达】兜底，先于下面的
@@ -770,10 +1107,30 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
                   file=sys.stderr)
 
     max_iters = int(os.environ.get("RAG_DRAIN_MAX_ITERS", "100000"))
+    # B12（2026-07-25）：墙钟预算。drain 此前只有次数上限（默认十万，等于无界），
+    # 一个持续慢但有进展的批可以跑到天荒地老而没有任何硬界。
+    # **只在批次边界检查**：不用 signal/线程异步中断当前批（那会在任意语句处撕开事务）。
+    # 到点 **raise 专用异常**而不是 exit 0 —— 「绝不静默成功」是本函数的既有不变量。
+    # 默认 0 = 关（与 A1 同一姿态：机制先就位，取值是待实验的运维决策，缺 P95 证据不硬设）。
+    try:
+        _max_seconds = float(os.environ.get("RAG_DRAIN_MAX_SECONDS", "0") or 0)
+    except ValueError:
+        _max_seconds = 0.0
+    _drain_started = time.monotonic()
+    if _max_seconds > 0:
+        print(f"[Orchestrator] drain 墙钟预算：{_max_seconds:.0f}s（RAG_DRAIN_MAX_SECONDS，批次边界检查）")
     prev_remaining = None
     iteration = 0
     while True:
         iteration += 1
+        if _max_seconds > 0 and iteration > 1:
+            _elapsed = time.monotonic() - _drain_started
+            if _elapsed > _max_seconds:
+                raise DrainTimeBudgetExceeded(
+                    f"Stage {stage} drain exceeded RAG_DRAIN_MAX_SECONDS="
+                    f"{_max_seconds:.0f}s (elapsed {_elapsed:.0f}s after "
+                    f"{iteration - 1} batch(es)); aborting at a batch boundary so the run is "
+                    f"marked failed rather than silently succeeding. Remaining rows stay claimable.")
         if iteration > max_iters:
             # 抛错而非 break：让 DataWorks 通过非零退出码识别异常，不能静默成功。
             raise RuntimeError(
@@ -786,7 +1143,17 @@ def run_stage_drained(stage: int, bizdate: str, simulate: bool):
             _reset_stale_stage2_locks()
         remaining = _count_pending_rows(stage)
         if remaining == 0:
-            print(f"[Orchestrator] Stage {stage} drained: 0 pending rows after {iteration - 1} batch(es).")
+            # A3：收尾必须区分「真全清」与「没有可认领的了，但还有楔住的行」——后者绝不能
+            # 打印无保留的全清字样（那正是"报绿+永不入库"的观感来源）。只报数，不改退出码。
+            _unclaimable = _probe_unclaimable_rows(stage)
+            _blocked = sum(c for _, c, _ in _unclaimable)
+            if _blocked:
+                print(f"[Orchestrator] Stage {stage}: 0 claimable rows after {iteration - 1} "
+                      f"batch(es)，但另有 {_blocked} 行处于不可认领状态 —— **未全清**：")
+                for _label, _cnt, _hint in _unclaimable:
+                    print(f"[Orchestrator]   · {_label}: {_cnt} —— {_hint}")
+            else:
+                print(f"[Orchestrator] Stage {stage} drained: 0 pending rows after {iteration - 1} batch(es).")
             break
         # (metrics accumulate after each batch below)
         if prev_remaining is not None and remaining >= prev_remaining:
@@ -863,6 +1230,10 @@ def main():
     # L6prov: per-run provenance header (RUNNING → SUCCESS/FAILED). Fail-open + no-op in simulate;
     # joins to kb_audit_log via the same git_commit/bizdate. Records which run/code/model ran this
     # stage and how it ended — the lineage capstone.
+    # A12（2026-07-25）：单实例互斥。必须在 run_start **之前**取锁 —— 竞争失败要直接退出，
+    # 不能留下一条 RUNNING 的 pipeline_run 记录。
+    _lock_handle = _acquire_stage_lock(args.stage, config, simulate_mode)
+
     from opensearch_pipeline.versions import build_run_provenance
     from opensearch_pipeline.pipeline_run import run_start, run_finish
     _prov = build_run_provenance(stage=args.stage, bizdate=args.bizdate)
@@ -890,6 +1261,8 @@ def main():
         import traceback
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
+    finally:
+        _release_stage_lock(_lock_handle)
 
 
 if __name__ == "__main__":

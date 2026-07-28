@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""PDF 条带切片资产级缝合（#F-mm9, RAG_PDF_STRIP_STITCH 默认 OFF）回归测试。
+"""PDF 条带切片资产级缝合（#F-mm9, RAG_PDF_STRIP_STITCH **2026-07-26 起默认 ON**）回归测试。
 
 背景：PDF 转换器把一张照片存成 N 条全宽横条（实证 FL-XS-WI-007 的 23 条
 1000×31），每条 aspect>8 逐条死于 Funnel-1，整图彻底消失且零告警。
@@ -45,11 +45,30 @@ def _run_of(tmp_path, n, start_idx=0, page=1, h=20, w=300):
             for i in range(n)]
 
 
-def test_off_by_default_passthrough(tmp_path, monkeypatch):
+def test_on_by_default(tmp_path, monkeypatch):
+    """2026-07-26 翻默认（Sam 拍板）。依据见 `_stitch_pdf_strip_assets` docstring：
+    实测救回 2 张《交货单》，生产影响面恰好 1 篇（580 篇全扫，命中率 0.18%）。"""
     monkeypatch.delenv("RAG_PDF_STRIP_STITCH", raising=False)
+    assets = _run_of(tmp_path, 6, h=20)
+    out, warns = _stitch_pdf_strip_assets(assets)
+    assert len(out) == 1 and len(warns) == 1
+
+
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "OFF"])
+def test_explicit_off_passthrough(tmp_path, monkeypatch, val):
+    """回滚路径：显式关掉时原样透传，一个资产都不动。"""
+    monkeypatch.setenv("RAG_PDF_STRIP_STITCH", val)
     assets = _run_of(tmp_path, 6)
     out, warns = _stitch_pdf_strip_assets(assets)
     assert out is assets and warns == []
+
+
+@pytest.mark.parametrize("val", ["", "1", "true", "乱填"])
+def test_unknown_values_stay_on(tmp_path, monkeypatch, val):
+    """默认 ON 的开关必须"配错也开" —— 静默退回旧行为=整图消失且零告警。"""
+    monkeypatch.setenv("RAG_PDF_STRIP_STITCH", val)
+    out, warns = _stitch_pdf_strip_assets(_run_of(tmp_path, 6, h=20))
+    assert len(warns) == 1
 
 
 def test_on_stitches_adjacent_run(tmp_path, monkeypatch):

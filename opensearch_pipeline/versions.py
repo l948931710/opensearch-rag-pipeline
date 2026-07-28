@@ -9,7 +9,9 @@ hang off.
 
 BUMP the relevant constant whenever you change that component's OUTPUT (not just refactor):
   - EXTRACTOR_VERSION:      extraction/* change that alters canonical text / blocks / assets
-  - CHUNKER_VERSION:        chunker.py change that alters chunk text / count / type
+  - CHUNKER_VERSION:        chunking-stage OUTPUT change (chunk text / count / type,
+                            含 pre-chunk 的 image_ref 注入——代码虽在 pipeline_nodes，
+                            改的是 step_card.image_refs 与随之入 chunk_text 的图注)
   - DETECTOR_VERSION:       the routing/boundary detectors specifically
                             (_CLAUSE_RE / _STEP_DETECT_RE / _detect_heading_level / node_chunk_documents routing)
   - EMBEDDING_MODEL_VERSION: embedding model / dimension / endpoint change
@@ -18,10 +20,17 @@ Pure / read-only: no DB, no prod write, no config mutation. Zero behavior change
 """
 from typing import Optional
 
+from opensearch_pipeline.ingest_flags import (
+    effective_funnel_policy_version,
+    image_content_override_enabled,
+    pdf_strip_stitch_enabled,
+)
+
 # ── component code-revision pins (bump on OUTPUT change; see module docstring) ──
-EXTRACTOR_VERSION = "1.0.0"
-CHUNKER_VERSION = "1.0.0"
-DETECTOR_VERSION = "1.0.0"          # _CLAUSE_RE / _STEP_DETECT_RE / heading / routing detector revision
+EXTRACTOR_VERSION = "1.3.0"   # 2026-07-26：RAG_PDF_STRIP_STITCH 默认 ON（条带缝合改变 assets）
+CHUNKER_VERSION = "1.3.0"   # 2026-07-25：RAG_IMAGE_CONTENT_OVERRIDE 默认翻 ON（D5=重复圈号 fail-closed）
+DETECTOR_VERSION = "1.1.0"          # _CLAUSE_RE / _STEP_DETECT_RE / heading / routing detector revision
+                                    # 1.1.0 = PDF-D3：heading 判定新增纯数字标注号 veto
 # ⚠️ 手工常量仅作 embedding_regime_version() 的最后兜底（config 完全不可用时）。
 # 盲区审计 P3-7：手工 pin 与运行时 RAG_EMBEDDING_MODEL/DIMENSION 脱钩——模型换代时
 # 必然过期且无人发现。chunk_meta.embedding_version 的写值与 /api/version 均已改用
@@ -118,6 +127,19 @@ def build_run_provenance(stage: Optional[int] = None, bizdate: Optional[str] = N
         "extractor_version": EXTRACTOR_VERSION,
         "chunker_version": CHUNKER_VERSION,
         "detector_version": DETECTOR_VERSION,
+        # 图↔步骤绑定制度：存**有效布尔值**而非原始字符串（"" / "1" / "TRUE " 在审计里
+        # 长得不一样却同义）。2026-07-25 起默认 True。
+        # ⚠️ 该 key 目前只被 pipeline_nodes 的 chunk `_provenance` 白名单消费，
+        #    **不进 pipeline_run**（逐列清单，加列需迁移 059）。
+        "image_content_override": image_content_override_enabled(),
+        # 漏斗弃图判据（选项 C，2026-07-26）。空串 = 历史判据。它决定了**哪些图能进
+        # 知识库**，因此必须与 chunk 一起留痕：同一份文档在两套判据下产出的 chunk
+        # 图集不同，事后没有这个标签就无法归因。同 image_content_override，
+        # **不进 pipeline_run**（逐列清单，加列需迁移，属后续项）。
+        "funnel_policy": effective_funnel_policy_version(),
+        # 条带缝合改变 assets（EXTRACTOR_VERSION 1.3.0 只反映**默认**姿态）——
+        # 显式关掉的 run 必须能与默认 ON 的 run 区分开（审查遗漏项 2026-07-26）。
+        "pdf_strip_stitch": pdf_strip_stitch_enabled(),
         "embedding_model_version": EMBEDDING_MODEL_VERSION,
         "embedding_model": embedding_model,
         "llm_model": llm_model,

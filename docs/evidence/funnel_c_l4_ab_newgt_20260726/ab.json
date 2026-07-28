@@ -1,0 +1,124 @@
+{
+ "off": {
+  "img_dup_factor_p95": 1.0,
+  "img_dup_factor_max": 1.0,
+  "n_degraded_docs": 2,
+  "errors": [],
+  "per_fmt": {
+   "pdf": {
+    "n_docs": 6,
+    "n_degraded_docs": 0,
+    "n_strong_chunks": 48,
+    "mean_jaccard": 0.8491895833333333,
+    "std_jaccard": 0.3318715293857609
+   },
+   "xlsx": {
+    "n_docs": 4,
+    "n_degraded_docs": 1,
+    "n_strong_chunks": 19,
+    "mean_jaccard": 1.0,
+    "std_jaccard": 0.0
+   },
+   "pptx": {
+    "n_docs": 3,
+    "n_degraded_docs": 1,
+    "n_strong_chunks": 0,
+    "mean_jaccard": null,
+    "std_jaccard": null
+   },
+   "docx": {
+    "n_docs": 16,
+    "n_degraded_docs": 0,
+    "n_strong_chunks": 0,
+    "mean_jaccard": null,
+    "std_jaccard": null
+   },
+   "unknown": {
+    "n_docs": 4,
+    "n_degraded_docs": 0,
+    "n_strong_chunks": 0,
+    "mean_jaccard": null,
+    "std_jaccard": null
+   }
+  },
+  "binding_jaccard_pdf": 0.8491895833333333,
+  "binding_jaccard_xlsx": 1.0,
+  "binding_jaccard_pptx": null,
+  "binding_jaccard_docx": null,
+  "binding_jaccard_unknown": null
+ },
+ "on": {
+  "img_dup_factor_p95": 1.0,
+  "img_dup_factor_max": 1.0,
+  "n_degraded_docs": 2,
+  "errors": [],
+  "per_fmt": {
+   "pdf": {
+    "n_docs": 6,
+    "n_degraded_docs": 0,
+    "n_strong_chunks": 48,
+    "mean_jaccard": 0.9131958333333333,
+    "std_jaccard": 0.2436643811076362
+   },
+   "xlsx": {
+    "n_docs": 4,
+    "n_degraded_docs": 1,
+    "n_strong_chunks": 19,
+    "mean_jaccard": 1.0,
+    "std_jaccard": 0.0
+   },
+   "pptx": {
+    "n_docs": 3,
+    "n_degraded_docs": 1,
+    "n_strong_chunks": 0,
+    "mean_jaccard": null,
+    "std_jaccard": null
+   },
+   "docx": {
+    "n_docs": 16,
+    "n_degraded_docs": 0,
+    "n_strong_chunks": 0,
+    "mean_jaccard": null,
+    "std_jaccard": null
+   },
+   "unknown": {
+    "n_docs": 4,
+    "n_degraded_docs": 0,
+    "n_strong_chunks": 0,
+    "mean_jaccard": null,
+    "std_jaccard": null
+   }
+  },
+  "binding_jaccard_pdf": 0.9131958333333333,
+  "binding_jaccard_xlsx": 1.0,
+  "binding_jaccard_pptx": null,
+  "binding_jaccard_docx": null,
+  "binding_jaccard_unknown": null
+ },
+ "supplementary_off": {
+  "null": {
+   "n_survivors": null,
+   "n_total_image_refs": 0,
+   "n_unique_refs": null,
+   "img_dup_factor": 1.0,
+   "mean_jaccard": null,
+   "n_strong_chunks": 0,
+   "refs_per_card_max": 0,
+   "refs_per_card_p95": 0,
+   "n_cards_with_refs": 0
+  }
+ },
+ "supplementary_on": {
+  "null": {
+   "n_survivors": null,
+   "n_total_image_refs": 0,
+   "n_unique_refs": null,
+   "img_dup_factor": 1.0,
+   "mean_jaccard": null,
+   "n_strong_chunks": 0,
+   "refs_per_card_max": 0,
+   "refs_per_card_p95": 0,
+   "n_cards_with_refs": 0
+  }
+ }
+}

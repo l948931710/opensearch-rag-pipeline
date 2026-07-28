@@ -13,8 +13,10 @@ def test_run_all_sequences_selected_jobs(monkeypatch):
     monkeypatch.setattr(qr, "run_rollup", lambda **k: calls.append("rollup") or {"ok": True, "slo_ok": 1})
     out = ops_monitor.run_all(alert=False)
     # P2-34/P2-15 起作业集含 queue_aging/ingest_funnel（模拟态 no-op skipped）
+    # B10+B11（2026-07-25）：作业集增 raw_inventory（raw/ 四桶只读盘点；未接调度，
+    # 现网节点仍只跑 --only reconcile_ha3 reconcile_oss）
     assert set(out) == {"reconcile_ha3", "reconcile_oss", "reconcile_raw", "qa_rollup",
-                        "queue_aging", "ingest_funnel"}
+                        "queue_aging", "ingest_funnel", "raw_inventory"}
     assert calls == ["ha3", "oss", "raw", "rollup"]
 
 

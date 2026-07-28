@@ -38,26 +38,128 @@ def test_match_finds_density_winner():
     ]
     gt = GtChunk(label="3.1", chunk_type="step_card",
                  keywords=["扫码", "报检"])
-    matched = ib._match_gt_chunk_to_produced(gt, chunks)
+    matched = ib._match_gt_chunk_to_produced(gt, chunks).chunk
     assert matched is chunks[0], "应优先 density 高的 step_card,不被 procedure_parent 抢"
 
 
-def test_match_returns_best_recall_fallback_when_no_cover():
-    """没有 chunk 覆盖率 ≥ 0.3 时,回退最高 recall。"""
+def test_match_covering_at_exact_threshold():
+    """recall 恰为 0.3 仍属 covering（判据是 >=，边界不许漂）。
+
+    原名 test_match_returns_best_recall_fallback_when_no_cover —— 它自称测 no-cover，
+    但样例 1/3=0.333 ≥ 0.3 根本没进那条分支；M2 改判后该分支语义已变，这里按它**实际**
+    覆盖的语义改名，真正的 no-cover 由下面的测试钉。
+    """
     chunks = [
-        FakeChunk("含关键词A"),  # 1/3 = 33% > 0.3, 覆盖
+        FakeChunk("含关键词A 含关键词B 含关键词C"),   # 3/10 = 0.30 恰好等于阈值
         FakeChunk("空"),
     ]
     gt = GtChunk(label="x", chunk_type="step_card",
-                 keywords=["关键词A", "关键词B", "关键词C"])
-    matched = ib._match_gt_chunk_to_produced(gt, chunks)
-    assert matched is chunks[0]
+                 keywords=[f"关键词{c}" for c in "ABCDEFGHIJ"])
+    res = ib._match_gt_chunk_to_produced(gt, chunks)
+    assert res.chunk is chunks[0]
+    assert res.status == ib.MATCH_STATUS_MATCHED
+
+
+def test_match_abstains_below_threshold():
+    """M2：无 covering 时**弃权**，不再"任选 recall 最高者"。
+
+    旧实现即使 recall=0 也会返回列表第一张卡，于是一条完全没匹上的 GT 仍可能因为
+    图片偶合拿到非零甚至 1.0 —— 那是虚高，不是分数。
+    """
+    chunks = [FakeChunk("毫不相干的一段话"), FakeChunk("另一段也不相干")]
+    gt = GtChunk(label="x", chunk_type="step_card",
+                 keywords=["扫码", "报检", "交货单"])
+    res = ib._match_gt_chunk_to_produced(gt, chunks)
+    assert res.chunk is None
+    assert res.status == ib.MATCH_STATUS_BELOW_THRESHOLD
+    assert res.best_recall == 0.0
+
+
+def test_match_status_enumeration():
+    """四态各有出口 —— 防状态枚举日后退化成"都是 None"。"""
+    gt_kw = GtChunk(label="x", chunk_type="step_card", keywords=[])
+    assert ib._match_gt_chunk_to_produced(gt_kw, [FakeChunk("abc")]).status == \
+        ib.MATCH_STATUS_NO_KEYWORDS
+    gt = GtChunk(label="x", chunk_type="step_card", keywords=["扫码"])
+    assert ib._match_gt_chunk_to_produced(gt, [FakeChunk("")]).status == \
+        ib.MATCH_STATUS_NO_SCORABLE
+    assert ib._match_gt_chunk_to_produced(gt, []).status == \
+        ib.MATCH_STATUS_NO_SCORABLE
+    assert ib._match_gt_chunk_to_produced(gt, [FakeChunk("无关")]).status == \
+        ib.MATCH_STATUS_BELOW_THRESHOLD
+    assert ib._match_gt_chunk_to_produced(gt, [FakeChunk("扫码")]).status == \
+        ib.MATCH_STATUS_MATCHED
+
+
+# ── M1：结构标签必须先于图片偏好（评测泄漏修复）────────────────────────────
+
+def test_structure_label_beats_image_presence_preference():
+    """xs_wi_007「步骤1」实证的最小复现：结构精确命中的**无图**真卡必须胜出。
+
+    旧实现把 has_imgs 硬过滤放在结构过滤之前 → recall 满分、step_no 精确命中的真卡
+    被提前淘汰，GT 转而匹到**别人的卡**拿假分。那等于用被测对象（有没有绑到图）
+    去挑选题目。
+    """
+    true_card = FakeChunk("步骤1 按产品标识卡清点实货 抄录货号", chunk_type="step_card",
+                          extra={"step_no": 1, "image_refs": []})
+    other = FakeChunk("步骤2 收集核对交货单 清点 抄录", chunk_type="step_card",
+                      extra={"step_no": 2, "image_refs": [{"image_index": 1}]})
+    gt = GtChunk(label="步骤1 按产品标识卡清点实货", chunk_type="step_card",
+                 keywords=["清点", "抄录"],
+                 expected_image_refs=[ImageRef(fmt="pdf", image_index=1)])
+    matched = ib._match_gt_chunk_to_produced(gt, [true_card, other]).chunk
+    assert matched is true_card, "结构标签(step_no)必须先于 has_imgs 偏好"
+
+
+def test_section_no_beats_image_presence_preference():
+    """pdf_sop「步骤4.1」同形：sec_no 精确命中的无图真卡必须胜出。"""
+    true_card = FakeChunk("4.1 按交货单填写设备 班次 数量", chunk_type="step_card",
+                          extra={"step_no": 4, "section_no": "4.1", "image_refs": []})
+    other = FakeChunk("4.2 填写完后 依次点击 设备 班次 数量", chunk_type="step_card",
+                      extra={"step_no": 4, "section_no": "4.2",
+                             "image_refs": [{"image_index": 9}, {"image_index": 10}]})
+    gt = GtChunk(label="步骤4.1 填写设备班次", chunk_type="step_card",
+                 keywords=["设备", "班次", "数量"],
+                 expected_image_refs=[ImageRef(fmt="pdf", image_index=10)])
+    matched = ib._match_gt_chunk_to_produced(gt, [true_card, other]).chunk
+    assert matched is true_card, "sec_no 必须先于 has_imgs 偏好"
+
+
+def test_image_presence_still_breaks_recall_ties():
+    """C2 修复不许回退：recall **完全并列**时，has_imgs 仍是正确判别器。
+
+    it_xxh_003「第一步」实证（该文档 GT label 抽不出结构号，全靠池内裁决）：
+    两张卡 recall 并列，无图那张 density 更高 —— 纯 recall→density 会选错。
+    """
+    imageless = FakeChunk("安装 CPU 处理器 说明", chunk_type="step_card",
+                          extra={"image_refs": []})
+    with_img = FakeChunk("安装 CPU 处理器 详细步骤 更长的正文内容在这里补足长度",
+                         chunk_type="step_card",
+                         extra={"image_refs": [{"image_index": 8}]})
+    gt = GtChunk(label="第一步 安装CPU处理器", chunk_type="step_card",
+                 keywords=["安装", "CPU", "处理器"],
+                 expected_image_refs=[ImageRef(fmt="pdf", image_index=8)])
+    matched = ib._match_gt_chunk_to_produced(gt, [imageless, with_img]).chunk
+    assert matched is with_img, "recall 并列时 has_imgs 必须仍能裁决（C2 不回退）"
+
+
+def test_explicit_negative_gt_gets_no_image_preference():
+    """GT 显式负例（expected_image_refs=[]）不得享受含图偏好 ——
+    否则等于奖励"给不该有图的步骤绑了图"。"""
+    imageless = FakeChunk("步骤2 收集核对交货单 通知班长", chunk_type="step_card",
+                          extra={"image_refs": []})
+    with_img = FakeChunk("步骤2 收集核对交货单 通知班长 补充", chunk_type="step_card",
+                         extra={"image_refs": [{"image_index": 1}]})
+    gt = GtChunk(label="步骤2", chunk_type="step_card",
+                 keywords=["收集", "核对", "交货单"], expected_image_refs=[])
+    matched = ib._match_gt_chunk_to_produced(gt, [imageless, with_img]).chunk
+    assert matched is imageless, "显式负例应按 density 裁决，不得偏向含图卡"
 
 
 def test_match_returns_none_for_no_keywords():
     """GT 无 keywords → 返 None(不该参与匹配)。"""
     gt = GtChunk(label="x", chunk_type="step_card", keywords=[])
-    assert ib._match_gt_chunk_to_produced(gt, [FakeChunk("abc")]) is None
+    assert ib._match_gt_chunk_to_produced(gt, [FakeChunk("abc")]).chunk is None
 
 
 # ── _extract_step_no_from_label(D8 Phase 3 finding 3)──────────
@@ -103,7 +205,7 @@ def test_match_prefers_sec_no_match_within_typed_pool():
     ]
     gt = GtChunk(label="步骤4.1 填写设备班次", chunk_type="step_card",
                  keywords=["U8", "扫码", "报检"])
-    matched = ib._match_gt_chunk_to_produced(gt, chunks)
+    matched = ib._match_gt_chunk_to_produced(gt, chunks).chunk
     assert matched is chunks[1], "sec_no='4.1' 应锁回真子 chunk,而非短文本父"
 
 
@@ -128,7 +230,7 @@ def test_match_prefers_step_no_when_sec_no_no_match_recall_wins():
     ]
     gt = GtChunk(label="步骤3.1 U8扫码报检", chunk_type="step_card",
                  keywords=["U8", "扫码", "报检", "业务导航", "质量管理"])
-    matched = ib._match_gt_chunk_to_produced(gt, chunks)
+    matched = ib._match_gt_chunk_to_produced(gt, chunks).chunk
     assert matched is chunks[2], "step_no=3 过滤池内 recall-max 应选真 main,而非 sub=2 sec=3.2"
 
 
@@ -142,7 +244,7 @@ def test_match_falls_back_density_when_step_no_not_in_any_chunk():
     ]
     gt = GtChunk(label="步骤3.1", chunk_type="step_card",
                  keywords=["扫码", "报检"])
-    matched = ib._match_gt_chunk_to_produced(gt, chunks)
+    matched = ib._match_gt_chunk_to_produced(gt, chunks).chunk
     assert matched is chunks[0], "step_no 全无匹配 → 回退 density-max,短文本胜"
 
 
@@ -156,7 +258,7 @@ def test_match_falls_back_density_when_label_has_no_step_no():
     ]
     gt = GtChunk(label="前言(作业前提+说明)", chunk_type="text_chunk",
                  keywords=["作业前提", "交货单", "标识卡", "报检"])
-    matched = ib._match_gt_chunk_to_produced(gt, chunks)
+    matched = ib._match_gt_chunk_to_produced(gt, chunks).chunk
     assert matched is chunks[0], "无步骤号 → density-max,短文本胜"
 
 
@@ -172,7 +274,7 @@ def test_match_step_no_filter_only_within_typed_pool():
     ]
     gt = GtChunk(label="步骤3.1", chunk_type="step_card",
                  keywords=["U8", "扫码", "报检"])
-    matched = ib._match_gt_chunk_to_produced(gt, chunks)
+    matched = ib._match_gt_chunk_to_produced(gt, chunks).chunk
     assert matched is chunks[1], "step_no 过滤限定在 typed pool 内;不同 type 不抢戏"
 
 
@@ -188,7 +290,7 @@ def test_match_sec_no_takes_precedence_over_step_no():
     ]
     gt = GtChunk(label="步骤4.1 填写设备班次", chunk_type="step_card",
                  keywords=["U8", "扫码", "报检"])
-    matched = ib._match_gt_chunk_to_produced(gt, chunks)
+    matched = ib._match_gt_chunk_to_produced(gt, chunks).chunk
     assert matched is chunks[1], "sec_no='4.1' 完全匹配 > 仅 step_no=4 匹配"
 
 

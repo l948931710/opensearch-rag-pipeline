@@ -1,0 +1,7 @@
+{
+  "off_warm": 0.8923625,
+  "on_warm": 0.9652791666666666,
+  "off_cold": 0.8472229166666666,
+  "on_cold": 0.89930625,
+  "_note": "L4-ingestion pdf 支柱（6 篇 GT / 48 strong 行，only_fmt=pdf）。warm=复用 scratch/vlm_cache.sqlite3；cold=空缓存强制 caption 全部重掷。三轮 warm-ON 逐题签名 byte-identical。"
+}

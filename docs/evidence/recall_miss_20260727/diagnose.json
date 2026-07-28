@@ -1,0 +1,382 @@
+[
+ {
+  "qid": "QA-09",
+  "query": "饭卡充值流程",
+  "gold_rank": 17,
+  "dept": "行政部",
+  "docs": [
+   {
+    "doc_id": "DOC_ADMIN_20260513120215_067E33",
+    "gold_name": "关于饭卡充值的通知",
+    "real_title": "关于饭卡充值的通知.docx",
+    "owner_dept": "admin",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 3,
+    "chunks_active": 3,
+    "query_kw_present": [
+     "饭卡",
+     "充值",
+     "流程"
+    ],
+    "query_kw_probed": [
+     "饭卡",
+     "充值",
+     "流程"
+    ]
+   }
+  ],
+  "verdict": "E2/E3 待分（在索引且含实体 → 查权限与检索可达性）"
+ },
+ {
+  "qid": "QA-38",
+  "query": "安全生产消防安全控制程序要求多久进行一次安全检查？",
+  "gold_rank": 20,
+  "dept": "人力资源部",
+  "docs": [
+   {
+    "doc_id": "DOC_HR_20260514123026_669AD0",
+    "gold_name": "A8安全生产、消防安全控制程序",
+    "real_title": "A8安全生产、消防安全控制程序.docx",
+    "owner_dept": "hr",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 5,
+    "chunks_active": 5,
+    "query_kw_present": [
+     "安全",
+     "生产",
+     "消防安全",
+     "控制程序",
+     "安全检查"
+    ],
+    "query_kw_probed": [
+     "安全",
+     "生产",
+     "消防安全",
+     "控制程序",
+     "多久",
+     "安全检查"
+    ]
+   }
+  ],
+  "verdict": "E2/E3 待分（在索引且含实体 → 查权限与检索可达性）"
+ },
+ {
+  "qid": "QA-102",
+  "query": "公司环境管理体系包含哪些核心程序？",
+  "gold_rank": 14,
+  "dept": "人力资源部",
+  "docs": [
+   {
+    "doc_id": "DOC_HR_20260514123018_DDE426",
+    "gold_name": "A1环境和职业健康安全运行控制程序",
+    "real_title": "A1环境和职业健康安全运行控制程序.docx",
+    "owner_dept": "hr",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 9,
+    "chunks_active": 9,
+    "query_kw_present": [
+     "环境",
+     "管理体系",
+     "程序"
+    ],
+    "query_kw_probed": [
+     "环境",
+     "管理体系",
+     "核心",
+     "程序"
+    ]
+   },
+   {
+    "doc_id": "DOC_HR_20260514123020_008F61",
+    "gold_name": "A2EHS环境健康管理控制程序",
+    "real_title": "A2EHS环境健康管理控制程序.docx",
+    "owner_dept": "hr",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 8,
+    "chunks_active": 8,
+    "query_kw_present": [
+     "环境",
+     "程序"
+    ],
+    "query_kw_probed": [
+     "环境",
+     "管理体系",
+     "核心",
+     "程序"
+    ]
+   },
+   {
+    "doc_id": "DOC_HR_20260514123021_C17A9C",
+    "gold_name": "A31环境因素识别、评价控制程序",
+    "real_title": "A31环境因素识别、评价控制程序.docx",
+    "owner_dept": "hr",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 14,
+    "chunks_active": 9,
+    "query_kw_present": [
+     "环境",
+     "程序"
+    ],
+    "query_kw_probed": [
+     "环境",
+     "管理体系",
+     "核心",
+     "程序"
+    ]
+   },
+   {
+    "doc_id": "DOC_HR_20260514123021_1BD0BB",
+    "gold_name": "A32环保培训控制程序",
+    "real_title": "A32环保培训控制程序.docx",
+    "owner_dept": "hr",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 36,
+    "chunks_active": 18,
+    "query_kw_present": [
+     "环境",
+     "程序"
+    ],
+    "query_kw_probed": [
+     "环境",
+     "管理体系",
+     "核心",
+     "程序"
+    ]
+   }
+  ],
+  "verdict": "E2/E3 待分（在索引且含实体 → 查权限与检索可达性）"
+ },
+ {
+  "qid": "QA-115",
+  "query": "公司车辆管理涉及哪些制度文件？",
+  "gold_rank": null,
+  "dept": "跨部门",
+  "docs": [
+   {
+    "doc_id": "DOC_ADMIN_20260513120215_766809",
+    "gold_name": "公司停车管理规定",
+    "real_title": "公司停车管理规定.docx",
+    "owner_dept": "admin",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 2,
+    "chunks_active": 2,
+    "query_kw_present": [
+     "车辆管理"
+    ],
+    "query_kw_probed": [
+     "车辆管理",
+     "制度",
+     "文件"
+    ]
+   },
+   {
+    "doc_id": "DOC_HR_20260514123023_33AD2C",
+    "gold_name": "A41车辆进出管理规定",
+    "real_title": "A41车辆进出管理规定.docx",
+    "owner_dept": "hr",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 3,
+    "chunks_active": 3,
+    "query_kw_present": [],
+    "query_kw_probed": [
+     "车辆管理",
+     "制度",
+     "文件"
+    ]
+   },
+   {
+    "doc_id": "DOC_HR_20260514123018_7E12DE",
+    "gold_name": "A21工厂进出厂、限制区域管理规定",
+    "real_title": "A21工厂进出厂、限制区域管理规定.docx",
+    "owner_dept": "hr",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 10,
+    "chunks_active": 10,
+    "query_kw_present": [
+     "制度"
+    ],
+    "query_kw_probed": [
+     "车辆管理",
+     "制度",
+     "文件"
+    ]
+   },
+   {
+    "doc_id": "DOC_ADMIN_20260513120215_A4D6AE",
+    "gold_name": "公司自行车管理规定",
+    "real_title": "公司自行车管理规定.docx",
+    "owner_dept": "admin",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 1,
+    "chunks_active": 1,
+    "query_kw_present": [],
+    "query_kw_probed": [
+     "车辆管理",
+     "制度",
+     "文件"
+    ]
+   },
+   {
+    "doc_id": "DOC_ADMIN_20260513120214_E32FC7",
+    "gold_name": "车牌识别一体机客户端作业指导书",
+    "real_title": "《车牌识别一体机客户端》作业指导书.docx",
+    "owner_dept": "admin",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 5,
+    "chunks_active": 5,
+    "query_kw_present": [
+     "文件"
+    ],
+    "query_kw_probed": [
+     "车辆管理",
+     "制度",
+     "文件"
+    ]
+   }
+  ],
+  "verdict": "E2/E3 待分（在索引且含实体 → 查权限与检索可达性）"
+ },
+ {
+  "qid": "J-r120_32",
+  "query": "如果是计划采购包装辅料，参照生产订单生成采购订单时，关于商检号和数量调整要注意哪些步骤？",
+  "gold_rank": null,
+  "dept": null,
+  "docs": [
+   {
+    "doc_id": "DOC_IT_20260513120634_8549A8",
+    "gold_name": "富岭U8+资材部操作手册",
+    "real_title": "富岭U8+资材部操作手册.docx",
+    "owner_dept": "it",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 100,
+    "chunks_active": 50,
+    "query_kw_present": [
+     "计划",
+     "采购",
+     "包装",
+     "辅料",
+     "参照",
+     "生产",
+     "订单",
+     "生成"
+    ],
+    "query_kw_probed": [
+     "计划",
+     "采购",
+     "包装",
+     "辅料",
+     "参照",
+     "生产",
+     "订单",
+     "生成"
+    ]
+   }
+  ],
+  "verdict": "E2/E3 待分（在索引且含实体 → 查权限与检索可达性）"
+ },
+ {
+  "qid": "J-r120_57",
+  "query": "内贴设备中，示波仪点检合格的标准数值是多少？",
+  "gold_rank": null,
+  "dept": null,
+  "docs": [
+   {
+    "doc_id": "DOC_PRODUCTION_20260513120636_9EB1B9",
+    "gold_name": "设备清扫基准书-拉片机",
+    "real_title": "设备清扫基准书-拉片机（淳迪） - 2拉.xlsx",
+    "owner_dept": "production",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 121,
+    "chunks_active": 63,
+    "query_kw_present": [
+     "设备",
+     "点检",
+     "合格"
+    ],
+    "query_kw_probed": [
+     "内贴",
+     "设备",
+     "示波",
+     "点检",
+     "合格"
+    ]
+   }
+  ],
+  "verdict": "E2/E3 待分（在索引且含实体 → 查权限与检索可达性）"
+ },
+ {
+  "qid": "J-r120_97",
+  "query": "阿德沃成型机每周清扫时，上片架滚柱和预热箱表面要用什么擦？",
+  "gold_rank": null,
+  "dept": null,
+  "docs": [
+   {
+    "doc_id": "DOC_PRODUCTION_20260513120636_9EB1B9",
+    "gold_name": "设备清扫基准书-拉片机",
+    "real_title": "设备清扫基准书-拉片机（淳迪） - 2拉.xlsx",
+    "owner_dept": "production",
+    "permission": "public",
+    "allowed_depts": null,
+    "status": "DONE",
+    "index_status": "SUCCESS",
+    "chunks_total": 121,
+    "chunks_active": 63,
+    "query_kw_present": [
+     "每周",
+     "清扫",
+     "表面"
+    ],
+    "query_kw_probed": [
+     "阿德",
+     "成型机",
+     "每周",
+     "清扫",
+     "上片",
+     "滚柱",
+     "预热",
+     "表面"
+    ]
+   }
+  ],
+  "verdict": "E2/E3 待分（在索引且含实体 → 查权限与检索可达性）"
+ }
+]

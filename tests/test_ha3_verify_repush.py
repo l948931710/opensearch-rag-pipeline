@@ -348,8 +348,17 @@ def test_drop_and_unknown_coexist_two_updates(monkeypatch):
         pn.node_verify_and_repush(ctx)
     upd = [e for e in conn.cur.executed if "UPDATE chunk_meta" in e[0]]
     assert len(upd) == 2                        # 两组分开写，保留故障分类
-    codes = [e[1][1] for e in upd]   # params=[max_retries, code, msg, *ids] (G9)
-    assert codes == ["PARITY_DROP", "PARITY_UNKNOWN"]
+    # 两组的 params 形状【有意不同】(A4 2026-07-25)：
+    #   DROP  = 确认性失败 → 消耗重试预算，params=[max_retries, code, msg, *ids] (G9)
+    #   UNKNOWN = 读不到、无法确认 → 不计数，params=[code, msg, *ids]
+    drop_sql, drop_params = upd[0]
+    unk_sql, unk_params = upd[1]
+    assert "index_retry_count = index_retry_count + 1" in drop_sql
+    # params[0] 是 chunk 级重试上限 RAG_STAGE3_CHUNK_MAX_RETRIES（≠ 本用例设的 parity 补推次数）
+    assert drop_params[0] == pn._stage3_chunk_max_retries()
+    assert drop_params[1] == "PARITY_DROP"
+    assert "index_retry_count" not in unk_sql, "读故障不得把健康 chunk 推向 DEAD"
+    assert unk_params[0] == "PARITY_UNKNOWN"
     assert conn.committed
     assert chunks[1].index_error_code == "PARITY_DROP"     # rds_id 11
     assert chunks[3].index_error_code == "PARITY_UNKNOWN"  # rds_id 13

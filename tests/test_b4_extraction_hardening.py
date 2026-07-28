@@ -60,6 +60,11 @@ class TestZipMemberBudget:
 class TestVlmCacheKeyUpgrade:
     def test_ns_default_version_2(self, monkeypatch):
         from opensearch_pipeline.extraction.unified_extractor import _vlm_cache_ns
+        # 本用例钉的是**缓存版本段**（B4 P2-03），不是漏斗策略段。2026-07-26 起
+        # RAG_FUNNEL_DISCARD_REQUIRES_CATEGORY 默认 ON ⇒ 键默认多一个 `:c1` 后缀
+        # （策略段的契约由 tests/test_funnel_discard_requires_category.py 单独钉）。
+        # 这里显式关掉它，让断言只覆盖版本段、保持本用例原意。
+        monkeypatch.setenv("RAG_FUNNEL_DISCARD_REQUIRES_CATEGORY", "0")
         monkeypatch.delenv("RAG_VLM_CACHE_VERSION", raising=False)
         assert _vlm_cache_ns(True) == "pub:2"          # B4 P2-03：默认版本 2
         assert _vlm_cache_ns(False) == "sec:2"

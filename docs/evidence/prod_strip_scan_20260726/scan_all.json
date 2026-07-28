@@ -1,0 +1,93 @@
+{
+ "scanned": 580,
+ "n_hit": 1,
+ "n_runs": 2,
+ "n_slices": 33,
+ "n_error": 17,
+ "downloaded_mb": 556.7,
+ "elapsed_s": 395.9,
+ "docs": [
+  {
+   "doc_id": "DOC_MARKETING_20260622132045_18BE54",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66472035E0F03137C99462', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66472035E0F03137C99462', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/marketing/internal/042002300711_65339215.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_MARKETING_20260622132046_F17D0B",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66472135E0F03137409562', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66472135E0F03137409562', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/marketing/internal/国内营销部部门管理制度-公司各类印章使用管理(执行中).pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_MARKETING_20260622132047_24378D",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66472135E0F03137BD9562', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66472135E0F03137BD9562', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/marketing/internal/富岭开票资料.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_PRODUCTION_20260513120635_328126",
+   "title": "FL-XS-WI-007《吸塑扫码报检》作业指导书-成品仓管.pdf",
+   "dept": "production_thermoforming",
+   "pages": 3,
+   "n_candidates": 42,
+   "n_runs": 2,
+   "n_slices": 33,
+   "warnings": [
+    "[pdf-strip-stitch] p1: 23 slices (1000x713) → doc_p1_img0003_pdfstitched23.png",
+    "[pdf-strip-stitch] p3: 10 slices (1036x300) → doc_p3_img0031_pdfstitched10.png"
+   ]
+  },
+  {
+   "doc_id": "DOC_PRODUCTION_20260622082127_1F22D5",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A6647D480B08E38381BEF02', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A6647D480B08E38381BEF02', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/production/internal/WPQH230467G水性涂层纸杯家庭堆肥证书2023.11.28.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_PRODUCTION_20260622084019_CFDBFD",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A6647D580B08E383866EF02', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A6647D580B08E383866EF02', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/production/internal/纸碗（H）-产品规格书-富岭20241216.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_PRODUCTION_20260622184306_39792E",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A664826E977083739AFCC7E', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A664826E977083739AFCC7E', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/production/internal/产品标准书2024新版（富岭科技)-PLA纸杯 25.05.29(3).pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_PRODUCTION_20260622184307_1784A3",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A664826E97708373901CD7E', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A664826E97708373901CD7E', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/production/internal/纸吸管(粗)、纸吸管(细)、16oz纸杯(H)、20oz纸杯(H)产品规格书-富岭20250117_1738900824734.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_PRODUCTION_20260622184311_900F6A",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A664826E97708373950CD7E', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A664826E97708373950CD7E', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/production/internal/餐包.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_PRODUCTION_20260622184312_3603F2",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A664827E977083739A3CD7E', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A664827E977083739A3CD7E', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/production/internal/茶百道桑葚系列 杯套产品定作合同 合同编号：2023-CGB-0109  时间：20230525.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_RD_20260622132038_88463D",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66487AE9770837390C757F', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66487AE9770837390C757F', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/rd/internal/2021-04-12-BJ8744 台州富岭塑胶有限公司 (1).pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_RD_20260622132039_3DB810",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66487AE97708373968757F', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66487AE97708373968757F', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/rd/internal/2021-02-22-BJ7820-台州富岭塑胶有限公司.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_RD_20260622132039_F0D044",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66487AE977083739A1757F', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66487AE977083739A1757F', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/rd/internal/2021-02-22-BJ7818-台州富岭塑胶有限公司.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_RD_20260622132041_A22D91",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66487AE97708373901767F', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66487AE97708373901767F', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/rd/internal/2021C0117  台州富岭塑胶有限公司(2).pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_RD_20260622132042_0EA495",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66487BE97708373967767F', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66487BE97708373967767F', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/rd/internal/2021C0286  台州富岭塑胶有限公司.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_RD_20260622132042_C0584C",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66487BE977083739BC767F', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66487BE977083739BC767F', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/rd/internal/2021C0189  台州富岭塑胶有限公司.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_RD_20260622132043_FD2BB6",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66487BE9770837390E777F', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66487BE9770837390E777F', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/rd/internal/2021C0287  台州富岭塑胶有限公司.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  },
+  {
+   "doc_id": "DOC_RD_20260622132044_2B2BD2",
+   "error": "NoSuchKey: {'status': 404, 'x-oss-request-id': '6A66487BE97708373945777F', 'details': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.', 'RequestId': '6A66487BE97708373945777F', 'HostId': '[oss-bucket-已剥离]', 'Key': 'raw/rd/internal/PLA-PBS吸管红外报告C.pdf#redacted', 'EC': '0026-00000001', 'RecommendDoc': 'https://api.aliyun.com/troubleshoot?q=0026-00000001'}}"
+  }
+ ],
+ "_scrubbed": "正文与真实人名已剥离（public repo）；结构化指标与文档标题保留，结论可复核"
+}

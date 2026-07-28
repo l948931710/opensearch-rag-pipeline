@@ -64,7 +64,8 @@ def _run_serving(cases: List[Dict], top_k: int, max_images: int,
             per_query.append({"qid": c["qid"], "error": f"{type(e).__name__}: {e}"[:160]})
             continue
         ans = gen["answer"]
-        det = M.analyze_answer(ans, chunks, max_images=max_images)
+        det = M.analyze_answer(ans, chunks, max_images=max_images,
+                               context=gen.get("context"))
         det_list.append(det)
         breadths.append(c.get("query_breadth") or "specific")
         per_query.append({"qid": c["qid"], "query": c["query"], "answer": ans, **det})
@@ -147,7 +148,8 @@ def _run_history_arm(cases: List[Dict], top_k: int, max_images: int) -> Dict:
         ans_ns = {int(m.group(1)) for m in _IMG_PLACEHOLDER_PATTERN.finditer(ans)}
         mimic = bool(hist_ns & ans_ns)
         mimic_flags.append(mimic)
-        det = M.analyze_answer(ans, chunks, max_images=max_images)
+        det = M.analyze_answer(ans, chunks, max_images=max_images,
+                               context=gen.get("context"))
         per_query.append({
             "qid": c["qid"], "query": c["query"], "answer": ans,
             "history_marker_ns": sorted(hist_ns), "answer_marker_ns": sorted(ans_ns),

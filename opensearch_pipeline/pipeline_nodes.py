@@ -23,7 +23,12 @@ from typing import Dict, List
 from opensearch_pipeline.chunker import Chunk, DocumentChunker
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.image_binding_reconcile import reconcile_move
+from opensearch_pipeline.ingest_flags import (
+    effective_funnel_policy_version,
+    image_content_override_enabled,
+)
 from opensearch_pipeline.reindex_states import (
+    RETRY_COUNT_INC_SQL,
     STAGE3_CLAIMABLE_INDEX_STATUS,
     ChunkIndexStatus,
     DocVersionIndexStatus,
@@ -419,8 +424,17 @@ def node_extract_text_with_ocr(ctx: dict):
                         task["local_path"] = local_path
                         print(f"    📥 {doc_id}: downloaded {raw_key} ({file_size} bytes)")
                     except Exception as e:
+                        # A2（2026-07-25）：取件失败必须留显式哨兵。此前只 print + 清空
+                        # local_path，抽取照跑并产出 0 字 canonical，定稿路径无条件写
+                        # canonical_json_key + extraction_status='COMPLETED'——而 stage-1 认领
+                        # 谓词要求 keys IS NULL，于是这篇文档【再也不会被重捡】，只能人工改库。
+                        # 判据用异常本身（不做 warning 文案匹配，避免误伤内容合法为空的文档）；
+                        # 键沿用同函数 _raw_checksum 的 (doc_id, version_no) 约定。
                         print(f"    ⚠️ Failed to download {raw_key} from OSS: {e}")
                         task["local_path"] = ""
+                        ctx.setdefault("_fetch_errors", {})[
+                            (task["doc_id"], task.get("version_no"))
+                        ] = f"{type(e).__name__}: {e}"
         elif simulate_oss and "mock_text" not in task and not task.get("local_path"):
             # 本地零 OSS 形态（LOCAL-DEV，见 docs/environment_design.md）：
             # 真实文档由 scripts/sample_corpus.py 预先采样到 scratch/sample_corpus/<raw_key>，
@@ -474,24 +488,51 @@ def node_extract_text_with_ocr(ctx: dict):
             )
         return result
 
+    # A1（2026-07-25）：无条件打印 configured/effective —— 这三个并发旋钮的代码路径早就就绪、
+    # 默认全 1，且在 dataworks_nodes/ 与 deploy/ 下零注入；此前只在 >1 时才打印，于是"到底有没有
+    # 生效"完全不可从节点日志验证。effective 会因批内文档数不足而低于 configured，必须分开报。
+    _eff_extract = extract_concurrency if len(tasks) > 1 else 1
+    print(f"    └─ [concurrency] extract: configured={extract_concurrency} effective={_eff_extract} "
+          f"(RAG_EXTRACT_CONCURRENCY, docs={len(tasks)})")
+    def _extract_guarded(task, task_tmp_dir):
+        """B2（2026-07-25）：单篇抽取异常不再冒泡打断整批。
+
+        此前串行路径单篇 raise、并发路径 `list(pool.map(...))` 一篇炸掉整个返回列表 ——
+        同批 k+1..N 篇**已经付过费**的 OCR/VLM 成果连同定稿一并丢弃，下一轮从头重付。
+        改为记 `(doc_id, version_no, error)` 进 ctx 并返回 None（**不在这里落库**：
+        单层归因，由 node_build_canonical 统一落库 + 聚合 raise）。
+        注意只包**单篇**：抽取器构造、tmp 目录、cache finalize 等非文档级异常仍整批 fail-fast。
+        """
+        try:
+            return _extract_one(task, task_tmp_dir)
+        except Exception as e:
+            print(f"    ❌ extraction failed for {task.get('doc_id')}: "
+                  f"{type(e).__name__}: {e}")
+            ctx.setdefault("_extract_errors", {})[
+                (task["doc_id"], task.get("version_no"))
+            ] = f"{type(e).__name__}: {e}"
+            return None
+
     try:
         if extract_concurrency > 1 and len(tasks) > 1:
             from concurrent.futures import ThreadPoolExecutor
-            print(f"    └─ Extracting {len(tasks)} docs with {extract_concurrency} concurrent workers "
-                  f"(RAG_EXTRACT_CONCURRENCY)...")
 
             def _extract_isolated(idx_task):
                 idx, task = idx_task
                 sub = os.path.join(tmp_dir, f"doc_{idx}")
                 os.makedirs(sub, exist_ok=True)
-                return _extract_one(task, sub)
+                return _extract_guarded(task, sub)
 
             with ThreadPoolExecutor(max_workers=extract_concurrency) as _pool:
-                # executor.map 保持 tasks 原序；单文档异常冒泡 fail 整节点（与串行一致）
-                extractions = list(_pool.map(_extract_isolated, enumerate(tasks)))
+                # executor.map 保持 tasks 原序；B2 起单文档异常在 _extract_guarded 内被记账
+                # 并返回 None（不再一篇炸掉整个返回列表），下面统一滤掉。
+                extractions = [r for r in _pool.map(_extract_isolated, enumerate(tasks))
+                               if r is not None]
         else:
             for task in tasks:
-                extractions.append(_extract_one(task, tmp_dir))
+                _res = _extract_guarded(task, tmp_dir)
+                if _res is not None:
+                    extractions.append(_res)
     finally:
         # ─── 在清理 tmp 之前，将保留图片上传到 OSS ───
         # 解决 local_path 生命周期问题：downstream 的 embedding 节点不再依赖 local_path。
@@ -511,6 +552,14 @@ def node_extract_text_with_ocr(ctx: dict):
         except Exception as _ve:
             print(f"    ⚠️ VLM cache OSS flush failed (non-fatal): {_ve}")
 
+        # A5（2026-07-25）：OCR 页级缓存同款收尾——底座只从 finalize 推 OSS 镜像，没有这个
+        # 调用点镜像就永远不会产生（DataWorks 每次都是全新 pod，跨运行命中率恒 0）。
+        try:
+            from opensearch_pipeline.extraction.ocr_client import OCRClient
+            OCRClient.flush_page_cache_to_oss()
+        except Exception as _oe:
+            print(f"    ⚠️ OCR page cache OSS flush failed (non-fatal): {_oe}")
+
         # 清理临时文件
         import shutil
         try:
@@ -519,6 +568,232 @@ def node_extract_text_with_ocr(ctx: dict):
             pass
 
     ctx["extractions"] = extractions
+
+
+def _fetch_canonical_json(canonical_json_key):
+    """只读拉取并解析一篇 canonical JSON（OSS 或本地模拟路径）。
+
+    **失败返回 None 而不是 {}** —— 下游按"缺 assets 键 = unknown"处理，绝不能让一次
+    读取失败变成"上一版本零张图"从而伪造出全量 removal。
+    """
+    if not canonical_json_key:
+        return None
+    try:
+        if os.path.exists(canonical_json_key):          # 本地模拟
+            with open(canonical_json_key, "r", encoding="utf-8") as f:
+                return json.load(f)
+        bucket, is_sim = _get_oss_bucket()
+        if is_sim or bucket is None:
+            return None
+        return json.loads(bucket.get_object(canonical_json_key).read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _emit_asset_set_diff(ctx, canonical, observed_stage, cur_checksum=None,
+                         simulate_db=False, conn=None):
+    """方案 F：把"存活图集相对上一成功服务版本的增减"写成可见信号。
+
+    **纯旁路 + fail-open**：任何异常只吞并打日志，绝不影响摄取决策或事务。
+    只在 diff 非空时写 kb_audit_log（action=ASSET_SET_DIFF），避免审计噪声。
+
+    **返回**：产出的事件 dict，或 None（不可比 / 无变化 / 任何异常）。调用方可据此决定
+    是否放行 skip（见 `_asset_additions_block_skip`）—— 但本函数自身**绝不改变**任何判定。
+
+    ⚠️ 当前 kb_audit_log 没有业务唯一键 ⇒ **不保证幂等**，stage 重试可能多写一行
+    （event_key 仅供人工/后续去重；唯一索引列为后续项）。
+    ⚠️ 同版本 maintenance re-chunk **不在本观测范围**（需要 pre-delete 快照，另行设计）。
+    """
+    try:
+        from opensearch_pipeline import asset_set_diff as _asd
+        from opensearch_pipeline.audit_log import write_audit
+        doc_id = canonical.get("doc_id")
+        observed_v = canonical.get("version_no")
+        if not doc_id or not observed_v or observed_v <= 1 or simulate_db:
+            return None
+        cur = _asd.survivors(canonical)
+        if not cur.known:
+            return None                 # 当前侧 unknown ⇒ 不产出任何结论
+        if _asd.extraction_degraded(canonical):
+            # 审查 P1-8：本轮抽取带降级信号（缺 PyMuPDF / 打不开文件 / OCR 部分失败 /
+            # VLM 供应商故障）时，assets 变少**不能**归因为判定漂移。标成 partial ⇒
+            # build_event 只会出 ordinal_diff_partial，不会出高置信 same_source_drift，
+            # 也不会打"图会从答案里消失"那条告警。留痕仍在（要的就是可见性）。
+            cur = _asd.SurvivorSet(cur.indices, cur.n_unindexed + 1, True)
+        # 审查 P2-14：两个调用点都在调用方持有共享连接期间（perf#92「本篇共享一个连接」/
+        # perf#93「闭环整批共享一个连接」刚做的合并）—— 能复用就复用，别再借还一次。
+        _own_conn = conn is None
+        conn = conn if conn is not None else _get_db_conn()
+        try:
+            with conn.cursor() as cur_db:
+                cur_db.execute(_asd.baseline_sql(), (doc_id, observed_v))
+                row = cur_db.fetchone()
+                if not row:
+                    return None         # 首灌或无合格基线：建立基线，不报 diff
+                base_v, base_key, base_checksum = row[0], row[1], row[2]
+                if cur_checksum is None:
+                    # DAG 1 的 skip-gate 早于 checksum 落库 ⇒ 调用方传 ctx["_raw_checksum"]；
+                    # 这里只是 DAG 2 侧的兜底查询。
+                    cur_db.execute("SELECT checksum_sha256 FROM document_version "
+                                   "WHERE doc_id=%s AND version_no=%s", (doc_id, observed_v))
+                    _r = cur_db.fetchone()
+                    cur_checksum = _r[0] if _r else None
+        finally:
+            if _own_conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        prev_canonical = _fetch_canonical_json(base_key)
+        prev = _asd.survivors(prev_canonical)
+        rel = _asd.source_relation(base_checksum, cur_checksum)
+        event = _asd.build_event(doc_id, base_v, observed_v, prev, cur, rel, observed_stage)
+        if not event:
+            return None
+        if _asd.is_high_confidence_loss(event):
+            print(_asd.log_line(doc_id, event))
+        write_audit(doc_id=doc_id, version_no=observed_v, action_type="ASSET_SET_DIFF",
+                    action_result=observed_stage, message=_asd.event_message(event),
+                    trace_id=_audit_trace(ctx), simulate=simulate_db)
+        return event
+    except Exception as _e:                                     # fail-open
+        print(f"    ⚠️ asset-set diff 观测失败（不影响摄取）: {type(_e).__name__}: {_e}")
+        return None
+
+
+def _audit_trace(ctx):
+    """审查 P2-13：ASSET_SET_DIFF 曾是本文件唯一不带 trace_id 的审计写 —— 而方案 F 的
+    存在理由正是回答"是哪次改动把图吃掉的"，没有 `<git_commit>:<bizdate>` 指纹就 join
+    不回 pipeline_run，定位不到当时的 extractor_version / funnel_policy / VLM 模型。"""
+    try:
+        from opensearch_pipeline.audit_log import audit_trace_id
+        return audit_trace_id(ctx)
+    except Exception:
+        return None
+
+
+def _asset_additions_block_skip(event) -> bool:
+    """skip-gate 是否应当**因资产集新增**而放行这一篇（审查 P1-5，2026-07-26）。
+
+    要解决的问题：`_canonical_sha256` 只哈希正文，而 `ROUTE_TO_VECTOR` 不产任何 block ——
+    于是选项 C / strip-stitch 救回来的图**不改变正文哈希**，生产默认开着的
+    `RAG_SKIP_UNCHANGED_REINGEST` 判 SKIPPED_DUPLICATE 并 continue，救回的图永远到不了
+    chunk_meta/HA3。也就是说这两项改动在"文件没变、只是想让图回来"这个**它们的目标场景**
+    上完全无效。
+
+    **为什么判据是非对称的（只看新增、不看减少）** —— 这是本函数最要紧的一条：
+      · **新增**只可能来自"这次多存活了图"（判据放宽 / 缝合救回），破损的抽取环境只会产出
+        **更少**的图，永远不会更多 ⇒ 用新增触发重摄取是安全的；
+      · **减少**则既可能是真漂移，也可能是环境缺依赖（如 py3.7 节点缺 PyMuPDF 时
+        `import fitz` 失败只 print、返回空 assets）。若据此放行 skip，DAG 3 收尾会拿一个
+        零图的新版本去停用正在服务的旧版本 —— 把观测变成事故。减少**只告警**（F 已经做了），
+        绝不改变 skip 决策。
+
+    为什么不改 `_canonical_sha256` 把 assets 折进去（审查建议的另一条路）：该哈希还被
+    跨文档去重消费，且已持久化在 `document_version.canonical_sha256` —— 改公式会让**全部
+    存量文档**下次摄取时看起来"变了"，爆炸半径不成比例。
+
+    回滚：`RAG_SKIP_GATE_HONORS_ASSETS=0/false/no/off` 恢复"只看正文"的历史行为。
+    """
+    if os.environ.get("RAG_SKIP_GATE_HONORS_ASSETS", "").strip().lower() in (
+            "0", "false", "no", "off"):
+        return False
+    return bool(event) and int(event.get("n_added") or 0) > 0
+
+
+def _pii_fingerprint(value: str):
+    """PII 值的**不可回推**指纹（审查 P2-12，2026-07-26）。
+
+    此前直接 `sha256(原始命中串)`。而该表此前唯一的写入方 node02 哈希的是**实体名/词表词/
+    文件名**，从来不是 PII 值 —— 所以「只存 SHA-256 + 掩码预览」这句在那边成立、在这边
+    不成立：无盐 SHA-256 对 11 位手机号是**秒级枚举**可还原，身份证受结构与校验位约束同理，
+    再叠加同行存着的首尾各 2 位，等价于把明文放进了一张有治理看板查询面、默认留存 24 个月
+    的表。
+
+    改用 HMAC：拿不到密钥时**返回 None 而不是退回明文哈希** —— 少一列指纹只是少了去重能力，
+    留一列可回推的指纹是把 PII 写进库。
+    """
+    # 专用 env（不复用 RAG_SESSION_SIGNING_KEY / RAG_UPLOAD_SIGNING_KEY —— config.py:1064
+    # 那条注释明说"一钥两用扩大泄漏半径"，这里遵守同一条）。
+    key = os.environ.get("RAG_PII_FINGERPRINT_KEY", "").strip().encode("utf-8")
+    if not key:
+        return None
+    import hmac
+    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _persist_image_scrub_findings(ctx, doc, findings):
+    """方案 A（2026-07-26）：把 G21 消费点掩码的命中写成 `document_sensitive_finding` 行。
+
+    **为什么需要它**：图像侧 PII 在审计表上此前完全不可见 —— `image_ocr:*` 恒 0 行
+    （只读调查 `docs/image_ocr_pii_exposure_investigation_2026-07-26.md` §4/§5.1 实证
+    「只看审计表会漏掉这处暴露」）。根因是那条留痕挂在 node02 的 `RAG_IMAGE_OCR_PII`
+    门内，而该 flag 只在 DataWorks 节点 setdefault、覆盖不了笔记本重跑；G21 因为默认 ON
+    且不读任何 flag，**两条执行路径都生效** —— 所以留痕该挂在它这里。
+
+    **纯留痕，不改任何判定**：
+      · `action` 恒为 `REDACTED` —— G21 只掩码、**从不隔离**（这正是不默认开
+        `RAG_IMAGE_OCR_PII` 的理由：它唯一的增量是把 2 篇在用的 public 手册降级成下架）；
+      · 不参与 `final_risk` 计算、不回写 `redaction_action`、不影响 chunk 产出。
+    **fail-open**：任何异常只吞并打日志 —— 与 node02 的 `raise` 刻意不同，那里留痕失败
+    意味着"隔离决策没落库"，这里只是少了一行审计。绝不让审计写把分块炸掉。
+
+    `finding_type` 用 **`image_scrub:`** 前缀而非 node02 的 `image_ocr:` —— 后者是判断
+    "node02 那条 flag 门内的路径有没有跑过"的既有判据（上述调查正是这么用的），复用会把它
+    毁掉。两个前缀并存即可分辨是哪一层留下的。
+
+    PII 纪律：只存 SHA-256 + 掩码预览，绝不存原文（同 node02）。
+    """
+    if not findings:
+        return
+    if _resolve_simulate(ctx, "db"):
+        return
+    conn = None
+    try:
+        rows, seen = [], set()
+        for name, matched in findings:
+            key = (name, matched)
+            if key in seen:            # 同一篇里同一实体同一值只留一行
+                continue
+            seen.add(key)
+            # 审查 P1-10：长度必须封顶。`secret_like`/`access_key`/`email` 的匹配长度
+            # 无上界，而列是 VARCHAR(255) —— 一条超长命中会让 executemany（pymysql 改写
+            # 为单条多值 INSERT）整体 1406 失败，**该文档本轮全部** image_scrub 行（含同篇
+            # 合法的手机号/身份证留痕）一起被 fail-open 吞掉，只剩一行 print。
+            # finding_type 早有 [:64]，preview 此前没有同等保护。
+            preview = ("*" * len(matched) if len(matched) <= 4
+                       else matched[:2] + "*" * (len(matched) - 4) + matched[-2:])[:255]
+            rows.append((doc["doc_id"], doc["version_no"], f"image_scrub:{name}"[:64],
+                         ENTITY_SEVERITY.get(name, "medium"), None, None,
+                         _pii_fingerprint(matched), preview, "REDACTED"))
+        conn = _get_db_conn(select_db=True)
+        with conn.cursor() as cur:
+            # node_detect_sensitive 按 (doc_id, version_no) 先 DELETE 再 INSERT，且它在
+            # DAG 2 里跑在本节点**之前** ⇒ 本函数的行不会被它清掉；重跑时它清一次、
+            # 两层各自重建，自愈。这里只清本层自己的行，避免同轮重入叠加。
+            cur.execute("DELETE FROM document_sensitive_finding WHERE doc_id=%s "
+                        "AND version_no=%s AND finding_type LIKE 'image_scrub:%%'",
+                        (doc["doc_id"], doc["version_no"]))
+            cur.executemany(
+                "INSERT INTO document_sensitive_finding ("
+                "  doc_id, version_no, finding_type, severity, page_num, block_index,"
+                "  matched_text_hash, matched_text_preview, action"
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
+        conn.commit()
+        print(f"    ├─ [pii-audit] {doc['doc_id']}: {len(rows)} 条 image_scrub:* 留痕入库")
+    except Exception as e:                                   # fail-open
+        print(f"    ⚠️ [pii-audit] 图像脱敏留痕写入失败（不影响分块）: {type(e).__name__}: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _audit_reingest_skip(ctx, doc_id, version_no, message, simulate_db):
@@ -591,6 +866,48 @@ def _rollback_or_discard(conn):
         return None
 
 
+def _same_image_ref(a: dict, b: dict) -> bool:
+    """B3（2026-07-25）：两个 image_ref 是否指向**同一张图**。
+
+    身份键沿用 xlsx 的载重契约（CLAUDE.md）：`filename` + `anchor_row` 是同 anchor 多图
+    消歧的严格身份；两者缺失时退到 `oss_key`/`source_image` + `image_index`。
+    只用于"追加第二张图"时的去重 —— 同一 figure_no 被多个 asset 共用时会重复追加。
+    """
+    for k1, k2 in (("filename", "anchor_row"), ("oss_key", "image_index"),
+                   ("source_image", "image_index")):
+        if a.get(k1) and a.get(k1) == b.get(k1) and a.get(k2) == b.get(k2):
+            return True
+    return False
+
+
+def _mark_extraction_failed(doc_id, version_no, reason: str, simulate_db: bool) -> None:
+    """把单篇标 `extraction_status='FAILED'` + 留痕（**不写 canonical keys**）。
+
+    stage-1 的四个单篇失败守卫（OSS-FETCH / ENV-DEP / COST-DEFER / B2 的抽取与定稿失败）
+    共用同一收口：keys 保持 NULL ⇒ 下一次 stage-1 按既有扫描谓词（NOT_STARTED 且
+    canonical_json_key IS NULL）自动重捡自愈；调用方负责把该篇记进各自清单，循环后统一 raise。
+
+    留痕失败**不吞守卫本身** —— canonical 已被扣住，重捡语义不受影响。
+    """
+    if simulate_db:
+        return
+    _conn = None
+    try:
+        _conn = _get_db_conn(select_db=True)
+        with _conn.cursor() as _cur:
+            _cur.execute(
+                "UPDATE document_version SET extraction_status='FAILED', "
+                "content_process_error=%s, processed_at=NOW() "
+                "WHERE doc_id=%s AND version_no=%s",
+                (reason, doc_id, version_no))
+        _conn.commit()
+    except Exception as _err:
+        print(f"    ⚠️ failed to mark extraction_status=FAILED in RDS for {doc_id} v{version_no}: {_err}")
+    finally:
+        if _conn is not None:
+            _conn.close()
+
+
 def node_build_canonical(ctx: dict):
     """
     构建 canonical document（增强版）。
@@ -604,6 +921,10 @@ def node_build_canonical(ctx: dict):
     canonicals = []
     env_dep_failures = []  # ENV-DEP 守卫命中清单（doc 级；循环后统一 raise 炸红本次运行）
     cost_defer_docs = []   # COST-DEFER 守卫命中清单（瞬态预算顺延；同 ENV-DEP 循环后 raise）
+    fetch_failures = []    # OSS-FETCH 守卫命中清单（取件失败；同 ENV-DEP 形态，循环后 raise）
+    _fetch_errors = ctx.get("_fetch_errors") or {}
+    finalize_failures = []  # B2：单篇定稿失败（OSS/RDS）清单；循环后与其它守卫一起 raise
+    extract_failures = []   # B2：抽取层传来的单篇失败（见下方 simulate_db 之后的落库循环）
 
     # perf#92：simulate 判定与 OSS bucket 客户端是循环不变量，提升到循环外一次构造
     # （原先每篇文档各构造一次 oss2.Auth+Bucket）。extractions 为空时不触碰 OSS，
@@ -612,6 +933,15 @@ def node_build_canonical(ctx: dict):
     bucket = is_simulated_oss = None
     if extractions:
         bucket, is_simulated_oss = _get_oss_bucket(ctx)
+
+    # B2（2026-07-25）：抽取层单篇失败的**统一落库点**。抽取层只产出
+    # `(doc_id, version_no, error)`、不落库 —— 单层归因，避免两处各标一次 FAILED、各计一次数。
+    # 这些 doc 根本没有 ExtractionResult，所以不会出现在下面的循环里，必须在这里收口。
+    for (_x_doc, _x_ver), _x_err in sorted((ctx.get("_extract_errors") or {}).items()):
+        _x_reason = f"[EXTRACT-FAILED] {_x_err}"[:500]
+        print(f"    ❌ ERROR {_x_doc} v{_x_ver}: {_x_reason}")
+        _mark_extraction_failed(_x_doc, _x_ver, _x_reason, simulate_db)
+        extract_failures.append(f"{_x_doc} v{_x_ver}: {_x_reason}")
 
     for result in extractions:
         # 兼容旧的 dict 格式和新的 ExtractionResult
@@ -647,7 +977,13 @@ def node_build_canonical(ctx: dict):
                 "partial_loss_notes": list(getattr(result, "partial_loss_notes", []) or []),
                 # G20：文本归一版本标记（canonical_sha256 建立在归一后文本上；规则变更须
                 # bump NORMALIZATION_VERSION，否则 skip-unchanged/去重把规则漂移误判为内容变更）
-                "normalization_version": None,
+                # 审查 P1-9（2026-07-26）：漏斗策略是 **Stage-1 属性** —— Stage-2 是独立进程、
+                # 重建 provenance、且**不重跑漏斗**（从 OSS 回读 canonical assets）。不把它
+                # 随 canonical 传下去的话，任一维护性重切都会给「由旧判据决定的图集」贴上
+                # 当时进程 env 的标签，事后拿 funnel_policy 盘点"谁还欠一次 C 重灌"会**恰好
+                # 漏掉全部欠账文档**——而 versions.py 给这个 key 写的理由正是"事后没有这个
+                # 标签就无法归因"。
+                "funnel_policy": effective_funnel_policy_version(),
                 "canonical_status": "DONE",
                 "canonical_key": (
                     f"processing/canonical/{result.doc_id}"
@@ -677,6 +1013,25 @@ def node_build_canonical(ctx: dict):
                 ),
             }
 
+        # ── OSS-FETCH 守卫（A2 2026-07-25）：原件根本没下下来 → 绝不定稿 ──
+        # node_extract 的下载 except 只 print + local_path=""，抽取仍会跑并产出 0 字 canonical；
+        # 若照常写 keys + extraction_status='COMPLETED'，stage-1 扫描谓词（NOT_STARTED 且
+        # canonical_json_key IS NULL）永远不会再捡它，一次 OSS 瞬断就把健康文档变成需要人工
+        # 改库才能复活的死件，且状态列字面谎报 COMPLETED。处置与下方 ENV-DEP 完全同型：
+        # 不写 canonical 文件/keys（keys 留 NULL → 下一次 stage-1 自动重捡自愈）、
+        # extraction_status='FAILED' + content_process_error 留痕、循环后统一 raise 炸红运行。
+        # 不动 retry_count：stage-1 全链路无任何一处给它自增，加谓词会命中
+        # ingest_policy 的「计得到、领不走 → 无进展守卫永久判死」陷阱。
+        _fetch_err = _fetch_errors.get((canonical["doc_id"], canonical["version_no"]))
+        if _fetch_err:
+            _fetch_reason = f"[OSS-FETCH] failed to download raw object: {_fetch_err}"[:500]
+            print(f"    ❌ ERROR {canonical['doc_id']} v{canonical['version_no']}: {_fetch_reason}")
+            _mark_extraction_failed(canonical["doc_id"], canonical["version_no"],
+                                    _fetch_reason, simulate_db)
+            fetch_failures.append(
+                f"{canonical['doc_id']} v{canonical['version_no']}: {_fetch_reason}")
+            continue
+
         # ── ENV-DEP 守卫：空 canonical + 缺模块警告 = 环境性抽取失败，绝不标 SUCCESS ──
         # /usr/bin/python3 缺 openpyxl/python-pptx 时，基础抽取器的优雅降级把 ImportError
         # 吞成 "Failed to extract ...: No module named '...'"，产出 0 chars/0 blocks 的空
@@ -701,23 +1056,8 @@ def node_build_canonical(ctx: dict):
             _env_reason = ("[ENV-DEP] empty canonical with missing python module: "
                            + "; ".join(_env_missing_warns)[:500])
             print(f"    ❌ ERROR {canonical['doc_id']} v{canonical['version_no']}: {_env_reason}")
-            if not simulate_db:
-                _f_conn = None
-                try:
-                    _f_conn = _get_db_conn(select_db=True)
-                    with _f_conn.cursor() as _f_cur:
-                        _f_cur.execute(
-                            "UPDATE document_version SET extraction_status='FAILED', "
-                            "content_process_error=%s, processed_at=NOW() "
-                            "WHERE doc_id=%s AND version_no=%s",
-                            (_env_reason, canonical["doc_id"], canonical["version_no"]))
-                    _f_conn.commit()
-                except Exception as _f_err:
-                    # 留痕失败不吞守卫本身——循环后的 raise 仍会炸红运行
-                    print(f"    ⚠️ failed to mark extraction_status=FAILED in RDS: {_f_err}")
-                finally:
-                    if _f_conn is not None:
-                        _f_conn.close()
+            _mark_extraction_failed(canonical["doc_id"], canonical["version_no"],
+                                    _env_reason, simulate_db)
             env_dep_failures.append(
                 f"{canonical['doc_id']} v{canonical['version_no']}: {_env_reason}")
             continue
@@ -734,23 +1074,8 @@ def node_build_canonical(ctx: dict):
             _defer_reason = ("[COST-DEFER] transient VLM budget (RUN/DAILY) exhausted; "
                             "canonical withheld, will be re-picked next run")
             print(f"    ⏸️ DEFER {canonical['doc_id']} v{canonical['version_no']}: {_defer_reason}")
-            if not simulate_db:
-                _f_conn = None
-                try:
-                    _f_conn = _get_db_conn(select_db=True)
-                    with _f_conn.cursor() as _f_cur:
-                        _f_cur.execute(
-                            "UPDATE document_version SET extraction_status='FAILED', "
-                            "content_process_error=%s, processed_at=NOW() "
-                            "WHERE doc_id=%s AND version_no=%s",
-                            (_defer_reason, canonical["doc_id"], canonical["version_no"]))
-                    _f_conn.commit()
-                except Exception as _f_err:
-                    # 留痕失败不吞守卫本身——canonical 已被扣住（不写 keys），重捡语义不受影响
-                    print(f"    ⚠️ failed to mark COST-DEFER in RDS: {_f_err}")
-                finally:
-                    if _f_conn is not None:
-                        _f_conn.close()
+            _mark_extraction_failed(canonical["doc_id"], canonical["version_no"],
+                                    _defer_reason, simulate_db)
             cost_defer_docs.append(f"{canonical['doc_id']} v{canonical['version_no']}")
             continue
 
@@ -810,6 +1135,7 @@ def node_build_canonical(ctx: dict):
             if _skip_unchanged and not simulate_db and (canonical.get("version_no") or 0) > 1:
                 _do_skip = False
                 _prior_v = None
+                _diff_event = None
                 try:
                     if _doc_conn is None:
                         _doc_conn = _get_db_conn(select_db=True)
@@ -821,6 +1147,28 @@ def node_build_canonical(ctx: dict):
                             (canonical["doc_id"], canonical["version_no"]))
                         _prior = _sk_cur.fetchone()
                         if _prior and _prior[1] == _canonical_sha256:
+                            # F（2026-07-25）+ P1-5（2026-07-26）：**在任何写之前**先比资产集。
+                            # 这条挂载点不能省 —— 生产默认 RAG_SKIP_UNCHANGED_REINGEST=true，
+                            # 正文 hash 相同即在此 continue、从 canonicals 排除、永远到不了
+                            # node_write_chunk_meta；而"同一份文件 + 正文没变 + 图集变化"
+                            # 恰恰是本观测要抓的核心场景。
+                            # ⚠️ 必须在 UPDATE 之前：SKIPPED_DUPLICATE 与 current_version_no
+                            # 回退一旦写下并 commit，再撤销 skip 就会留下自相矛盾的状态行。
+                            _diff_event = _emit_asset_set_diff(
+                                ctx, canonical, observed_stage="SKIP_GATE",
+                                cur_checksum=ctx.get("_raw_checksum", {}).get(
+                                    (canonical["doc_id"], canonical.get("version_no"))),
+                                simulate_db=simulate_db, conn=_doc_conn)
+                        if (_prior and _prior[1] == _canonical_sha256
+                                and _asset_additions_block_skip(_diff_event)):
+                            # P1-5：资产集**新增** ⇒ 撤销 skip，照常入库。否则 C / strip-stitch
+                            # 救回的图永远进不了索引（正文哈希不含 assets，ROUTE_TO_VECTOR
+                            # 也不产 block）。只看新增不看减少 —— 理由见
+                            # `_asset_additions_block_skip` 的 docstring。
+                            print(f"    ↩️ {canonical['doc_id']} v{canonical['version_no']}: "
+                                  f"资产集新增 {_diff_event['n_added']} 张 "
+                                  f"{_diff_event['added']} ⇒ **不 skip**，照常入库")
+                        elif _prior and _prior[1] == _canonical_sha256:
                             # F3 锁序纪律：同事务多表写一律 document_meta 先行（与 console/
                             # reconciler/quarantine 的 meta→…→dv 统一），杜绝 dv→meta 反序
                             # 与 meta-first 写方成环死锁。语义不变（单次 commit 原子）。
@@ -1056,12 +1404,52 @@ def node_build_canonical(ctx: dict):
 
             # Append only after a successful (non-skipped) build — the skip-gate `continue`s above.
             canonicals.append(canonical)
+        except Exception as _finalize_err:
+            # B2（2026-07-25）：单篇定稿失败（canonical OSS 上传 / RDS 写）不再冒泡打断整批。
+            # 此前第 k 篇一 raise，k+1..N 篇**已经付过费**的 OCR/VLM 抽取成果连同定稿一起丢弃
+            # （下一轮从头重付）。改为按篇隔离：标 FAILED 留痕 + continue，循环后统一 raise
+            # 让运行照常变红。keys 未写 ⇒ 下一次 stage-1 按既有谓词自动重捡（与 OSS-FETCH /
+            # ENV-DEP / COST-DEFER 三个守卫同一自愈通道）。
+            _fin_reason = f"[CANONICAL-FINALIZE] {type(_finalize_err).__name__}: {_finalize_err}"[:500]
+            print(f"    ❌ ERROR {canonical['doc_id']} v{canonical['version_no']}: {_fin_reason}")
+            _mark_extraction_failed(canonical["doc_id"], canonical["version_no"],
+                                    _fin_reason, simulate_db)
+            finalize_failures.append(
+                f"{canonical['doc_id']} v{canonical['version_no']}: {_fin_reason}")
+            continue
         finally:
             # perf#92：本篇共享连接统一归还（skip/dedup 的 continue、OSS/DB 的 raise、正常路径皆经此）。
             if _doc_conn is not None:
                 _doc_conn.close()
 
     ctx["canonicals"] = canonicals
+
+    # B2 收尾：抽取失败 / 定稿失败 —— 与下面三个守卫同型（受影响 doc 已逐条标 FAILED、
+    # canonical 被扣住，健康文档已逐篇落库不受影响），统一 raise 让 DataWorks 变红。
+    # 自愈条件：keys 保持 NULL ⇒ 下一次 stage-1 自动重捡。
+    if extract_failures or finalize_failures:
+        _all = extract_failures + finalize_failures
+        _shown = " | ".join(_all[:10])
+        if len(_all) > 10:
+            _shown += f" | ...(+{len(_all) - 10} more)"
+        raise RuntimeError(
+            f"[STAGE1-PARTIAL] {len(extract_failures)} doc(s) failed extraction + "
+            f"{len(finalize_failures)} failed canonical finalize (each marked "
+            f"extraction_status=FAILED, canonical withheld). Healthy docs in this batch were "
+            f"finalized normally and are NOT lost. They will be re-picked automatically: {_shown}")
+
+    # OSS-FETCH 收尾（A2）：与 ENV-DEP 同型——受影响 doc 已逐条标 FAILED 且 canonical 被扣住，
+    # 健康文档已逐篇落库不受影响；统一 raise 让 DataWorks 任务变红。自愈条件：OSS 恢复后
+    # 下一次 stage-1 按既有谓词（NOT_STARTED 且 keys IS NULL）自动重捡，无须人工干预。
+    if fetch_failures:
+        _shown = " | ".join(fetch_failures[:10])
+        if len(fetch_failures) > 10:
+            _shown += f" | ...(+{len(fetch_failures) - 10} more)"
+        raise RuntimeError(
+            f"[OSS-FETCH] {len(fetch_failures)} doc(s) could not be downloaded from OSS "
+            f"(marked extraction_status=FAILED, canonical withheld, content_process_status "
+            f"stays NOT_STARTED). They will be re-picked automatically once OSS is reachable: "
+            f"{_shown}")
 
     # ENV-DEP 守卫收尾：受影响 doc 已逐条标 FAILED 并被排除出 canonicals（健康文档的
     # canonical/COMPLETED 均已逐篇落库，不受影响）；这里统一 raise 让 DAG/DataWorks
@@ -1270,6 +1658,11 @@ def _clean_llm_json_response(text: str) -> str:
     return text
 
 
+# A10：摄取分类器专用的输出上限（**不复用 config.llm.max_tokens** —— 那是与问答共用的字段，
+# 见下方 payload 注释）。分类响应是一个小 JSON，1024 足够且留了充分余量。
+_CLASSIFY_MAX_TOKENS = 1024
+
+
 def run_gemini_classification(text: str, model_name: str, api_key: str, api_base_url: str) -> dict:
     """
     调用 LLM 接口（兼容 Gemini 和阿里云 DashScope Qwen 接口）进行分类和风险评估。使用 structured JSON Schema 输出，排除权限字段。
@@ -1377,7 +1770,18 @@ def run_gemini_classification(text: str, model_name: str, api_key: str, api_base
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            "temperature": 0  # DET: deterministic classification → stable category → stable chunk routing
+            "temperature": 0,  # DET: deterministic classification → stable category → stable chunk routing
+            # A10（2026-07-25）：思考模式与输出上限都必须**钉死**，与 intent_router /
+            # query_rewriter / query_decomposer / general_answerer 等小判别调用同款。
+            # 供应商若把该模型的 thinking 默认翻成开，content 会被 reasoning 挤空 → JSON 解析
+            # 失败 → 走 fail-safe 把文档打成 restricted/QUARANTINE/PENDING_AUDIT/high-risk。
+            # **刻意不读 config.llm**：LLMConfig 是分类与问答共用的（llm_generator 读同一个
+            # enable_thinking / max_tokens），谁为调答案设了 RAG_LLM_ENABLE_THINKING=true，
+            # 摄取分类器就会跟着翻——而类别决定 chunk 家族路由，等于静默 re-roll 全库切块。
+            "enable_thinking": False,
+            # 1024 而非 512：分类 JSON 很短，但太紧的失败模式不是"截断答案"而是解析失败后
+            # 走上面那条隔离链路，宁可给足余量。
+            "max_tokens": _CLASSIFY_MAX_TOKENS,
         }
         
         from opensearch_pipeline.vlm_retry import post_json_with_retry
@@ -1966,7 +2370,7 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     conn_dv = _get_db_conn(select_db=True)
                     with conn_dv.cursor() as cursor:
-                        cursor.execute("""
+                        cursor.execute(f"""
                             UPDATE document_version
                             SET classification_method = 'LLM',
                                 classification_confidence = 0.0,
@@ -1974,7 +2378,7 @@ def node_classify_and_risk_assess(ctx: dict):
                                 classification_status = 'PENDING_AUDIT',
                                 content_process_status = 'FAILED',
                                 content_process_error = %s,
-                                retry_count = retry_count + 1
+                                {RETRY_COUNT_INC_SQL}
                             WHERE doc_id = %s AND version_no = %s
                         """, (api_error_reason, doc["doc_id"], doc["version_no"]))
                         conn_dv.commit()
@@ -2968,7 +3372,7 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                 cy = (float(b_extra["y0"]) + float(b_extra.get("y1") or b_extra["y0"])) / 2
                 label_points.append((lab, cx, cy, bpg))
 
-            # 严格包含（无容忍带）：±tol 会把贴在本图边缘外侧的标注误吸进相邻图
+            # 严格包含（无容忍带，_OVERLAY_TOL=0.0）：±tol 会把贴在本图边缘外侧的标注误吸进相邻图
             # bbox 形成「错误的唯一归属」——实测三例标注（①⑦⑧）都严格落在所属图
             # bbox 内部，宽容不带来收益只扩大误吸面（2026-06-11 对抗评审收窄）。
             _OVERLAY_TOL = 0.0
@@ -2985,6 +3389,39 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                 if len(containing) == 1:
                     overlay_label_owner.setdefault(id(containing[0]), []).append(lab)
 
+            # ── 重复圈号 = 不可采信的图号（PDF-D5，2026-07-25；取代 D4 的图片数判据）──
+            # 1b 命中会**压过几何**，所以它只该接受高精度的 figure-ID 证据：
+            # **仅页内唯一出现**的圈号才算图号；重复出现即 fail-closed，回落几何。
+            # 这不是"两次出现必然指向不同图"的数学推导（两个点可能都在同一张图内），
+            # 而是**可采信门**——重复时不去从不稳定的信息里"恢复唯一性"。
+            #
+            # 为什么判据必须建在 label_points（pdf_extractor 的 circled_label 块 = 纯
+            # 文本层）而不是 overlay_label_owner（"几张**存活**图认领它"）：
+            #   后者是 **VLM 判断的函数** —— 漏斗对同一张图的留/弃会随 caption 重掷而变。
+            #   实证 FL-ZS-WI-009：暖缓存下 page1 存活图 [1..6]，image 2 与 image 5 各
+            #   认领一个游离 ① ⇒ 判歧义、image 5 按几何正确归步骤3；空缓存重掷 caption
+            #   后 **image 2 被漏斗丢弃**，① 只剩 image 5 认领 ⇒ 歧义判定失效 ⇒ image 5
+            #   又被 1b 拖回步骤2（正文"（图①）"在那）。同两次抽取里，标记的页级计数
+            #   `{(1,'②'):1, (1,'①'):3, ...}` **逐字相同**，存活图集却不同。
+            #
+            # 口径（三条都是语义的一部分）：
+            #   · 计数只数 label_points（页级标记出现次数），与哪些图存活无关；
+            #   · 一旦判歧义，该字符对该页 overlay / vlm_annotation_map /
+            #     visual_summary **三源全部弃用**（只堵 overlay 会被后两级回退绕回）；
+            #   · **先过滤歧义字符、再做各源 `len(...) == 1` 唯一性判断**，同源里未歧义
+            #     的其他字符仍可用。
+            #
+            # ⚠️ 本守门只消除"重复圈号歧义判定"对存活 asset 集的依赖，**不**等于 1b 已
+            # caption-independent：1b 仍只收 ROUTE_TO_VECTOR/TEXT 的资产，且 map/summary
+            # 两级证据本身就是 VLM 产物。
+            _label_occurrences: Dict[tuple, int] = {}
+            for lab, _cx, _cy, lpg in label_points:
+                _label_occurrences[(lpg, lab)] = _label_occurrences.get((lpg, lab), 0) + 1
+            _ambiguous_by_page: dict = {}
+            for (_pg, _c), _n in _label_occurrences.items():
+                if _n > 1:
+                    _ambiguous_by_page.setdefault(_pg, set()).add(_c)
+
             for va in page_only_assets:
                 ann_map = va.get("vlm_annotation_map", {})
                 img_page = va.get("page_num")
@@ -2992,15 +3429,20 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                 # 圈号候选 —— 关键约束：仅当图片的圈号【唯一】时才当作"这张图的图号"。
                 # 截图内部的 UI 步骤标注（①②③④⑤⑥ 一串）不是图号：拿它们去匹配
                 # 正文"如图①"会把 步骤3 的截图错绑到 步骤2（2026-06-10 pdf_sop 实证）。
-                overlay_circled = overlay_label_owner.get(id(va), [])
-                map_circled = [k for k in ann_map if k in _CIRCLED_NUMS]
+                # PDF-D4：先剔除该页的歧义字符，再做各源唯一性判断
+                _amb = _ambiguous_by_page.get(img_page, ())
+                overlay_circled = [c for c in overlay_label_owner.get(id(va), [])
+                                   if c not in _amb]
+                map_circled = [k for k in ann_map
+                               if k in _CIRCLED_NUMS and k not in _amb]
                 circled_candidates = overlay_circled if len(overlay_circled) == 1 else []
                 if not circled_candidates:
                     circled_candidates = map_circled if len(map_circled) == 1 else []
                 if not circled_candidates:
                     # 次选：visual_summary 标注语境圈号（如"红色方框标注区域③"），同样要求唯一
-                    vs_circled = list(dict.fromkeys(
-                        _vs_circled_re.findall(va.get("visual_summary", "") or "")))
+                    vs_circled = [c for c in dict.fromkeys(
+                        _vs_circled_re.findall(va.get("visual_summary", "") or ""))
+                        if c not in _amb]
                     if len(vs_circled) == 1:
                         circled_candidates = vs_circled
                 for ann_key in circled_candidates:
@@ -3121,9 +3563,7 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                 # 阈值保守：MIN_ABS=10、RATIO=3.0 — pdf_sop image 9/10 bg=1/7 信号
                 # 弱不触发，it_xxh_003 无 step_card 不影响。Env-gate 默认 OFF：评测开、
                 # 生产默认不开，3 doc 实测稳定后再考虑默认 ON。
-                if (best_idx is not None and os.getenv(
-                        "RAG_IMAGE_CONTENT_OVERRIDE", "").lower()
-                        in ("1", "true", "yes")):
+                if (best_idx is not None and image_content_override_enabled()):
                     geo_blk = blocks[best_idx]
                     geo_txt = ((geo_blk.get("text", "")
                                if isinstance(geo_blk, dict)
@@ -3200,9 +3640,7 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                 # 通用词与 step text bigram 仅 1 命中)不触发,Path B 圈号集精确语
                 # 义信号补上。仅 img OCR 含 ≥2 圈号且 alt Jaccard ≥0.5 且 ≥1.5x
                 # geo Jaccard 才触发,避免单圈号 OCR 噪声。
-                if (best_idx is not None and os.getenv(
-                        "RAG_IMAGE_CONTENT_OVERRIDE", "").lower()
-                        in ("1", "true", "yes")):
+                if (best_idx is not None and image_content_override_enabled()):
                     _CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
                     img_ocr_txt = va.get("ocr_text") or ""
                     img_circled = set(c for c in img_ocr_txt if c in _CIRCLED)
@@ -3263,9 +3701,7 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
                 #      但 visual "手写记录"与 step 3.1 "U8 扫码报检"无关被误拉)
                 # 全文扫含 STEP_BOUNDARY 的 step 起始块(不限同页),逆序优先前
                 # 页 step。env-gated 默认 OFF。
-                if (best_idx is not None and os.getenv(
-                        "RAG_IMAGE_CONTENT_OVERRIDE", "").lower()
-                        in ("1", "true", "yes")):
+                if (best_idx is not None and image_content_override_enabled()):
                     _CIRCLED_C = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
                     # D8 Tier 0 post-review: 移除 vlm_annotation_map.keys() 圈号源
                     # VLM 在 annotation_map 标注的 ①-⑥ 是图内"区域位置编号"(如
@@ -3359,9 +3795,7 @@ def _insert_image_refs_heuristic(blocks: list, assets: list, doc: dict) -> list:
             # Path A strong override 的 image 作为 seed,同页 image_index 邻接 +
             # bbox 相对页高 < 0.20 + 高熵 token 共享 + follower 无反向证据 →
             # 跟随 seed。详 _apply_path_d_cluster_propagation docstring 8 守门。
-            if (geo_assets and os.getenv(
-                    "RAG_IMAGE_CONTENT_OVERRIDE", "").lower()
-                    in ("1", "true", "yes")):
+            if (geo_assets and image_content_override_enabled()):
                 _apply_path_d_cluster_propagation(geo_assets)
 
             # Second pass: 用 Path D 调整后的 best_idx 构造 img_block + insertions
@@ -4015,18 +4449,20 @@ def node_chunk_documents(ctx: dict):
         # 门耦合，改写即破坏哈希语义）；保护随每轮 chunk 消费重建，不依赖 flag 存续。
         if os.environ.get("RAG_IMAGE_OCR_PII_FAILCLOSED", "true").lower() not in ("0", "false", "no"):
             _g21_scrubbed = 0
+            _g21_findings = []          # A（2026-07-26）：留痕回收口，见下方 _persist
             for _asset in doc.get("assets", []) or []:
                 for _fld in ("ocr_text", "visual_summary"):
                     _orig = _asset.get(_fld)
                     if not _orig:
                         continue
-                    _new = scrub_image_text(_orig)
+                    _new = scrub_image_text(_orig, findings=_g21_findings)
                     if _new != _orig:
                         _asset[_fld] = _new
                         _g21_scrubbed += 1
             if _g21_scrubbed:
                 print(f"    ├─ [pii-failclosed] {doc['doc_id']}: {_g21_scrubbed} 个图片 "
                       f"OCR/caption 字段命中 PII，已在消费点掩码（node 03 flag 未生效的兜底）")
+            _persist_image_scrub_findings(ctx, doc, _g21_findings)
 
         text = doc.get("redacted_text") or doc["text"]
         
@@ -4062,7 +4498,13 @@ def node_chunk_documents(ctx: dict):
             # 这些文档永远拿不到 step_card。_detect_step_patterns 仍要求 is_sop_like(sop/操作/作业指导/
             # 规程/检验 等关键词或 ≥2 SOP 锚词) + ≥2 步骤边界，纯制度/规定政策文档（无 sop 信号）不会被
             # 误升，仍走 clause。
-            if m_mode in ("text", "clause") and _detect_step_patterns(doc):
+            # B17（2026-07-25）：路由可观测。**只观测、不改判据** —— 收紧 detector 会改
+            # chunk 家族（需冻结重灌 + manifest 门），而现在连"多少篇制度类文档实际走了
+            # step、因为哪个词"都查不出来，无从判断该不该收紧。记初始/最终模式与命中信号，
+            # 随 chunk.extra → extra_json 落 chunk_meta，一条 SQL 即可统计。
+            _initial_mode = m_mode
+            _step_detected = _detect_step_patterns(doc)
+            if m_mode in ("text", "clause") and _step_detected:
                 m_mode = "step"
                 m_chunk = ctx.get("sop_size", config.chunker.sop_strategy.max_chunk_chars)
                 m_overlap = 0  # step 模式按步骤边界切，不需要 overlap
@@ -4201,6 +4643,20 @@ def node_chunk_documents(ctx: dict):
         # 标记脱敏状态
         for chunk in chunks:
             chunk.sensitive_redacted = doc.get("redaction_action") == "REDACTED"
+
+        # B17（2026-07-25）：路由观测落 chunk.extra → 随 extra_json 进 chunk_meta。
+        # 记**三个**量（不只是最终模式）：初始模式、detector 是否命中、最终模式 ——
+        # PPTX/XLSX 会在 detector 之后再次覆盖 m_mode，只记最终值无法归因是谁改的。
+        # 纯观测：不改任何判据（收紧 detector = 改 chunk 家族，需冻结重灌 + manifest 门）。
+        _route_obs = {
+            "route_initial_mode": _initial_mode,
+            "route_final_mode": m_mode,
+            "step_detector_matched": bool(_step_detected),
+        }
+        for chunk in chunks:
+            if getattr(chunk, "extra", None) is None:
+                chunk.extra = {}
+            chunk.extra.update(_route_obs)
 
         # ─── 结构化 XLSX 图片绑定（按 anchor_row / figure_refs 绑定到 chunk）───
         # layout_bound_fns：被结构化版式有意绑定（即使载体是文本类 chunk）的图片文件名，
@@ -4366,10 +4822,15 @@ def node_chunk_documents(ctx: dict):
                         fno = a.get("figure_no")
                         if fno:
                             fno_counts[fno] = fno_counts.get(fno, 0) + 1
-                    figure_no_meaningful = (
-                        any(v > 1 for v in fno_counts.values())
-                        or bool(all_step_fig_refs)
-                    )
+                    # B3（2026-07-25）：改为 **per-figure** 判定。上面注释里的 (a)(b) 本来就是
+                    # 逐图号成立的条件，此前却折叠成一个**文档级**布尔：只要文档里任意一句
+                    # "如图2"，`figure_no_meaningful` 就为 True，于是**全篇**的位置计数器
+                    # 图号都被当成作者语义标签走 N→stepN 直连 —— 那些从没被引用过的图因此被
+                    # 按序号硬绑。现在只有该 fno 自己满足 (a) 或 (b) 才允许直连。
+                    def _fno_meaningful(fno) -> bool:
+                        if not fno:
+                            return False
+                        return fno_counts.get(fno, 0) > 1 or fno in all_step_fig_refs
 
                     # step_no → row_num 映射：来自 doc.blocks（procedure_image_guide
                     # 提取器把行号塞进每个 step block 的 extra.row_num，但 chunker 没
@@ -4470,18 +4931,36 @@ def node_chunk_documents(ctx: dict):
                             target = None
                             fno = str(a.get("figure_no") or "")
                             mnum = _re_fig.search(r"(\d+)", fno)
-                            # 仅当 figure_no 在该文档中"有语义意义"时才信任 图N→stepN
-                            # 直接映射；否则它只是 extractor 给的位置序号，绑了就是误绑。
-                            if (figure_no_meaningful and mnum
-                                    and int(mnum.group(1)) not in bound_nos):
-                                target = step_by_no.get(int(mnum.group(1)))
-                            if target is None and fno:
+                            # B3：**先**作者显式引用（figure_refs 精确匹配），**后**位置计数器
+                            # 直连。此前顺序相反 —— 与上面注释自述的 "(b) 命中后的绑定走
+                            # figure_refs 分支" 直接矛盾：步骤6 写「如图3」而步骤3 恰好空着时，
+                            # 图3 会被绑到步骤3；这条错绑经 image_refs_json 直达钉钉卡片，
+                            # 一线员工看到的就是错图。
+                            if fno:
                                 for c in step_cards:
                                     if fno in (c.extra.get("figure_refs") or []) and c.extra.get("step_no") not in bound_nos:
                                         target = c
                                         break
+                                # B3：显式引用的图，即便该步骤已在 bound_nos（上一轮已绑过图）
+                                # 也追加为**第二张图** —— 作者写了「如图N」就是要在这一步看到它。
+                                if target is None:
+                                    for c in step_cards:
+                                        if fno in (c.extra.get("figure_refs") or []):
+                                            target = c
+                                            break
+                            # 位置计数器直连只在该 fno 自己"有语义意义"时才可信（见 _fno_meaningful）
+                            if (target is None and _fno_meaningful(fno) and mnum
+                                    and int(mnum.group(1)) not in bound_nos):
+                                target = step_by_no.get(int(mnum.group(1)))
                             if target is not None:
-                                target.extra.setdefault("image_refs", []).append(_img_entry(a))
+                                # B3：按**图片实体身份**去重。bound_nos 只防步骤被重复占用，
+                                # 防不住同一张图被追加两次（同一 fno 被多个 asset 共用时会）。
+                                # 身份键沿用 xlsx 的载重契约：filename + anchor_row；
+                                # 无 anchor 时退到 oss_key/source_image + image_index。
+                                _entry = _img_entry(a)
+                                _refs = target.extra.setdefault("image_refs", [])
+                                if not any(_same_image_ref(_entry, _e) for _e in _refs):
+                                    _refs.append(_entry)
                                 bound_nos.add(target.extra.get("step_no"))
                             else:
                                 unbound.append(a)
@@ -5155,6 +5634,37 @@ def node_validate_chunks(ctx: dict):
         ctx.setdefault("validation_warnings", []).append(
             f"severed {_severed} orphan parent links")
 
+    # B4（2026-07-25）：超长 table_chunk 被整块丢弃的**按 doc 归因留痕**。
+    # 五处 table_chunk 创建点都没有长度上限（对照 step_card 有拆分、procedure_parent 有
+    # _PARENT_MAX_TOKENS），中文 ~1.5 字/token ⇒ 约 3000 字触顶就整块没了，表现为
+    # 「问规格参数查不到」。**本批只留痕、不做行级切分**——切分会改 chunk 家族，
+    # 需要冻结重灌 + manifest 门，先拿现网真实计数再决定是否值得。
+    # 语义刻意拆两种（不为了留痕改掉零产出的既有失败语义）：
+    #   · 该 doc 还有其它有效 chunk → partial-loss note，走 NEEDS_REVIEW（可服务）
+    #   · 全丢导致 0 chunk        → 保留既有 FAILED+retry 语义，只把原因写进错误信息
+    _tbl_dropped: Dict[tuple, int] = {}
+    for chunk in chunks:
+        if getattr(chunk, "chunk_type", "") != "table_chunk":
+            continue
+        if any(inv["chunk_id"] == chunk.chunk_id and "too_many_tokens" in inv["issues"]
+               for inv in invalid):
+            _key = (chunk.doc_id, getattr(chunk, "version_no", None))
+            _tbl_dropped[_key] = _tbl_dropped.get(_key, 0) + 1
+    if _tbl_dropped:
+        _surviving = {(c.doc_id, getattr(c, "version_no", None)) for c in valid}
+        for (_d, _v), _n in sorted(_tbl_dropped.items()):
+            _note = (f"[TABLE_DROPPED] {_n} 张超长表格（token_count>2000）被整块丢弃，"
+                     f"表内内容未进入索引")
+            if (_d, _v) in _surviving:
+                ctx.setdefault("table_drop_notes", {}).setdefault((_d, _v), []).append(_note)
+                print(f"    🚨 [VALIDATE] {_d} v{_v}: {_note} —— 该文档仍有其它有效 chunk，"
+                      f"走 partial-loss/NEEDS_REVIEW 通道")
+            else:
+                # 0 chunk：不碰既有"疑似失败"分支的定级，只补原因（那条链路会 FAILED+retry）
+                ctx.setdefault("table_drop_notes", {}).setdefault((_d, _v), []).append(_note)
+                print(f"    🚨 [VALIDATE] {_d} v{_v}: {_note} —— 该文档已无有效 chunk，"
+                      f"沿用既有 0-chunk 疑似失败语义（FAILED + retry）")
+
     ctx["valid_chunks"] = valid
     ctx["invalid_chunks"] = invalid
 
@@ -5383,6 +5893,10 @@ def node_publish_to_rag_ready(ctx: dict):
             _publish_conc = int(os.environ.get("RAG_PUBLISH_CONCURRENCY", "1"))
         except ValueError:
             _publish_conc = 1
+        # A1：同 stage-1 抽取，无条件报 configured/effective（旋钮生效与否必须可从日志验证）
+        print(f"    └─ [concurrency] publish: configured={_publish_conc} "
+              f"effective={_publish_conc if len(upload_jobs) > 1 else 1} "
+              f"(RAG_PUBLISH_CONCURRENCY, docs={len(upload_jobs)})")
         if _publish_conc > 1 and len(upload_jobs) > 1:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(
@@ -5567,9 +6081,19 @@ def node_write_chunk_meta(ctx: dict):
                 if not _prov:
                     from opensearch_pipeline.versions import build_run_provenance
                     _prov = build_run_provenance(bizdate=ctx.get("bizdate"))
+                # ⚠️ 固定白名单 —— 往 build_run_provenance() 加 key 不会自动落到这里。
+                # image_content_override（2026-07-25）：本 chunk 是在哪种图↔步骤绑定
+                # 制度下产出的。**本字段目前只落 chunk_meta.extra_json._provenance，
+                # 不进 pipeline_run**（该表是逐列清单，加列需迁移 059，属后续项）。
                 _provenance = {k: _prov.get(k) for k in (
                     "git_commit", "extractor_version", "chunker_version",
-                    "detector_version", "embedding_model_version", "bizdate")}
+                    "detector_version", "embedding_model_version", "bizdate",
+                    "image_content_override", "funnel_policy")}
+                # P1-9：funnel_policy 优先取 **canonical 里 Stage-1 写下的那个**；
+                # 取不到才回落当前进程 env（老 canonical 没有该键）。
+                _canon_policy = doc.get("funnel_policy")
+                if _canon_policy is not None:
+                    _provenance["funnel_policy"] = _canon_policy
                 _chunk_set_hashes = _compute_chunk_set_hashes(valid_chunks)
 
                 insert_rows = []
@@ -5740,13 +6264,16 @@ def node_write_chunk_meta(ctx: dict):
                     # 自增 retry_count —— claim 本身不自增，否则确定性坏文档(损坏 DOCX 等)会无限重处理。
                     _chunk_status, _cps = "NEEDS_REVIEW", "FAILED"
                     _cpe = ("suspected extraction/chunk failure: " + "; ".join(_reasons))[:255]
-                    _retry_clause = ", retry_count = retry_count + 1"
+                    _retry_clause = ", " + RETRY_COUNT_INC_SQL
                     print(f"    🚨 {doc_id} v{ver}: 0 chunks + SUSPECTED FAILURE → "
                           f"chunk_status=NEEDS_REVIEW, content_process_status=FAILED, retry_count+1 ({_cpe})")
                 else:
                     _chunk_status, _cps = "EMPTY", "DONE"
                     _cpe = "No valid chunks generated (empty document)"
-                    _retry_clause = ""
+                    # B1a（2026-07-25）：这是**成功出口**（合法空文档），必须清零 ——
+                    # retry_count 的语义是「连续失败次数」，只增不减会让一篇曾失败 2 次、
+                    # 后来正常收口的文档带着旧计数，下次再失败一次就提前进死信。
+                    _retry_clause = ", retry_count = 0"
                     _tag = "quarantined" if _is_quarantine else "treated as empty"
                     print(f"    ⚠️ No valid chunks generated for document {doc_id} v{ver} ({_tag})")
 
@@ -5778,11 +6305,17 @@ def node_write_chunk_meta(ctx: dict):
                         if _closure_conn is None:
                             _closure_conn = _get_db_conn(select_db=True)
                         with _closure_conn.cursor() as cursor:
+                            # B1a（2026-07-25）：成功出口清零 retry_count（与 EMPTY/DONE 出口同型）。
+                            # 语义 = 「连续失败次数」；只增不减会让一篇曾失败 2 次、后来正常收口的
+                            # 文档带着旧计数，下次再失败一次就提前进死信。合入同一条原子 UPDATE：
+                            # 不新增目标集合、不新增写次数，因此不新增所有权暴露面
+                            # （该 closure 本身仍无 per-claim fence，属 B1b 的遗留风险，未修复）。
                             cursor.execute("""
                                 UPDATE document_version
                                 SET content_process_status = 'DONE',
                                     chunk_status = 'DONE',
                                     chunk_count = %s,
+                                    retry_count = 0,
                                     processed_at = NOW(),
                                     content_process_error = NULL
                                 WHERE doc_id = %s AND version_no = %s
@@ -5801,6 +6334,17 @@ def node_write_chunk_meta(ctx: dict):
                             action_result=("DONE" if chunk_cnt > 0 else "EMPTY"),
                             trace_id=audit_trace_id(ctx), message=f"{chunk_cnt} chunks",
                             simulate=simulate_db)
+
+                # F（2026-07-25）：非 skip 版本的资产集比对——放在 chunk 提交**之后**，
+                # 避免给已回滚的版本留下"已变化"事件。observed_stage=CHUNK_COMMITTED
+                # **不表示**该版本已上线（stage 3 成功才写 index_status=SUCCESS）。
+                _canon_for_diff = next(
+                    (c for c in (ctx.get("canonicals") or [])
+                     if c.get("doc_id") == doc_id and c.get("version_no") == ver), None)
+                if _canon_for_diff is not None:
+                    _emit_asset_set_diff(ctx, _canon_for_diff,
+                                         observed_stage="CHUNK_COMMITTED",
+                                         simulate_db=simulate_db)
 
                 # ── P2-32（VLM 供应商降级传播）：本文档存在 degraded 兜底图片（VLM 超时/解析
                 # 失败 → 占位 caption 或保守隔离，见 image_funnel_processor ~430）→ 收尾在 DONE
@@ -5823,6 +6367,8 @@ def node_write_chunk_meta(ctx: dict):
                 # NEEDS_REVIEW 通道——「有产出但不完整」绝不静默定稿 DONE。
                 _partial_notes = list(
                     (_canon_by_dv.get((doc_id, ver), {}) or {}).get("partial_loss_notes") or [])
+                # B4：超长 table_chunk 丢弃留痕**合并追加**进同一通道（不覆盖 B5/既有 note）。
+                _partial_notes.extend((ctx.get("table_drop_notes") or {}).get((doc_id, ver)) or [])
                 if _vlm_degraded_n > 0 or _partial_notes:
                     _note_parts = []
                     if _vlm_degraded_n > 0:
@@ -6525,16 +7071,19 @@ def node_deactivate_old_chunks(ctx: dict):
         (d["doc_id"], d["old_version"], d["chunk_id"]) for d in deactivated
     ]
     if _audit_deactivations:
-        from opensearch_pipeline.audit_log import write_audit, audit_trace_id
+        # A7（2026-07-25）：批量写。此前逐条 write_audit(cursor=None) 每次都「取连接 → INSERT →
+        # COMMIT → close」，按【旧 chunk 条数】计费——万级旧 chunk 即万级提交。行粒度不变
+        # （N 条旧 chunk 仍 N 行，取证表的行粒度是既有契约），只合并 DB 往返。
+        from opensearch_pipeline.audit_log import write_audit_many, audit_trace_id
         _trace = audit_trace_id(ctx)
-        for _doc_id, _old_ver, _ref in _audit_deactivations:
-            _new_ver = current_versions.get(_doc_id)
-            write_audit(
-                doc_id=_doc_id, version_no=_old_ver,
-                action_type="DEACTIVATE", action_result="SUCCESS", trace_id=_trace,
-                message=f"old v{_old_ver} retired by v{_new_ver} (id={_ref})",
-                simulate=simulate_db,
-            )
+        write_audit_many([
+            {
+                "doc_id": _doc_id, "version_no": _old_ver,
+                "action_type": "DEACTIVATE", "action_result": "SUCCESS", "trace_id": _trace,
+                "message": f"old v{_old_ver} retired by v{current_versions.get(_doc_id)} (id={_ref})",
+            }
+            for _doc_id, _old_ver, _ref in _audit_deactivations
+        ], simulate=simulate_db)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -6914,13 +7463,40 @@ def node_build_opensearch_payload(ctx: dict):
     # D8 Phase 11(A/B framework Step A):NDJSON 序列化 + 切批抽到 bulk_helpers,
     # 生产 ingestion 与评测 chunker_ab 灌入共享单一来源,避免序列化漂移
     from opensearch_pipeline.bulk_helpers import build_opensearch_bulk_actions
-    batches = build_opensearch_bulk_actions(chunks, max_bulk_size_bytes=max_bulk_limit)
-
+    # B15（2026-07-25）：HA3 路径上的 NDJSON payload 是纯死重 —— 推送消费的是内存 chunk 对象
+    # （_push_chunks_to_ha3），payload 只被上传 OSS 再归档，而 `payload_oss_key` 全仓只有写方、
+    # 无任何读回方。RAG_BULK_PAYLOAD_ARCHIVE=false 时不再拼字符串/不上传/不归档，主要收益是
+    # 峰值内存（ctx["bulk_batches"] 全程持有整批 NDJSON），而非 CPU/OSS 费用。
+    # **默认 on 保持现状**；且只允许在 HA3 后端关闭 —— 标准 OpenSearch 的 client.bulk 直接
+    # 消费 batch["payload"]，simulate 路径也要写本地 pending JSONL（sim 断言依赖）。
+    _archive_payload = os.environ.get("RAG_BULK_PAYLOAD_ARCHIVE", "true").strip().lower() \
+        not in ("0", "false", "no")
     bucket, is_simulated = _get_oss_bucket(ctx)
+    if not _archive_payload:
+        _client_probe = _get_opensearch_client(ctx)
+        _is_ha3 = hasattr(_client_probe, "push_documents") and _client_probe != "MOCK_HA3_CLIENT"
+        if is_simulated or not _is_ha3:
+            print("    ⚠️ RAG_BULK_PAYLOAD_ARCHIVE=false 被忽略：仅 HA3 后端可关"
+                  "（标准 OpenSearch/simulate 直接消费 payload）——本轮仍物化。")
+            _archive_payload = True
+    batches = build_opensearch_bulk_actions(chunks, max_bulk_size_bytes=max_bulk_limit,
+                                            materialize=_archive_payload)
+    if not _archive_payload:
+        # 不物化 ⇒ 无归档对象。payload_oss_key 写 NULL（schema 允许），不编造路径。
+        for _b in batches:
+            _b["job_id"] = ""      # 下面统一分配
+            _b["oss_key"] = ""
+        print(f"    └─ [B15] payload 归档已关闭（HA3 后端）：{len(batches)} 批不拼 NDJSON、"
+              f"不上传 OSS；payload_size 口径不变（等价 NDJSON 未压缩字节数）")
     base_job_id = f"BULK_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     date_str = datetime.now().strftime('%Y-%m-%d')
 
-    if is_simulated:
+    if not _archive_payload:
+        # B15：只分配 job_id（opensearch_bulk_job 仍要建行做统计），oss_key 留空 → 落库 NULL
+        for i, batch in enumerate(batches):
+            batch["job_id"] = f"{base_job_id}_P{i + 1}"
+            batch["oss_key"] = ""
+    elif is_simulated:
         # Save payloads to physical pending JSONL files on disk
         pending_dir = f"index-jobs/opensearch/pending/{date_str}"
         os.makedirs(pending_dir, exist_ok=True)
@@ -6989,7 +7565,8 @@ def node_build_opensearch_payload(ctx: dict):
                         batch["job_id"],
                         ctx.get("opensearch_index") or get_config().opensearch.index_name,
                         len(batch["chunks"]),
-                        batch["oss_key"],
+                        # B15：未归档 ⇒ 写 NULL（列允许），不编造一个并不存在的对象路径
+                        batch["oss_key"] or None,
                         batch["payload_size"]
                     ))
                 conn.commit()
@@ -7001,6 +7578,19 @@ def node_build_opensearch_payload(ctx: dict):
         finally:
             if conn:
                 conn.close()
+
+
+def _sample_repr(value, limit: int = 500) -> str:
+    """A9：把响应片段安全地截成可入日志的样本。
+
+    只用于 HA3 响应的**结构**取样（code/message/index/body 形态），绝不喂文档正文；
+    repr 失败也不抛（形态诊断不该反过来炸掉推送路径）。
+    """
+    try:
+        text = repr(value)
+    except Exception:   # noqa: BLE001 — 诊断辅助，任何异常都降级
+        return "<unreprable>"
+    return text if len(text) <= limit else text[:limit] + f"...(+{len(text) - limit} chars)"
 
 
 def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
@@ -7024,6 +7614,16 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
     ha3_docs = [{"cmd": "add", "fields": c.to_ha3_doc(cfg.pk_field, include_allowed_depts=_incl_ad)} for c in all_chunks]
 
     start_time = time.time()
+
+    # A9（2026-07-25）：响应形态采样收集器。本函数没有 ctx（且被 04b parity 的两处补推复用），
+    # 所以 warning 走【返回值】而不是 ctx —— 调用方 node_push_to_opensearch 再并进
+    # ctx["validation_warnings"]。list.append 在 GIL 下原子，子批并行推送时安全。
+    _push_warnings: list = []
+
+    def _note_push_warning(msg):
+        line = f"[HA3-RESP] {msg}"
+        print(f"    ⚠️ {line}")
+        _push_warnings.append(line)
 
     def _push_one_subbatch(sub_start):
         """推送一个 ≤100 条子批（重试 + per-doc 结果解析），**原地**改写子批 chunk 状态。
@@ -7090,7 +7690,11 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
         if isinstance(body, str) and body.strip():
             try:
                 body = json.loads(body)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as _je:
+                # A9：解析失败仍按"无 per-doc 错误"处理（行为不变），但必须留下形态样本 ——
+                # 这是「被 HA3 拒收却被标 INDEXED」最可能的入口，而至今没人见过真实响应长什么样。
+                _note_push_warning(f"2xx body is a string that failed JSON parse ({_je}): "
+                                   f"{_sample_repr(body)}")
                 body = None
 
         if 200 <= status_code < 300:
@@ -7103,21 +7707,48 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
                     per_doc_parsed = True
                     error_indices = set()
                     for err_item in errors_list:
+                        # A9（2026-07-25）：归因判据此前只有上界 —— `err_idx < len(sub_chunks)` 对
+                        # err_idx=-1 恒真，于是 sub_chunks[-1]（本子批**最后一个** chunk）被误标
+                        # FAILED，真正出错的那条却被下面的 else 分支标成 INDEXED。补下界，并排除
+                        # bool（Python 里 True/False 是 int 子类，会被当成索引 1/0）与非 dict 条目
+                        # （err_item.get 会直接抛异常，把整个子批打成"意外异常"）。
+                        if not isinstance(err_item, dict):
+                            _note_push_warning(f"error item is {type(err_item).__name__}, not dict: "
+                                               f"{_sample_repr(err_item)}")
+                            continue
                         err_idx = err_item.get("index")
                         err_msg = err_item.get("message", "Unknown HA3 error")
                         err_code = str(err_item.get("code", "HA3_DOC_ERROR"))
-                        if err_idx is not None and err_idx < len(sub_chunks):
+                        if (isinstance(err_idx, int) and not isinstance(err_idx, bool)
+                                and 0 <= err_idx < len(sub_chunks)):
                             sub_chunks[err_idx].index_status = ChunkIndexStatus.FAILED
                             sub_chunks[err_idx].index_error_code = err_code
                             sub_chunks[err_idx].index_error_message = err_msg
                             error_indices.add(err_idx)
                             print(f"    ├─ [HA3 Error] Chunk {sub_chunks[err_idx].chunk_id} failed: {err_code} - {err_msg}")
+                        else:
+                            # 不可归因（缺 index / 负数 / 越界 / 非 int）：**不改变既有行为**——
+                            # 这条错误就此丢失，其余 chunk 仍标 INDEXED。之所以不升级为
+                            # sub-batch fail-closed：至今没有一份真实生产的 HA3 部分失败响应样本，
+                            # 贸然 fail-closed 会把正常批判死并触发全量重推。先采样拿形态。
+                            _note_push_warning(
+                                f"unattributable HA3 error item (index={_sample_repr(err_idx)}, "
+                                f"sub_batch_size={len(sub_chunks)}, code={_sample_repr(err_code)}, "
+                                f"message={_sample_repr(err_msg)})")
                     # 标记未出错的 chunks 为成功
                     for ci, sc in enumerate(sub_chunks):
                         if ci not in error_indices:
                             sc.index_status = ChunkIndexStatus.INDEXED
                             sc.index_error_code = None
                             sc.index_error_message = None
+                elif errors_list:
+                    # errors 存在但不是 list（形态不符）→ 采样，行为不变（走下面整批 INDEXED）
+                    _note_push_warning(f"body['errors'] is {type(errors_list).__name__}, not list: "
+                                       f"{_sample_repr(errors_list)}")
+            elif body is not None:
+                # 2xx 但 body 非 dict（含 JSON 解析失败被置 None 之外的形态）→ 采样，行为不变
+                _note_push_warning(f"2xx response body is {type(body).__name__}, not dict: "
+                                   f"{_sample_repr(body)}")
 
             if not per_doc_parsed:
                 # 无 per-document 错误信息，整批标记成功
@@ -7156,7 +7787,25 @@ def _push_chunks_to_ha3(client, cfg, chunks, *, max_retries) -> dict:
     took_ms = int((time.time() - start_time) * 1000)
     indexed_count = sum(1 for c in all_chunks if c.index_status == ChunkIndexStatus.INDEXED)
     failed_count = len(all_chunks) - indexed_count
-    return {"indexed": indexed_count, "failed": failed_count, "took_ms": took_ms}
+    return {"indexed": indexed_count, "failed": failed_count, "took_ms": took_ms,
+            "warnings": _push_warnings}
+
+
+def _record_archive_warning(ctx: dict, batch: dict, message: str) -> None:
+    """A8（2026-07-25）：payload 归档失败留痕，**绝不 raise**。
+
+    此前归档失败直接 `raise`，而它发生在 HA3 push 成功【之后】、node_update_index_status
+    【之前】：一次 OSS 抖动就让整轮 stage-3 白跑并回滚（chunk 已进 HA3、job 却停在
+    PENDING），若归档失败是确定性的（权限/生命周期规则），stage-3 会对全语料停摆直到
+    人工修 OSS。归档产物无任何读回方（全仓 `payload_oss_key` 只有写方），属辅助可观测性，
+    与本仓「辅助功能失败绝不打断主流程」的既定约定一致 → 降级为警告。
+
+    两处留痕：ctx 里本轮可见；batch 上的副本由 node_update_index_status 落进
+    opensearch_bulk_job.error_message（列已存在，无 schema 迁移），保证跨运行可查。
+    """
+    print(f"    ⚠️ {message}")
+    batch["archive_warning"] = message[:1000]
+    ctx.setdefault("validation_warnings", []).append(message)
 
 
 def node_push_to_opensearch(ctx: dict):
@@ -7265,6 +7914,10 @@ def node_push_to_opensearch(ctx: dict):
                     cfg = config.alibaba_vector
                     push_stats = _push_chunks_to_ha3(
                         client, cfg, batch["chunks"], max_retries=config.embedding.max_retries)
+                    # A9：把子批收集到的响应形态样本并进 ctx（04b parity 的两处补推丢弃返回值，
+                    # 只打印不入 ctx —— 那两处不在本节点的 ctx 生命周期内）。
+                    if push_stats.get("warnings"):
+                        ctx.setdefault("validation_warnings", []).extend(push_stats["warnings"])
                     result = {
                         "status": "SUCCESS" if push_stats["failed"] == 0 else "PARTIAL_FAIL",
                         "took_ms": push_stats["took_ms"],
@@ -7341,9 +7994,9 @@ def node_push_to_opensearch(ctx: dict):
                         batch["oss_key"] = target_path
                         print(f"    ├─ Moved batch file to {target_path}")
                     except Exception as e:
-                        # TODO: Add archive_status and archive_error columns to opensearch_bulk_job table for better DB observability
-                        print(f"    ⚠️ Failed to move batch payload file: {e}")
-                        raise RuntimeError(f"Failed to move batch payload file during archive: {e}") from e
+                        _record_archive_warning(
+                            ctx, batch,
+                            f"[ARCHIVE] failed to move batch payload file {source_path}: {e}")
             else:
                 # Real OSS object movement (copy + delete)
                 try:
@@ -7360,9 +8013,9 @@ def node_push_to_opensearch(ctx: dict):
                     batch["oss_key"] = target_key
                     print(f"    ├─ Archived OSS payload: {source_path} -> {target_key}")
                 except Exception as e:
-                    # TODO: Add archive_status and archive_error columns to opensearch_bulk_job table for better DB observability
-                    print(f"    ⚠️ Failed to archive OSS payload object: {e}")
-                    raise RuntimeError(f"Failed to archive OSS payload object during archive: {e}") from e
+                    _record_archive_warning(
+                        ctx, batch,
+                        f"[ARCHIVE] failed to archive OSS payload {source_path}: {e}")
 
     # Aggregating values for backward compatibility in context
     total_took_ms = sum(b.get("result", {}).get("took_ms", 0) for b in batches)
@@ -7453,23 +8106,46 @@ def node_update_index_status(ctx: dict):
         try:
             conn = _get_db_conn(select_db=True)
             with conn.cursor() as cursor:
+                # A4：成功路径要清零 index_retry_count，先只读探一次列是否存在（迁移 019）。
+                # 一次 SELECT 换掉"写失败再回退"——后者会连带丢弃本事务里已做的 bulk_job 更新，
+                # 详见 _chunk_meta_has_index_retry 的 docstring。
+                _has_retry_col = _chunk_meta_has_index_retry(cursor)
                 # Update bulk job records
                 for batch in batches:
                     result = batch.get("result", {})
                     if not result:
                         continue
                     job_status = "COMPLETED" if result.get("failed", 0) == 0 else "PARTIAL_FAIL"
-                    cursor.execute("""
-                        UPDATE opensearch_bulk_job
-                        SET status=%s, success_count=%s, fail_count=%s, payload_oss_key=%s, completed_at=NOW()
-                        WHERE job_id=%s
-                    """, (
-                        job_status,
-                        result.get("indexed", 0),
-                        result.get("failed", 0),
-                        batch.get("oss_key", ""),
-                        batch.get("job_id", "")
-                    ))
+                    # A8：归档失败的持久留痕落 error_message（列已存在）——只写 ctx 的话
+                    # pipeline_run 不收集 validation_warnings，运行一结束线索就没了。
+                    # 无归档警告时保持原 SQL 形态（不写该列），零行为变化。
+                    _arch_warn = batch.get("archive_warning")
+                    if _arch_warn:
+                        cursor.execute("""
+                            UPDATE opensearch_bulk_job
+                            SET status=%s, success_count=%s, fail_count=%s, payload_oss_key=%s,
+                                error_message=%s, completed_at=NOW()
+                            WHERE job_id=%s
+                        """, (
+                            job_status,
+                            result.get("indexed", 0),
+                            result.get("failed", 0),
+                            batch.get("oss_key", ""),
+                            _arch_warn,
+                            batch.get("job_id", "")
+                        ))
+                    else:
+                        cursor.execute("""
+                            UPDATE opensearch_bulk_job
+                            SET status=%s, success_count=%s, fail_count=%s, payload_oss_key=%s, completed_at=NOW()
+                            WHERE job_id=%s
+                        """, (
+                            job_status,
+                            result.get("indexed", 0),
+                            result.get("failed", 0),
+                            batch.get("oss_key", ""),
+                            batch.get("job_id", "")
+                        ))
 
                     # Update individual chunks in chunk_meta
                     index_name = result.get("index_name", "fuling_knowledge_v1")
@@ -7535,6 +8211,24 @@ def node_update_index_status(ctx: dict):
                         for _i in range(0, len(_g_ids), 1000):
                             _g_sub = _g_ids[_i:_i + 1000]
                             _g_ph = ",".join(["%s"] * len(_g_sub))
+                            _g_args = [
+                                _g_emb_status,
+                                _g_emb_model,
+                                _embedding_version,
+                                _g_dim,
+                                _g_emb_at,
+                                index_name,
+                                batch.get("job_id"),
+                                _g_idx_at,
+                            ] + _g_sub
+                            # A4（2026-07-25）：成功即把 index_retry_count 清零。此前该列只增不减
+                            # （唯一写点是 _fail_chunks_with_retry_budget 的 +1），于是"累计失败 3 次"
+                            # 而非"连续失败 3 次"就转 DEAD 死信 → chunk 不再被 loader 重选，
+                            # node_deactivate_old_chunks 的完整性闸把旧版本停用永久推迟（双版本长存）。
+                            # 只在这条【干净成功】路径复位：上面的逐条分支只会收到非 INDEXED 或带
+                            # error 的 chunk（见前面 `continue` 的分流条件），在那里复位等于抹掉真
+                            # 失败的重试预算。列不存在时（迁移 019 未应用）走无该列的 SQL，
+                            # 行为与迁移前逐字节一致。
                             cursor.execute(f"""
                                 UPDATE chunk_meta
                                 SET
@@ -7544,6 +8238,7 @@ def node_update_index_status(ctx: dict):
                                     embedding_dimension = %s,
                                     embedded_at = %s,
                                     index_status = '{ChunkIndexStatus.INDEXED}',
+                                    {"index_retry_count = 0," if _has_retry_col else ""}
                                     index_name = %s,
                                     opensearch_doc_id = chunk_id,
                                     opensearch_bulk_job_id = %s,
@@ -7551,16 +8246,7 @@ def node_update_index_status(ctx: dict):
                                     index_error_message = NULL,
                                     indexed_at = %s
                                 WHERE chunk_id IN ({_g_ph})
-                            """, [
-                                _g_emb_status,
-                                _g_emb_model,
-                                _embedding_version,
-                                _g_dim,
-                                _g_emb_at,
-                                index_name,
-                                batch.get("job_id"),
-                                _g_idx_at,
-                            ] + _g_sub)
+                            """, _g_args)
 
                 # 回写 embedding 失败的 chunk（不在任何 batch 中）为 FAILED：
                 # 下轮 loader 按 index_status IN ('NOT_INDEXED','FAILED') 重新加载并重试。
@@ -7628,6 +8314,28 @@ def _parity_content_hash(text) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def _chunk_meta_has_index_retry(cursor) -> bool:
+    """chunk_meta.index_retry_count（迁移 019）是否存在。只读探测，异常一律按"不存在"处理。
+
+    ⚠️ 为什么是【只读探测】而不是本文件别处那种"先试带新列的写、1054 再回退"：
+    本连接栈上一条失败的语句会把**同一事务里已做但尚未提交的写全部丢弃**——pymysql 把
+    1054 归为 OperationalError，DBUtils SteadyDB 据此认为连接可能已坏并透明重连（它不知道
+    我们在事务里：_begin_txn 调的是底层 pymysql 的 begin，不经 SteadyDB 的事务记账），
+    重连即隐式回滚。本地无 019 的库上实测：同一事务先写 v=99、再触发一次 1054、然后提交，
+    读回仍是旧值。node_update_index_status 的事务里还压着 opensearch_bulk_job 的状态更新，
+    用"失败即探测"会把它一起蒸发（本次实测到的真实回归）。
+    """
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'chunk_meta' "
+            "AND COLUMN_NAME = 'index_retry_count'")
+        row = cursor.fetchone()
+        return bool(row and int(row[0]) > 0)
+    except Exception:
+        return False
+
+
 def _stage3_chunk_max_retries() -> int:
     try:
         return int(os.environ.get("RAG_STAGE3_CHUNK_MAX_RETRIES", "3"))
@@ -7636,7 +8344,7 @@ def _stage3_chunk_max_retries() -> int:
 
 
 def _fail_chunks_with_retry_budget(cursor, chunk_ids, extra_set_sql="", extra_params=(),
-                                   expect_all=False):
+                                   expect_all=False, count_retry=True):
     """G9：chunk 级失败回写 + 重试预算。返回本次转 DEAD 的 chunk_id 列表。
 
     index_retry_count +1；达上限（RAG_STAGE3_CHUNK_MAX_RETRIES，默认 3）→
@@ -7645,14 +8353,35 @@ def _fail_chunks_with_retry_budget(cursor, chunk_ids, extra_set_sql="", extra_pa
     +1 后的新值。迁移 019 未应用（1054 未知列）→ 回退旧 SQL（无计数/无 DEAD，
     行为与迁移前一致，fail-open）。expect_all=True 时 rowcount 不符即 raise
     （沿用 parity 全有或全无语义，由调用方 rollback）。
+
+    A4（2026-07-25）count_retry=False：只回写 FAILED，**不消耗重试预算**。用于
+    「无法确认」类瞬态失败（PARITY_UNKNOWN = HA3 读失败，见 _point_read_one 对任何
+    异常都返回 'unknown'）——供应商侧一次读故障不该把健康 chunk 推向 DEAD 死信。
+    死信资格只留给确认性失败（PARITY_DROP / PARITY_DRIFT / embedding 失败）。
     """
     if not chunk_ids:
         return []
     max_r = _stage3_chunk_max_retries()
     dead_ids: list = []
+
+    def _legacy_update(sub, ph):
+        """无计数回写（迁移 019 未应用，或 count_retry=False 的瞬态失败）。"""
+        cursor.execute(
+            f"UPDATE chunk_meta SET index_status='{ChunkIndexStatus.FAILED}'"
+            f"{extra_set_sql} WHERE chunk_id IN ({ph})",
+            list(extra_params) + sub,
+        )
+        _rc = getattr(cursor, "rowcount", None)
+        if expect_all and isinstance(_rc, int) and _rc != len(sub):
+            raise RuntimeError(
+                f"state-persistence failure: marked {_rc} of {len(sub)} chunk_meta rows")
+
     for _i in range(0, len(chunk_ids), 1000):
         sub = list(chunk_ids[_i:_i + 1000])
         ph = ",".join(["%s"] * len(sub))
+        if not count_retry:
+            _legacy_update(sub, ph)
+            continue
         try:
             cursor.execute(
                 f"UPDATE chunk_meta SET index_retry_count = index_retry_count + 1, "
@@ -7671,15 +8400,7 @@ def _fail_chunks_with_retry_budget(cursor, chunk_ids, extra_set_sql="", extra_pa
             dead_ids.extend(r[0] for r in (cursor.fetchall() or []))
         except Exception as _e:
             if "1054" in str(_e) or "index_retry_count" in str(_e).lower():
-                cursor.execute(
-                    f"UPDATE chunk_meta SET index_status='{ChunkIndexStatus.FAILED}'"
-                    f"{extra_set_sql} WHERE chunk_id IN ({ph})",
-                    list(extra_params) + sub,
-                )
-                _rc = getattr(cursor, "rowcount", None)
-                if expect_all and isinstance(_rc, int) and _rc != len(sub):
-                    raise RuntimeError(
-                        f"state-persistence failure: marked {_rc} of {len(sub)} chunk_meta rows")
+                _legacy_update(sub, ph)
             else:
                 raise
     return dead_ids
@@ -7711,6 +8432,8 @@ def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, m
 
     - DROP（确认 HA3 缺失）→ 'PARITY_DROP'；UNKNOWN（无法确认）→ 'PARITY_UNKNOWN'；
       DRIFT（PK 在但内容陈旧、补推后仍不一致）→ 'PARITY_DRIFT'。三组**分开** UPDATE，保留故障分类。
+    - 重试预算只由确认性失败消耗：DROP/DRIFT 走 index_retry_count+1（达上限转 DEAD），
+      UNKNOWN 只回写 FAILED 不计数（A4 2026-07-25——读故障≠坏 chunk）。
     - 全有或全无：任一 UPDATE 的 rowcount 与目标数不符 → rollback + raise 状态持久化错误。
       （部分写回会让一些 chunk 仍 INDEXED → 下轮 loader 不会重选 → 静默丢失/漂移被持久化。）
       注：pymysql 默认 rowcount=changed 行数；这些 chunk RDS 当前为 INDEXED→FAILED 必然计数。
@@ -7748,11 +8471,15 @@ def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, m
                 # G9：FAILED 回写带重试预算——达上限转 DEAD 死信（不再被 loader 重选，
                 # 消除毒 chunk 每轮重推→校验失败→raise 的队头阻塞）。全有或全无语义保留
                 # （expect_all；rowcount 不符 → raise → 下方 rollback）。
+                # A4（2026-07-25）：PARITY_UNKNOWN 不消耗预算——它只表示"读不到、无法确认"
+                # （_point_read_one 对任何异常都返回 'unknown'），一次 HA3 读故障会把整批
+                # 健康 chunk 打进 unknown 桶；若照常 +1，三次读故障即集体转 DEAD。
                 try:
                     _dead = _fail_chunks_with_retry_budget(
                         cursor, ids,
                         extra_set_sql=", index_error_code=%s, index_error_message=%s",
-                        extra_params=[code, msg], expect_all=True)
+                        extra_params=[code, msg], expect_all=True,
+                        count_retry=(code != "PARITY_UNKNOWN"))
                 except RuntimeError as _pe:
                     conn.rollback()
                     raise RuntimeError(
@@ -7807,10 +8534,11 @@ def node_verify_and_repush(ctx: dict):
     PK 在但内容陈旧 = drift → 有界补推(upsert) → 重读重算 hash → 仍不一致写 'PARITY_DRIFT' 阻断 05。
     drift 读/hash 异常只 fail-open 该 chunk 的 drift 判定，存在性三态结论不受影响。
 
-    ⚠️ 已知遗留：Stage-3 chunk_meta 无 per-chunk retry_count 上限（loader 仅按
-    index_status IN (NOT_INDEXED,FAILED) 重选）。被 HA3 永久拒收的"毒 chunk"会每轮重推→
-    校验失败→raise（中断整轮 drain）。这是既有性质（node_update 对永久 push 失败同样无限中断），
-    本 PR 不修；后续可加 chunk_meta.retry_count + DEAD 终态。
+    重试预算（G9，schema/019 + _fail_chunks_with_retry_budget）：确认性失败（PARITY_DROP /
+    PARITY_DRIFT / embedding 失败）逐次 index_retry_count+1，达上限（RAG_STAGE3_CHUNK_MAX_RETRIES，
+    默认 3）转 DEAD 死信并把文档置 NEEDS_REVIEW——毒 chunk 不再每轮重推阻塞整轮 drain。
+    PARITY_UNKNOWN（读不到、无法确认）不消耗预算；干净成功路径把计数清零（A4 2026-07-25），
+    故语义是"连续失败次数"而非"累计失败次数"。
     """
     if ctx.get("dag_id") == "dag3_chunk_to_opensearch" and ctx.get("dag3_no_work"):
         print("    [SKIP] node_verify_and_repush skipped because ctx['dag3_no_work'] is True.")

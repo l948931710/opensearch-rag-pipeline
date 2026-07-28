@@ -1,0 +1,296 @@
+{
+ "gates": {
+  "index_health (L0)": {
+   "target": "all gates pass",
+   "value": true,
+   "pass": true
+  },
+  "retrieval recall@5 (L1)": {
+   "target": ">= 0.85 (xlsx 正例召回率@5)",
+   "value": 0.9506,
+   "ci": [
+    0.9136,
+    0.9815
+   ],
+   "pass": true
+  },
+  "source attribution recall@1 (L1, 来源标注)": {
+   "target": ">= 0.95 (xlsx 来源标注)",
+   "value": 0.947,
+   "pass": false
+  },
+  "xlsx RAG retrieval recall@5 (L1, clean gold)": {
+   "target": ">= 0.85",
+   "value": 1.0,
+   "pass": true
+  },
+  "score calibration (L2)": {
+   "target": "labels still fit",
+   "value": true,
+   "pass": true
+  },
+  "off-topic discrimination AUC (L2)": {
+   "target": ">= 0.85 (pos vs off-topic-negative top-1 separation)",
+   "value": 0.978,
+   "pass": true
+  },
+  "thinking-off verified (L3)": {
+   "target": "0 reasoning leaks",
+   "value": 0,
+   "pass": true
+  },
+  "positive over-refusal (L3)": {
+   "target": "<= 0.10 (hard refusals)",
+   "value": 0.0,
+   "pass": true
+  },
+  "answer source-leak (L3)": {
+   "target": "<= 0.05",
+   "value": 0.0044,
+   "pass": true
+  },
+  "answer keyword-coverage (L3, 完整性)": {
+   "target": ">= 0.70",
+   "value": 0.7043,
+   "pass": true
+  },
+  "binding pdf Jaccard (L4-ing)": {
+   "target": ">= 0.78 hard (#F-mm8 升档)",
+   "value": 0.9132,
+   "pass": true
+  },
+  "binding xlsx Jaccard (L4-ing)": {
+   "target": ">= 0.85 hard (D7 升档)",
+   "value": 1.0,
+   "pass": true
+  },
+  "binding docx Jaccard (L4-ing)": {
+   "target": ">= 0.95 hard (D6 设定)",
+   "value": 0.9898,
+   "pass": true,
+   "notes": "per-image micro-acc via fuling_chunk_exp fixture (SOP-only)"
+  },
+  "img_dup_factor p95 (L4-ing, 全格式)": {
+   "target": "<= 1.20 hard (>1.5 是已知 over-attach bug)",
+   "value": 1.0,
+   "pass": true
+  },
+  "<<IMG:N>> marker validity (L4-srv)": {
+   "target": ">= 0.95 hard / >= 0.98 soft",
+   "value": 0.6667,
+   "pass": false
+  },
+  "dangling 口惠图但卡片无图 (L4-srv)": {
+   "target": "<= 0.05 hard (扩正则后)",
+   "value": 0.0,
+   "pass": true
+  },
+  "orphan rate (L4-srv, trend 监控)": {
+   "target": "<= 0.30 soft (trend, advisory)",
+   "value": 0.5921,
+   "pass": false,
+   "advisory": true
+  },
+  "marker distinctness (L4-srv, advisory)": {
+   "target": "advisory — 1.0 = no image reuse (lower = bundled/reused markers)",
+   "value": 0.9118,
+   "pass": false,
+   "advisory": true
+  },
+  "answer image rate (L4-srv, advisory)": {
+   "target": "advisory — trend (锁分布后再定阈值; 主臂=生产 cosurface=False 姿态)",
+   "value": 0.7241,
+   "pass": null,
+   "na_reason": "expected_na",
+   "advisory": true,
+   "notes": "n_image_answers=29; 对照臂见 l4.arms.cosurface_true"
+  },
+  "permission filtering (L5)": {
+   "target": "no leak + injection-safe",
+   "value": true,
+   "pass": true
+  },
+  "chunk-quality verdict (L6)": {
+   "target": "GO (all hard gates measured & pass)",
+   "value": "GO",
+   "pass": true
+  },
+  "[L6-hard] tokens in [5,2000] (B)": {
+   "target": "= 0 chunks out of band",
+   "value": 0,
+   "pass": true
+  },
+  "[L6-hard] no oversize structural chunk (B/A2)": {
+   "target": "= 0",
+   "value": 0,
+   "pass": true
+  },
+  "[L6-hard] orphan step_cards = 0 (A/D4)": {
+   "target": "= 0",
+   "value": 0,
+   "pass": true
+  },
+  "[L6-hard] procedure_parent balance (A/D7)": {
+   "target": "missing=0 ∧ duplicate=0",
+   "value": {
+    "missing": 0,
+    "duplicate": 0
+   },
+   "pass": true
+  },
+  "[L6-hard] RDS↔HA3 step_card drift (A/D1)": {
+   "target": "sym_diff <= 15 (0.5%)",
+   "value": 0,
+   "pass": true
+  },
+  "[L6-hard] image_refs shape compliance (A/D6)": {
+   "target": ">= 0.95",
+   "value": 0.9834,
+   "pass": true
+  },
+  "[L6-hard] img_dup_factor p95 (F)": {
+   "target": "<= 1.20",
+   "value": 1.0,
+   "pass": true
+  },
+  "[L6-hard] image_refs JSON parseable (F)": {
+   "target": "= 0 malformed",
+   "value": 0,
+   "pass": true
+  },
+  "[L6-hard] RDS↔HA3 all-type id-set (H)": {
+   "target": "missing=0 ∧ extra=0",
+   "value": {
+    "missing": 0,
+    "extra": 0
+   },
+   "pass": true
+  },
+  "[L6-soft] mid-sentence cut rate (B)": {
+   "target": "CI-upper <= 0.05",
+   "value": 0.5001,
+   "pass": false,
+   "advisory": true
+  },
+  "[L6-soft] dangling-anaphor rate (C)": {
+   "target": "CI-upper <= 0.05",
+   "value": 0.0038,
+   "pass": true,
+   "advisory": true
+  },
+  "[L6-soft] cross-doc near-dup factor (E)": {
+   "target": "<= 1.10",
+   "value": 1.0271,
+   "pass": true,
+   "advisory": true
+  },
+  "[L6-soft] routing-family match rate (D)": {
+   "target": "CI-lower >= 0.95 (soft, metadata-level)",
+   "value": 0.897,
+   "pass": false,
+   "advisory": true
+  },
+  "judge inter-rater agreement (L6 chunk panel)": {
+   "target": "mean overall inter-judge stdev <= 1.2 (1-5 scale)",
+   "value": 0.201,
+   "pass": true
+  },
+  "answer faithfulness (Claude, L3)": {
+   "target": ">= 4.0 / 5",
+   "value": 4.911,
+   "pass": true
+  },
+  "answer correctness (Claude, L3)": {
+   "target": ">= 4.0 / 5",
+   "value": 4.449,
+   "pass": true
+  },
+  "answer completeness (Claude, L3)": {
+   "target": ">= 4.0 / 5",
+   "value": 4.221,
+   "pass": true
+  },
+  "positive fabrication (Claude, L3)": {
+   "target": "<= 0.05",
+   "value": 0.022,
+   "pass": true
+  },
+  "negative fabrication (Claude, L3)": {
+   "target": "<= 0.10",
+   "value": 0.0,
+   "pass": true
+  },
+  "judge inter-rater agreement (L3 panel)": {
+   "target": "mean overall inter-judge stdev <= 1.2 (1-5 scale; lower=more agreement)",
+   "value": 0.079,
+   "pass": true
+  },
+  "image relevance (judge-mm, advisory)": {
+   "target": ">= 3.5 advisory（caption 贴题率;先锁两轮分布再议升 hard）",
+   "value": 3.914,
+   "pass": true,
+   "advisory": true,
+   "notes": "n=35; noise_image_rate=0.229; expected_match=3.343"
+  },
+  "fusion/calibration regime (guard)": {
+   "target": "fusion == 'weighted' AND rerank == True (thresholds' calibration regime == production serving regime)",
+   "value": "active fusion=weighted, rerank=True",
+   "pass": true
+  },
+  "baseline regression (regime)": {
+   "target": "baseline regime must match run regime to compare",
+   "value": "REGIME MISMATCH on ['l4_ingestion_evaluator_version', 'funnel_policy'] — baseline not comparable",
+   "pass": null,
+   "na_reason": "regime_mismatch",
+   "notes": "refreeze the baseline for the current regime (run_eval baseline-freeze)"
+  }
+ },
+ "meta": {
+  "run_id": "eval_refreeze_20260726",
+  "timestamp": "20260726_185818",
+  "n_cases": 258,
+  "goldset": "/Users/laijunchen/Projects/opensearch-rag-pipeline/eval_harness/goldset/golden_full.json",
+  "layers": [
+   "l0",
+   "l1",
+   "l2",
+   "l3",
+   "l4",
+   "l5",
+   "l6"
+  ],
+  "llm_model": "qwen3.7-plus",
+  "embedding_model": "text-embedding-v4",
+  "ha3_endpoint": "ha-cn-kgl4slr1n01.public.ha.aliyuncs.com",
+  "ha3_instance": "ha-cn-kgl4slr1n01",
+  "ha3_table": "fuling_kb_chunks",
+  "rds_host": "rm-bp15j7wekd5738f093o.rwlb.rds.aliyuncs.com",
+  "rds_db": "fuling_knowledge",
+  "keys_present": {
+   "dashscope": true,
+   "ha3_user": true,
+   "ha3_password": true,
+   "rds_password": true
+  },
+  "rag_environment": "test",
+  "simulate": "false",
+  "regime": {
+   "eval_set_sha": "07be5aed621f5ca0",
+   "fusion": "weighted",
+   "rerank_enable": true,
+   "llm_model": "qwen3.7-plus",
+   "embedding_model": "text-embedding-v4",
+   "reranker_models": "qwen3-rerank/qwen3-vl-rerank",
+   "threshold_version": "sh=0.57,sm=0.52,rh=0.9,rm=0.8",
+   "judge_model": "claude-opus-4-8",
+   "judge_rubric_version": "answer_rubric_v1",
+   "vlm_model": "qwen3-vl-plus",
+   "vlm_cache_version": "2",
+   "l4_gt_sha": "d91855974893c86b",
+   "l4_ingestion_evaluator_version": "2.0.0",
+   "funnel_policy": "c1",
+   "code_commit": "277f740"
+  },
+  "judge_calibration_status": "NOT ACTIVE — no human labels; judge 绝对效度无锚。生成标注模板见 judge_calibration.build_template，标注后放 outdir/judge_calibration_labels.json 或设 RAG_JUDGE_CAL_LABELS"
+ }
+}

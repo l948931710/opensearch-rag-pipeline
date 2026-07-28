@@ -1,0 +1,667 @@
+{
+ "n_cases": 35,
+ "total_markers": 79,
+ "total_invalid": 2,
+ "marker_validity": 0.9747,
+ "rows": [
+  {
+   "qid": "QA-18",
+   "query": "新员工住宿安排作业指导书的入住流程是什么？",
+   "n_chunks": 19,
+   "image_map_keys": [
+    3,
+    11,
+    13,
+    14,
+    16,
+    19
+   ],
+   "markers": [
+    3,
+    11
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "QA-92",
+   "query": "新员工从入职到入住宿舍需要经过哪些流程？",
+   "n_chunks": 20,
+   "image_map_keys": [
+    4,
+    14,
+    15,
+    17,
+    20
+   ],
+   "markers": [
+    20,
+    20,
+    17,
+    14,
+    4,
+    15
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "QA-94",
+   "query": "员工离职时需要办理哪些手续？",
+   "n_chunks": 20,
+   "image_map_keys": [
+    6,
+    7,
+    8,
+    10,
+    11,
+    13,
+    14,
+    17,
+    19
+   ],
+   "markers": [
+    6
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "QA-112",
+   "query": "公司宿舍管理涉及哪些制度和流程？",
+   "n_chunks": 7,
+   "image_map_keys": [],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-water_seal",
+   "query": "奶茶杯测水试验，吸管孔怎么密封？",
+   "n_chunks": 8,
+   "image_map_keys": [
+    4,
+    5,
+    6
+   ],
+   "markers": [
+    5
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-water_soak",
+   "query": "奶茶杯测水的泡水和擦干步骤怎么做？",
+   "n_chunks": 8,
+   "image_map_keys": [
+    1,
+    2,
+    3,
+    5
+   ],
+   "markers": [
+    1,
+    1
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-r120_21",
+   "query": "我想把某个部门合并到另一个部门里去，具体在系统里怎么操作？",
+   "n_chunks": 14,
+   "image_map_keys": [
+    2,
+    3,
+    6,
+    8,
+    10,
+    13,
+    14
+   ],
+   "markers": [
+    10,
+    10
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-r120_22",
+   "query": "如果要把一个部门划转到别的部门下面，步骤是怎样的？",
+   "n_chunks": 15,
+   "image_map_keys": [
+    4,
+    7,
+    8,
+    9,
+    12,
+    13,
+    14,
+    15
+   ],
+   "markers": [
+    4,
+    4
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-r120_23",
+   "query": "我要修改一个员工档案里的信息，比如改个手机号，该怎么弄？",
+   "n_chunks": 21,
+   "image_map_keys": [
+    2,
+    4,
+    9,
+    12,
+    14,
+    18,
+    19,
+    20,
+    21
+   ],
+   "markers": [
+    9,
+    9,
+    9
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-r120_30",
+   "query": "我想给新供应商做资格审批，从进系统到提交给质检部，具体要点击哪些按钮？",
+   "n_chunks": 7,
+   "image_map_keys": [],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-r120_31",
+   "query": "质检部审批通过后，我怎么把供应商信息正式录入到档案里？后续还要选什么日期？",
+   "n_chunks": 7,
+   "image_map_keys": [
+    7
+   ],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-r120_36",
+   "query": "供应商资格审批通过后，我在消息中心双击消息进入审批表，接下来要点哪个按钮才能转到填制界面去录入档案？",
+   "n_chunks": 7,
+   "image_map_keys": [],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-r120_37",
+   "query": "在采购订单里，表头的“业务类型”默认是什么？表体里的“无/含税单价”又是从哪里自动取值的？",
+   "n_chunks": 16,
+   "image_map_keys": [
+    5,
+    9,
+    10,
+    14,
+    16
+   ],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-r120_55",
+   "query": "在C01成型机的清扫基准里，清理液压站和管路分别需要多少分钟？",
+   "n_chunks": 7,
+   "image_map_keys": [
+    1,
+    6
+   ],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-r120_56",
+   "query": "片材机每周都要清扫的部件里，哪一个耗时最长，具体要多久？",
+   "n_chunks": 7,
+   "image_map_keys": [],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-r120_96",
+   "query": "淳迪拉片机的三辊在开机前应该怎么清洁？",
+   "n_chunks": 11,
+   "image_map_keys": [
+    2,
+    3,
+    4,
+    5
+   ],
+   "markers": [
+    3
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-itin_step1",
+   "query": "组装电脑的第一步是安装什么部件？",
+   "n_chunks": 17,
+   "image_map_keys": [
+    3
+   ],
+   "markers": [
+    3
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-itin_socket",
+   "query": "安装CPU之前怎么打开主板上的LGA775插座？",
+   "n_chunks": 19,
+   "image_map_keys": [
+    2,
+    3
+   ],
+   "markers": [
+    2,
+    2
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "J-itin_steps",
+   "query": "《电脑安装》作业指导书一共分为哪几个步骤？",
+   "n_chunks": 10,
+   "image_map_keys": [
+    4,
+    6,
+    8,
+    9
+   ],
+   "markers": [
+    4,
+    6,
+    8,
+    9
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "BIND-01",
+   "query": "吸塑车间扫码报检怎么操作？",
+   "n_chunks": 23,
+   "image_map_keys": [
+    4,
+    5,
+    6,
+    9,
+    10,
+    15,
+    17,
+    18
+   ],
+   "markers": [
+    4,
+    5,
+    6,
+    9,
+    10
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "BIND-02",
+   "query": "注塑销售出库单怎么开？",
+   "n_chunks": 14,
+   "image_map_keys": [
+    3,
+    6,
+    9,
+    11,
+    12
+   ],
+   "markers": [
+    3,
+    6,
+    9,
+    11,
+    12
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "BIND-03",
+   "query": "U8系统怎么导出国外销售出货情况？",
+   "n_chunks": 22,
+   "image_map_keys": [
+    2,
+    5,
+    6,
+    9,
+    12,
+    13,
+    17,
+    20,
+    22
+   ],
+   "markers": [
+    2,
+    4,
+    5,
+    6,
+    9,
+    12,
+    13
+   ],
+   "invalid": [
+    4
+   ],
+   "invalid_detail": [
+    {
+     "n": 4,
+     "in_context": true,
+     "beyond_doc_count": false,
+     "ctx_has_img_tag": false,
+     "chunk_type": "procedure_parent",
+     "has_image_refs": true,
+     "renderable": false
+    }
+   ],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "BIND-04",
+   "query": "注塑成品收货报检的步骤是什么？",
+   "n_chunks": 16,
+   "image_map_keys": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    12,
+    13
+   ],
+   "markers": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    12,
+    13
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "BIND-05",
+   "query": "注塑发货拖柜怎么操作？",
+   "n_chunks": 18,
+   "image_map_keys": [
+    3,
+    6,
+    7,
+    8,
+    10,
+    13,
+    16
+   ],
+   "markers": [
+    3,
+    6,
+    7,
+    8,
+    10
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "BIND-06",
+   "query": "磨床操作流程是什么？",
+   "n_chunks": 12,
+   "image_map_keys": [],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "B-whs_manual",
+   "query": "U8+成品仓库怎么操作？",
+   "n_chunks": 21,
+   "image_map_keys": [
+    1,
+    10,
+    14,
+    17,
+    18,
+    19,
+    21
+   ],
+   "markers": [
+    1,
+    10
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "B-whs_daily",
+   "query": "成品仓库仓管员在U8系统里日常都要做哪些业务？",
+   "n_chunks": 28,
+   "image_map_keys": [
+    11,
+    14,
+    25,
+    26,
+    27
+   ],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "B-zc_manual",
+   "query": "资材部怎么用U8系统？",
+   "n_chunks": 7,
+   "image_map_keys": [
+    2,
+    3,
+    5,
+    6,
+    7
+   ],
+   "markers": [
+    3,
+    2,
+    5,
+    1
+   ],
+   "invalid": [
+    1
+   ],
+   "invalid_detail": [
+    {
+     "n": 1,
+     "in_context": true,
+     "beyond_doc_count": false,
+     "ctx_has_img_tag": false,
+     "chunk_type": "text_chunk",
+     "has_image_refs": false,
+     "renderable": false
+    }
+   ],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "B-zc_supplier_flow",
+   "query": "在U8里管理供应商，从资格审批到正式录入档案的完整流程是怎样的？",
+   "n_chunks": 7,
+   "image_map_keys": [],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "B-hr_manual",
+   "query": "人事部怎么用U8系统做人事管理？",
+   "n_chunks": 13,
+   "image_map_keys": [
+    2,
+    3,
+    4,
+    7,
+    9,
+    11,
+    12,
+    13
+   ],
+   "markers": [
+    4,
+    7,
+    9,
+    11,
+    2,
+    3
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "B-hr_org_flow",
+   "query": "U8人事系统里组织机构管理都包含哪些操作？",
+   "n_chunks": 17,
+   "image_map_keys": [
+    1,
+    2,
+    5,
+    7,
+    12,
+    16,
+    17
+   ],
+   "markers": [],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "B-itin_manual",
+   "query": "新电脑从组装到装好系统的完整过程是怎么样的？",
+   "n_chunks": 21,
+   "image_map_keys": [
+    18,
+    20
+   ],
+   "markers": [
+    18
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "B-water_manual",
+   "query": "奶茶杯测水试验整个流程怎么做？",
+   "n_chunks": 8,
+   "image_map_keys": [
+    4,
+    5,
+    6,
+    8
+   ],
+   "markers": [
+    4,
+    5,
+    6,
+    8
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "B-clean_manual",
+   "query": "拉片机的日常清扫保养怎么做？",
+   "n_chunks": 7,
+   "image_map_keys": [
+    1,
+    2,
+    3,
+    4,
+    5
+   ],
+   "markers": [
+    1,
+    4,
+    3
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  },
+  {
+   "qid": "B-dorm_manual",
+   "query": "新员工住宿怎么安排？",
+   "n_chunks": 13,
+   "image_map_keys": [
+    3,
+    12
+   ],
+   "markers": [
+    3,
+    12
+   ],
+   "invalid": [],
+   "invalid_detail": [],
+   "answer_head": "[正文已剥离·public repo]"
+  }
+ ],
+ "_scrubbed": "正文与真实人名已剥离（public repo）；结构化指标与文档标题保留，结论可复核"
+}

@@ -314,7 +314,15 @@ def extract_images_from_pdf(
     try:
         import fitz
     except ImportError:
+        # 审查 P1-8（2026-07-26）：此前这里**只 print**、不写 stats、不写 warnings ——
+        # 于是"整篇图一张没提取"与"这篇本来就没有图"在下游完全无法区分：canonical 得到
+        # 一个干净的 `assets: []`，方案 F 会把它读成"基线的每张图都没了"并升成最高置信的
+        # same_source_drift（"图会从答案里消失"），而实际上一张都没丢。
+        # 注意 stage-1 的 preflight_extractor_deps 有意不预检 pdf/PyMuPDF，所以这条是
+        # 该环境下唯一的信号来源。
         print("      ⚠️ PyMuPDF (fitz) not installed, skipping PDF image extraction")
+        if stats is not None:
+            stats["pdf_image_extract_failed"] = "PyMuPDF (fitz) not installed"
         return []
 
     assets: List[ImageAsset] = []
@@ -324,11 +332,19 @@ def extract_images_from_pdf(
         pdf = fitz.open(local_path)
     except Exception as e:
         print(f"      ⚠️ Failed to open PDF for image extraction: {e}")
+        if stats is not None:                       # 同上（审查 P1-8）
+            stats["pdf_image_extract_failed"] = f"fitz.open failed: {e}"
         return []
 
     doc_basename = os.path.splitext(os.path.basename(local_path))[0]
     img_index = 0
     corrected_counts: dict = {}  # op 名 -> 校正张数（用于日志）
+
+    # B5（2026-07-25）：超出 max_pages 的页从未被扫过图 —— 记进 stats 供调用方留痕
+    # （既有 stats 通道已被 _warn_skipped_vector_images 用于矢量图跳过，同款）。
+    # 只统计、不动上限本身：这三个页上限是当前唯一的摄取侧成本闸。
+    if stats is not None and len(pdf) > max_pages:
+        stats["skipped_pages_beyond_cap"] = len(pdf) - max_pages
 
     for page_idx in range(min(len(pdf), max_pages)):
         page = pdf[page_idx]

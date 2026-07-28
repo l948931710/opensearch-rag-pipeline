@@ -1,0 +1,198 @@
+{
+ "off": {
+  "n_assets": 8,
+  "stitch_log": [],
+  "assets": [
+   {
+    "image_index": 1,
+    "page": 1,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p1_img0001.jpeg",
+    "cat": "form_image",
+    "summary": "[正文已剥离·public repo]",
+    "w": 487,
+    "h": 548
+   },
+   {
+    "image_index": 2,
+    "page": 1,
+    "status": "ROUTE_TO_VECTOR",
+    "filename": "pdf_xs_wi_007_p1_img0002.png",
+    "cat": "visual_knowledge",
+    "summary": "[正文已剥离·public repo]",
+    "w": 391,
+    "h": 69
+   },
+   {
+    "image_index": 26,
+    "page": 2,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p2_img0026.jpeg",
+    "cat": "step_screenshot",
+    "summary": "[正文已剥离·public repo]",
+    "w": 588,
+    "h": 580
+   },
+   {
+    "image_index": 27,
+    "page": 2,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p2_img0027.jpeg",
+    "cat": "step_screenshot",
+    "summary": "[正文已剥离·public repo]",
+    "w": 631,
+    "h": 377
+   },
+   {
+    "image_index": 28,
+    "page": 2,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p2_img0028.jpeg",
+    "cat": "step_screenshot",
+    "summary": "[正文已剥离·public repo]",
+    "w": 1360,
+    "h": 356
+   },
+   {
+    "image_index": 29,
+    "page": 2,
+    "status": "ROUTE_TO_VECTOR",
+    "filename": "pdf_xs_wi_007_p2_img0029.jpeg",
+    "cat": "form_image",
+    "summary": "[正文已剥离·public repo]",
+    "w": 763,
+    "h": 526
+   },
+   {
+    "image_index": 30,
+    "page": 3,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p3_img0030.jpeg",
+    "cat": "step_screenshot",
+    "summary": "[正文已剥离·public repo]",
+    "w": 1033,
+    "h": 311
+   },
+   {
+    "image_index": 41,
+    "page": 3,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p3_img0041.jpeg",
+    "cat": "step_screenshot",
+    "summary": "[正文已剥离·public repo]",
+    "w": 1033,
+    "h": 409
+   }
+  ]
+ },
+ "on": {
+  "n_assets": 10,
+  "stitch_log": [
+   "[pdf-strip-stitch] p1: 23 slices (1000x713) → pdf_xs_wi_007_p1_img0003_pdfstitched23.png",
+   "[pdf-strip-stitch] p3: 10 slices (1036x300) → pdf_xs_wi_007_p3_img0031_pdfstitched10.png"
+  ],
+  "assets": [
+   {
+    "image_index": 1,
+    "page": 1,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p1_img0001.jpeg",
+    "cat": "form_image",
+    "summary": "[正文已剥离·public repo]",
+    "w": 487,
+    "h": 548
+   },
+   {
+    "image_index": 2,
+    "page": 1,
+    "status": "ROUTE_TO_VECTOR",
+    "filename": "pdf_xs_wi_007_p1_img0002.png",
+    "cat": "visual_knowledge",
+    "summary": "[正文已剥离·public repo]",
+    "w": 391,
+    "h": 69
+   },
+   {
+    "image_index": 3,
+    "page": 1,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p1_img0003_pdfstitched23.png",
+    "cat": "form_image",
+    "summary": "[正文已剥离·public repo]",
+    "w": 1000,
+    "h": 713
+   },
+   {
+    "image_index": 26,
+    "page": 2,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p2_img0026.jpeg",
+    "cat": "step_screenshot",
+    "summary": "[正文已剥离·public repo]",
+    "w": 588,
+    "h": 580
+   },
+   {
+    "image_index": 27,
+    "page": 2,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p2_img0027.jpeg",
+    "cat": "step_screenshot",
+    "summary": "[正文已剥离·public repo]",
+    "w": 631,
+    "h": 377
+   },
+   {
+    "image_index": 28,
+    "page": 2,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p2_img0028.jpeg",
+    "cat": "step_screenshot",
+    "summary": "[正文已剥离·public repo]",
+    "w": 1360,
+    "h": 356
+   },
+   {
+    "image_index": 29,
+    "page": 2,
+    "status": "ROUTE_TO_VECTOR",
+    "filename": "pdf_xs_wi_007_p2_img0029.jpeg",
+    "cat": "form_image",
+    "summary": "[正文已剥离·public repo]",
+    "w": 763,
+    "h": 526
+   },
+   {
+    "image_index": 30,
+    "page": 3,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p3_img0030.jpeg",
+    "cat": "step_screenshot",
+    "summary": "[正文已剥离·public repo]",
+    "w": 1033,
+    "h": 311
+   },
+   {
+    "image_index": 31,
+    "page": 3,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p3_img0031_pdfstitched10.png",
+    "cat": "form_image",
+    "summary": "[正文已剥离·public repo]",
+    "w": 1036,
+    "h": 300
+   },
+   {
+    "image_index": 41,
+    "page": 3,
+    "status": "ROUTE_TO_TEXT",
+    "filename": "pdf_xs_wi_007_p3_img0041.jpeg",
+    "cat": "step_screenshot",
+    "summary": "[正文已剥离·public repo]",
+    "w": 1033,
+    "h": 409
+   }
+  ]
+ },
+ "_scrubbed": "正文与真实人名已剥离（public repo）；结构化指标与文档标题保留，结论可复核"
+}

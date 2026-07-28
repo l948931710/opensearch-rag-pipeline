@@ -112,8 +112,10 @@ def test_funnel_cap_skips_count_into_degraded(monkeypatch, tmp_path):
     from opensearch_pipeline.extraction.unified_extractor import UnifiedExtractor
     monkeypatch.setenv("RAG_FUNNEL_MAX_IMAGES", "1")
     monkeypatch.setattr(ImageFunnelProcessor, "__init__", lambda self, simulate=False: None)
-    monkeypatch.setattr(ImageFunnelProcessor, "_static_heuristics",
-                        lambda self, p: (200, 200, 50.0))   # 假 PNG 过 Funnel 1
+    # A11（2026-07-25）：Funnel-1 的 seam 换成 screen_static（唯一入口，携带 verdict/error）
+    monkeypatch.setattr(ImageFunnelProcessor, "screen_static",
+                        lambda self, p: {"width": 200, "height": 200, "file_size_kb": 50.0,
+                                         "aspect_ratio": 1.0, "verdict": "OK", "error": ""})
     monkeypatch.setattr(
         ImageFunnelProcessor, "process_image",
         lambda self, p, d, is_public=True, doc_title="": {

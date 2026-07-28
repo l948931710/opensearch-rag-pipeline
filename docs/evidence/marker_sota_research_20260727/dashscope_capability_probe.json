@@ -1,0 +1,24 @@
+{
+ "tested_at": "2026-07-27",
+ "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+ "model": "qwen3.7-plus",
+ "response_format_json_object": {
+  "http": 200,
+  "accepted": true
+ },
+ "response_format_json_schema_strict_enum": {
+  "http": 200,
+  "accepted": true,
+  "enforced": true,
+  "trials": 5,
+  "in_enum": 5,
+  "out_of_enum": 0,
+  "adversarial_prompt": "要求填 999，enum=[3,7]",
+  "control_without_response_format": "{\"image_id\": 999}"
+ },
+ "logprobs": {
+  "http": 200,
+  "returned": true
+ },
+ "verdict": "enum 约束在本端点【实测被执行】——推翻本轮 deep-research 结论6(依据厂商文档、3-0 高置信)。 供应商能力时效性强，引用本结论须带测试日期。"
+}

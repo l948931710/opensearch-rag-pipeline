@@ -392,6 +392,11 @@ def _md(r: Dict, gates: Dict) -> str:
                  f"{l1.get('n_positive_scorable')} total  |  permission-gated excluded: "
                  f"{l1.get('n_permission_gated')}  |  negatives: {l1.get('n_negative')}")
         L.append(f"- **ranking (single-target)**: {json.dumps(l1.get('ranking'), ensure_ascii=False)}")
+        # rerank 实况。0 时不出行（不给正常轮次添噪）；>0 必须显眼——这几题是按融合序打的分，
+        # regime 里的 `rerank_enable: True` 对它们不成立，排序类结论要把它们剔掉。
+        if l1.get("n_rerank_degraded"):
+            L.append(f"- ⚠️ **rerank 降级（fail-open，按融合序计分）**: "
+                     f"{l1['n_rerank_degraded']} 题 — {l1.get('rerank_degraded_qids')}")
         if l1.get("ranking_multidoc"):
             L.append(f"- ranking (multi-doc, single-rank proxy): {json.dumps(l1.get('ranking_multidoc'), ensure_ascii=False)}")
         if l1.get("content_hit_rate") is not None:

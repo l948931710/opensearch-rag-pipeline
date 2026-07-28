@@ -1,0 +1,55 @@
+{
+ "n_assets": 2724,
+ "old": {
+  "label": "OLD（D1 修复前：text 级 + 裸「编码」）",
+  "n_high": 0,
+  "n_medium": 42,
+  "entities": {
+   "cn_mobile": 10,
+   "email": 8,
+   "address": 14,
+   "bank_card": 4,
+   "masked_id": 47
+  },
+  "high_docs": {}
+ },
+ "new": {
+  "label": "NEW（D1 修复后：match 级 + 正向锚点）",
+  "n_high": 2,
+  "n_medium": 40,
+  "entities": {
+   "cn_mobile": 10,
+   "email": 8,
+   "address": 14,
+   "cn_id_card": 3,
+   "bank_card": 4,
+   "masked_id": 47
+  },
+  "high_docs": {
+   "DOC_IT_20260513120634_ED2762": [
+    "cn_id_card"
+   ],
+   "DOC_IT_20260514123026_951420": [
+    "cn_id_card"
+   ]
+  }
+ },
+ "newly_high": {
+  "DOC_IT_20260513120634_ED2762": {
+   "title": "富岭U8+人事部操作手册.docx",
+   "dept": "it",
+   "perm": "public",
+   "entities": [
+    "cn_id_card"
+   ]
+  },
+  "DOC_IT_20260514123026_951420": {
+   "title": "工资核算管理操作手册（2025年5月28日初版）.docx",
+   "dept": "it",
+   "perm": "public",
+   "entities": [
+    "cn_id_card"
+   ]
+  }
+ }
+}

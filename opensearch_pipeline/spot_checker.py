@@ -458,9 +458,11 @@ def reconcile_stranded_versions() -> dict:
                                                             DocVersionIndexStatus.DELETED))})
                   AND (dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
                        OR dv.updated_at < NOW() - INTERVAL 2 HOUR)
-                  AND EXISTS (SELECT 1 FROM chunk_meta o
-                              WHERE o.doc_id = cm_new.doc_id
-                                AND o.version_no < cm_new.version_no AND o.is_active = 1)
+                  AND (EXISTS (SELECT 1 FROM chunk_meta o
+                               WHERE o.doc_id = cm_new.doc_id
+                                 AND o.version_no < cm_new.version_no AND o.is_active = 1)
+                       OR dv.index_status IN ({sql_in_list((DocVersionIndexStatus.FAILED,
+                                                            DocVersionIndexStatus.NOT_INDEXED))}))
                   AND EXISTS (SELECT 1 FROM chunk_meta n
                               WHERE n.doc_id = cm_new.doc_id
                                 AND n.version_no = cm_new.version_no
@@ -472,9 +474,14 @@ def reconcile_stranded_versions() -> dict:
                 LIMIT 200
             """)
             # 谓词解读：最新 active 版本的 chunk【全部】INDEXED（≥1 条，"已验证索引成功"）、
-            # 旧版本仍有 active chunk（搁浅特征）、未被隔离、未进删除队列（PENDING_DELETE/
-            # DELETED = retire/visibility 正在下线，修回 SUCCESS 恒错）、且不与 2h 内在跑的
-            # stage-3 抢锁。此扫描只产【提示】，权威判定在下方逐 doc 的 meta 锁内重验。
+            # 未被隔离、未进删除队列（PENDING_DELETE/DELETED = retire/visibility 正在下线，
+            # 修回 SUCCESS 恒错）、且不与 2h 内在跑的 stage-3 抢锁。
+            # B8（2026-07-25）：「旧版本仍有 active chunk」从**必要条件**降为**分支条件** ——
+            # stage-3 是批级 all-or-nothing：同批任一 chunk 失败就整节点 raise，orchestrator
+            # 再把**全部** preempted 键 CAS 成 FAILED，不区分本批内已全成功的文档。首版文档
+            # （无更旧 active chunk）因此会永久停在 index_status='FAILED'：内容其实已正确入
+            # 索引、可检索，只是状态列失真，误导人工排障并可能引发重复重灌。这类候选走
+            # RDS-only 分支（**零 HA3 删除**）。此扫描只产【提示】，权威判定在下方 meta 锁内重验。
             rows = cursor.fetchall()
 
         result["total"] = len(rows)
@@ -486,16 +493,25 @@ def reconcile_stranded_versions() -> dict:
             len(rows),
         )
 
-        # fail-closed：bounded 客户端能力缺失 → 整批拒跑，候选停留原搁浅态（可重试），
+        # fail-closed：bounded 客户端能力缺失 → 需要删除的候选拒跑（停留原搁浅态、可重试），
         # 零 HA3/RDS 写。绝不回退无界老路径。
-        try:
-            os_client = _get_bounded_search_client()
-        except Exception as cap_err:
-            result["failed"] = len(rows)
-            result["errors"].append(
-                f"bounded search client unavailable (fail-closed, no mutations): {cap_err}")
-            logger.error("[RECONCILE] bounded 客户端不可用——fail-closed 整批拒跑: %s", cap_err)
-            return result
+        # B8：改为**按需惰性获取** —— RDS-only 分支（无更旧 active chunk）根本不删 HA3，
+        # 不该因为客户端不可用而被整批拒跑。
+        _client_box = {"client": None, "err": None}
+
+        def _bounded_client():
+            if _client_box["client"] is None and _client_box["err"] is None:
+                try:
+                    _client_box["client"] = _get_bounded_search_client()
+                except Exception as cap_err:      # noqa: BLE001 — 记下，逐 doc 分支据此 fail-closed
+                    _client_box["err"] = cap_err
+                    logger.error("[RECONCILE] bounded 客户端不可用——需删除的候选 fail-closed: %s",
+                                 cap_err)
+            if _client_box["err"] is not None:
+                raise RuntimeError(
+                    f"bounded search client unavailable (fail-closed, no mutations): "
+                    f"{_client_box['err']}")
+            return _client_box["client"]
 
         index_name = getattr(config.opensearch, "index_name", "fuling_knowledge_v1")
         deadline_s = _reconcile_ha3_deadline_s()
@@ -545,8 +561,7 @@ def reconcile_stranded_versions() -> dict:
                 max_active_ver = max((r[1] for r in all_chunks), default=None)
                 if (max_active_ver != version_no
                         or not cur_statuses
-                        or any(s != ChunkIndexStatus.INDEXED for s in cur_statuses)
-                        or not old_ids):
+                        or any(s != ChunkIndexStatus.INDEXED for s in cur_statuses)):
                     conn.rollback()
                     result["skipped_stale"] += 1
                     logger.info(
@@ -554,18 +569,45 @@ def reconcile_stranded_versions() -> dict:
                         doc_id, version_no)
                     continue
 
-                # 先删索引、成功后才动 RDS（与 node_deactivate_old_chunks 同序）；bounded
-                _search_delete_old_chunks(os_client, config, index_name, doc_id, version_no,
-                                          old_ids, deadline_ts=time.monotonic() + deadline_s)
+                # B8（2026-07-25）：无更旧 active chunk = RDS-only 分支（状态列失真，内容已在索引）。
+                # 此时必须用 document_meta.current_version_no 做**锁内一致性信号**，但它是
+                # **注册分配指针**（console 在新版本尚未摄取前就递增），绝不能当硬等式门：
+                #   · candidate > current  → 不一致态（不该发生），跳过并计数告警
+                #   · candidate == current → 正常，允许
+                #   · candidate < current  → 合法的 served-fallback（v2 全量 INDEXED、v3 刚登记
+                #     还没产 chunk），此时 candidate 仍是最新 active-chunk 版本 → 允许修
+                # 上面的 `max_active_ver != version_no` 已保证"仍是最新 active-chunk 版本"。
+                if not old_ids:
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT current_version_no FROM document_meta WHERE doc_id = %s",
+                            (doc_id,))
+                        _mrow = cursor.fetchone()
+                    _cur_ver = int(_mrow[0]) if _mrow and _mrow[0] is not None else None
+                    if _cur_ver is not None and version_no > _cur_ver:
+                        conn.rollback()
+                        result["skipped_stale"] += 1
+                        logger.warning(
+                            "[RECONCILE] %s v%s > document_meta.current_version_no=%s（不一致态），跳过",
+                            doc_id, version_no, _cur_ver)
+                        continue
+
+                # 先删索引、成功后才动 RDS（与 node_deactivate_old_chunks 同序）；bounded。
+                # RDS-only 分支零删除：不构造、不调用 HA3 客户端。
+                if old_ids:
+                    _search_delete_old_chunks(_bounded_client(), config, index_name,
+                                              doc_id, version_no, old_ids,
+                                              deadline_ts=time.monotonic() + deadline_s)
 
                 finalized = False
                 with conn.cursor() as cursor:
                     # 锁序：chunk 先于 dv（对齐 stage-3）
-                    cursor.execute(f"""
-                        UPDATE chunk_meta
-                        SET is_active = FALSE, index_status = '{ChunkIndexStatus.DELETED}'
-                        WHERE doc_id = %s AND version_no < %s AND is_active = 1
-                    """, (doc_id, version_no))
+                    if old_ids:
+                        cursor.execute(f"""
+                            UPDATE chunk_meta
+                            SET is_active = FALSE, index_status = '{ChunkIndexStatus.DELETED}'
+                            WHERE doc_id = %s AND version_no < %s AND is_active = 1
+                        """, (doc_id, version_no))
                     # 版本收尾分派（docstring §F3）
                     if observed_status == DocVersionIndexStatus.SUCCESS:
                         cursor.execute("""

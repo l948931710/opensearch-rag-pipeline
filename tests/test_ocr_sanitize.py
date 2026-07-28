@@ -139,3 +139,81 @@ def test_unsafe_legacy_entries_rejected():
 
 def test_cache_miss_returns_none():
     assert _vlm_cache_lookup({}, "nope", True) is None
+
+
+# ═══════════ OCRClient 构造器回退（2026-07-25，B6 实测中踩到的陷阱）═══════════
+# 症状：`OCRClient(simulate=False)` 静默拿到空 key（全量 401）+ 错误默认模型 qwen-vl-max。
+# 根因：api_key 回退只读 DASHSCOPE_API_KEY **环境变量**，而本仓密钥在
+# RAG_DASHSCOPE_API_KEY、由 config.py 解析进 config.ocr.api_key，构造器不看它。
+# 两个生产构造点都显式传 config 所以没踩到，但任何临时脚本都会踩，且失败表现为
+# "密钥无效"，极易误判成密钥过期（B6 实测时就误判了一轮）。
+
+def test_ocrclient_falls_back_to_config_when_arg_omitted(monkeypatch):
+    from opensearch_pipeline.extraction.ocr_client import OCRClient
+    import opensearch_pipeline.config as cfgmod
+
+    class _Ocr:
+        api_key = "sk-from-config"
+        api_base_url = "https://example.invalid/api/v1"
+        model = "qwen-vl-ocr-latest"
+        max_ocr_pages = 33
+
+    monkeypatch.setattr(cfgmod, "get_config",
+                        lambda: type("C", (), {"ocr": _Ocr()})())
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    c = OCRClient(simulate=True)
+    assert c.api_key == "sk-from-config"
+    assert c.ocr_model == "qwen-vl-ocr-latest"      # 不再是 qwen-vl-max
+    assert c.api_base_url == "https://example.invalid/api/v1"
+    assert c.max_ocr_pages == 33
+
+
+def test_ocrclient_explicit_args_still_win(monkeypatch):
+    from opensearch_pipeline.extraction.ocr_client import OCRClient
+    import opensearch_pipeline.config as cfgmod
+
+    class _Ocr:
+        api_key = "sk-from-config"
+        api_base_url = "https://example.invalid/api/v1"
+        model = "qwen-vl-ocr-latest"
+        max_ocr_pages = 33
+
+    monkeypatch.setattr(cfgmod, "get_config",
+                        lambda: type("C", (), {"ocr": _Ocr()})())
+    c = OCRClient(api_key="explicit", ocr_model="m2", max_ocr_pages=1, simulate=True)
+    assert (c.api_key, c.ocr_model, c.max_ocr_pages) == ("explicit", "m2", 1)
+
+
+def test_ocrclient_empty_api_key_means_explicitly_none(monkeypatch):
+    """`api_key=""` 是**显式无 key**，不得回退 —— test_real_extractors 靠它验优雅降级。"""
+    from opensearch_pipeline.extraction.ocr_client import OCRClient
+    import opensearch_pipeline.config as cfgmod
+
+    class _Ocr:
+        api_key = "sk-from-config"
+        api_base_url = "u"
+        model = "m"
+        max_ocr_pages = 20
+
+    monkeypatch.setattr(cfgmod, "get_config",
+                        lambda: type("C", (), {"ocr": _Ocr()})())
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    assert OCRClient(api_key="", simulate=False).api_key == ""
+
+
+def test_ocrclient_warns_loudly_when_real_mode_has_no_key(monkeypatch, capsys):
+    from opensearch_pipeline.extraction.ocr_client import OCRClient
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    OCRClient(api_key="", simulate=False)
+    assert "401" in capsys.readouterr().out, "无 key 的真实模式必须响一声"
+
+
+def test_ocrclient_construction_survives_broken_config(monkeypatch):
+    """配置不可用不该让构造失败（fail-open 退回字面量默认）。"""
+    from opensearch_pipeline.extraction.ocr_client import OCRClient
+    import opensearch_pipeline.config as cfgmod
+    monkeypatch.setattr(cfgmod, "get_config",
+                        lambda: (_ for _ in ()).throw(RuntimeError("config broken")))
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    c = OCRClient(simulate=True)
+    assert c.ocr_model == "qwen-vl-max" and c.max_ocr_pages == 20

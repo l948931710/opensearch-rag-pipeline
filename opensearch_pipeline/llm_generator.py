@@ -783,6 +783,93 @@ def build_gen_meta(
 # 非流式生成
 # ═══════════════════════════════════════════════════════════════
 
+def _select_system_prompt(system_prompt: Optional[str], pure_text: bool, context: str) -> str:
+    """选 system prompt 的**单一来源**（generate_answer / generate_answer_stream 共用）。
+
+    优先级：显式 `system_prompt` 入参 > 纯文本模式 > 图文默认。
+
+    #F-mm14「无可插图时不发图规则」（`RAG_IMG_RULE_REQUIRES_IMAGES`，**2026-07-27 起默认 ON**）
+    ─────────────────────────────────────────────────────────────────────
+    规则 10（"在相关段落后插入 `<<IMG:N>>`"）此前只按**调用点传的 `pure_text`** 挂，
+    **不看这一轮的 context 里到底有没有图**。于是图文路径上，哪怕检索回来的文档一张
+    可渲染图都没有，模型仍被要求插图标记 —— 它就照做，凭空编造文档号。
+
+    实测（2026-07-27，35 题图 case，`docs/evidence/marker_validity_20260727/`）：
+    96 个 marker / 34 非法 / `marker_validity` 0.6458（硬闸 ≥0.95）。逐条裁定后
+    "越界 / 截断 / 渲染侧不可渲染"三种解释**各 0 例**，21 个去重非法 N 全部是
+    "文档在 context 里但没有 `<<IMG:N>>` 标记"；其中 **62%（21/34 次）来自 4 道
+    context 里一张图都没有的题**（BIND-06 把 `<<IMG:1>>` 发了 7 次）。
+
+    判据用**模型实际看到的 context 串**（`"<<IMG:" not in context`），不是入参 chunks：
+    带图 chunk 可能被 6000 字预算截掉，那样标记同样没进 context，规则同样该撤。
+
+    关闭（显式设 false/0/no）时逐字节回到原行为（`system_prompt or (TEXT_ONLY if pure else DEFAULT)`）。
+    """
+    if system_prompt:
+        return system_prompt          # 显式覆盖优先，flag 不介入
+    if pure_text:
+        return TEXT_ONLY_SYSTEM_PROMPT
+    try:
+        _on = bool(get_config().rag.img_rule_requires_images)
+    except Exception:                 # noqa: BLE001 — 配置不可用 → 维持历史行为
+        _on = False
+    if _on and "<<IMG:" not in (context or ""):
+        logger.info("本轮 context 无 <<IMG:N>> 标记，改用纯文本 prompt（#F-mm14）")
+        return TEXT_ONLY_SYSTEM_PROMPT
+    return DEFAULT_SYSTEM_PROMPT + _img_id_whitelist_rule(context)
+
+
+# 本轮 context 里真实出现的图片标记编号（含子下标形式 `<<IMG:3.1>>` → 取 3）。
+_CTX_IMG_ID_RE = re.compile(r"<{1,2}IMG:(\d+)(?:\.\d+)?>{1,2}")
+
+# 规则 13（#F-mm15）：把**本轮可用的图片编号**显式列进 prompt。
+# 措辞刻意点名"相邻编号"与"宁可不插"——判别实验里 11 条残余非法 marker 有 9 条是模型
+# **正确识别了来源文档、但那篇没有绑定图**（见下方 docstring），它需要的是"这篇不在清单里
+# 就别插图"的弃权许可，而不是"改成邻居的号"。
+_IMG_ID_WHITELIST_TMPL = """
+13. 【本轮可用图片编号】只有 {ids} 这{n}个。<<IMG:N>> 里的 N 必须严格取自该清单并逐字照抄；
+清单以外的编号一律不得出现——**包括与清单相邻的编号**。若某段内容所依据的文档不在该清单里，
+说明那篇文档没有配图，该段就不要插入任何图片标记（宁可不插，也不要插一个不在清单里的编号）"""
+
+
+def _img_id_whitelist_rule(context: Optional[str]) -> str:
+    """规则 13：显式枚举本轮可用图片编号（`RAG_IMG_ID_WHITELIST`，**2026-07-27 起默认 ON**）。
+
+    为什么是"逐文档粒度"而不是"语义重绑定"
+    ────────────────────────────────────
+    `#F-mm14` 之后残余的非法 marker 全部 |N − 最近合法图号| ≤ 2，看着像"数错号"，SOTA 调研
+    给出的唯一有量级支撑的路线也是 CiteFix 式重绑定（ACL 2025 Industry，+15.5% MQLA）。
+    但判别实验（`docs/evidence/marker_slip_discriminator_20260727/`，判据先于数据写死、
+    两种 marker 归属窗口互为对照且 **11/11 一致**）给出的是相反结论：
+
+      · **H-noimg（来源判对了、那篇没图）9 条**，相似度差 a−b = +0.06 ~ **+0.28**
+        （`B-clean_manual` 三条 a≈0.30 vs b≈0.02，差一个数量级）；
+      · H-slip（数错号）仅 2 条，差 −0.038/−0.032 且 a、b 绝对值都在 0.03~0.10 的噪声区。
+
+    被引文档的类型也吻合：9 条 H-noimg 全落在 `procedure_parent`(5) / `text_chunk`(4) —— 这
+    两类**天然不绑图**，图都挂在兄弟 `step_card` 上。即模型在讲某段正文时想配图，而图不在
+    那一篇上。
+
+    ⇒ CiteFix 式语义重绑定（把 `<<IMG:6>>` 改成 `<<IMG:3>>`）在这里是**错的方向**：a/b 差
+    一个数量级时改号 = 给员工看一张不属于该步骤的图。正解是把规则粒度从"context 里有图就
+    全开"收到"逐文档"，并把可用编号清单直接摆给模型 + 给出弃权许可。
+
+    清单来源同 `#F-mm14`：**模型实际看到的 context 串**，不是入参 chunks —— 被 6000 字预算
+    截掉的带图 chunk 其标记没进 context，模型引不了，也就不该出现在清单里。
+
+    关闭（显式设 false/0/no）时返回空串 ⇒ prompt 逐字节回到加本规则之前。
+    """
+    try:
+        if not get_config().rag.img_id_whitelist:
+            return ""
+    except Exception:                     # noqa: BLE001 — 配置不可用 → 维持历史行为
+        return ""
+    ids = sorted({int(m.group(1)) for m in _CTX_IMG_ID_RE.finditer(context or "")})
+    if not ids:
+        return ""                         # 无可用编号 → 不追加（该情形由 #F-mm14 处理）
+    return _IMG_ID_WHITELIST_TMPL.format(ids="、".join(str(i) for i in ids), n=len(ids))
+
+
 def generate_answer(
     query: str,
     context_chunks: List[Dict[str, Any]],
@@ -823,14 +910,14 @@ def generate_answer(
 
     # 解析纯文本开关：显式参数优先，否则取全局 config
     _pure = config.rag.pure_text if pure_text is None else pure_text
-    _system = system_prompt or (TEXT_ONLY_SYSTEM_PROMPT if _pure else DEFAULT_SYSTEM_PROMPT)
+    # 组装 context —— **提前到选 prompt 之前**：#F-mm14 要按模型实际看到的 context 里
+    # 有没有 `<<IMG:N>>` 判定。两串互不依赖，flag OFF 时结果与原顺序逐字节相同。
+    context, _included_chunks = _format_context_ex(
+        context_chunks, max_chars=max_context_chars, pure_text=_pure)
+    _system = _select_system_prompt(system_prompt, _pure, context)
     if _is_low_confidence(context_chunks):
         logger.info("低置信度护栏触发（top 分低于 medium 阈值），追加强化拒答指令")
         _system = _system + LOW_CONFIDENCE_RULE
-
-    # 组装 context
-    context, _included_chunks = _format_context_ex(
-        context_chunks, max_chars=max_context_chars, pure_text=_pure)
     messages = _build_messages(query, context, history=history, system_prompt=_system)
     # P2-20/21/22：prompt 装配完成后立刻定格生成元数据（messages[0] 即最终 system prompt，
     # 含 _build_messages 内条件追加的全部规则）；fail-open，失败落 None
@@ -947,13 +1034,13 @@ def generate_answer_stream(
         raise RuntimeError("LLM API Key 未配置")
 
     _pure = config.rag.pure_text if pure_text is None else pure_text
-    _system = system_prompt or (TEXT_ONLY_SYSTEM_PROMPT if _pure else DEFAULT_SYSTEM_PROMPT)
+    # 顺序同 generate_answer（#F-mm14）：先出 context，再据其有无 `<<IMG:N>>` 选 prompt。
+    context, _included_chunks = _format_context_ex(
+        context_chunks, max_chars=max_context_chars, pure_text=_pure)
+    _system = _select_system_prompt(system_prompt, _pure, context)
     if _is_low_confidence(context_chunks):
         logger.info("低置信度护栏触发（top 分低于 medium 阈值），追加强化拒答指令")
         _system = _system + LOW_CONFIDENCE_RULE
-
-    context, _included_chunks = _format_context_ex(
-        context_chunks, max_chars=max_context_chars, pure_text=_pure)
     messages = _build_messages(query, context, history=history, system_prompt=_system)
     # P2-20/21/22：经出参回填生成元数据（generate_answer_via_stream / api.ask_stream 落库用）
     if meta_out is not None:

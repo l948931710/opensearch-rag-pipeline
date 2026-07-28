@@ -33,8 +33,10 @@ def _mk_extractor():
 def _patch_funnel(monkeypatch, results_by_name):
     monkeypatch.setattr(ImageFunnelProcessor, "__init__",
                         lambda self, simulate=False: None)
-    monkeypatch.setattr(ImageFunnelProcessor, "_static_heuristics",
-                        lambda self, p: (200, 200, 50.0))
+    # A11：Funnel-1 seam = screen_static（唯一入口）
+    monkeypatch.setattr(ImageFunnelProcessor, "screen_static",
+                        lambda self, p: {"width": 200, "height": 200, "file_size_kb": 50.0,
+                                         "aspect_ratio": 1.0, "verdict": "OK", "error": ""})
 
     def _process(self, local_path, doc_id, is_public=True, doc_title=""):
         import os

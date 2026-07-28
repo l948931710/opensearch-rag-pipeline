@@ -622,50 +622,84 @@ def _revalidate_main_hits(results):
     失败语义：权威表不可达 / 返回整体为空（几乎必然是连错库/桩连接而非全部命中同时失效）
     → 保留原结果并告警。HA3 服务端过滤是第一道边界，本检查只是投影延迟的防御纵深，
     不把 RDS 故障放大为全站无答案（与本模块 stitch/expand 的 fail-open 风格一致）。
+
+    B7（2026-07-25）追加**物理 PK 轴**：同版本重切（node_write_chunk_meta 按
+    (doc_id, version_no) 全量 DELETE→INSERT）会给同一 chunk_id 重新分配 chunk_meta.id
+    ——也就是 HA3 的主键。旧 PK 就此成为孤儿：它既不在 deactivate 的覆盖面（那按
+    version_no < N 选行，同版本重切时旧行连 id 都不在 RDS 了），也不在按 version 删的
+    PENDING_DELETE 里。孤儿行的 chunk_id / is_active / permission 全都对得上，只按
+    chunk_id 复核会**原样放行**，于是被修文档的旧文本可能被当作现行内容投给 LLM。
+    改为 (chunk_id, HA3 返回的 id) 双轴比对，不一致即丢弃。
     """
     cfg = get_config()
     if not cfg.rag.main_hit_revalidate or not results or cfg.simulate_db:
         return results
-    ids = [str(r.get("chunk_id") or r.get("id") or "") for r in results]
-    ids = sorted({i for i in ids if i})
-    if not ids:
+    # 两个轴**分开收集**：此前 `r.get("chunk_id") or r.get("id")` 把两者压进同一个列表再按
+    # chunk_id 查，于是"chunk_id 为空、只有 HA3 id"的历史命中永远查不到（所谓 id 兜底是假的）。
+    cid_axis = sorted({str(r.get("chunk_id")) for r in results if r.get("chunk_id")})
+    pk_axis = sorted({str(r.get("id")) for r in results
+                      if not r.get("chunk_id") and r.get("id") not in (None, "")})
+    if not cid_axis and not pk_axis:
         return results
     try:
         from opensearch_pipeline.db import _get_db_conn   # 惰性：tests monkeypatch db._get_db_conn
         conn = _get_db_conn()
         try:
+            rows = []
             with conn.cursor() as cur:
-                ph = ",".join(["%s"] * len(ids))
-                cur.execute(
-                    "SELECT chunk_id, is_active, permission_level, owner_dept"
-                    f" FROM chunk_meta WHERE chunk_id IN ({ph})", tuple(ids))
-                rows = cur.fetchall() or []
+                if cid_axis:
+                    ph = ",".join(["%s"] * len(cid_axis))
+                    cur.execute(
+                        "SELECT chunk_id, is_active, permission_level, owner_dept, id"
+                        f" FROM chunk_meta WHERE chunk_id IN ({ph})", tuple(cid_axis))
+                    rows.extend(cur.fetchall() or [])
+                if pk_axis:
+                    # chunk_id 为空的历史行：按物理 PK 兜底查，否则上面那条查不到它们
+                    ph2 = ",".join(["%s"] * len(pk_axis))
+                    cur.execute(
+                        "SELECT chunk_id, is_active, permission_level, owner_dept, id"
+                        f" FROM chunk_meta WHERE id IN ({ph2})", tuple(pk_axis))
+                    rows.extend(cur.fetchall() or [])
         finally:
             conn.close()
     except Exception as e:   # noqa: BLE001 — 权威不可达 → 默认保留（HA3 是第一道边界）；strict 只留 public
         logger.warning("主命中 RDS 复核失败（HA3 结果）: %s", e)
         return _keep_public_only_if_strict(results, "RDS 不可达")
     if not rows:
-        logger.warning("主命中 RDS 复核返回空集（%d 个 chunk_id 全部未知）——按权威不可用处理", len(ids))
+        logger.warning("主命中 RDS 复核返回空集（%d 个键全部未知）——按权威不可用处理",
+                       len(cid_axis) + len(pk_axis))
         return _keep_public_only_if_strict(results, "复核返回空集")
-    meta = {str(r[0]): (r[1], r[2], r[3]) for r in rows}
+    # r[4]=chunk_meta.id；对不含该列的行形态（旧桩/降级查询）取 None，下面据此跳过 PK 比对
+    def _row(r):
+        return (r[1], r[2], r[3], r[4] if len(r) > 4 else None)
+
+    meta = {str(r[0]): _row(r) for r in rows if r[0]}
+    meta_by_pk = {str(r[4]): _row(r) for r in rows if len(r) > 4 and r[4] is not None}
     kept, dropped = [], 0
     for r in results:
-        cid = str(r.get("chunk_id") or r.get("id") or "")
-        if not cid:
-            kept.append(r)
+        cid = str(r.get("chunk_id") or "")
+        row = meta.get(cid) if cid else meta_by_pk.get(str(r.get("id") or ""))
+        if row is None and not cid and not r.get("id"):
+            kept.append(r)     # 两个轴都没有键 → 无从复核，保留（沿用既有 fail-open）
             continue
-        row = meta.get(cid)
         if row is None:
             dropped += 1       # RDS 已无此 chunk（purge/删除），HA3 残留
             continue
-        active, perm, owner = row
+        active, perm, owner, rds_pk = row
         if not active:
             dropped += 1
             continue
         if (str(perm or "") != str(r.get("permission_level") or "")
                 or str(owner or "") != str(r.get("owner_dept") or "")):
             dropped += 1       # 投影陈旧：ACL 轴不一致，不投放
+            continue
+        # B7：物理 PK 轴。HA3 返回的 id 与 RDS 现行 chunk_meta.id 不一致 ⇒ 同版本重切留下的
+        # 孤儿行（旧文本），丢弃。**HA3 id 缺失时只跳过这一项比对**、不丢弃命中 ——
+        # 历史行没有该字段，因缺字段整条丢会把正常内容一起打掉。
+        _ha3_pk = r.get("id")
+        if (_ha3_pk not in (None, "") and rds_pk is not None
+                and str(_ha3_pk) != str(rds_pk)):
+            dropped += 1
             continue
         kept.append(r)
     if dropped:

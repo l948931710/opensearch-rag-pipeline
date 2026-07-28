@@ -13,10 +13,28 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Sequence
 
+# 标题归一口径的语义版本。**改这里就是改尺子** —— L1 的 recall@k 全部由 gold_doc_rank 决定，
+# 而它只看归一后的标题。与 l4_ingestion_evaluator_version / l6_evaluator_version 同款用途：
+# 进 regime，使"尺子变了"与"管线变好了"在差量网里可区分。
+#   2.0.0 (2026-07-27)：剥文件扩展名 + 括号只去符号保留内容（两条见下）
+MATCHER_VERSION = "2.0.0"
+
 # 《...》 document-name spans
 _BOOKNAME = re.compile(r"《([^《》]+)》")
-# strip version/parenthetical noise + punctuation for fuzzy title compare
-_NOISE = re.compile(r"[（(【\[].*?[)）】\]]|[\s　_\-—·、,，。.／/]+")
+# 文件扩展名。语料标题带扩展名（HA3 的 `title` 就是文件名），金集写的是纯文档名 ——
+# 不剥的话包含判定被尾巴挡死，只能退到 bigram Jaccard。实测 QA-109：检索把
+# 《A37-8化学品泄露.docx》放在 rank 1/3/4，金集写《A37-8化学品泄露应急响应》，
+# 归一成 'a378化学品泄露docx' vs 'a378化学品泄露应急响应' → 互不包含 → 0.5 < 0.6 →
+# **判不匹配，记成 gold_rank=13**。这类错只会低报召回，不会高报。
+_EXT = re.compile(r"\.(docx?|xlsx?|pptx?|pdf|txt|csv|html?|md)$", re.I)
+# 括号：**只去符号，保留内容**。此前是把括号连内容一起删（`[（(【\[].*?[)）】\]]`），
+# 会把标题塌缩成通用词根：《通知（进出厂规定）》→ '通知'，而 '通知' ⊂ 任何含"通知"的标题
+# ⇒ 相似度 1.0。实测该规则今天就能让《关于饭卡充值的通知》《关于2021年秋季上下班时间调整
+# 通知》三份**完全无关**的文档冒充金档（本轮实跑里恰好没开火，是潜伏的高报召回源）。
+# 保留内容既杀掉这条假阳性，又不损失任何真匹配（21746 对全量交叉验证：翻上 2 组皆应匹配、
+# 翻下 3 组皆为该假匹配家族、0 组真匹配被破坏）。
+_BRACKETS = re.compile(r"[（()）【\[\]】]")
+_PUNCT = re.compile(r"[\s　_\-—·、,，。.／/]+")
 
 
 def parse_expected_docs(cell) -> List[str]:
@@ -41,7 +59,9 @@ def normalize_title(s: Optional[str]) -> str:
     if not s:
         return ""
     s = _BOOKNAME.sub(r"\1", str(s))           # drop 《》 wrappers
-    s = _NOISE.sub("", s)                         # drop parentheticals + punctuation/space
+    s = _EXT.sub("", s)                        # drop file extension (titles carry it, gold doesn't)
+    s = _BRACKETS.sub("", s)                   # drop bracket CHARS, keep their content
+    s = _PUNCT.sub("", s)                      # drop punctuation/space
     return s.lower()
 
 

@@ -10,6 +10,7 @@ DAG 层不需要知道文件类型，只调用 extract() 即可。
 
 import copy
 import datetime as _dt
+import hashlib
 import os
 import re
 import tempfile
@@ -22,6 +23,11 @@ from opensearch_pipeline.extraction.text_extractor import (
     extract_title_from_blocks,
 )
 from opensearch_pipeline.extraction.ocr_client import OCRClient, sanitize_ocr_text
+from opensearch_pipeline import funnel_verdict_store
+from opensearch_pipeline.ingest_flags import (
+    effective_funnel_policy_version,
+    pdf_strip_stitch_enabled,
+)
 
 
 _DEFAULT_IMG_DIR: Optional[str] = None
@@ -192,6 +198,75 @@ def _warn_skipped_vector_images(warnings: list, stats: dict) -> None:
     )
 
 
+def _warn_page_cap_skips(warnings: list, stats: dict) -> list:
+    """B5（2026-07-25）：图片提取的页上限跳过 → 结构化 warning + partial_loss_notes 追加项。
+
+    与 OCR 页上限、原生抽取页上限走**同一条**留痕通道：三处此前都只打日志/只写结构化字段，
+    没有一处进 partial_loss_notes ⇒ 长文档尾部内容不进索引，而 document_version 照常
+    DONE+INDEXED，运维无法用一条 SQL 圈出需要重扫的对象。
+    """
+    n = int((stats or {}).get("skipped_pages_beyond_cap", 0) or 0)
+    if n <= 0:
+        return []
+    note = (f"image_page_cap: {n} page(s) beyond pdf_image_max_pages were never scanned "
+            f"for images — figures on those pages are missing from the index")
+    warnings.append(note)
+    return [note]
+
+
+def _warn_pdf_image_extract_failed(warnings: list, img_stats: dict) -> list:
+    """审查 P1-8：PDF 图片提取**整段失败**（缺 PyMuPDF / 打不开文件）→ 结构化 warning +
+    partial_loss_notes 追加项。
+
+    不留这条的话，「一张图都没提取出来」与「这篇本来就没图」在 canonical 里长得一模一样
+    （都是 `assets: []`），下游的资产集比对会把前者读成"基线的图全没了"。
+    """
+    reason = (img_stats or {}).get("pdf_image_extract_failed")
+    if not reason:
+        return []
+    note = (f"pdf_image_extract_failed: {reason} —— 本篇**一张图都未提取**，"
+            f"assets 为空不代表原文无图")
+    warnings.append(note)
+    return [note]
+
+
+def _warn_verdict_store_unavailable(warnings: list, funnel_stats: dict) -> list:
+    """E：权威判决记录不可用且无同策略缓存兜底 → warning + partial_loss_notes 追加项。
+
+    为什么必须显式降级而不是静默继续（codex BLOCKER-3）：这一格里本次的图集是**现场
+    重判**的结果，可能与该文档已服务版本不一致，而"靠方案 F 事后喊出来"不成立——
+    F 依赖同一个 RDS、自身 fail-open，且正文改一个字就只产 source_changed 普通审计。
+    落 NEEDS_REVIEW 让人来看，与 ocr_partial / vlm_degraded 同一通道。
+    """
+    note = (funnel_stats or {}).get("verdict_store_note")
+    if not note:
+        return []
+    warnings.append(note)
+    return [note]
+
+
+def _warn_unreadable_images(warnings: list, funnel_stats: dict) -> list:
+    """A11（2026-07-25）：把「解码失败」的图记成结构化 warning，并返回 partial_loss_notes 追加项。
+
+    此前这类图被 `_static_heuristics` 的 `(0,0,0.0)` 兜底压成 DISCARD_DECORATIVE，
+    与"真的是装饰线条"混为一谈：无 warning、无 partial note、不计 vlm_degraded，
+    运维只能在日志里看到一行和正常丢弃一模一样的 print。
+
+    ⚠️ 文案里的 `decode failed` 是**载荷**不是修辞：node_write_chunk_meta 的 0-chunk
+    「疑似失败」判据按关键词表（fail/error/cannot/无法/错误/失败）扫 canonical warnings，
+    命中才落 chunk_status='NEEDS_REVIEW' + content_process_status='FAILED'。改文案前先看
+    那份关键词表（tests 有钉死这条耦合）。
+    """
+    names = list(funnel_stats.get("unreadable_names") or [])
+    if not names:
+        return []
+    shown = "; ".join(names[:5]) + (f" ...(+{len(names) - 5})" if len(names) > 5 else "")
+    note = (f"[IMAGE_UNREADABLE] {len(names)} 张图片无法解码（decode failed），"
+            f"未进入漏斗/索引：{shown}")
+    warnings.append(note)
+    return [note]
+
+
 def _html_to_text(raw_html: str) -> str:
     """HTML → 纯文本：剥标签、跳过 script/style、块级标签转换行；失败回退原文。"""
     import re
@@ -283,7 +358,35 @@ def _read_text_with_fallback(local_path: str):
     return text.replace("\r\n", "\n").replace("\r", "\n"), warnings
 
 
-_VLM_CACHE_VALID_STATUSES = {"DISCARD_DECORATIVE", "ROUTE_TO_TEXT", "ROUTE_TO_VECTOR"}
+# 缓存条目「可消费」状态：process_image 的四值契约（image_funnel_processor.py 的
+# 返回契约 docstring）。刻意**不含** DISCARD_UNREADABLE —— 写入门本就拒它（解码失败
+# 多为一次性），万一历史脏写混进缓存，重算才是正确处置。
+_VLM_CACHE_USABLE_STATUSES = {"DISCARD_DECORATIVE", "ROUTE_TO_TEXT",
+                              "ROUTE_TO_VECTOR", "QUARANTINE_SENSITIVE"}
+
+# public 裸 key 回退**专用**白名单：刻意排除 QUARANTINE_SENSITIVE（裸 key 全部产生于
+# public-bypass 时代，复用它会跳过敏感审计）。与上面那个集合语义不同，**禁止合并**。
+_VLM_CACHE_LEGACY_PUBLIC_STATUSES = {"DISCARD_DECORATIVE", "ROUTE_TO_TEXT", "ROUTE_TO_VECTOR"}
+
+
+def _vlm_cache_entry_usable(entry) -> bool:
+    """缓存条目可消费性契约（单一来源）。
+
+    D1（2026-07-25）：消费者直接吃 entry.get("ocr_text") 与 entry["status"]，条目形态
+    一旦异常就不是"这张图没缓存"，而是**整篇文档抽取抛异常失败**（实测：本机缓存里
+    3 条 `{sha256}:pub:2` 的值是 JSON 数字，命中即 AttributeError）。此处把形态校验收
+    到唯一入口，非法条目一律视同未命中 → 重算 → 同 key 被合法 dict 覆盖，自愈。
+
+    校验到 status 而不止 isinstance(dict)：未知状态不会抛异常，但会安静地绕过
+    DISCARD 等值跳过、带着空字段流进 asset_dict —— 那比崩溃更难查。
+
+    先判 str 再判集合成员：status 若是 list/dict 等不可哈希值，直接 `in <set>` 会抛
+    TypeError —— 守卫自己崩掉就等于没修（本函数的单测钉死这条）。
+    """
+    if not isinstance(entry, dict):
+        return False
+    status = entry.get("status")
+    return isinstance(status, str) and status in _VLM_CACHE_USABLE_STATUSES
 
 
 def _vlm_cache_ns(is_public):
@@ -297,7 +400,15 @@ def _vlm_cache_ns(is_public):
     """
     ns = "pub" if is_public else "sec"
     ver = os.environ.get("RAG_VLM_CACHE_VERSION", "2").strip()
-    return f"{ns}:{ver}" if ver else ns
+    ns = f"{ns}:{ver}" if ver else ns
+    # 漏斗策略后缀（选项 C）。⚠️ **2026-07-26 起 C 默认 ON ⇒ 默认键就带 `:c1`**
+    # （此处旧注释曾写"默认策略为空串、存量键逐字节不变"，那是 C 默认 OFF 时的事实，
+    # 翻默认后与代码相反 —— 审查遗漏项已订正）。存量键因此不再被主查询命中，靠
+    # `_cross_policy_cache_fallback` 有条件复用。
+    # 键必须带策略：命中判定发生在 process_image 之前，不带的话开了 C 也会被旧的 DISCARD
+    # 条目直接短路 —— A/B 变成假 ON，反向（C-ON 写的 rescue 被 C-OFF 读到）同样不成立。
+    policy = effective_funnel_policy_version()
+    return f"{ns}:{policy}" if policy else ns
 
 
 def _funnel_doc_title(task: dict) -> str:
@@ -341,8 +452,82 @@ def _xlsx_cell_to_str(c) -> str:
     return str(c)
 
 
+def _image_sha256(local_path: str, fallback_seed=None) -> str:
+    """图片字节 sha256（VLM 缓存主键）。读不出来时回退到进程内唯一键 —— 该键以
+    `fallback_` 开头，写缓存的门会据此拒绝入库（跨进程无意义的键不能落盘）。"""
+    try:
+        with open(local_path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return "fallback_%s" % (id(fallback_seed) if fallback_seed is not None else id(local_path))
+
+
+def _vlm_cache_put_allowed(simulate: bool, funnel_res: dict, file_hash: str) -> bool:
+    """VLM 缓存写入门（**单一来源** —— 嵌入图批量路径与独立图片路径共用）。
+
+    拒绝四类：
+      · simulate 的 mock 结果（按真实 sha256 落键后会毒化真实运行）；
+      · degraded（VLM 超时/解析失败的兜底）—— 缓存会把一次性故障固化成永久标签；
+      · A11 的 DISCARD_UNREADABLE —— 同上，解码失败往往是一次性的；
+      · fallback_ 前缀键（基于内存地址，跨进程无意义）。
+    """
+    return (not simulate
+            and not funnel_res.get("degraded")
+            and funnel_res.get("status") != "DISCARD_UNREADABLE"
+            and not str(file_hash).startswith("fallback_"))
+
+
+def _vlm_cache_entry(funnel_res: dict) -> dict:
+    """缓存条目的字段形态（单一来源，防两条路径各写各的）。"""
+    return {
+        "status": funnel_res.get("status", ""),
+        "visual_summary": funnel_res.get("visual_summary", ""),
+        "image_category": funnel_res.get("image_category", ""),
+        "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
+        "reason": funnel_res.get("reason", ""),
+        "width": funnel_res.get("width", 0),
+        "height": funnel_res.get("height", 0),
+        "file_size_kb": funnel_res.get("file_size_kb", 0.0),
+        "ocr_text": funnel_res.get("ocr_text", ""),
+    }
+
+
+def _funnel3_discard(entry) -> bool:
+    """该缓存条目是否是 **Funnel 3 的语义弃图** —— 也就是选项 C 会改变结论的那一类。
+
+    非 DISCARD 一律 False（C 不动 ROUTE_TO_* / QUARANTINE_*）。是 DISCARD 但
+    **认不出 Funnel 级别**时返回 True（保守重判）：宁可多付一次 VLM，也不能让一条
+    来路不明的旧弃图在新策略下静默沿用 —— 错弃是不可见且不可恢复的那一侧。
+    """
+    if not isinstance(entry, dict):
+        return False
+    if not str(entry.get("status", "")).startswith("DISCARD"):
+        return False
+    # Funnel 1 的弃图是纯几何判据，确定且与 C 无关，可安全跨策略复用
+    return "Funnel 1" not in str(entry.get("reason", ""))
+
+
+def _cross_policy_cache_fallback(vlm_cache, file_hash, is_public):
+    """非默认漏斗策略下，回退查基础策略键 —— **仅当 C 不可能改变该条目结论时**接受。
+
+    命中即迁移到当前策略键（内存中；真实运行随 _save_vlm_cache 持久化）。
+    默认策略下本函数是 no-op（当前键就是基础键）。
+    """
+    policy = effective_funnel_policy_version()
+    if not policy:
+        return None
+    ns = "pub" if is_public else "sec"
+    ver = os.environ.get("RAG_VLM_CACHE_VERSION", "2").strip()
+    base_key = f"{file_hash}:{ns}:{ver}" if ver else f"{file_hash}:{ns}"
+    entry = vlm_cache.get(base_key)
+    if not _vlm_cache_entry_usable(entry) or _funnel3_discard(entry):
+        return None
+    vlm_cache[f"{file_hash}:{_vlm_cache_ns(is_public)}"] = entry
+    return entry
+
+
 def _vlm_cache_lookup(vlm_cache, file_hash, is_public):
-    """带命名空间的 VLM 缓存查询 + 遗留裸 MD5 key 的只读回退。
+    """带命名空间的 VLM 缓存查询 + 跨策略/遗留裸 MD5 key 的条件回退。
 
     遗留条目（命名空间化之前写入，OSS 上 ~1500 条）用现行带后缀 key 永远
     查不到 → 回灌时全量重打 VLM 白花钱。回退仅限 public 命名空间（裸 key
@@ -354,7 +539,26 @@ def _vlm_cache_lookup(vlm_cache, file_hash, is_public):
     cache_key = f"{file_hash}:{_vlm_cache_ns(is_public)}"
     entry = vlm_cache.get(cache_key)
     if entry is not None:
-        return entry
+        if _vlm_cache_entry_usable(entry):
+            return entry
+        # D1：形态异常的条目**视同未命中**（不 early-return，继续走下面的回退逻辑
+        # = 忠实地"就当这个 key 不存在"）。advisory 缓存绝不能打断抽取。
+        # 只打类型与截断后的 status，不输出 caption/OCR 正文。
+        _bad = entry.get("status") if isinstance(entry, dict) else None
+        print(f"      ⚠️ [VLM Cache] 条目形态异常，视同未命中重算: {cache_key[:20]}… "
+              f"(type={type(entry).__name__}, status={str(_bad)[:24]!r})")
+
+    # ── 跨策略条件回退（选项 C）──
+    # 整体换策略命名空间的代价是"5 万条缓存一次性失效 → 下次摄取全量重付 VLM，且把每张图
+    # 重新暴露给今天那个已被证明更差的 VLM 制度"。而现在挡住漂移的**恰恰是** 2026-07-20
+    # 那批缓存条目（方案 §8.3）—— 整体换 key 等于亲手把保护拆掉。
+    # 所以只对"C 可能改变结论"的条目重判：Funnel-3 的 DISCARD。Funnel-1 的结构性弃图是
+    # 确定的几何判据、C 不碰；ROUTE_TO_* / QUARANTINE_* 也不受 C 影响，可安全复用。
+    # 判不出是哪一级的 DISCARD 一律**保守重判**（宁可多花一次调用，绝不静默沿用旧弃图）。
+    policy_entry = _cross_policy_cache_fallback(vlm_cache, file_hash, is_public)
+    if policy_entry is not None:
+        return policy_entry
+
     # 设了显式缓存版本（模型/prompt 升级）→ 不回退任何旧 key，让旧条目干净失效、按新模型重打。
     if os.environ.get("RAG_VLM_CACHE_VERSION", "").strip():
         return None
@@ -363,7 +567,7 @@ def _vlm_cache_lookup(vlm_cache, file_hash, is_public):
     legacy = vlm_cache.get(file_hash)
     if not isinstance(legacy, dict):
         return None
-    if legacy.get("status") not in _VLM_CACHE_VALID_STATUSES:
+    if legacy.get("status") not in _VLM_CACHE_LEGACY_PUBLIC_STATUSES:
         return None
     blob = (f"{legacy.get('visual_summary', '')}|{legacy.get('ocr_text', '')}"
             f"|{legacy.get('reason', '')}")
@@ -387,7 +591,20 @@ def _funnel1_discard_bound(w, h, kb):
 
 
 def _stitch_pdf_strip_assets(assets):
-    """缝合 PDF 条带切片（#F-mm9，RAG_PDF_STRIP_STITCH 默认 OFF）→ (assets, warnings)。
+    """缝合 PDF 条带切片（#F-mm9，`RAG_PDF_STRIP_STITCH`，**2026-07-26 起默认 ON**）
+    → (assets, warnings)。
+
+    翻默认的依据（方案 §15-16，Sam 拍板 2026-07-26）：
+      · FL-XS-WI-007 实测：33 条横条缝成 **2 张完整的《交货单》**（手册号/客户/商检号/货号/
+        表格/条形码俱全），存活 8→10 零丢失。而《交货单》正是该篇《吸塑扫码报检》SOP 的
+        核心物件（作业说明/步骤2/4/5.1/6 逐条点名）—— 今天它是**静默全损**的；
+      · L4（GT 修正后）：该篇 0.7778 → 0.8889，pdf 总 0.89236 → 0.91320，其余 5 篇逐位不变，
+        `img_dup` 不动；
+      · **生产影响面 = 恰好 1 篇**（580 篇当前版本 PDF 全扫，实扫 563 篇，命中率 0.18%，
+        命中的就是这一篇本身）；
+      · 结构上只碰 `_funnel1_discard_bound` 已判死的资产 —— **不可能伤害任何当前存活的图**。
+
+    回滚：显式设 `0/false/no/off`。
 
     PDF 转换器把一张照片存成 N 条 1000×31 全宽横条时，每条 aspect>8 逐条死于
     Funnel-1，整图彻底消失且零告警（实证：FL-XS-WI-007 PDF 的 23 条横条）。
@@ -410,7 +627,9 @@ def _stitch_pdf_strip_assets(assets):
     缝合产物：bbox=成员并集（正常参与 chunk 期几何 y 锚定）、保留 page_num 与
     首条 image_index。任何 PIL/IO 失败该 run 原样保留（fail-open）。
     """
-    if os.environ.get("RAG_PDF_STRIP_STITCH", "").strip().lower() not in ("1", "true", "yes"):
+    # 2026-07-26 起**默认 ON**（Sam 拍板）。off-list 极性：默认 ON 的开关若把未知值也当关，
+    # 配错一个字就会静默退回"整图消失且零告警"，而这条链本来就无信号可查。
+    if not pdf_strip_stitch_enabled():
         return assets, []
     if not assets:
         return assets, []
@@ -910,9 +1129,15 @@ class UnifiedExtractor:
             local_path, _safe_image_output_dir(task), max_pages=self.pdf_image_max_pages,
             stats=img_stats)
         _warn_skipped_vector_images(warnings, img_stats)
+        _page_cap_notes = _warn_page_cap_skips(warnings, img_stats)   # B5：图片页上限留痕
+        _page_cap_notes.extend(_warn_pdf_image_extract_failed(warnings, img_stats))  # P1-8
         raw_assets, stitch_warnings = _stitch_pdf_strip_assets(raw_assets)
         warnings.extend(stitch_warnings)
-        assets, img_blocks, vlm_degraded = self._process_embedded_images(raw_assets, task)
+        _funnel_stats: dict = {}
+        assets, img_blocks, vlm_degraded = self._process_embedded_images(
+            raw_assets, task, stats=_funnel_stats)
+        _warn_unreadable_images(warnings, _funnel_stats)   # A11：坏图留痕（PDF）
+        _page_cap_notes.extend(_warn_verdict_store_unavailable(warnings, _funnel_stats))  # E
         if img_blocks:
             blocks.extend(img_blocks)
             flat_text = blocks_to_text(blocks)
@@ -977,15 +1202,26 @@ class UnifiedExtractor:
         # 恢复真实页数并回写 result.page_count（入口局部 page_count 仍是 0）——若只看局部量，>20 页
         # 扫描 PDF 会漏判截断被当完整上线。真实总页数优先取 result.page_count，回退入口 page_count，
         # 并回写 result.page_count 确保总页数落库（document_version.page_count），供治理看板统计截断文档数。
+        # B5：图片页上限的留痕合并进来（**追加不覆盖** —— 同一 closure 里还有 A11 的
+        # unreadable、批次6 的 ocr_partial、B4 的 table_drop）
+        if _page_cap_notes:
+            result.partial_loss_notes.extend(_page_cap_notes)
+
         effective_page_count = result.page_count or page_count or 0
         if effective_page_count > self.pdf_native_max_pages:
             result.extract_truncated = True
             result.extracted_pages = self.pdf_native_max_pages
             result.page_count = effective_page_count
-            result.warnings.append(
+            _trunc_note = (
                 f"[TRUNCATED] PDF 共 {effective_page_count} 页，仅前 {self.pdf_native_max_pages} 页被抽取；"
-                f"第 {self.pdf_native_max_pages + 1} 页起的内容未进入索引（含 OCR）。"
-            )
+                f"第 {self.pdf_native_max_pages + 1} 页起的内容未进入索引（含 OCR）。")
+            result.warnings.append(_trunc_note)
+            # B5（2026-07-25）：此前只有 warnings + 结构化字段，**没进 partial_loss_notes** ——
+            # 于是这类文档照常定稿 DONE，不走 NEEDS_REVIEW 复查通道，运维圈不出重扫对象。
+            # 三处页级上限（原生抽取 / OCR / 图片提取）自此统一走同一条留痕通道。
+            result.partial_loss_notes.append(
+                f"native_page_cap: {effective_page_count - self.pdf_native_max_pages} page(s) "
+                f"beyond pdf_native_max_pages were never extracted")
 
         return result
 
@@ -1071,9 +1307,12 @@ class UnifiedExtractor:
         except Exception as _e:
             print(f"      ⚠️ [strip-stitch] skipped (non-fatal): {_e}")
 
+        _funnel_stats: dict = {}
         assets, img_blocks, vlm_degraded = self._process_embedded_images(
-            exported_images, task,
+            exported_images, task, stats=_funnel_stats,
         )
+        _warn_unreadable_images(warnings, _funnel_stats)   # A11：坏图留痕（DOCX）
+        _verdict_notes = _warn_verdict_store_unavailable(warnings, _funnel_stats)   # E
         # 不再 extend img_blocks — image_ref 已内联在 blocks 中
         # img_blocks 是 _process_embedded_images 生成的冗余 image_ref，
         # 只有当 blocks 中完全没有 image_ref 时才 fallback 追加
@@ -1099,6 +1338,10 @@ class UnifiedExtractor:
             warnings=warnings,
             assets=assets,
             vlm_degraded_count=vlm_degraded,
+            # E：判决记录不可用时的降级留痕。⚠️ DOCX 分支此前**完全没有** partial_loss_notes
+            # 通道 —— 同一处 A11 的 unreadable 留痕返回值也被丢掉（既有缺口，未在本次修，
+            # 补它会让"含坏图的 DOCX"新落 NEEDS_REVIEW，是独立的行为变更）。
+            partial_loss_notes=_verdict_notes,
         )
 
     # ── XLSX / XLS ──
@@ -1355,11 +1598,14 @@ class UnifiedExtractor:
         # 提取嵌入图片 → 三阶段过滤漏斗
         # perf#62：普通模式 wb 直接传给 extract_images_from_xlsx 复用，省第三次 zip 解包；
         # read_only / 加载失败时 _img_wb=None → 其内部照旧自行加载（graceful degradation）。
+        _funnel_stats: dict = {}
         assets, img_blocks, vlm_degraded = self._process_embedded_images(
             extract_images_from_xlsx(local_path, _safe_image_output_dir(task),
                                      workbook=_img_wb),
-            task,
+            task, stats=_funnel_stats,
         )
+        partial_notes.extend(_warn_unreadable_images(warnings, _funnel_stats))   # A11（XLSX）
+        partial_notes.extend(_warn_verdict_store_unavailable(warnings, _funnel_stats))   # E
 
         # ── part_labels 提取（混合策略：part_candidates 优先 + 白名单 fallback）──
         if all_part_candidates or self._PART_KEYWORDS_FALLBACK:
@@ -1638,11 +1884,14 @@ class UnifiedExtractor:
 
         # 提取嵌入图片 → 三阶段过滤漏斗
         img_stats: dict = {}
+        _funnel_stats: dict = {}
         assets, img_blocks, vlm_degraded = self._process_embedded_images(
             extract_images_from_pptx(local_path, _safe_image_output_dir(task), stats=img_stats),
-            task,
+            task, stats=_funnel_stats,
         )
         _warn_skipped_vector_images(warnings, img_stats)
+        partial_notes.extend(_warn_unreadable_images(warnings, _funnel_stats))   # A11（PPTX）
+        partial_notes.extend(_warn_verdict_store_unavailable(warnings, _funnel_stats))   # E
         if img_blocks:
             blocks.extend(img_blocks)
 
@@ -1725,8 +1974,10 @@ class UnifiedExtractor:
     #           原样保留供 tests/eval 脚本独立使用）
     # OSS 镜像: processing/cache/vlm_cache.sqlite3（跨 DataWorks 运行 warm-start；
     #           遗留 processing/cache/vlm_cache.json 在本地/镜像两级皆空时兜底迁移）
-    # 缓存 key: "{图片MD5}:{ns}"（遗留裸 MD5 兼容见 _vlm_cache_lookup）——契约不变
+    # 缓存 key: "{图片SHA-256}:{ns}"（B4 起主键由 MD5 换 SHA-256；遗留裸 MD5 只读兼容
+    #           见 _vlm_cache_lookup）
     # 缓存 value: funnel_result dict (status, visual_summary, reason, width, height, ...)
+    #            形态由 _vlm_cache_entry_usable 单点把关（D1）：非法条目读侧视同未命中
     # 这里只留三个薄委托：类方法名/调用点（pipeline_nodes finally 的 flush、
     # _process_embedded_images 的 load/save）保持不变。
 
@@ -1749,7 +2000,70 @@ class UnifiedExtractor:
         from opensearch_pipeline.vlm_cache import flush_vlm_cache_to_oss
         flush_vlm_cache_to_oss()
 
-    def _process_embedded_images(self, image_assets: list, task: dict) -> tuple:
+    def _fetch_funnel_verdicts(self, hashes, is_public):
+        """E：按文档批量预读判决记录 → `(三态, {sha256: row})`。
+
+        自开自关一条只读连接：抽取阶段没有现成的 DB 句柄，而把连接生命周期挂到
+        extractor 实例上会跨文档并发共享（`pipeline_nodes.py:374`）。每篇一次、只读、
+        短连接，代价可忽略。
+        """
+        conn = None
+        try:
+            from opensearch_pipeline.db import _get_db_conn
+            conn = _get_db_conn()
+            return funnel_verdict_store.fetch_many(
+                conn, hashes, is_public, effective_funnel_policy_version())
+        except Exception as e:
+            print(f"    ⚠️ [verdict-store] 取连接失败（降级为纯缓存行为）: {type(e).__name__}: {e}")
+            return funnel_verdict_store.UNAVAILABLE, {}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _record_funnel_verdicts(self, hash_to_result, hash_to_cached, existing_rows,
+                                is_public, doc_id, task):
+        """E：把本篇判决写进记录（first-writer-wins，已有行不覆盖）。
+
+        缓存命中的图也提升进来（`provenance='cache_promoted'`）—— 在"不重灌存量"的前提
+        下，L2 只能这样从存量缓存渐进建起来。但**绝不拿当前模型冒充历史事实**：提升行的
+        `vlm_model` 留 None（存量缓存没有模型/时间/首篇信息）。
+        """
+        fresh, promoted = [], []
+        for h, res in (hash_to_result or {}).items():
+            if h in existing_rows:
+                continue                       # 已有权威行 ⇒ 不覆盖（first-writer-wins）
+            (promoted if h in hash_to_cached else fresh).append(
+                {"image_sha256": h, "funnel_res": res})
+        if not fresh and not promoted:
+            return
+        conn = None
+        try:
+            from opensearch_pipeline.db import _get_db_conn
+            conn = _get_db_conn()
+            policy = effective_funnel_policy_version()
+            vno = task.get("version_no")
+            if fresh:
+                funnel_verdict_store.record_many(
+                    conn, fresh, is_public, policy,
+                    vlm_model=getattr(getattr(self.config, "ocr", None), "vlm_model", None),
+                    doc_id=doc_id, version_no=vno, provenance="fresh_decision")
+            if promoted:
+                funnel_verdict_store.record_many(
+                    conn, promoted, is_public, policy, vlm_model=None,
+                    doc_id=doc_id, version_no=vno, provenance="cache_promoted")
+        except Exception as e:
+            print(f"    ⚠️ [verdict-store] 判决落库跳过（不影响摄取）: {type(e).__name__}: {e}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _process_embedded_images(self, image_assets: list, task: dict, stats: dict = None) -> tuple:
         """
         将提取出的嵌入图片送入 ImageFunnelProcessor 三阶段过滤漏斗（并发 + 去重 + 持久缓存）。
 
@@ -1792,23 +2106,39 @@ class UnifiedExtractor:
         # ── Phase 1: Funnel 1 串行预过滤（<1ms/张，无需并发） ──
         candidates = []  # 通过 Funnel 1 的图片
         discard_count = 0
+        unreadable_names = []   # A11：解码失败的图（≠装饰图），经 stats 出参回传给调用方留痕
 
         for img_asset in image_assets:
             try:
-                w, h, kb = processor._static_heuristics(img_asset.local_path)
-                aspect = max(w / max(h, 1), h / max(w, 1))
-                if w < 50 or h < 50 or kb < 3.0 or aspect > 8.0:
-                    fname = os.path.basename(img_asset.local_path)
-                    print(f"    [Funnel 1] Discarded decorative image: {fname} ({w}x{h}, {kb:.1f}KB, ratio={aspect:.1f})")
+                # A11（2026-07-25）：改调 processor.screen_static —— 此前这里内联了一份与
+                # process_image 完全相同的判据（阈值 50/3.0/8.0 各写一遍），两处可以各自漂移；
+                # 且因为异常在 _static_heuristics 内部已被吞掉，下面那个 except 其实永远看不到
+                # 解码失败，坏图只会被计成 decorative。
+                screen = processor.screen_static(img_asset.local_path)
+                fname = os.path.basename(img_asset.local_path)
+                if screen["verdict"] == "UNREADABLE":
+                    print(f"    [Funnel 1] UNREADABLE image: {fname} ({screen['error']})")
+                    unreadable_names.append(f"{img_asset.original_name or fname}: {screen['error']}")
+                    continue
+                if screen["verdict"] == "DECORATIVE":
+                    print(f"    [Funnel 1] Discarded decorative image: {fname} "
+                          f"({screen['width']}x{screen['height']}, {screen['file_size_kb']:.1f}KB, "
+                          f"ratio={screen['aspect_ratio']:.1f})")
                     discard_count += 1
                     continue
                 candidates.append(img_asset)
             except Exception as e:
                 print(f"      ⚠️ Funnel 1 heuristic failed for {img_asset.original_name}: {e}")
+                unreadable_names.append(f"{img_asset.original_name}: screen failed: {e}")
                 continue
 
         if discard_count:
             print(f"      [Funnel 1] Pre-filtered: {discard_count} decorative, {len(candidates)} remaining")
+        if unreadable_names:
+            print(f"      [Funnel 1] ⚠️ {len(unreadable_names)} image(s) unreadable (decode failed)")
+        if stats is not None:
+            stats["unreadable_count"] = len(unreadable_names)
+            stats["unreadable_names"] = list(unreadable_names)
 
         if not candidates:
             return [], [], 0
@@ -1922,6 +2252,46 @@ class UnifiedExtractor:
         # 合并结果：缓存命中 + 新处理
         hash_to_result = dict(hash_to_cached_result)  # 先放入缓存命中的
 
+        # ── E：判决记录预读（flag RAG_FUNNEL_VERDICT_STORE 默认 OFF）──
+        # 一次 IN(...) 拿全篇，不逐图往返。三态：拿到记录 / 确认没有 / **拿不到**——
+        # 第三态不能当成第二态，否则"库一抖就允许重判"，而重判正是要挡的事。
+        _vs_state, _vs_rows, _vs_undecided = None, {}, 0
+        _vs_declined = []           # pin 被红线拒绝的图（P0-1/P0-2）
+        if funnel_verdict_store.store_enabled():
+            _vs_state, _vs_rows = self._fetch_funnel_verdicts(
+                list(hash_to_representative), is_public)
+            if _vs_state == funnel_verdict_store.UNAVAILABLE:
+                # 权威判决拿不到 ⇒ 只有同策略缓存能兜底；两边都没有的图，本次是"现场重判"，
+                # 必须显式降级留痕（partial_loss_notes → NEEDS_REVIEW），不得静默定稿。
+                _vs_undecided = len([h for h in hash_to_representative
+                                     if h not in hash_to_cached_result])
+                if _vs_undecided and stats is not None:
+                    # 走 per-call 的 stats 字典而**不是**实例属性 —— 一个 UnifiedExtractor
+                    # 会被跨文档并发复用（pipeline_nodes.py:374），实例状态会串篇。
+                    stats["verdict_store_note"] = funnel_verdict_store.unavailable_note(
+                        doc_id, _vs_undecided)
+
+        # ── E / 审查 P1-7：**缓存命中的图也要受权威判决约束** ──
+        # 此前 pin 只作用于 `need_vlm_hashes` 那条 as_completed 循环 ⇒ 缓存与 059 冲突时
+        # **缓存获胜**：某次 RDS 抖动（UNAVAILABLE ⇒ 不 pin）下 VLM 漂移判出的 DISCARD 会被
+        # 写进共享缓存；下一轮 RDS 恢复、059 里权威行仍是 keep，但缓存命中直接短路，
+        # 权威行从头到尾没被查询 —— 图被丢弃且**零信号**（`_vs_undecided` 只统计不在缓存
+        # 里的图，连 NEEDS_REVIEW 都不会有）。多机场景（笔记本与 DataWorks 各持一份本地
+        # vlm_cache、共用同一张 059）无需任何故障即可复现。
+        # 写侧本来就把缓存命中的结论以 cache_promoted 建记录 —— 读侧不信记录、写侧却拿
+        # 缓存去建记录，两侧方向相反。这里补齐读侧。
+        if _vs_rows:
+            for _h, _cached in list(hash_to_result.items()):
+                _rec = _vs_rows.get(_h)
+                if _rec and funnel_verdict_store.recordable(_cached):
+                    _pinned = funnel_verdict_store.apply_verdict(_cached, _rec)
+                    if _pinned.get("verdict_pin_declined"):
+                        _vs_declined.append(_h)
+                    elif _pinned.get("status") != _cached.get("status"):
+                        print(f"      [verdict-store] 缓存条目与权威记录冲突，按记录纠正: "
+                              f"{str(_h)[:12]}… {_cached.get('status')} → {_pinned['status']}")
+                    hash_to_result[_h] = _pinned
+
         # P2-32：漏斗执行异常（OCR/VLM 供应商故障导致 process_image 整体 raise）→ 该唯一图片
         # 完全没有结论、不进 assets——与 degraded 兜底同属「供应商降级」，计入文档级降级数，
         # 使文档收尾走 NEEDS_REVIEW、供应商恢复后重扫可自愈（否则静默 INDEXED 终态无物重扫）。
@@ -1939,26 +2309,27 @@ class UnifiedExtractor:
                     file_hash = future_to_hash[future]
                     try:
                         funnel_res = future.result()
+                        # E：有权威记录就把 status 盖回去 —— caption 本表刻意不存、只能
+                        # 重掷，但**图集不能因此改变**。这正是 E 的主目标。
+                        _rec = _vs_rows.get(file_hash)
+                        if _rec and funnel_verdict_store.recordable(funnel_res):
+                            funnel_res = funnel_verdict_store.apply_verdict(funnel_res, _rec)
+                            if funnel_res.get("verdict_pin_declined"):
+                                # P0-1/P0-2 红线：pin 被拒 ⇒ 该图不受权威记录保护。
+                                # 不能静默 —— 走与 UNAVAILABLE 同一条降级通道。
+                                _vs_declined.append(file_hash)
                         hash_to_result[file_hash] = funnel_res
                         # 写入持久缓存：跳过降级结果（VLM 超时/解析失败的兜底，缓存会把一次性
                         # 故障变成跨文档/跨运行的永久错误标签）和无法稳定取哈希的 fallback key
                         # （基于内存地址，跨进程无意义）。缓存键按 is_public 分命名空间。
                         # ⚠️ simulate 模式的 mock 结果绝不能入持久缓存 —— 按真实 MD5 落键后，
                         # 真实运行会命中 mock 描述（缓存投毒）。
-                        if (not self.simulate and not funnel_res.get("degraded")
-                                and not file_hash.startswith("fallback_")):
+                        # A11：DISCARD_UNREADABLE 同样**不得入缓存** —— 与上面 degraded 的理由
+                        # 逐字相同：解码失败往往是一次性的（临时文件被截断/落盘竞态/内存压力），
+                        # 缓存会把它固化成该图跨文档、跨运行的永久标签，而缓存命中侧不校验状态。
+                        if _vlm_cache_put_allowed(self.simulate, funnel_res, file_hash):
                             cache_key = f"{file_hash}:{_vlm_cache_ns(is_public)}"
-                            vlm_cache[cache_key] = {
-                                "status": funnel_res.get("status", ""),
-                                "visual_summary": funnel_res.get("visual_summary", ""),
-                                "image_category": funnel_res.get("image_category", ""),
-                                "vlm_annotation_map": funnel_res.get("vlm_annotation_map", {}),
-                                "reason": funnel_res.get("reason", ""),
-                                "width": funnel_res.get("width", 0),
-                                "height": funnel_res.get("height", 0),
-                                "file_size_kb": funnel_res.get("file_size_kb", 0.0),
-                                "ocr_text": funnel_res.get("ocr_text", ""),
-                            }
+                            vlm_cache[cache_key] = _vlm_cache_entry(funnel_res)
                     except Exception as e:
                         rep = hash_to_representative[file_hash]
                         funnel_exception_count += 1
@@ -1967,6 +2338,21 @@ class UnifiedExtractor:
             # 处理完本文档后持久化缓存（simulate 不落盘，防 mock 污染共享缓存）
             if not self.simulate:
                 self._save_vlm_cache()
+
+        # pin 被拒的图同样要留痕（与 UNAVAILABLE 同通道）。**追加不覆盖** —— 两种降级
+        # 可以同时发生（RDS 抖动 + 本轮判敏感）。
+        if _vs_declined and stats is not None:
+            _pn = funnel_verdict_store.pin_declined_note(doc_id, len(_vs_declined))
+            stats["verdict_store_note"] = (
+                (stats.get("verdict_store_note", "") + " || " + _pn).lstrip(" |")
+                if stats.get("verdict_store_note") else _pn)
+
+        # ── E：把本篇的判决落进记录（first-writer-wins，已有行不覆盖）──
+        # 缓存命中的图也一并提升（provenance=cache_promoted）：不重灌存量的前提下，L2 只能
+        # 这样渐进建起来。但**绝不拿当前模型冒充历史事实** —— 提升行的 vlm_model 留空。
+        if _vs_state in (funnel_verdict_store.HIT, funnel_verdict_store.MISS) and not self.simulate:
+            self._record_funnel_verdicts(hash_to_result, hash_to_cached_result,
+                                         _vs_rows, is_public, doc_id, task)
 
         # ── Phase 3: 扇出结果到所有图片（包括重复项） ──
         all_results = []  # (img_asset, funnel_res)
@@ -1990,11 +2376,20 @@ class UnifiedExtractor:
         ))
 
         degraded_asset_count = 0
+        # A11：Phase-3 兜底 —— process_image 内部也可能判 UNREADABLE（Phase-1 与它各跑一次
+        # 解码，第二次才失败的竞态确实存在），这些同样要计入留痕。
+        _unreadable_late = []
         for img_asset, funnel_res in all_results:
             status = funnel_res["status"]
 
             # Funnel 1 结果在 process_image 内部也会触发（双重保护），跳过
-            if status == "DISCARD_DECORATIVE":
+            # A11：DISCARD_UNREADABLE 一并跳过——**必须是精确等值枚举而非 DISCARD 前缀匹配**：
+            # 这条链路上确实只有它是等值判断，漏掉就会让读不出来的图混进 asset_dict，
+            # 带着 0×0 尺寸和空 ocr_text 一路流进 image_refs 契约。
+            if status in ("DISCARD_DECORATIVE", "DISCARD_UNREADABLE"):
+                if status == "DISCARD_UNREADABLE":
+                    _unreadable_late.append(
+                        f"{img_asset.original_name}: {funnel_res.get('reason', 'unreadable')}")
                 continue
 
             asset_dict = {
@@ -2061,6 +2456,11 @@ class UnifiedExtractor:
             print(f"      [img-funnel] ⚡ VLM calls={vlm_calls}, cache_hits={cache_hit_count}, "
                   f"dedup={dup_count}, time={elapsed:.1f}s ({avg_ms:.0f}ms/call, workers={max_workers})")
 
+        # A11：把 Phase-3 兜底抓到的 unreadable 并进 stats（Phase-1 已写过一次，这里累加）
+        if _unreadable_late and stats is not None:
+            stats["unreadable_names"] = list(stats.get("unreadable_names", [])) + _unreadable_late
+            stats["unreadable_count"] = len(stats["unreadable_names"])
+
         # P2-32：文档级降级数 = degraded asset 张数 + 漏斗异常整张丢失的唯一图片数
         # + 批次6：预算 cap/DENY 跳过的唯一图片数（同一 NEEDS_REVIEW 自愈通道）。
         vlm_degraded_count = degraded_asset_count + funnel_exception_count + _budget_skipped_count
@@ -2082,11 +2482,36 @@ class UnifiedExtractor:
         is_public = "_quarantine/" not in task.get("raw_key", "")
         
         processor = ImageFunnelProcessor(simulate=self.simulate)
-        funnel_res = processor.process_image(
-            local_path, task["doc_id"], is_public=is_public,
-            doc_title=_funnel_doc_title(task),
-        )
-        
+        # A13（2026-07-25）：接入跨文档持久 VLM 缓存 —— 此前独立图片文档直接 process_image，
+        # 前后无查/无写，每次首灌/升版/重试都重付 1 OCR + 1 VLM。金额是小头，**真正的理由是
+        # 确定性**：visual_summary 每次重掷正是 xlsx 图↔步骤绑定漂移那场战役的根因。
+        # 缓存语义与嵌入图逐字一致（sha256 主键 + pub/sec 命名空间 + 版本；写入门与条目形态
+        # 都走 _vlm_cache_put_allowed / _vlm_cache_entry 单一来源）。
+        file_hash = _image_sha256(local_path)
+        vlm_cache = self._load_vlm_cache()
+        funnel_res = _vlm_cache_lookup(vlm_cache, file_hash, is_public)
+        if funnel_res is not None:
+            # 命中也要过反幻觉复洗（与嵌入图路径同款，幂等）
+            if funnel_res.get("ocr_text"):
+                _clean, _m = sanitize_ocr_text(
+                    funnel_res.get("ocr_text", ""),
+                    width=funnel_res.get("width") or None,
+                    height=funnel_res.get("height") or None,
+                )
+                if _clean != funnel_res.get("ocr_text"):
+                    funnel_res = dict(funnel_res)
+                    funnel_res["ocr_text"] = _clean
+                    vlm_cache[f"{file_hash}:{_vlm_cache_ns(is_public)}"] = funnel_res
+            print(f"      [VLM Cache] hit for standalone image {os.path.basename(local_path)}")
+        else:
+            funnel_res = processor.process_image(
+                local_path, task["doc_id"], is_public=is_public,
+                doc_title=_funnel_doc_title(task),
+            )
+            if _vlm_cache_put_allowed(self.simulate, funnel_res, file_hash):
+                vlm_cache[f"{file_hash}:{_vlm_cache_ns(is_public)}"] = _vlm_cache_entry(funnel_res)
+                self._save_vlm_cache()
+
         status = funnel_res["status"]
         assets = [{
             "filename": os.path.basename(local_path),
@@ -2145,6 +2570,19 @@ class UnifiedExtractor:
             ))
         elif status == "QUARANTINE_SENSITIVE":
             warnings.append(f"🚨 Sensitive content detected in non-public image asset: {funnel_res.get('reason')}")
+
+        # A11：独立图片文档 = 那张图就是文档本体，读不出来 ⇒ 整篇没有任何内容。
+        # 走既有 0-chunk「疑似失败」闭环：warning 文案命中 node_write_chunk_meta 的关键词表
+        # （decode failed 里的 "fail"）→ chunk_status='NEEDS_REVIEW' +
+        # content_process_status='FAILED' + retry_count+1，沿用毒文档重试预算，3 次后停在
+        # FAILED 等人工（控制台徽章「处理失败」）。**不是**自愈：stage-2 重试重跑的是同一份
+        # canonical 的切块，不会重新解码图片，三次结果确定性相同。
+        _unreadable_notes = []
+        if status == "DISCARD_UNREADABLE":
+            _unreadable_notes = _warn_unreadable_images(
+                warnings,
+                {"unreadable_names": [f"{os.path.basename(local_path)}: "
+                                      f"{funnel_res.get('reason', 'decode failed')}"]})
         
         flat_text = blocks_to_text(blocks)
 
@@ -2163,6 +2601,7 @@ class UnifiedExtractor:
             warnings=warnings,
             assets=assets,
             vlm_degraded_count=1 if funnel_res.get("degraded") else 0,
+            partial_loss_notes=_unreadable_notes,
         )
 
 
@@ -2404,5 +2843,17 @@ class UnifiedExtractor:
                      f"(pages {_failed_pgs[:10]}) — content of failed pages missing")
             result.partial_loss_notes.append(_note)
             result.warnings.append(_note)
+
+        # B5（2026-07-25）：被 max_ocr_pages 上限砍掉的页同样要留痕。它们**不产生**
+        # OCRPageResult，所以上面那条只看 pages 的判据永远看不见它们 —— 长文档尾部内容
+        # 不进索引，而 document_version 照常 DONE+INDEXED，运维无法用一条 SQL 圈出重扫对象。
+        # 只留痕：**不动上限本身**（那三个页上限是当前唯一的摄取侧成本闸 —— cost_breaker
+        # 因 RebuildConfig.enabled=False 恒 no-op；拆闸之前必须先有 breaker）。
+        _capped = int(getattr(ocr_result, "skipped_pages", 0) or 0)
+        if _capped > 0:
+            _cap_note = (f"ocr_page_cap: {_capped} page(s) never OCR'd — capped by "
+                         f"max_ocr_pages; their content is missing from the index")
+            result.partial_loss_notes.append(_cap_note)
+            result.warnings.append(_cap_note)
 
         return result

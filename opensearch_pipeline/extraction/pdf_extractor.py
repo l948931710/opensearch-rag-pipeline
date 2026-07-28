@@ -22,7 +22,7 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 from opensearch_pipeline.extraction.schema import (
-    STEP_BOUNDARY_PATTERN, ExtractedBlock, is_pseudo_heading,
+    STEP_BOUNDARY_PATTERN, ExtractedBlock, is_bare_numeric_callout, is_pseudo_heading,
 )
 from opensearch_pipeline.extraction.text_extractor import (
     extract_text_file,
@@ -455,7 +455,18 @@ def _pass2_extract_page(
         # 大纵向间隙（>40pt ≈ 嵌入图片/图表占位）也切段：否则环绕图片的文字会被
         # 合并成一个跨越整版的巨型段落（y0..y1 罩住所有图），图片按 y 锚定时
         # 全部塌到同一块上（2026-06-10 pdf_sop p3 实证：1 段 y183-693 吞 3 图）
-        elif text_buffer and (line_info["top"] - text_buffer[-1][2]) > 40:
+        #
+        # PDF-D2（2026-07-25）：取**绝对值**——此前只认向下的间隙，看不见向上的跳回。
+        # 两个真实成因会制造负 gap：
+        #   ① 双栏页的阅读序是「左栏整栏 → 右栏整栏」（_detect_column_split），
+        #      从左栏末行跳到右栏首行时 gap 恒为负；
+        #   ② 页眉最后一行落在 10% 候选带外（不进页眉候选）却跨在 crop_top 上时，
+        #      pdfplumber 裁剪保留该词并把 top 钳到 crop_top，于是它带着一个远小于
+        #      正文的假 y 出现在流的后段。
+        # 实证 FL-XS-WI-007 p2：两者叠加使 Step4 段落块膨胀成 [95.0, 507.68]（412pt，
+        # 罩住整页），图片按 y 重叠锚定时整组错位（步骤3/步骤4 图集对调）。
+        # 跨栏本就该切段——段落块的 y 包络跨栏时没有意义。
+        elif text_buffer and abs(line_info["top"] - text_buffer[-1][2]) > 40:
             _flush_paragraph()
 
         line_size = line_info["dominant_size"]
@@ -468,7 +479,12 @@ def _pass2_extract_page(
         # 标注式 callout veto："⑤双击图标"常以标题字号/加粗排版，字号/加粗
         # 启发会把它当 heading → section_title 污染（章节：⑤双击图标）。
         # veto 后圈数字行成为普通段落，归入所属步骤文本。
-        looks_callout = is_pseudo_heading(line_text)
+        # ⚠️ 本 veto 同时作用于**字号与加粗两条视觉启发**（下面两个策略都读它）；
+        #    第三路中文正则 fallback 不受它约束——圈号与纯数字本就不命中该正则。
+        # PDF-D3（2026-07-25）：纯阿拉伯数字标注号（"18" / "13  16"）同属该形态。
+        #    只在 PDF 侧扩，不动 is_pseudo_heading —— 那是 PDF/DOCX 共享接口，
+        #    DOCX 的 heading 来自样式（作者意图），不可由 PDF 版面证据外推。
+        looks_callout = is_pseudo_heading(line_text) or is_bare_numeric_callout(line_text)
 
         # 策略 1: 字号推断（需要文本长度 ≤50 防止长段落误判）
         if (not looks_callout and analysis.heading_size_to_level

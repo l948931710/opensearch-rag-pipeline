@@ -114,6 +114,32 @@ def _call_rerank(query: str, documents: List[Any], model: str, api_key: str,
     return resp.json()["output"]["results"]  # [{index, relevance_score}, ...]
 
 
+# fail-open 降级标记键。**只做留痕，不改行为**：值是原因串，下游（评测 L1、qa 日志）读它就能
+# 区分"这题真的重排过"与"这题悄悄按融合序走了"。
+#
+# 为什么需要：`rerank_chunks` 的三条降级路径原本只写一行 warning 就原样返回，返回的 chunk 上
+# 没有任何痕迹。后果不是打错档位标签（`llm_generator.score_level` 是**按 chunk 看有没有
+# rerank_score 键**选阈值的，降级后自动落回融合阈 —— 那条链是对的），而是**评测尺子说谎**：
+# 冻结基线的 regime 里写着 `rerank_enable: True`,那是【意图】；20260726 重冻的 gate.log 里
+# 有 2 次 `rerank failed ... fail-open`(读超时),那几题实际是按融合序打的分,却和重排过的题
+# 混进同一个 recall@1。DashScope 抖一下就能把整轮悄悄降级,而闸门会把它读成管线回退。
+RERANK_DEGRADED_KEY = "_rerank_degraded"
+
+
+def _degraded(chunks: List[Dict[str, Any]], top_k: Optional[int],
+              reason: str) -> List[Dict[str, Any]]:
+    """原样返回（截断到 top_k），但在每个 chunk 上盖降级原因。
+
+    就地盖标记与成功路径写 `rerank_score` 是同一种做法（同样就地改入参 dict），
+    故不额外复制；调用方本来就把 `rerank_chunks` 的返回当作新顺序使用。
+    """
+    out = chunks[: top_k] if top_k else chunks
+    for c in out:
+        if isinstance(c, dict):
+            c[RERANK_DEGRADED_KEY] = reason
+    return out
+
+
 def rerank_chunks(
     query: str,
     chunks: List[Dict[str, Any]],
@@ -134,12 +160,13 @@ def rerank_chunks(
     """
     cfg = get_config().alibaba_vector
     if not chunks or len(chunks) < 2:
+        # 池 <2 无可排序 —— 这不是降级，不打标记。
         return chunks[: top_k] if top_k else chunks
 
     api_key = get_config().embedding.api_key
     if not api_key:
         logger.warning("rerank: no DashScope key; skipping rerank")
-        return chunks[: top_k] if top_k else chunks
+        return _degraded(chunks, top_k, "no_api_key")
 
     base_url = get_config().embedding.api_base_url
     # native rerank endpoint lives at the DashScope root; strip a trailing /api/v1 if present
@@ -166,7 +193,7 @@ def rerank_chunks(
         results = _call_rerank(query, documents, model, api_key, base_url, cfg.rerank_timeout)
     except Exception as e:
         logger.warning("rerank failed (model=%s, fail-open): %s", model, e)
-        return chunks[: top_k] if top_k else chunks
+        return _degraded(chunks, top_k, f"call_failed:{type(e).__name__}")
 
     # reorder by returned index; annotate scores
     reordered: List[Dict[str, Any]] = []
@@ -181,7 +208,7 @@ def rerank_chunks(
         reordered.append(ch)
 
     if not reordered:  # defensive: nothing usable came back
-        return chunks[: top_k] if top_k else chunks
+        return _degraded(chunks, top_k, "empty_result")
 
     logger.info("rerank ok: model=%s, in=%d, images=%s, out=%d",
                 model, len(chunks), n_img if use_images else 0, len(reordered))

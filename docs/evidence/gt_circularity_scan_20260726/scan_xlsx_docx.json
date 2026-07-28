@@ -1,0 +1,257 @@
+[
+ {
+  "doc": "xlsx_sop",
+  "fmt": "xlsx",
+  "n_funnel_calls": 6,
+  "n_discarded": 0,
+  "n_gt_refs": 6,
+  "discarded": []
+ },
+ {
+  "doc": "xlsx_spec",
+  "fmt": "xlsx",
+  "n_funnel_calls": 7,
+  "n_discarded": 1,
+  "n_gt_refs": 0,
+  "discarded": [
+   {
+    "file": "5c88c225e55b",
+    "status": "DISCARD_DECORATIVE",
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo",
+    "w": 8000,
+    "h": 4500,
+    "kb": 221.6,
+    "category": "logo_header",
+    "src": "cached"
+   }
+  ]
+ },
+ {
+  "doc": "xlsx_inspect",
+  "fmt": "xlsx",
+  "n_funnel_calls": 9,
+  "n_discarded": 0,
+  "n_gt_refs": 1,
+  "discarded": []
+ },
+ {
+  "doc": "xlsx_clean",
+  "fmt": "xlsx",
+  "n_funnel_calls": 24,
+  "n_discarded": 0,
+  "n_gt_refs": 8,
+  "discarded": []
+ },
+ {
+  "doc": "docx_sop",
+  "fmt": "docx",
+  "n_funnel_calls": 31,
+  "n_discarded": 5,
+  "n_gt_refs": 0,
+  "discarded": [
+   {
+    "file": "b7f80f5c39bc",
+    "status": "DISCARD_DECORATIVE",
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo",
+    "w": 260,
+    "h": 187,
+    "kb": 81.8,
+    "category": "decorative",
+    "src": "cached"
+   },
+   {
+    "file": "f02e741f2ebe",
+    "status": "DISCARD_DECORATIVE",
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo",
+    "w": 232,
+    "h": 148,
+    "kb": 52.8,
+    "category": "decorative",
+    "src": "cached"
+   },
+   {
+    "file": "8498a8bd1645",
+    "status": "DISCARD_DECORATIVE",
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo",
+    "w": 90,
+    "h": 139,
+    "kb": 23.5,
+    "category": "decorative",
+    "src": "cached"
+   },
+   {
+    "file": "9daa6b26c2be",
+    "status": "DISCARD_DECORATIVE",
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo",
+    "w": 124,
+    "h": 175,
+    "kb": 14.7,
+    "category": "decorative",
+    "src": "cached"
+   },
+   {
+    "file": "7ae9f097a446",
+    "status": "DISCARD_DECORATIVE",
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo",
+    "w": 378,
+    "h": 84,
+    "kb": 12.2,
+    "category": "logo_header",
+    "src": "cached"
+   }
+  ]
+ },
+ {
+  "doc": "docx_water",
+  "fmt": "docx",
+  "n_funnel_calls": 9,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_qc",
+  "fmt": "docx",
+  "n_funnel_calls": 11,
+  "n_discarded": 1,
+  "n_gt_refs": 0,
+  "discarded": [
+   {
+    "file": "7ae9f097a446",
+    "status": "DISCARD_DECORATIVE",
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo",
+    "w": 378,
+    "h": 84,
+    "kb": 12.2,
+    "category": "logo_header",
+    "src": "cached"
+   }
+  ]
+ },
+ {
+  "doc": "docx_manual",
+  "fmt": "docx",
+  "n_funnel_calls": 167,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_dorm",
+  "fmt": "docx",
+  "n_funnel_calls": 0,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_itctrl",
+  "fmt": "docx",
+  "n_funnel_calls": 0,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_qtwi",
+  "fmt": "docx",
+  "n_funnel_calls": 16,
+  "n_discarded": 1,
+  "n_gt_refs": 0,
+  "discarded": [
+   {
+    "file": "aa8f08e1e089",
+    "status": "DISCARD_DECORATIVE",
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo",
+    "w": 123,
+    "h": 75,
+    "kb": 14.9,
+    "category": "logo_header",
+    "src": "cached"
+   }
+  ]
+ },
+ {
+  "doc": "docx_canteen",
+  "fmt": "docx",
+  "n_funnel_calls": 0,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_fire",
+  "fmt": "docx",
+  "n_funnel_calls": 0,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_car",
+  "fmt": "docx",
+  "n_funnel_calls": 0,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_smoking",
+  "fmt": "docx",
+  "n_funnel_calls": 0,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_forklift",
+  "fmt": "docx",
+  "n_funnel_calls": 0,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_hazard",
+  "fmt": "docx",
+  "n_funnel_calls": 0,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_uniform",
+  "fmt": "docx",
+  "n_funnel_calls": 0,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ },
+ {
+  "doc": "docx_jobresp",
+  "fmt": "docx",
+  "n_funnel_calls": 1,
+  "n_discarded": 1,
+  "n_gt_refs": 0,
+  "discarded": [
+   {
+    "file": "d89405599e88",
+    "status": "DISCARD_DECORATIVE",
+    "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo",
+    "w": 238,
+    "h": 55,
+    "kb": 3.4,
+    "category": "logo_header",
+    "src": "cached"
+   }
+  ]
+ },
+ {
+  "doc": "docx_adminresp",
+  "fmt": "docx",
+  "n_funnel_calls": 0,
+  "n_discarded": 0,
+  "n_gt_refs": 0,
+  "discarded": []
+ }
+]

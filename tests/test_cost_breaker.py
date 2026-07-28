@@ -222,6 +222,10 @@ def test_drain_loop_shares_one_breaker_and_budget_accumulates(monkeypatch):
     cfg = make_cfg(run_budget_rmb=1.0, doc_budget_rmb=1.0, max_pages=1000)
     # run_stage_drained 用 get_config() 构造共享熔断器；换成启用了 rebuild 的 stub
     monkeypatch.setattr(orch, "get_config", lambda: cfg)
+    # B1a（2026-07-25）：run_stage_drained 现在会在非 simulate 下取 A12 单实例互斥锁
+    # （现网入口是 DataWorks 节点直调 drained，锁必须在这里）。本用例只验成本熔断器，
+    # 用的是不含 rds 的 stub 配置 → 显式关掉互斥，避免 fail-closed 退出。
+    monkeypatch.setenv("RAG_INGEST_SINGLETON_LOCK", "false")
 
     breakers, results = [], []
 

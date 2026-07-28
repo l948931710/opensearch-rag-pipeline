@@ -1,0 +1,15 @@
+{
+  "g_unset": {
+    "pdf": 0.9652791666666666,
+    "row_signature": "3bd45a975f54c49c"
+  },
+  "g_on": {
+    "pdf": 0.9652791666666666,
+    "row_signature": "3bd45a975f54c49c"
+  },
+  "g_off": {
+    "pdf": 0.8923625,
+    "row_signature": "d787892d3401b980"
+  },
+  "_note": "L4-ing pdf 支柱（6 篇 GT / 48 strong 行，only_fmt=pdf，同一 warm-cache 快照）。验收：默认未设 == 显式 ON（签名相同）；显式 OFF == 历史 OFF（0.8923625）；ON 相对 OFF 零退化。"
+}

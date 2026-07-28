@@ -2646,6 +2646,15 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
     if (str(chunk_status or "").upper() == "EMPTY"
             or str(publish_status or "").upper().startswith("SKIPPED")):
         return "未入索引"
+    # B13（2026-07-25）：chunk_status='NEEDS_REVIEW' 必须排在「已上线」之前。
+    # 窄口：stage-3 的毒 chunk 死信路径（_mark_docs_needs_review_for_dead）**只改
+    # chunk_status**，dv.index_status 仍是 SUCCESS —— 于是"部分 chunk 永久 DEAD、
+    # 再不会被 loader 重选"的文档在控制台显示「已上线」，管理员看不出它缺内容。
+    # 刻意**不**把 NEEDS_REVIEW 整体塞进 _KB_BAD_BADGES：另外两条写路径里，
+    # VLM 降级那条明写"文本照常可检索、占位图注照常可服务"，翻成异常与既定的优雅降级冲突；
+    # 0-chunk 疑似失败那条同时写 content_process_status='FAILED'，已由「处理失败」覆盖。
+    if str(chunk_status or "").upper() == "NEEDS_REVIEW":
+        return "未入索引"
     # 管线把 document_version.index_status 置 'SUCCESS'（非 'INDEXED'）作为上线成功值。
     if ix in ("INDEXED", "SUCCESS") and (chunk_active is None or chunk_active > 0):
         return "已上线"
@@ -2679,6 +2688,8 @@ _KB_BADGE_CASE_SQL = (
     " WHEN UPPER(COALESCE(v.publish_status,'')) = 'QUARANTINED' THEN '已隔离'"
     " WHEN UPPER(COALESCE(v.chunk_status,'')) = 'EMPTY'"
     "      OR LEFT(UPPER(COALESCE(v.publish_status,'')),7) = 'SKIPPED' THEN '未入索引'"
+    # B13：与 _kb_status_badge 同位插入（parity 测试守着两者同序同义）
+    " WHEN UPPER(COALESCE(v.chunk_status,'')) = 'NEEDS_REVIEW' THEN '未入索引'"
     " WHEN UPPER(COALESCE(v.index_status,'')) IN ('INDEXED','SUCCESS') THEN '已上线'"
     " WHEN UPPER(COALESCE(v.content_process_status,'')) = 'FAILED'"
     "      OR UPPER(COALESCE(v.index_status,'')) = 'FAILED' THEN '处理失败'"

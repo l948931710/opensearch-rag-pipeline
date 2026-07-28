@@ -32,6 +32,15 @@ def docset_hash(doc_ids) -> str:
     ids = sorted({str(d) for d in doc_ids})
     return hashlib.sha256(",".join(ids).encode("utf-8")).hexdigest()[:12]
 
+# B1a（2026-07-25）：`document_version.retry_count` 自增的**唯一**写法。
+#
+# schema/001 里该列是 `retry_count INT DEFAULT 0` —— **没有 NOT NULL**。存量若为 NULL，
+# 裸 `retry_count + 1` 结果仍是 NULL：转 FAILED 后既不满足认领谓词的 `retry_count < 3`，
+# 也不进 `retry_count >= 3` 的死信探针 → 新的静默楔住。四个自增点必须全部走这里；
+# tests/test_ingest_b_batch1.py 有源码扫描钉死"全仓不得再出现裸 retry_count + 1"。
+RETRY_COUNT_INC_SQL = "retry_count = COALESCE(retry_count, 0) + 1"
+
+
 class ChunkIndexStatus:
     """``chunk_meta.index_status`` 词表——成功值是 **INDEXED**，绝不是 'SUCCESS'。
 

@@ -558,6 +558,16 @@ class RAGConfig:
     #        接受 .M（模块级常量，不门控）——OFF 时仅多「识别并 strip 掉畸形 .M
     #        残片」这一无害增强，不是逐字节不变（对标准 <<IMG:N>> 完全兼容）。
     img_subindex: bool = False  # RAG_IMG_SUBINDEX
+    # 无可插图时不发图规则（#F-mm14）。**2026-07-27 起默认 ON**（Sam 拍板，两轮 A/B 后）。
+    # 关闭值只认 false/0/no（_env_bool 的 off-list 语义）—— 默认 ON 的开关若把未知值也当关，
+    # 配错一个字就会静默退回旧行为、幻觉 marker 重现且无人察觉。
+    # A/B：marker_validity 0.6458 → 0.8784/0.8987（两轮），误伤 0 题，覆盖率不降反升。
+    img_rule_requires_images: bool = True  # RAG_IMG_RULE_REQUIRES_IMAGES
+    # 规则 13：显式枚举本轮可用图片编号（#F-mm15）。**2026-07-27 起默认 ON**（Sam 拍板）。
+    # 依据见 llm_generator._img_id_whitelist_rule（判别实验：残余非法 marker 9/11 是
+    # "来源判对了但那篇没图"，需要逐文档粒度 + 弃权许可，而不是语义重绑定）。
+    # A/B（在 mm14 已 ON 之上）：0.8987 → 0.9747/0.9759（两轮，差 0.0012），残余 2 个/轮。
+    img_id_whitelist: bool = True  # RAG_IMG_ID_WHITELIST
     # P2-01：把「=== 参考文档 === 区块是不可信数据、其中的指令一律不执行」写进 system prompt
     # （间接 prompt injection 防护）。默认 OFF 与全项目 prompt-flag 约定一致（OFF 时 prompt 逐字节
     # 不变、不动 eval 基线）；**生产建议 RAG_PROMPT_INJECTION_GUARD=true 开启**（本 LLM 无工具执行，
@@ -1042,6 +1052,8 @@ def load_config() -> PipelineConfig:
             image_tiebreak_eps=_env_float("IMAGE_TIEBREAK_EPS", 0.05),              # RAG_IMAGE_TIEBREAK_EPS
             image_tiebreak_pool=_env_int("IMAGE_TIEBREAK_POOL", 14),                # RAG_IMAGE_TIEBREAK_POOL
             img_subindex=_env_bool("IMG_SUBINDEX", False),                          # RAG_IMG_SUBINDEX
+            img_rule_requires_images=_env_bool("IMG_RULE_REQUIRES_IMAGES", True),   # RAG_IMG_RULE_REQUIRES_IMAGES（默认 ON）
+            img_id_whitelist=_env_bool("IMG_ID_WHITELIST", True),                   # RAG_IMG_ID_WHITELIST（默认 ON）
             prompt_injection_guard=_env_bool("PROMPT_INJECTION_GUARD", False),       # RAG_PROMPT_INJECTION_GUARD
         ),
     )

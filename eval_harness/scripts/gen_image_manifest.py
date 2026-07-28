@@ -89,6 +89,40 @@ def _build_ref_key(fmt: str, asset: dict) -> dict:
     return {k: v for k, v in rk.items() if v is not None}
 
 
+def _pre_funnel_candidates(doc_path: str, fmt: str) -> list:
+    """漏斗**前**的候选图集（含会被 Funnel 1/3 弃掉的），失败返回 []（调用方回落存活集）。
+
+    manifest 的职责是锁 extractor_version/doc_sha256 + 查 ref-key 漂移；这三件事在候选集上
+    全部成立且更干净 —— `image_index` 本来就是漏斗**之前**分配的、弃图留序号空位。
+    用存活集会把 GT preflight 变成循环判据：GT 只可能标到漏斗留下的图，一旦独立重标引用了
+    被弃的图，`_preflight_manifest` 就判 drift 把整篇 degraded 踢出统计（方案 §13.1 实证：
+    两个 arm 的分数因此变得逐位相同）。
+    """
+    import tempfile
+    try:
+        from opensearch_pipeline.extraction.image_extraction_utils import (
+            extract_images_from_pdf, extract_images_from_xlsx,
+            extract_images_from_docx, extract_images_from_pptx,
+        )
+    except Exception:
+        return []
+    fn = {"pdf": extract_images_from_pdf, "xlsx": extract_images_from_xlsx,
+          "docx": extract_images_from_docx, "pptx": extract_images_from_pptx}.get(fmt)
+    if fn is None:
+        return []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = fn(doc_path, tmp) or []
+            # 只留 manifest 用得到的字段（文件本身即将随 tmp 一起消失）
+            return [{"image_index": getattr(a, "image_index", None),
+                     "page_num": getattr(a, "page_num", None),
+                     "filename": os.path.basename(getattr(a, "local_path", "") or ""),
+                     "anchor_row": getattr(a, "anchor_row", None)} for a in out]
+    except Exception as e:
+        print(f"    ⚠️ 取漏斗前候选集失败（回落存活集）: {type(e).__name__}: {e}")
+        return []
+
+
 def gen_manifest(doc_path: str, doc_label: str) -> dict:
     """跑 UnifiedExtractor 出 manifest dict。注意:本函数需要真依赖(prod env),
     模拟模式可能图为空 — 调用前应确保 RAG_SIMULATE=false 或在能跑 extractor 的环境。"""
@@ -107,6 +141,20 @@ def gen_manifest(doc_path: str, doc_label: str) -> dict:
     }
     result = extractor.extract(task)
     assets = result.assets or []
+
+    # ⚠️ 审查遗漏项（2026-07-26）：`result.assets` 是**漏斗存活集** —— 被 Funnel 1/3 弃掉
+    # 的图在 `_process_embedded_images` 的 Phase-3 就 `continue` 掉了，压根不在里面。
+    # 用它生成 manifest 会把 GT preflight 变成**循环判据**：GT 只可能标到"漏斗留下的图"，
+    # 而一旦 GT 引用了被弃的图（独立重标之后必然如此），`_preflight_manifest` 就判 drift、
+    # 把整篇 degraded 踢出统计 —— 实测两个 arm 的分数因此变得逐位相同（方案 §13.1）。
+    # manifest 的职责是锁 extractor_version/doc_sha256 + 查 ref-key 漂移，这三件事在
+    # **漏斗前候选集**上全部成立且更干净（image_index 本来就是漏斗之前分配的）。
+    # 自己按格式取候选集 —— **不为一个评测工具去改生产抽取契约**（ExtractionResult
+    # 不需要多一个只有 manifest 用得上的字段）。这里调的正是 UnifiedExtractor 内部
+    # 用的同一批函数，image_index 的分配逻辑因此逐字节一致。
+    _cand = _pre_funnel_candidates(doc_path, fmt)
+    if _cand:
+        assets = _cand
 
     # 全格式统一:直接用 extractor 的 asset 顺序 + image_index(2026-06-12 简化,
     # 不再为 PDF 按页重启 — extractor 已给全文连续 image_index)

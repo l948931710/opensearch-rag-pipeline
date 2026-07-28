@@ -15,6 +15,13 @@ from PIL import Image
 
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.extraction.ocr_client import OCRClient
+from opensearch_pipeline.ingest_flags import funnel_discard_requires_category_enabled
+
+# VLM **明确表态**为装饰的两个类别 —— 选项 C 的唯一弃图依据。prompt 里
+# `logo_header` = "封面Logo、公司标志、页眉装饰"、`decorative` = "其他纯装饰图/留白/线条"
+# （`_vlm_audit_and_summary` 的类别清单）。只有这两个是"我认定它是装饰"的**断言**；
+# `unknown` 是**拒绝归类**，不是断言 —— 这个区别就是 C 的全部依据。
+_DECORATIVE_CATS = frozenset({"decorative", "logo_header"})
 
 
 class ImageFunnelProcessor:
@@ -60,11 +67,28 @@ class ImageFunnelProcessor:
         filename = os.path.basename(local_path)
 
         # ─── Funnel 1: Heuristic Structural & Layout Filter ───
-        width, height, file_size_kb = self._static_heuristics(local_path)
-        aspect_ratio = max(width / max(height, 1), height / max(width, 1))
+        screen = self.screen_static(local_path)
+        width = screen["width"]
+        height = screen["height"]
+        file_size_kb = screen["file_size_kb"]
+        aspect_ratio = screen["aspect_ratio"]
+
+        # A11（2026-07-25）：解码失败与"真的是装饰图"必须分开。此前 _static_heuristics 把任何
+        # PIL 解码/读文件异常吞成 (0,0,0.0)，必然命中下面的低分辨率判据 → 记成
+        # DISCARD_DECORATIVE：一张读不出来的图（损坏/不支持的编码）被归因成"装饰线条"，
+        # 无任何持久信号，运维看日志只会当噪声跳过。
+        if screen["verdict"] == "UNREADABLE":
+            print(f"    [Funnel 1] UNREADABLE image: {filename} ({screen['error']})")
+            return {
+                "status": "DISCARD_UNREADABLE",
+                "width": width,
+                "height": height,
+                "file_size_kb": file_size_kb,
+                "reason": f"Funnel 1: image unreadable (decode failed): {screen['error']}",
+            }
 
         # 过滤规则：分辨率小于50px，文件小于3KB，或者长宽比大于8.0的装饰线条
-        if width < 50 or height < 50 or file_size_kb < 3.0 or aspect_ratio > 8.0:
+        if screen["verdict"] == "DECORATIVE":
             print(f"    [Funnel 1] Discarded decorative image: {filename} ({width}x{height}, {file_size_kb:.1f}KB, ratio={aspect_ratio:.1f})")
             return {
                 "status": "DISCARD_DECORATIVE",
@@ -110,23 +134,65 @@ class ImageFunnelProcessor:
                 "reason": "Funnel 3: VLM Audit Detected Sensitive Entities (Seals, Stamps, ID Card, Signatures)"
             }
         elif vlm_status == "LOW_RELEVANCE":
+            _low_cat = vlm_result.get("image_category", "unknown")
             # 低语义价值：如果文字多，仍然可以做文本路由（不浪费 OCR 结果）
             if is_text_heavy:
                 print(f"    [Funnel 2→3] Routed text-heavy low-relevance image to text: {filename} (text_len={len(ocr_text)})")
                 return {
                     "status": "ROUTE_TO_TEXT",
                     "ocr_text": ocr_text.strip(),
+                    "image_category": _low_cat,
                     "width": width,
                     "height": height,
                     "file_size_kb": file_size_kb,
+                    "degraded": vlm_degraded,
                     "reason": "Funnel 2+3: High OCR Text + VLM Low Relevance → Text Paragraph"
                 }
-            print(f"    [Funnel 3] Discarded low-relevance graphic: {filename}")
+
+            # ── 选项 C（`RAG_FUNNEL_DISCARD_REQUIRES_CATEGORY`，**2026-07-26 起默认 ON**）──
+            # 弃图需要 VLM **明确表态**。实测（2026-07-26，77 张过 Funnel-1 的候选逐张真
+            # 调）：32 张 LOW_RELEVANCE 里 26 张 `image_category="unknown"`，而它们的
+            # caption 全都准确实质（"一只手正在将多色线缆连接至主板上的CPU散热器风扇
+            # 接口"）。prompt 给 LOW_RELEVANCE 的定义只有「装饰图/封面Logo/页边留白/
+            # 空白排版线条」——手在主板上操作一条都不沾。模型是在**拒绝归类**而非断言
+            # "这是装饰"，在一个非断言上弃图违背 §3 的成本不对称（错弃 = 该步骤永久缺图
+            # 且无任何信号）。故：只有它自己说 decorative/logo_header 才弃。
+            if _low_cat not in _DECORATIVE_CATS and funnel_discard_requires_category_enabled():
+                print(f"    [Funnel 3] Rescued low-relevance image (VLM declined to categorize): "
+                      f"{filename} (cat={_low_cat})")
+                return {
+                    "status": "ROUTE_TO_VECTOR",
+                    "visual_summary": vlm_result.get("caption", ""),
+                    "image_category": _low_cat,
+                    "vlm_annotation_map": (vlm_result.get("annotation_map") or {}),
+                    "ocr_text": ocr_text.strip(),
+                    "width": width,
+                    "height": height,
+                    "file_size_kb": file_size_kb,
+                    "degraded": vlm_degraded,
+                    "reason": (f"Funnel 3: Low relevance but VLM did not assert decorative "
+                               f"(category='{_low_cat}') → kept (policy C)"),
+                }
+
+            print(f"    [Funnel 3] Discarded low-relevance graphic: {filename} (cat={_low_cat})")
             return {
                 "status": "DISCARD_DECORATIVE",
+                # C 的判据要读它，缓存条目也要留它 —— 否则日后只有一句 free-text reason
+                # 声称"VLM 明确表态"，没有结构化证据可复核（codex MAJOR-5）。
+                "image_category": _low_cat,
+                # ⬇️ 审查 P0-2（2026-07-26）：这三个字段**本次调用早已拿到**（就在上面的
+                # `vlm_result` 里），此前被这条分支丢掉。后果是选项 E 的 `apply_verdict`
+                # 把判决钉回 keep 类时只能产出**空壳资产**（无 caption/无 OCR）——而
+                # "本轮判 DISCARD、记录说 keep" 正是 E 要挡的**唯一**漂移方向，等于 E 在
+                # 自己的主场景上产出不可检索的图，还会把它写进跨文档共享缓存永久固化。
+                # 弃图本身不进 assets，多带这三个键对下游零影响；它们只在被 pin 回来时救命。
+                "visual_summary": vlm_result.get("caption", ""),
+                "vlm_annotation_map": (vlm_result.get("annotation_map") or {}),
+                "ocr_text": ocr_text.strip(),
                 "width": width,
                 "height": height,
                 "file_size_kb": file_size_kb,
+                "degraded": vlm_degraded,
                 "reason": "Funnel 3: Low Semantic Value or Generic Stock Photo"
             }
         else:
@@ -186,18 +252,45 @@ class ImageFunnelProcessor:
                 "degraded": vlm_degraded,
             }
 
-    def _static_heuristics(self, local_path: str) -> Tuple[int, int, float]:
-        """获取图片的基础物理属性。"""
+    # Funnel 1 的判定阈值（**唯一**一份 —— 此前 unified_extractor 的 Phase-1 预过滤是同一
+    # 判据的第二份拷贝，两处阈值可以各自漂移而无人察觉）
+    MIN_SIDE_PX = 50
+    MIN_FILE_KB = 3.0
+    MAX_ASPECT_RATIO = 8.0
+
+    def screen_static(self, local_path: str) -> dict:
+        """A11：Funnel 1 静态筛查的唯一入口。返回
+        `{width, height, file_size_kb, aspect_ratio, verdict, error}`，
+        `verdict ∈ {"OK", "DECORATIVE", "UNREADABLE"}`。
+
+        与旧 `_static_heuristics` 的关键差别：**保留异常信息**。解码失败不再被压成
+        `(0,0,0.0)` 后与"真的很小"混为一谈——前者是需要人看的抽取缺口，后者是正常丢弃。
+        注意 `aspect_ratio > 8.0` 误杀宽幅截图是**有意的**启发式（配套救援见
+        RAG_PDF_STRIP_STITCH，2026-07-26 起默认 ON），不在本次改动范围。
+        """
         try:
             with Image.open(local_path) as img:
                 width, height = img.size
-            file_size_bytes = os.path.getsize(local_path)
-            file_size_kb = file_size_bytes / 1024.0
-            return width, height, file_size_kb
+            file_size_kb = os.path.getsize(local_path) / 1024.0
         except Exception as e:
-            # 兜底返回，如果解析异常则置零，在 Funnel 1 直接丢弃
             print(f"    ⚠️ Warning failed to read image heuristics: {e}")
-            return 0, 0, 0.0
+            return {"width": 0, "height": 0, "file_size_kb": 0.0, "aspect_ratio": 0.0,
+                    "verdict": "UNREADABLE", "error": f"{type(e).__name__}: {e}"}
+        aspect_ratio = max(width / max(height, 1), height / max(width, 1))
+        decorative = (width < self.MIN_SIDE_PX or height < self.MIN_SIDE_PX
+                      or file_size_kb < self.MIN_FILE_KB
+                      or aspect_ratio > self.MAX_ASPECT_RATIO)
+        return {"width": width, "height": height, "file_size_kb": file_size_kb,
+                "aspect_ratio": aspect_ratio,
+                "verdict": "DECORATIVE" if decorative else "OK", "error": ""}
+
+    def _static_heuristics(self, local_path: str) -> Tuple[int, int, float]:
+        """获取图片的基础物理属性（薄封装，保持既有三元组契约）。
+
+        新代码请用 `screen_static` —— 它区分得出"读不出来"与"确实是装饰图"。
+        """
+        s = self.screen_static(local_path)
+        return s["width"], s["height"], s["file_size_kb"]
 
     # 结构抽取 prompt（G17）：按类别路由，输出纯文本（非 JSON——结构行本身就是产物）
     _STRUCT_PROMPTS = {

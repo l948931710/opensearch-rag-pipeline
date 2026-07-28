@@ -29,9 +29,12 @@ SQLite/迁移/镜像/退化代码，参数化底座重复最少，崩溃安全�
     实际是 FIFO——对一次写入终身只读的 VLM 标注足够）。
 
 键/值契约与旧 JSON 完全一致（unified_extractor 零语义迁移）：
-  key   = "{图片MD5}:{pub|sec}[:{RAG_VLM_CACHE_VERSION}]"（遗留裸 MD5 兼容照旧，
-          见 unified_extractor._vlm_cache_lookup）
+  key   = "{图片SHA-256}:{pub|sec}[:{RAG_VLM_CACHE_VERSION}]"（B4/2026-07-17 起主键由
+          MD5 换 SHA-256 以关闭碰撞继承 CLEAN 结论的通道；遗留裸 MD5 key 仅存量只读
+          兼容，见 unified_extractor._vlm_cache_lookup）
   value = funnel 结果 dict（status/visual_summary/ocr_text/width/...，JSON 编码存储）
+          ⚠️ 值形态由 unified_extractor._vlm_cache_entry_usable 单点把关：本层只做
+          JSON 语法解码，历史脏写/外部污染进来的标量在读侧被视同未命中（D1）。
 
 legacy scratch/vlm_cache.json 原样保留不删（tests/eval 脚本仍可独立读它——advisory
 缓存允许分叉，与 embedding 缓存迁移同一约定）。simulate 不落盘契约保留：per-doc

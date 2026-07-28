@@ -43,6 +43,7 @@ import re
 import shutil
 import statistics
 import tempfile
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from .ref_keys import ImageRef, jaccard, img_dup_factor, parse_ref_dict
@@ -202,30 +203,63 @@ def _extract_step_no_from_label(label: str) -> Tuple[Optional[int], Optional[str
     return (None, None)
 
 
-def _match_gt_chunk_to_produced(gt: GtChunk, chunks: List[Any]) -> Optional[Any]:
-    """keyword recall ≥ 0.3 → density 最大者,但**chunk_type 同类型优先**。
+# L4-ingestion 评测判定口径的语义版本 —— 进 regime 指纹（run_eval._regime）。
+# 只在**判定口径**变化时手工 bump（与 EXTRACTOR_VERSION 同纪律）；刻意不用全仓
+# code_commit：那对任何无关提交都变，会把 regime 闸变成噪声源。
+#   1.0.0 = 本常量引入前的隐式口径（with_imgs 硬过滤先于结构标签；no-cover 不弃权）
+#   2.0.0 = M1 结构标签先于图片偏好 + M2 no-cover 真弃权（2026-07-25）
+L4_INGESTION_EVALUATOR_VERSION = "2.0.0"
 
-    口径同 gt_eval.py 的 covering+density 但加两道偏好:
-      1) chunk_type 同类型优先:GT 标 step_card 时,先在 covering 集里找 chunk_type=
-         step_card 的 candidate;若有,density 最大者胜。否则回退全 covering 集。
-      2) 2026-06-13 D8 Phase 3 finding 3 修:GT label 含步骤号(如"步骤3.1"/"4.2.1")时,
-         在 typed pool 内先按 extra.section_no 完全匹配过滤;若空再按 extra.step_no
-         过滤;命中后 recall-max(tie 用 density),全无匹配回退当前 typed density-max。
+MATCH_STATUS_MATCHED = "matched"
+MATCH_STATUS_BELOW_THRESHOLD = "below_threshold"
+MATCH_STATUS_NO_KEYWORDS = "no_keywords"
+MATCH_STATUS_NO_SCORABLE = "no_scorable_chunks"
 
-    Why (1):density = hits / sqrt(len) 让短文本不公平胜出 — 实测 pdf_sop 步骤1.1 时,
-    前言段(text_chunk, 123 字, 4 hits = density 0.36)恰好比完整步骤段(step_card,
-    300 字, 6 hits = density 0.35)略胜,导致 matcher 选错 chunk 类型,使该 GT
-    被无图的 text_chunk 抢戏 jaccard=0。chunk_type 优先反映了 GT 标注者的真实意图。
 
-    Why (2):typed pool 内 density 也会让短文本父 chunk 偶然命中 keyword 抢戏真子
-    chunk — pdf_sop GT 3.1 实证:step_no=4 父 43 字(d=0.457, imgs=[])偶然含
-    "U8/扫码/报检" 抢戏 step_no=3 main 349 字(d=0.161, imgs=[5,6])。GT label 已
-    显式写"步骤3.1",据此抽 step_no=3 锁回真 chunk;过滤后 recall-max 让 keyword
-    覆盖更全的真 chunk 胜出(避免 step_no=3 内 sub=2 sec=3.2 短文本再次抢戏)。
+@dataclass
+class MatchResult:
+    """匹配结果 + 失败原因 —— 不让调用点从 `chunk is None` 反推三种不同的失败。"""
+    chunk: Optional[Any]
+    status: str
+    best_recall: float = 0.0
+
+    def __bool__(self) -> bool:
+        return self.chunk is not None
+
+
+def _match_gt_chunk_to_produced(gt: GtChunk, chunks: List[Any]) -> MatchResult:
+    """把一条 GT 匹配到一张产出 chunk。判定链（顺序本身就是语义）：
+
+        1. covering = recall >= MATCH_THRESHOLD（含等号）；**空则弃权**（M2）
+        2. chunk_type 同类型优先；无同类型 → 回退全 covering 的 density-max
+        3. **结构标签收窄**：GT label 抽出的 section_no 完全匹配 > step_no 匹配
+        4. 池内：recall 最大 → **recall 并列时**由 has_imgs 裁决 → density
+
+    每一条都有实测支撑，改顺序前先看证据：
+
+    · chunk_type 优先：density = hits/sqrt(len) 让短文本不公平胜出 —— pdf_sop 步骤1.1
+      实证，前言 text_chunk(123 字, d=0.36) 险胜完整 step_card(300 字, d=0.35)，
+      该 GT 被无图的 text_chunk 抢戏 J=0。
+
+    · 结构标签必须**先于**图片偏好（M1，2026-07-25 修）：结构标签是 GT 标注者显式写下
+      的身份，图片存在性只是启发式。旧实现把 has_imgs 硬过滤放在结构过滤**之前**，
+      于是"真卡恰好无图"时真卡被提前淘汰、结构过滤在残池里再也找不到它 ——
+      **这等于用被测对象（有没有绑到图）去挑选题目，是评测泄漏**。
+      实证 xs_wi_007 GT「步骤1」：typed 池内 step_no=1（recall=1.00, imgs=[]）与
+      step_no=2（recall=0.67, imgs=[1,2]）并存；has_imgs 先跑淘汰了 recall 满分的真卡
+      → 步骤1 靠匹到**别人的卡**拿了假 1.0，同时把 步骤2 挤成 0。
+      pdf_sop GT「步骤4.1」（sec=4.1 真卡无图）同形。
+
+    · has_imgs 保留为**并列裁决**而非硬过滤（C2 修复不回退）：实证 it_xxh_003
+      「第一步 安装CPU处理器」（该文档 GT label 是「第N步」形态，抽不出结构号，全靠
+      池内裁决）—— 池内两张卡 recall **完全并列** 0.83，一张 imgs=[] density 0.248、
+      一张 imgs=[8] density 0.219；纯 recall→density 会选中无图那张得 J=0。
+      GT 显式负例（expected_image_refs=[]）不参与该裁决 —— 否则等于奖励"给不该有图
+      的步骤绑了图"。
     """
     kws = gt.keywords
     if not kws:
-        return None
+        return MatchResult(None, MATCH_STATUS_NO_KEYWORDS)
 
     scored = []
     for c in chunks:
@@ -237,46 +271,47 @@ def _match_gt_chunk_to_produced(gt: GtChunk, chunks: List[Any]) -> Optional[Any]
         density = hits / math.sqrt(max(len(text), 1))
         scored.append((c, recall, density))
 
+    if not scored:
+        return MatchResult(None, MATCH_STATUS_NO_SCORABLE)
+
+    best_recall = max(s[1] for s in scored)
     covering = [s for s in scored if s[1] >= MATCH_THRESHOLD]
-    if covering:
-        # chunk_type 同类型优先 — 给 GT 标的 chunk_type 一道偏好;无同类型回退全集
-        if gt.chunk_type:
-            typed = [s for s in covering if _gv(s[0], "chunk_type") == gt.chunk_type]
-            if typed:
-                # D8 Phase 5 Bug C2 修:GT expected_image_refs 非空时,typed pool
-                # 内优先选含 image_refs 的 chunk —— 反映"主步骤含图"标注意图,
-                # 避免短的 visual_knowledge/摘要先行 chunk(image_refs=[],但因 text
-                # 含 visual_summary 命中 keyword)用 density 抢戏真子步骤。
-                # it_xxh_003 实证:step_no=5 sub1 i=8([补充图示] 摘要 200 字,
-                # imgs=[]) vs sub2 i=9(主步骤 500+字, imgs=[20-25])—— 旧路径
-                # density-max 选 sub1 → pred=[] J=0;含图过滤后选 sub2 J=1.0。
-                # 0-image GT(expected_image_refs=[])不进 filter → 无副作用。
-                if gt.expected_image_refs:
-                    with_imgs = [s for s in typed
-                                 if (_gv(s[0], "extra") or {}).get("image_refs")]
-                    if with_imgs:
-                        typed = with_imgs
-                # GT label 含步骤号 → sec_no/step_no 次级过滤(D8 Phase 3 finding 3 修)
-                step_no, sec_no = _extract_step_no_from_label(gt.label)
-                if step_no is not None:
-                    # sec_no 完全匹配优先(最特异,如 "3.1"/"4.2.1")
-                    if sec_no is not None:
-                        sec_matched = [
-                            s for s in typed
-                            if (_gv(s[0], "extra") or {}).get("section_no") == sec_no
-                        ]
-                        if sec_matched:
-                            return max(sec_matched, key=lambda s: (s[1], s[2]))[0]
-                    # step_no 匹配次之(覆盖父 chunk / 无 section_no 的子 chunk)
-                    step_matched = [
-                        s for s in typed
-                        if (_gv(s[0], "extra") or {}).get("step_no") == step_no
-                    ]
+    if not covering:
+        # M2：旧实现在这里"任选 recall 最高者"，哪怕 recall=0 —— 于是一条完全没匹上的
+        # GT 仍可能因图片偶合拿到非零甚至 1.0。弃权记 0 才是诚实口径。
+        return MatchResult(None, MATCH_STATUS_BELOW_THRESHOLD, best_recall)
+
+    def _pick(pool):
+        top_recall = max(s[1] for s in pool)
+        top = [s for s in pool if s[1] == top_recall]
+        if len(top) > 1 and gt.expected_image_refs:
+            with_imgs = [s for s in top if (_gv(s[0], "extra") or {}).get("image_refs")]
+            if with_imgs:
+                top = with_imgs
+        return max(top, key=lambda s: (s[1], s[2]))[0]
+
+    if gt.chunk_type:
+        typed = [s for s in covering if _gv(s[0], "chunk_type") == gt.chunk_type]
+        if typed:
+            pool = typed
+            step_no, sec_no = _extract_step_no_from_label(gt.label)
+            if step_no is not None:
+                narrowed = None
+                if sec_no is not None:      # sec_no 完全匹配最特异（"3.1"/"4.2.1"）
+                    sec_matched = [s for s in pool
+                                   if (_gv(s[0], "extra") or {}).get("section_no") == sec_no]
+                    if sec_matched:
+                        narrowed = sec_matched
+                if narrowed is None:        # step_no 次之（父 chunk / 无 section_no 的子卡）
+                    step_matched = [s for s in pool
+                                    if (_gv(s[0], "extra") or {}).get("step_no") == step_no]
                     if step_matched:
-                        return max(step_matched, key=lambda s: (s[1], s[2]))[0]
-                return max(typed, key=lambda s: s[2])[0]
-        return max(covering, key=lambda s: s[2])[0]
-    return max(scored, key=lambda s: s[1])[0] if scored else None
+                        narrowed = step_matched
+                if narrowed is not None:
+                    pool = narrowed
+            return MatchResult(_pick(pool), MATCH_STATUS_MATCHED, best_recall)
+    return MatchResult(max(covering, key=lambda s: s[2])[0],
+                       MATCH_STATUS_MATCHED, best_recall)
 
 
 def _pred_refs_from_chunk(chunk: Any, fmt: str) -> List[ImageRef]:
@@ -298,9 +333,15 @@ def _all_step_card_refs(chunks: List[Any], fmt: str) -> List[ImageRef]:
 
 def _doc_to_judge_bundle_item(
     label: str, fmt: str, gt: GtChunk, produced: Any, pred_refs: List[ImageRef],
-    score: float,
+    score: float, match_status: str = MATCH_STATUS_MATCHED,
+    shared_with_gt: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """构造 image_binding judge bundle item — 给 Claude 维度评审用。"""
+    """构造 image_binding judge bundle item — 给 Claude 维度评审用。
+
+    produced=None 是**弃权**条目（M2）：输出规范化空值（type=null / excerpt="" /
+    refs=[] / chunk_id=null），让"没匹上"在 bundle 里可见，而不是整条消失。
+    shared_with_gt 是 many-to-one 的**人工审计证据**（M4），不参与任何自动 gate。
+    """
     extra = _gv(produced, "extra") or {}
     img_refs_raw = extra.get("image_refs") or []
     return {
@@ -313,7 +354,10 @@ def _doc_to_judge_bundle_item(
             {k: v for k, v in r.__dict__.items() if v is not None and k != "fmt"}
             for r in gt.expected_image_refs
         ],
-        "produced_chunk_type": _gv(produced, "chunk_type"),
+        "produced_chunk_type": _gv(produced, "chunk_type") if produced is not None else None,
+        "produced_chunk_id": _gv(produced, "chunk_id") if produced is not None else None,
+        "match_status": match_status,
+        "shared_with_gt": list(shared_with_gt or []),
         "produced_chunk_text_excerpt": (_gv(produced, "chunk_text") or "")[:300],
         "produced_image_refs": [
             # 2026-06-13: 取消 [:5] 截断 —— 旧 cap 让 6+ 图的 step_card（如 it_xxh_003
@@ -343,41 +387,80 @@ def evaluate_doc(label: str, doc: GtDoc, doc_path: str) -> Dict[str, Any]:
     judge_items: List[Dict[str, Any]] = []
     strong_scores: List[float] = []
 
-    for gt in doc.gt_chunks:
+    # M4（2026-07-25）：碰撞留痕走**两遍**。第一遍只匹配、按稳定 chunk_id 记账；
+    # 第二遍才写分数与 shared_with_gt。刻意**不**引入 consumed set —— 一张产出卡
+    # 合法覆盖多个 GT 子步骤时（chunker 真把两个子步骤合成了一张卡），两条 GT 都
+    # 该打在它上面、各得部分分，那正是对"合并"的正确惩罚；强行拆开是假阴性。
+    # 这里只把 many-to-one 从"看不见"变成"可审计"，不改任何一条 GT 的分数。
+    matched: List[Tuple[GtChunk, MatchResult]] = [
+        (gt, _match_gt_chunk_to_produced(gt, chunks)) for gt in doc.gt_chunks
+    ]
+    shared_by_chunk_id: Dict[Any, List[str]] = {}
+    for gt, res in matched:
+        if res.chunk is None:
+            continue
+        cid = _gv(res.chunk, "chunk_id")
+        if cid is None:
+            continue
+        shared_by_chunk_id.setdefault(cid, []).append(gt.label)
+
+    def _shared_with(res: MatchResult, gt: GtChunk) -> List[str]:
+        cid = _gv(res.chunk, "chunk_id") if res.chunk is not None else None
+        if cid is None:
+            return []
+        return [lbl for lbl in shared_by_chunk_id.get(cid, []) if lbl != gt.label]
+
+    for gt, res in matched:
+        produced = res.chunk
         if not gt.has_strong_refs:
             # 弱 GT(只标 page 等 weak ref 或完全没标)— 不计入 Jaccard 均值,
             # 但仍跑 matcher 记录 nimg 供 trend(与 gt_eval.image_accuracy 同口径)
-            produced = _match_gt_chunk_to_produced(gt, chunks)
             n_pred = len(_pred_refs_from_chunk(produced, fmt)) if produced else 0
             per_chunk.append({
                 "gt_label": gt.label, "weak": True,
                 "n_expected_refs": len(gt.expected_image_refs),
                 "n_pred_refs": n_pred,
                 "matched_produced_type": _gv(produced, "chunk_type") if produced else None,
+                "match_status": res.status,
+                "matched_produced_chunk_id": _gv(produced, "chunk_id") if produced else None,
+                "shared_with_gt": _shared_with(res, gt),
             })
             continue
 
-        produced = _match_gt_chunk_to_produced(gt, chunks)
         if not produced:
+            # M2 弃权：分数语义不变（记 0.0、进分母），但**产出一条 judge bundle 条目**
+            # 让弃权可审计——旧实现在这里直接 continue，弃权在 bundle 里完全消失。
             per_chunk.append({
                 "gt_label": gt.label, "weak": False,
                 "n_expected_refs": len(gt.expected_image_refs),
                 "n_pred_refs": 0,
                 "jaccard": 0.0,
                 "matched_produced_type": None,
+                "match_status": res.status,
+                "best_recall": round(res.best_recall, 4),
+                "matched_produced_chunk_id": None,
+                "shared_with_gt": [],
             })
             strong_scores.append(0.0)
+            if gt.expected_image_refs:
+                judge_items.append(_doc_to_judge_bundle_item(
+                    label, fmt, gt, None, [], 0.0,
+                    match_status=res.status, shared_with_gt=[]))
             continue
 
         pred_refs = _pred_refs_from_chunk(produced, fmt)
         score = jaccard(gt.expected_image_refs, pred_refs, strict=True)
         strong_scores.append(score)
+        shared = _shared_with(res, gt)
         per_chunk.append({
             "gt_label": gt.label, "weak": False,
             "n_expected_refs": len(gt.expected_image_refs),
             "n_pred_refs": len(pred_refs),
             "jaccard": round(score, 4),
             "matched_produced_type": _gv(produced, "chunk_type"),
+            "match_status": res.status,
+            "matched_produced_chunk_id": _gv(produced, "chunk_id"),
+            "shared_with_gt": shared,
         })
         # 2026-06-12 D6 改进:Claude image_binding judge bundle 只 emit "图相关" case
         # GT 显式负例(expected_image_refs=[])+ chunker 也没绑图 → 不送评(图无关 case 评 ib=3
@@ -385,7 +468,8 @@ def evaluate_doc(label: str, doc: GtDoc, doc_path: str) -> Dict[str, Any]:
         # GT 含图 OR pred 含图(含 cross-bind/over-attach 真 bug)→ 送评 — 真有图位置可判
         if gt.expected_image_refs or pred_refs:
             judge_items.append(_doc_to_judge_bundle_item(
-                label, fmt, gt, produced, pred_refs, score))
+                label, fmt, gt, produced, pred_refs, score,
+                match_status=res.status, shared_with_gt=shared))
 
     all_refs = _all_step_card_refs(chunks, fmt)
     dup = img_dup_factor(all_refs)

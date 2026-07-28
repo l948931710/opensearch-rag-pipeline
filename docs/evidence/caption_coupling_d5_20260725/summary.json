@@ -1,0 +1,7 @@
+{
+  "warm_off_d5": 0.8923625,
+  "warm_on_d5": 0.9652791666666666,
+  "same_cache_replay_d4": 0.84375,
+  "same_cache_replay_d5": 0.8541666666666666,
+  "_note": "L4-ing pdf 支柱（6 篇 GT / 48 strong 行，only_fmt=pdf）。warm=复用 scratch/vlm_cache.sqlite3；same_cache_replay=在同一份冷抽 caption 快照上分别重放 D4 与 D5 代码（消除 VLM 重掷随机性）。独立冷跑之间不可比分数，只可比漂移性质。"
+}

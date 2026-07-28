@@ -7,6 +7,8 @@ family_* / analyze_corpus / merge_chunk_panel functions and asserts the detector
 """
 from __future__ import annotations
 
+import pytest
+
 import os as _os
 
 # Importing the L6 layer triggers eval_harness.envboot.boot() at import time, which mutates
@@ -457,3 +459,100 @@ def test_merge_chunk_panel_keeps_buckets_separate():
     assert m["representative"]["pass_rate_overall_ge4"] == 1.0
     assert m["risk_enriched"]["pass_rate_overall_ge4"] == 0.0
     assert set(m["by_chunk_type"]) == {"text_chunk", "step_card"}
+
+
+# ── mid-sentence 判据的形态豁免（2026-07-27）────────────────────────────────
+#
+# 起因：`midsentence_cut_rate = 0.5001` 对门槛 0.05 —— **超标 10 倍**，且长期存在。
+# 诊断（`scratch/midsentence_diagnose_20260727.py`，220 条生产同款路由的散文类 chunk）：
+# 命中 91 条里 —— 表格(制表符) 59、清单/表 17、标签 OCR 3、图片 OCR 合成块 4、幻灯标题 3、
+# 目录点线 1、尾部孤立标题 2，**真·句中切断只有 2 条**。旧判据"末字符非终止标点"对散文
+# 成立，但 `text_chunk` 实际是"其它"类，上述形态本来就不以句号结尾。
+# ⇒ **不是分块缺陷，是判据缺陷**（今天第二次遇到闸门读数与事实相反，前一次是 L4 GT 循环性）。
+
+from eval_harness.layers.l6_chunk_quality import (  # noqa: E402
+    L6_EVALUATOR_VERSION,
+    _HEADING_TAIL_RE,
+    _is_prose_like,
+    family_boundary,
+)
+
+# 实测语料里那两条**真**·句中切断（逐字保留，是本组测试的灵敏度锚）
+_REAL_CUT_1 = ("对到货信息，并通知品质部进行检验；\n\n"
+               "4、品质部接通知后，按对应货号原辅料的图纸要求对版面内容、印刷颜色、感官、")
+_REAL_CUT_2 = ("，以减少后期万一开箱追查的工作量；\n\n"
+               "16、品质部指定专人保管钥匙，每周抽查核算发放记录、库存数据，报废数据等，")
+
+
+def test_sensitivity_preserved_real_cuts_still_flagged():
+    """**最要紧的一条**：收窄误判绝不能顺手削掉灵敏度。
+
+    这两条是实测语料里仅有的真·句中切断；新口径下必须仍被判为散文、且仍命中。
+    """
+    for i, txt in enumerate((_REAL_CUT_1, _REAL_CUT_2), 1):
+        assert _is_prose_like(txt) is True, f"真切断 #{i} 被误豁免 —— 灵敏度被削"
+        chunks = [{"chunk_id": f"c{i}", "doc_id": "d", "chunk_type": "text_chunk",
+                   "chunk_text": txt, "token_count": 40}]
+        b = family_boundary(chunks)
+        assert b["midsentence_cut_rate"] == 1.0, f"真切断 #{i} 未命中"
+
+
+@pytest.mark.parametrize("label,text", [
+    # ⚠️ 签署人姓名一律用化名：本仓为 public repo，真实语料里的员工姓名不得入库。
+    # 判据只看「制表符 / 多个『字段：』」这些**形态**，与姓名内容无关，化名不影响覆盖。
+    ("表格-制表符", "编制:\t张三\t日期:2025.5.21\n审核:\t李四\t日期:2025.5.21"),
+    ("表格-空格签署栏", "……以上为流程说明\n编制：王五    审核：    批准：    日期：2022.12.10"),
+    ("表格-符号标记", "无破裂及穿孔；淋膜层均匀无漏膜、脱模、分层、折痕或脏、破 GB/T 27590 Δ☆"),
+    ("目录点线", "• 第六步：安装光驱、电源„„„„„„„„„„„„„„„„"),
+    ("图片OCR合成块", "透明塑料杯，杯身印有蓝色字样。\n[图片OCR] CAUTION HOT 120°C"),
+    ("幻灯标题", "【文档:pptx_training】\n产品介绍-吸塑产品"),
+    ("清单-多行短行", "1、检查\n2、记录\n3、上报\n4、归档\n5、复核\n6、存档"),
+])
+def test_legitimate_non_prose_forms_are_exempt(label, text):
+    """这些都是**合法地不以句号结尾**的形态 —— 豁免的是形态，不是"不及格的"。"""
+    assert _is_prose_like(text) is False, f"{label} 未被豁免，会继续制造假命中"
+
+
+def test_title_exemption_is_anchored_on_the_extractor_marker_not_on_length():
+    """标题豁免的护栏 —— 这条是被**既有测试证伪后**改出来的，别再退回长度判据。
+
+    最初写的是"≤40 字且不含句内标点 ⇒ 标题"。`test_boundary_midsentence_doc_clustered`
+    立刻红了：`"这句话没有结束符号被切断"`（12 字、无顿号）与真标题在长度和标点上**同形**，
+    按长度判等于连灵敏度一起削。改为锚在抽取器自己生成的 `【文档:…】` 头上。
+    """
+    assert _is_prose_like("【文档:pptx_training】\n产品介绍-吸塑产品") is False   # 真标题块
+    assert _is_prose_like("产品介绍-吸塑产品") is True            # 无标记 ⇒ 不豁免（宁可假阳）
+    assert _is_prose_like("这句话没有结束符号被切断") is True       # 短的真切断必须仍命中
+    assert _is_prose_like("对版面内容、印刷颜色、感官、") is True
+
+
+@pytest.mark.parametrize("tail", ["3、定期保养", "4.3驾驶规定", "三、职责", "3定义",
+                                  "(五)火场休克的抢救"])
+def test_trailing_heading_forms_detected(tail):
+    """尾部孤立标题不是"句中切断"，但**是**真边界缺陷 —— 单列 `trailing_heading_rate`，
+    绝不因为收窄 mid-sentence 口径而把它悄悄丢掉。"""
+    assert _HEADING_TAIL_RE.search(f"上一段正文结束。\n{tail}"), f"{tail} 未被识别为尾部标题"
+
+
+def test_trailing_heading_is_counted_not_dropped():
+    chunks = [{"chunk_id": "c1", "doc_id": "d", "chunk_type": "text_chunk",
+               "chunk_text": "发现缺油或油变质应立即补充或更换。\n3、定期保养", "token_count": 30}]
+    b = family_boundary(chunks)
+    assert b["trailing_heading_rate"] == 1.0, "尾部标题必须被单列统计"
+    assert b.get("midsentence_cut_rate") in (None, 0.0), "它不该同时算作句中切断"
+
+
+def test_evaluator_version_is_in_regime_keys():
+    """改**尺子**必须能与"管线变好了"区分开 —— L4 早有 `l4_ingestion_evaluator_version`，
+    L6 此前没有对应键，改口径在差量网里完全隐形。"""
+    from eval_harness.baseline import _LENIENT_REGIME_KEYS, _REGIME_KEYS
+    assert L6_EVALUATOR_VERSION
+    assert "l6_evaluator_version" in _REGIME_KEYS
+    assert "l6_evaluator_version" not in _LENIENT_REGIME_KEYS, "跨口径比较必须硬失败"
+
+
+def test_sample_is_emitted_for_diagnosis():
+    """旧实现只给一个率、不给样本 —— 0.5 的读数无从归因（这次诊断就卡在这儿）。"""
+    b = family_boundary([{"chunk_id": "c1", "doc_id": "d", "chunk_type": "text_chunk",
+                          "chunk_text": _REAL_CUT_1, "token_count": 40}])
+    assert b.get("midsentence_sample") and b["midsentence_sample"][0].get("tail")

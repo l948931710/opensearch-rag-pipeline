@@ -1,0 +1,776 @@
+{
+ "n_prose": 220,
+ "n_flagged": 91,
+ "rate": 0.4136,
+ "last_char_hist": {
+  "„": 1,
+  "：": 1,
+  "1": 2,
+  "a": 1,
+  "检": 1,
+  "☆": 5,
+  "0": 3,
+  "部": 2,
+  "品": 2,
+  "2": 1,
+  "◆": 33,
+  "观": 1,
+  "统": 2,
+  "成": 1,
+  "次": 3,
+  "天": 1,
+  "前": 1,
+  "班": 6,
+  "周": 1,
+  "训": 1,
+  "算": 1,
+  "解": 1,
+  "证": 1,
+  "C": 1,
+  "o": 1,
+  "理": 3,
+  "、": 1,
+  "，": 1,
+  "6": 1,
+  "利": 1,
+  "放": 1,
+  "日": 2,
+  "义": 1,
+  "救": 1,
+  "养": 1,
+  "露": 1,
+  "定": 2,
+  "录": 1
+ },
+ "flagged": [
+  {
+   "doc": "pdf_it_xxh_003",
+   "type": "text_chunk",
+   "last_char": "„",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 287
+  },
+  {
+   "doc": "pdf_u8_unapprove",
+   "type": "text_chunk",
+   "last_char": "：",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 144
+  },
+  {
+   "doc": "xlsx_sop",
+   "type": "text_chunk",
+   "last_char": "1",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 715
+  },
+  {
+   "doc": "xlsx_spec",
+   "type": "text_chunk",
+   "last_char": "a",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 603
+  },
+  {
+   "doc": "xlsx_spec",
+   "type": "text_chunk",
+   "last_char": "检",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 597
+  },
+  {
+   "doc": "xlsx_spec",
+   "type": "text_chunk",
+   "last_char": "☆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 624
+  },
+  {
+   "doc": "xlsx_spec",
+   "type": "text_chunk",
+   "last_char": "☆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 608
+  },
+  {
+   "doc": "xlsx_spec",
+   "type": "text_chunk",
+   "last_char": "☆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 570
+  },
+  {
+   "doc": "xlsx_spec",
+   "type": "text_chunk",
+   "last_char": "☆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 430
+  },
+  {
+   "doc": "xlsx_spec",
+   "type": "text_chunk",
+   "last_char": "☆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 548
+  },
+  {
+   "doc": "xlsx_spec",
+   "type": "text_chunk",
+   "last_char": "0",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 492
+  },
+  {
+   "doc": "pptx_training",
+   "type": "text_chunk",
+   "last_char": "部",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 77
+  },
+  {
+   "doc": "pptx_training",
+   "type": "text_chunk",
+   "last_char": "品",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 28
+  },
+  {
+   "doc": "xlsx_inspect",
+   "type": "text_chunk",
+   "last_char": "2",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 298
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 119
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 118
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 110
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 87
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 99
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 88
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 97
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 108
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 121
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 120
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 108
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 89
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 99
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 116
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 120
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 101
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 102
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "观",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 53
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "统",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 53
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "统",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 53
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "成",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 53
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 87
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 83
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 90
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 84
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 78
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 87
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 78
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 78
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 86
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 81
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 79
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 77
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 84
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 77
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 74
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "◆",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 78
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "次",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 94
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "次",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 109
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "次",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 124
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "天",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 109
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "前",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 62
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "班",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 64
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "班",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 50
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "班",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 50
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "班",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 70
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "班",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 83
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "班",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 52
+  },
+  {
+   "doc": "xlsx_clean",
+   "type": "text_chunk",
+   "last_char": "周",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 50
+  },
+  {
+   "doc": "pptx_cost",
+   "type": "text_chunk",
+   "last_char": "部",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 70
+  },
+  {
+   "doc": "pptx_cost",
+   "type": "text_chunk",
+   "last_char": "训",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 19
+  },
+  {
+   "doc": "pptx_cost",
+   "type": "text_chunk",
+   "last_char": "算",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 69
+  },
+  {
+   "doc": "pptx_bagasse",
+   "type": "text_chunk",
+   "last_char": "品",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 18
+  },
+  {
+   "doc": "pptx_bagasse",
+   "type": "text_chunk",
+   "last_char": "解",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 255
+  },
+  {
+   "doc": "pptx_bagasse",
+   "type": "text_chunk",
+   "last_char": "0",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 229
+  },
+  {
+   "doc": "pptx_bagasse",
+   "type": "text_chunk",
+   "last_char": "证",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 373
+  },
+  {
+   "doc": "docx_water",
+   "type": "text_chunk",
+   "last_char": "C",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 363
+  },
+  {
+   "doc": "docx_water",
+   "type": "text_chunk",
+   "last_char": "o",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 227
+  },
+  {
+   "doc": "docx_water",
+   "type": "text_chunk",
+   "last_char": "理",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 414
+  },
+  {
+   "doc": "docx_qc",
+   "type": "text_chunk",
+   "last_char": "、",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 267
+  },
+  {
+   "doc": "docx_qc",
+   "type": "text_chunk",
+   "last_char": "，",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 257
+  },
+  {
+   "doc": "docx_qc",
+   "type": "text_chunk",
+   "last_char": "6",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 1248
+  },
+  {
+   "doc": "docx_qc",
+   "type": "text_chunk",
+   "last_char": "利",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 1122
+  },
+  {
+   "doc": "docx_qc",
+   "type": "text_chunk",
+   "last_char": "放",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 481
+  },
+  {
+   "doc": "docx_qc",
+   "type": "text_chunk",
+   "last_char": "1",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 513
+  },
+  {
+   "doc": "docx_qc",
+   "type": "text_chunk",
+   "last_char": "日",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 72
+  },
+  {
+   "doc": "docx_itctrl",
+   "type": "clause_chunk",
+   "last_char": "义",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 168
+  },
+  {
+   "doc": "docx_fire",
+   "type": "text_chunk",
+   "last_char": "救",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 613
+  },
+  {
+   "doc": "docx_fire",
+   "type": "text_chunk",
+   "last_char": "理",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 470
+  },
+  {
+   "doc": "docx_car",
+   "type": "clause_chunk",
+   "last_char": "养",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 121
+  },
+  {
+   "doc": "docx_car",
+   "type": "clause_chunk",
+   "last_char": "日",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 113
+  },
+  {
+   "doc": "docx_smoking",
+   "type": "clause_chunk",
+   "last_char": "理",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 169
+  },
+  {
+   "doc": "docx_forklift",
+   "type": "clause_chunk",
+   "last_char": "露",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 349
+  },
+  {
+   "doc": "docx_forklift",
+   "type": "clause_chunk",
+   "last_char": "定",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 88
+  },
+  {
+   "doc": "docx_forklift",
+   "type": "clause_chunk",
+   "last_char": "定",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 133
+  },
+  {
+   "doc": "docx_forklift",
+   "type": "clause_chunk",
+   "last_char": "录",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 100
+  },
+  {
+   "doc": "docx_jobresp",
+   "type": "text_chunk",
+   "last_char": "0",
+   "tail": "[正文已剥离·public repo]",
+   "head": "[正文已剥离·public repo]",
+   "n_chars": 305
+  }
+ ],
+ "_scrubbed": "正文与真实人名已剥离（public repo）；结构化指标与文档标题保留，结论可复核"
+}

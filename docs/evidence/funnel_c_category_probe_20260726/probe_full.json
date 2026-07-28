@@ -1,0 +1,772 @@
+[
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 1,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 2,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 3,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 4,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 5,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 6,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 7,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 8,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "visual_knowledge",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 9,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 10,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 11,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 12,
+  "group": "f3_discard",
+  "note": "GT期望",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 13,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 14,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "decorative",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 15,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 16,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "inspection_photo",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 17,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "decorative",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 18,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 19,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 20,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "inspection_photo",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 21,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "inspection_photo",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 22,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "product_photo",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 23,
+  "group": "f3_discard",
+  "note": "GT期望",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 24,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "inspection_photo",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 25,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "inspection_photo",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 26,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 27,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 28,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "decorative",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 29,
+  "group": "f3_discard",
+  "note": "GT期望",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 30,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 31,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 32,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 33,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 34,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 35,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 36,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 37,
+  "group": "f3_discard",
+  "note": "GT不要",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_sop",
+  "image_index": 1,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_sop",
+  "image_index": 2,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "inspection_photo",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_sop",
+  "image_index": 3,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "visual_knowledge",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_sop",
+  "image_index": 4,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_sop",
+  "image_index": 5,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_sop",
+  "image_index": 6,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_sop",
+  "image_index": 7,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_sop",
+  "image_index": 9,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_sop",
+  "image_index": 10,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_sop",
+  "image_index": 11,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "decorative",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_travel_subsidy",
+  "image_index": 3,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_travel_subsidy",
+  "image_index": 4,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_u8_unapprove",
+  "image_index": 0,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_u8_unapprove",
+  "image_index": 1,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_u8_unapprove",
+  "image_index": 3,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_u8_unapprove",
+  "image_index": 4,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_u8_unapprove",
+  "image_index": 5,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_u8_unapprove",
+  "image_index": 6,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_xs_wi_007",
+  "image_index": 0,
+  "group": "f3_discard",
+  "note": "无GT",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "logo_header",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_xs_wi_007",
+  "image_index": 1,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_xs_wi_007",
+  "image_index": 2,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "visual_knowledge",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_xs_wi_007",
+  "image_index": 26,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_xs_wi_007",
+  "image_index": 27,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_xs_wi_007",
+  "image_index": 28,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_xs_wi_007",
+  "image_index": 29,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_xs_wi_007",
+  "image_index": 30,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_xs_wi_007",
+  "image_index": 41,
+  "group": "kept",
+  "note": "无GT",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 1,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 2,
+  "group": "f3_discard",
+  "note": "GT期望",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "decorative",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 3,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 4,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 5,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 6,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 7,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "product_photo",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 8,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "visual_knowledge",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 9,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 10,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 11,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 12,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "form_image",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 13,
+  "group": "kept",
+  "note": "GT期望",
+  "vlm_status": "CLEAN",
+  "image_category": "visual_knowledge",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ }
+]

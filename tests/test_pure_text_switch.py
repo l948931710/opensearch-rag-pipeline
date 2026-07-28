@@ -52,7 +52,12 @@ def fake_cfg(monkeypatch):
         # 用真实 RAGConfig 默认值构造 rag mock：自动带上 _format_context 读取的所有
         # 字段（score_threshold_*, rerank_score_threshold_*, pure_text 等），
         # 避免生产端新增配置字段后 mock 漂移再次 AttributeError。
-        rag=RAGConfig(pure_text=False),
+        # img_id_whitelist 显式关掉：本文件测的是 **pure_text 开关**选哪个 base prompt，
+        # 不是规则 13。#F-mm15 于 2026-07-27 翻默认 ON 后，图文分支的 prompt 变成
+        # DEFAULT + 规则13，这里的逐字节等值断言就不再成立 —— 隔离掉才是对的，
+        # 把断言放宽成 startswith 会连"选错 base prompt"都测不出来
+        # （TEXT_ONLY 是 DEFAULT 的前缀，startswith 永远真）。
+        rag=RAGConfig(pure_text=False, img_id_whitelist=False),
         # 同理用真实 LLMConfig 默认值构造 llm mock（自动带上 enable_thinking 等），
         # 仅覆盖测试关心的 endpoint/model。
         llm=LLMConfig(

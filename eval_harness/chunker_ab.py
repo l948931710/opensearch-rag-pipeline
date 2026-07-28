@@ -18,7 +18,7 @@ env(避免 `@lru_cache get_config()` 缓存污染),config_fingerprint 跨 arm �
 CLI 示例:
     python -m eval_harness.chunker_ab \\
         --mode binding_only \\
-        --arm 'off' --arm-env 'off:' \\
+        --arm 'off' --arm-env 'off:RAG_IMAGE_CONTENT_OVERRIDE=0' \\
         --arm 'on'  --arm-env 'on:RAG_IMAGE_CONTENT_OVERRIDE=1' \\
         --gt-file ~/Downloads/opensearch-rag-data/eval_samples/ground_truth/gt_pdf_analysis.json \\
         --docs-dir ~/Downloads/opensearch-rag-data/eval_samples/documents \\
@@ -718,7 +718,10 @@ class ChunkerAB:
 def _parse_arm_env(spec: str) -> Tuple[str, Dict[str, str]]:
     """`name:K1=V1,K2=V2` → (name, {K1: V1, K2: V2}).
 
-    空 env 允许:`off:` → ('off', {}).
+    空 env 允许:`off:` → ('off', {}) —— 语义是"**不覆盖**任何变量、继承父进程与代码
+    默认"，**不等于把某个开关关掉**。2026-07-25 起 `RAG_IMAGE_CONTENT_OVERRIDE`
+    默认 ON，因此 OFF arm 必须写成显式 `off:RAG_IMAGE_CONTENT_OVERRIDE=0`；
+    仍写 `off:` 会让两个 arm 都跑 ON、A/B 静默失真。
     """
     if ":" not in spec:
         raise ValueError(f"--arm-env 格式必须是 'name:K=V[,K=V]': {spec!r}")
@@ -746,7 +749,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--arm", action="append", required=True,
                     help="arm 名(可重复 — 必须 2 个,如 'off' 'on')")
     ap.add_argument("--arm-env", action="append", default=[],
-                    help="arm env override: 'name:K1=V1,K2=V2'(可重复)。空 env: 'off:'")
+                    help=("arm env override: 'name:K1=V1,K2=V2'(可重复)。空 env 'off:' = 不覆盖、"
+                          "继承父进程与代码默认——**不等于关开关**；关某开关须显式写 "
+                          "'off:RAG_IMAGE_CONTENT_OVERRIDE=0'"))
     ap.add_argument("--out", required=True, help="输出目录")
     ap.add_argument("--seed", type=int, default=20260614)
     # Tier 0 specific

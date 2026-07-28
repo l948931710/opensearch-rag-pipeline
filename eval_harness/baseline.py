@@ -153,10 +153,19 @@ def regime_of(results: Dict) -> Dict:
 # VLM 指纹哨兵(2026-07-20 xlsx 绑定漂移 P2)：vlm_model / vlm_cache_version 同理——
 # visual_summary 是 l4ing.jaccard.* 与 l6.image_binding 的输入,VLM 换代或缓存版本提升
 # = 全部图 caption 重掷,分数不可与前次直接比较(0.8917→0.7167 曾烧一晚二分定位)。
+# l4_ingestion_evaluator_version(2026-07-25 M3)：L4-ing 的 GT→产出卡匹配判定链自身
+# 就会移动 l4ing.jaccard.*。code_commit 虽被 _regime() 记录却刻意不在本元组里（它对
+# 任何无关提交都变，进闸即噪声源），结果"改了尺子"与"改了管线"在差量网里此前完全
+# 无法区分。本键**刻意不进** _LENIENT_REGIME_KEYS：老 baseline 缺该键即 mismatch，
+# 强制重冻——跨口径静默比较比 N/A 危险得多。
 _REGIME_KEYS = ("eval_set_sha", "fusion", "rerank_enable", "llm_model",
                 "embedding_model", "reranker_models", "threshold_version",
                 "judge_model", "judge_rubric_version",
-                "vlm_model", "vlm_cache_version", "l4_gt_sha")
+                "vlm_model", "vlm_cache_version", "l4_gt_sha",
+                "l4_ingestion_evaluator_version", "funnel_policy",
+                "l6_evaluator_version",
+                "l1_matcher_version",
+                "l4_serving_evaluator_version")
 # P2-24 向后兼容宽容窗口：judge_model / judge_rubric_version 是 2026-07 新增 regime 键,
 # 存量 baseline.json 里没有——老基线缺该键（None）视为匹配,新 freeze 起自动带上;
 # 一旦 baseline 里有值,就按普通键严格比较。refreeze 需在用户机器上跑 live eval

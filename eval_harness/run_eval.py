@@ -74,6 +74,18 @@ def _l4_gt_files() -> list:
     ] if os.path.exists(p)]
 
 
+def _l4_ingestion_evaluator_version() -> "str | None":
+    """L4-ingestion 判定口径的语义版本（单一来源在 binding.ingestion_binding）。
+
+    import 失败 fail-open 成 None——与 harness 其余 regime helper 同款，绝不让指纹
+    采集把整轮 eval 打挂。"""
+    try:
+        from .binding.ingestion_binding import L4_INGESTION_EVALUATOR_VERSION
+        return L4_INGESTION_EVALUATOR_VERSION
+    except Exception:
+        return None
+
+
 def _l4_gt_sha() -> "str | None":
     """L4 GT 组合指纹:basename+内容,按名排序(顺序无关)。数据仓不可达 → None
     (CI 无数据仓;走 baseline._LENIENT_REGIME_KEYS 宽容窗口)。"""
@@ -88,6 +100,49 @@ def _l4_gt_sha() -> "str | None":
     for name, blob in blobs:
         h.update(name.encode("utf-8")); h.update(b"\0"); h.update(blob); h.update(b"\0")
     return h.hexdigest()[:16]
+
+
+def _l6_evaluator_version() -> "str | None":
+    """L6 判定口径的语义版本（单一来源在 layers.l6_chunk_quality）。import 失败 fail-open。"""
+    try:
+        from .layers.l6_chunk_quality import L6_EVALUATOR_VERSION
+        return L6_EVALUATOR_VERSION
+    except Exception:
+        return None
+
+
+def _l4_serving_evaluator_version() -> "str | None":
+    """L4-serving 判定口径的语义版本（单一来源在 mm_answer_metrics）。import 失败 fail-open。"""
+    try:
+        from .mm_answer_metrics import L4SRV_EVALUATOR_VERSION
+        return L4SRV_EVALUATOR_VERSION
+    except Exception:
+        return None
+
+
+def _l1_matcher_version() -> "str | None":
+    """L1 标题匹配口径的语义版本（单一来源在 matching.py）。import 失败 fail-open。"""
+    try:
+        from .matching import MATCHER_VERSION
+        return MATCHER_VERSION
+    except Exception:
+        return None
+
+
+def _funnel_policy():
+    """当前漏斗弃图判据的标签（选项 C）。**历史判据回 None 而不是空串**。
+
+    它进的是 `_REGIME_KEYS` 的严格段（不在 lenient 窗口里）。历史判据回 None 是为了让
+    存量 baseline（根本没有这个键、取值 `None`）不至于凭空多一条失配。
+    ⚠️ **2026-07-26 起 C 默认 ON**，所以默认姿态下本函数返回的是 `"c1"` 而非 None，
+    与任何历史基线**硬失配** —— 这正是要的（跨判据比较必须强制重冻），但"默认姿态下该键
+    完全隐形"那句已随翻默认过期，此处订正。
+    """
+    try:
+        from opensearch_pipeline.ingest_flags import effective_funnel_policy_version
+        return effective_funnel_policy_version() or None
+    except Exception:
+        return None
 
 
 def _regime(cfg, goldset_path: str) -> dict:
@@ -148,6 +203,27 @@ def _regime(cfg, goldset_path: str) -> dict:
         # sha 覆盖面内——GT 重标会静默移动 l4ing.* 而基线网无感知(clean 战役当天实证:
         # 液压泵/电机螺丝两行 GT 修正对基线完全隐形)。老 baseline 缺键走宽容窗口。
         "l4_gt_sha": _l4_gt_sha(),
+        # L4-ing 评测口径指纹(2026-07-25 M3)：GT→产出卡的匹配判定链本身会移动
+        # l4ing.jaccard.*，而 code_commit 虽被记录却**不在** _REGIME_KEYS 里
+        # (它对任何无关提交都变，进闸就是噪声源)——于是"改了尺子"和"改了管线"在
+        # 差量网里此前完全无法区分。本键只在判定口径变化时手工 bump，
+        # **不进** _LENIENT_REGIME_KEYS：跨口径比较必须硬失败、强制重冻。
+        "l4_ingestion_evaluator_version": _l4_ingestion_evaluator_version(),
+        # L6 判定口径指纹（2026-07-27）：与上面 L4 那条同款用途 —— 改**尺子**会移动 l6.*，
+        # 而 code_commit 不在 _REGIME_KEYS 里，不进 regime 就无法与"管线变好了"区分。
+        "l6_evaluator_version": _l6_evaluator_version(),
+        # L1 标题归一口径指纹（2026-07-27）：gold_doc_rank 只看归一后的标题，改口径直接移动
+        # 全部 l1.* recall —— 与上面两条同款，不进 regime 就无法与"检索变好了"区分。
+        "l1_matcher_version": _l1_matcher_version(),
+        # L4-serving 判定口径指纹（2026-07-27）：orphan 分母从"全部带图 chunk"收窄到
+        # "标记真的进了 context 的图"，会移动 l4srv.orphan_rate —— 同 l4_ingestion/l6/l1
+        # 三条先例，改尺子必须与"模型放图变好了"可区分。
+        "l4_serving_evaluator_version": _l4_serving_evaluator_version(),
+        # 漏斗弃图判据指纹(2026-07-26 选项 C)：它决定**哪些图能进知识库**，是 l4ing.*
+        # 与 L6 图指标的上游输入 —— 换判据后的分数与换判据前的不可直接比较（更要命的是
+        # 方向会骗人：救回的图进 Jaccard 并集只会压低分，看起来像回归其实是修复）。
+        # **不进** _LENIENT_REGIME_KEYS：跨判据比较必须硬失败、强制重冻。
+        "funnel_policy": _funnel_policy(),
         "code_commit": commit,
     }
 

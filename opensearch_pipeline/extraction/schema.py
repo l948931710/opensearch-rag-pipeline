@@ -22,6 +22,29 @@ _PSEUDO_HEADING_PREFIX_RE = re.compile(
     r'^[\s　>·•\-–—]*[①-⑳⓪-⓿❶-❿]'
 )
 
+# 整行只有整数的标注号行（"18"、多 token 的 "13  16"）。用 \d（Unicode 十进制数字）
+# 而非 [0-9] 是**有意的**：全角 "１８" 属同一形态，同样是画在截图上的标注号（有测试钉）。
+# 含点编号（4.1 / 3.2.4）刻意不匹配 —— 它们是合法节标题，驱动切块边界。
+_BARE_NUMERIC_CALLOUT_RE = re.compile(r'^[\s　]*\d+(?:[\s　]+\d+)*[\s　]*$')
+
+
+def is_bare_numeric_callout(text: str) -> bool:
+    """整行只有整数 ⇒ 画在截图上的标注号，不是节标题（PDF-D3，2026-07-25）。
+
+    **刻意不并入 is_pseudo_heading**：后者是 PDF/DOCX 共享接口，DOCX 的 heading 来自
+    样式（作者意图），纯数字标题在那里未必是误判；本判据只服务 **PDF 的字号/加粗版面
+    启发**（pdf_extractor 的 looks_callout 同时 veto 这两路；regex fallback 不受影响，
+    纯数字本就不命中它）。
+
+    实证（《U8弃审》作业指导书，图内标注号是纯阿拉伯数字 1–24 而非圈号）：这些行以标题
+    字号渲染 → 字号启发判成 heading → ①section_path 被污染成 '7'/'13  16'，②chunker
+    按 heading 建步骤组，孵出正文只有 "18"/"21"/"22" 的 step_card，**把图全抢走**，真正
+    的 step_no=4/5/6 卡 image_refs 为空。
+    """
+    if not text:
+        return False
+    return bool(_BARE_NUMERIC_CALLOUT_RE.match(text))
+
 
 def is_pseudo_heading(text: str) -> bool:
     """标注式 callout 行被 PDF 字号/加粗启发误判为 heading 时，会把

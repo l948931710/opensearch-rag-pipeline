@@ -42,7 +42,7 @@ made `dangling` blind to the most common failure: figure-phrase + zero markers
                aggregate() maps it for replay compatibility.
 """
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from opensearch_pipeline.content_blocks_builder import (
     _extract_image_chunks,
@@ -117,10 +117,30 @@ def dump_dangling_cases(per_answer: List[Dict[str, Any]],
     return out
 
 
+L4SRV_EVALUATOR_VERSION = "2.0.0"
+# 2.0.0 (2026-07-27)：orphan 分母收窄到「模型实际看得见的图」。见 analyze_answer 的
+# `context` 参数。旧口径同时保留为 orphan_rate_all，便于逐轮对照。
+
+# `<<IMG:N>>` 与其子下标形式 `<<IMG:N.m>>`（RAG_IMG_SUBINDEX 开时 context 发的是后者）。
+_VISIBLE_MARKER_TMPL = r"<{{1,2}}IMG:{n}(?:\.\d+)?>{{1,2}}"
+
+
+def _visible_indices(image_map: Dict[int, Any], context: Optional[str]) -> set:
+    """`image_map` 里**标记真的进了 context** 的那些文档号。
+
+    `context is None` → 退回全量（老调用方 / 回放旧 det 时的兼容路径）。
+    """
+    if context is None:
+        return set(image_map.keys())
+    return {n for n in image_map
+            if re.search(_VISIBLE_MARKER_TMPL.format(n=n), context)}
+
+
 def analyze_answer(
     answer: str,
     used_chunks: List[Dict[str, Any]],
     max_images: int = 6,
+    context: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Per-answer deterministic placement metrics (referenced-only semantics).
 
@@ -132,9 +152,26 @@ def analyze_answer(
                     (config.rag.max_answer_images / RAG_MAX_ANSWER_IMAGES) — the
                     old default 3 mismatched production and skewed
                     n_shown/over_cap/avg_images_shown.
+        context: `_format_context` 给模型的那一份上下文串。给了就把 orphan 的分母收窄到
+                 **标记真的进了 context** 的图（见下）。不给 → 老口径（全量）。
+
+    orphan 分母为什么必须是"可见集"（2026-07-27）
+    ─────────────────────────────────────────────
+    `available` 原本数的是**全部**带图 chunk，但 `_format_context` 有 `max_context_chars`
+    （6000）预算，尾部 chunk 会被截掉 —— 它们的 `<<IMG:N>>` 根本没进 context，模型看不见，
+    自然引用不了，却照样计入 orphan 分母。实测 35 题：available 152 / **可见仅 110**，
+    即 **27.6% 的分母是模型无从引用的图**。最典型 QA-94：9 个可用、只有 1 个可见、模型
+    引用了那 1 个 —— 实际 **1/1 全对**，旧口径记成 1/9。
+
+    这与本模块文档串自称的语义（"High orphan rate = the model isn't *placing* images"）
+    直接矛盾：27.6% 的部分与"placing"无关，只与截断有关。
+
+    收窄后 orphan_rate 0.6184 → 0.4727，**仍高于 0.30 soft 门槛** —— 这不是往绿了调。
+    旧口径保留为 `orphan_rate_all`，逐轮可对照。
     """
     image_map = _extract_image_chunks(used_chunks)  # {1-based idx: [img dicts]}
-    available = set(image_map.keys())
+    available_all = set(image_map.keys())
+    available = _visible_indices(image_map, context)
 
     markers = [int(m.group(1)) for m in _IMG_PLACEHOLDER_PATTERN.finditer(answer)]
     invalid = [n for n in markers if n not in image_map]
@@ -168,7 +205,12 @@ def analyze_answer(
 
     return {
         # availability / what gets shown
-        "n_available": len(available),
+        "n_available": len(available),             # 可见集（模型真能引用的）
+        # 旧口径（全量带图 chunk）—— 保留以便逐轮对照"收窄了多少"，不参与闸门。
+        "n_available_all": len(available_all),
+        "n_orphan_all": len(available_all - referenced),
+        "orphan_rate_all": ((len(available_all - referenced) / len(available_all))
+                            if available_all else None),
         "n_shown": n_shown,
         "n_referenced_images": n_referenced_images,
         # rendered_any = card 实际出图（answer_image_rate 的分子；referenced-only 主指标）
@@ -229,6 +271,9 @@ def aggregate(per_answer: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     total_available = sum(a["n_available"] for a in with_imgs)
     total_orphan = sum(a["n_orphan"] for a in with_imgs)
+    # 旧口径合计（老 det 缺这两个键时退回新口径值，回放兼容）
+    total_available_all = sum(a.get("n_available_all", a["n_available"]) for a in with_imgs)
+    total_orphan_all = sum(a.get("n_orphan_all", a["n_orphan"]) for a in with_imgs)
     total_markers = sum(a["n_markers"] for a in per_answer)
     # in-range / distinct occurrences (fallbacks recompute from older stored dets lacking the new keys)
     total_inrange = sum(a.get("n_inrange_markers", a["n_markers"] - a["n_invalid_markers"])
@@ -252,6 +297,11 @@ def aggregate(per_answer: List[Dict[str, Any]]) -> Dict[str, Any]:
         "answer_image_rate": _safe_mean([1.0 if _rendered(a) else 0.0 for a in with_imgs]),
         "interleave_rate": _safe_mean([1.0 if a["interleaved"] else 0.0 for a in with_imgs]),
         "orphan_rate": (total_orphan / total_available) if total_available else None,
+        # 旧口径（全量分母）：与上一行的差 = 被 max_context_chars 截掉、模型无从引用的图
+        "orphan_rate_all": ((total_orphan_all / total_available_all)
+                            if total_available_all else None),
+        "n_available_visible": total_available,
+        "n_available_all": total_available_all,
         # validity = in-range occurrences / total occurrences (reuse not penalised)
         "marker_validity": (total_inrange / total_markers) if total_markers else None,
         # advisory: distinct in-range images / in-range occurrences (1.0 = no reuse)

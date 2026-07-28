@@ -66,6 +66,12 @@ def run(cases: List[Dict], top_k: int = 10, stitch_window: int = 1) -> Dict:
             "publicly_retrievable": _publicly_retrievable(c),
             "live_scorable": c.get("live_scorable"),
             "expected_permission": c.get("expected_permission"),
+            # rerank 是否真的跑了。regime 里的 `rerank_enable` 是【配置意图】，这个是【实况】：
+            # rerank_chunks 的 fail-open 只写 warning 就按融合序返回，此前逐题记录里毫无痕迹，
+            # 于是"被重排的题"和"悄悄没重排的题"混进同一个 recall@1。20260726 重冻的 gate.log
+            # 里就有 2 次读超时 fail-open。degraded 的题做排序 A/B 是无效样本，必须能剔出来。
+            "rerank_degraded": next((r.get("_rerank_degraded") for r in res
+                                     if r.get("_rerank_degraded")), None),
             "gold_rank": rank, "found_top10": bool(rank),
             "top1_score": scores[0] if scores else None,
             "top3_scores": scores[:3], "n_results": len(res),
@@ -134,6 +140,10 @@ def run(cases: List[Dict], top_k: int = 10, stitch_window: int = 1) -> Dict:
         "permission_gated_qids": [q["qid"] for q in gated],
         "n_negative": len(negs),
         "errors": [q["qid"] for q in per_query if q["error"]],
+        # rerank 实况（≠ regime 里的配置意图）：>0 表示本轮有题是按融合序打的分，
+        # 排序类结论对这些题不成立。qid 一并列出，A/B 时可直接剔除。
+        "n_rerank_degraded": sum(1 for q in per_query if q.get("rerank_degraded")),
+        "rerank_degraded_qids": [q["qid"] for q in per_query if q.get("rerank_degraded")],
         "ranking": summary,
         "ranking_multidoc": summary_multidoc,
         "content_hit_rate": content_hit_rate,

@@ -1,0 +1,159 @@
+{
+ "doc": "pdf_it_xxh_003",
+ "scheme": "v2 image_index（漏斗前分配，与判决无关）",
+ "method": "逐图目视 + 源 PDF 逐页正文佐证；未参考 manifest/chunk/漏斗产出",
+ "annotations": {
+  "0": {
+   "belongs_to": "none",
+   "evidence": "页眉公司 logo，每页重复；非内容图"
+  },
+  "1": {
+   "belongs_to": "overview",
+   "evidence": "封面 4 宫格元件合影（盒装 CPU/主板/显卡/显示器）——文档级概览，不对应任一步骤动作"
+  },
+  "2": {
+   "belongs_to": "step1",
+   "evidence": "CPU 正面（金属顶盖）。p1「上图中我们可以看到，LGA 775接口的英特尔处理器全部采…」"
+  },
+  "3": {
+   "belongs_to": "step1",
+   "evidence": "CPU 背面触点。p1「32位的处理器采用了478针脚结构，而64位的则全部统一到LGA775平台」"
+  },
+  "4": {
+   "belongs_to": "step1",
+   "evidence": "手向下微压压杆。p2「用适当的力向下微压固定CPU的压杆，同时用力往外推压杆」"
+  },
+  "5": {
+   "belongs_to": "step1",
+   "evidence": "压杆拉起、插座露出触点。p2「压杆脱离卡扣后，我们便可以顺利的将压杆拉起」"
+  },
+  "6": {
+   "belongs_to": "step1",
+   "evidence": "提起固定盖。p2「接下来，我们将固定处理器的盖子与压杆反方向提起」"
+  },
+  "7": {
+   "belongs_to": "step1",
+   "evidence": "LGA775 插座全貌。p3「LGA 775插座展现在我们的眼前」"
+  },
+  "8": {
+   "belongs_to": "step1",
+   "evidence": "三角标识对齐。p3「处理器上印有三角标识的那个角要与主板上印有三角标识的那个角对齐」"
+  },
+  "9": {
+   "belongs_to": "step1",
+   "evidence": "双手将 CPU 轻压到位。p3「然后慢慢的将处理器轻压到位」"
+  },
+  "10": {
+   "belongs_to": "step1",
+   "evidence": "扣盖盖好、压杆扣下。p4「将CPU安放到位以后，盖好扣盖，并反方向微用力扣下处理器的压杆」"
+  },
+  "11": {
+   "belongs_to": "step2",
+   "evidence": "原装散热器顶视（风扇面）。p4「**上图**是 Intel LGA775 针接口处理器的原装散热器」——显式图注引用"
+  },
+  "12": {
+   "belongs_to": "step2",
+   "evidence": "同一散热器侧视（露铜底）。同上「上图」指代"
+  },
+  "13": {
+   "belongs_to": "step2",
+   "evidence": "风扇插头接 CPU_FAN。p5「找到主板上安装风扇的接口（主板上的标识字符为 CPU_FAN），将风扇插头插放即可」"
+  },
+  "14": {
+   "belongs_to": "step3",
+   "evidence": "主板内存插槽（双通道同色槽）。p5「在相同颜色的内存插槽中插入两条规格相同的内存」"
+  },
+  "15": {
+   "belongs_to": "step3",
+   "evidence": "双手将内存条压入插槽。p5「先用手将内存插槽两端的扣具打开，然后将内存平行放入内存插槽中」"
+  },
+  "16": {
+   "belongs_to": "step4",
+   "evidence": "主板放入机箱。p6「双手平行托住主板，将主板放入机箱中」"
+  },
+  "17": {
+   "belongs_to": "step4",
+   "evidence": "机箱背部 I/O 挡板。p6「确定机箱安放到位，可以通过机箱背部的主板挡板来确定」"
+  },
+  "18": {
+   "belongs_to": "step4",
+   "evidence": "螺丝刀拧主板螺丝。p6「拧紧螺丝，固定好主板」"
+  },
+  "19": {
+   "belongs_to": "step4",
+   "evidence": "主板已装入机箱全景。p7「主板安静的躺入到机箱中，安装过程结束」"
+  },
+  "20": {
+   "belongs_to": "step5",
+   "evidence": "3.5 寸硬盘托架扳手。p7「机箱中固定3.5寸托架的扳手，拉动此扳手即可固定或取下3.5寸硬盘托架」"
+  },
+  "21": {
+   "belongs_to": "step5",
+   "evidence": "第五步 硬盘固定（p7 段落配图）"
+  },
+  "22": {
+   "belongs_to": "step5",
+   "evidence": "取出后的托架。p8「取出后的3.5寸硬盘托架」"
+  },
+  "23": {
+   "belongs_to": "step5",
+   "evidence": "硬盘装入托架。p8「将硬盘装入托架中，并拧紧螺丝」"
+  },
+  "24": {
+   "belongs_to": "step5",
+   "evidence": "拧紧托架螺丝（p8 同句配图）"
+  },
+  "25": {
+   "belongs_to": "step5",
+   "evidence": "托架重新装入机箱。p9「将托架重新装入机箱，并将固定扳手拉回原位固定好硬盘托架」"
+  },
+  "26": {
+   "belongs_to": "step6",
+   "evidence": "光驱＋抽拉式托架。p9「在安装前，我们先要将类似于抽屉设计的托架安装到光驱上」"
+  },
+  "27": {
+   "belongs_to": "step6",
+   "evidence": "光驱推入机箱托架。p10「像推拉抽屉一样，将光驱推入机箱托架中」"
+  },
+  "28": {
+   "belongs_to": "step6",
+   "evidence": "机箱正面已装光驱、可见簧片。p10「机箱安装到位，需要取下时，用两手按们将两边的簧片，即可以拉出」"
+  },
+  "29": {
+   "belongs_to": "step6",
+   "evidence": "机箱电源安装。p10「机箱电源的安装，放入到位后，拧紧螺丝即可」"
+  },
+  "30": {
+   "belongs_to": "step7",
+   "evidence": "主板 PCI-E 插槽（空槽）。p11「主板上的PCI-E显卡插槽」——逐字对应"
+  },
+  "31": {
+   "belongs_to": "step7",
+   "evidence": "双手装显卡。p11「用手轻握显卡两端，垂直对准主板上的显卡插槽，向下轻压到位」"
+  },
+  "32": {
+   "belongs_to": "step7",
+   "evidence": "IDE 排线插入主板。p12「安装主板上的IDE数据线」——逐字对应"
+  },
+  "33": {
+   "belongs_to": "step7",
+   "evidence": "24PIN 主板供电接口。p12「主板供电电源接口…目前大部分主板采用了24PIN的供电电源设计」"
+  },
+  "34": {
+   "belongs_to": "step7",
+   "evidence": "四针 CPU 加强供电插头正在接入。p13「CPU供电接口，在部分采用四针的加强供电接口设计」"
+  },
+  "35": {
+   "belongs_to": "step7",
+   "evidence": "SATA 口＋前面板接线。p13「主板上SATA硬盘、USB及机箱开关、重启、硬盘工作指示灯接口」"
+  },
+  "36": {
+   "belongs_to": "step7",
+   "evidence": "额外显卡供电接口。p13「在SLI或交火的主板上…一般提供额外的显卡供电接口」"
+  },
+  "37": {
+   "belongs_to": "closing",
+   "evidence": "整机内部、线缆已整理。p14「对机箱内的各种线缆进行简单的整理，以提供良好的散热空间」"
+  }
+ }
+}

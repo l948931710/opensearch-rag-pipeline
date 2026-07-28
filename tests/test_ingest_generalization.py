@@ -73,9 +73,11 @@ def _fake_funnel(monkeypatch, funnel_result):
         def __init__(self, simulate=True):
             pass
 
-        def _static_heuristics(self, local_path):
+        def screen_static(self, local_path):
             # 让嵌入图路径的 Funnel-1 预过滤恒通过（真实现读文件尺寸/大小）
-            return 200, 120, 10.0
+            # A11：唯一入口从 _static_heuristics 换成 screen_static（带 verdict/error）
+            return {"width": 200, "height": 120, "file_size_kb": 10.0,
+                    "aspect_ratio": 1.67, "verdict": "OK", "error": ""}
 
         def process_image(self, local_path, doc_id, is_public=True, doc_title=""):
             return dict(funnel_result)

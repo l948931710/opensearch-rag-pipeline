@@ -1,0 +1,1178 @@
+{
+ "deterministic": {
+  "img_dup_factor_p95": 1.0,
+  "img_dup_factor_max": 1.0,
+  "n_degraded_docs": 2,
+  "errors": [],
+  "per_fmt": {
+   "pdf": {
+    "n_docs": 3,
+    "n_degraded_docs": 0,
+    "n_strong_chunks": 30,
+    "mean_jaccard": 0.8777799999999999,
+    "std_jaccard": 0.28002745727443623
+   },
+   "xlsx": {
+    "n_docs": 4,
+    "n_degraded_docs": 1,
+    "n_strong_chunks": 19,
+    "mean_jaccard": 1.0,
+    "std_jaccard": 0.0
+   },
+   "pptx": {
+    "n_docs": 3,
+    "n_degraded_docs": 1,
+    "n_strong_chunks": 0,
+    "mean_jaccard": null,
+    "std_jaccard": null
+   },
+   "docx": {
+    "n_docs": 20,
+    "n_degraded_docs": 3,
+    "n_strong_chunks": 689,
+    "mean_jaccard": 0.9898,
+    "std_jaccard": 0.013902530839305175,
+    "_source": "strict_fixture"
+   },
+   "unknown": {
+    "n_docs": 4,
+    "n_degraded_docs": 0,
+    "n_strong_chunks": 0,
+    "mean_jaccard": null,
+    "std_jaccard": null
+   }
+  },
+  "binding_jaccard_pdf": 0.8777799999999999,
+  "binding_jaccard_xlsx": 1.0,
+  "binding_jaccard_pptx": null,
+  "binding_jaccard_docx": 0.9898,
+  "binding_jaccard_unknown": null
+ },
+ "judge_bundle_binding": [
+  {
+   "qid": "pdf_sop::步骤1.1 收取交货单",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "收取",
+    "交货单",
+    "标识卡",
+    "机台",
+    "货号",
+    "核对"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 1,
+     "page": 1
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 1,
+     "page_num": 1,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_sop::步骤1.2 核对错误处理",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "核对错误",
+    "群通知",
+    "班长",
+    "成品",
+    "竖起"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 2,
+     "page": 1
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 2,
+     "page_num": 1,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_sop::步骤1.3 抄录订单信息",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "抄录",
+    "订单",
+    "信息",
+    "时间",
+    "机台",
+    "数量"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 3,
+     "page": 1
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 3,
+     "page_num": 1,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_sop::步骤2 交货单分类",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "交货单",
+    "分类",
+    "放置",
+    "班次",
+    "货号"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 4,
+     "page": 2
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 4,
+     "page_num": 2,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_sop::步骤3.1 U8扫码报检",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "U8",
+    "扫码",
+    "报检",
+    "业务导航",
+    "质量管理"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 5,
+     "page": 2
+    },
+    {
+     "image_index": 6,
+     "page": 2
+    },
+    {
+     "image_index": 9,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 5,
+     "page_num": 2,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 6,
+     "page_num": 2,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 0.6667
+  },
+  {
+   "qid": "pdf_sop::步骤3.2 扫码枪扫描",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "扫码枪",
+    "条形码",
+    "扫描",
+    "红光"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 7,
+     "page": 2
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 7,
+     "page_num": 2,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": ""
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_sop::步骤4.1 填写设备班次",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "设备",
+    "班次",
+    "数量",
+    "机台",
+    "ZS"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 10,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 9,
+     "page_num": 3,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 10,
+     "page_num": 3,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 0.5
+  },
+  {
+   "qid": "pdf_sop::步骤4.2 班组人员",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "班组人员",
+    "修改",
+    "报检",
+    "备注",
+    "报检异常"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 9,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 9,
+     "page_num": 3,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 10,
+     "page_num": 3,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 0.5
+  },
+  {
+   "qid": "pdf_sop::步骤5 群通知完成",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "群通知",
+    "报检完成",
+    "注塑车间",
+    "仓管"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 11,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 11,
+     "page_num": 3,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤1 按产品标识卡清点实货",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "产品标识卡",
+    "清点",
+    "定单号",
+    "机台号",
+    "抄录",
+    "纸箱"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 1,
+     "page": 1
+    },
+    {
+     "image_index": 2,
+     "page": 1
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 1,
+     "page_num": 1,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 2,
+     "page_num": 1,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤2 收集核对交货单",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "收集",
+    "交货单",
+    "班长",
+    "异常",
+    "产品规格",
+    "尾数"
+   ],
+   "expected_image_refs": [],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 1,
+     "page_num": 1,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 2,
+     "page_num": 1,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 0.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤3 进入U8扫码报检界面",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "U8系统",
+    "扫码报检",
+    "桌面",
+    "帐号密码",
+    "登录",
+    "双击"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 26,
+     "page": 2
+    },
+    {
+     "image_index": 27,
+     "page": 2
+    },
+    {
+     "image_index": 28,
+     "page": 2
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 26,
+     "page_num": 2,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 27,
+     "page_num": 2,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 28,
+     "page_num": 2,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤4 扫码枪扫描交货单",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "扫码枪",
+    "红光",
+    "条形码",
+    "扫描",
+    "交货单"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 29,
+     "page": 2
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 29,
+     "page_num": 2,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤5.1 报检主流程(填写设备班次数量)",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "报检",
+    "设备",
+    "班次",
+    "数量",
+    "XS-D06",
+    "交货单"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 30,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 41,
+     "page_num": 3,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 0.0
+  },
+  {
+   "qid": "pdf_xs_wi_007::步骤5.2 报检异常流程(增加人员)",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "增加",
+    "输入人名",
+    "模糊查询",
+    "双击编码",
+    "重新分配",
+    "带不出人员"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 41,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 41,
+     "page_num": 3,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::第一步 安装CPU处理器",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "CPU",
+    "LGA775",
+    "处理器",
+    "三角标识",
+    "插座",
+    "压杆"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 8,
+     "page": 3
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 8,
+     "page_num": 3,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::第二步 安装散热器",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "散热器",
+    "导热硅脂",
+    "扣具",
+    "CPU_FAN",
+    "风扇接口"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 12,
+     "page": 4
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 12,
+     "page_num": 4,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::第四步 将主板安装固定到机箱中",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "主板",
+    "机箱",
+    "ATX",
+    "MATX",
+    "垫脚螺母",
+    "挡板"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 16,
+     "page": 6
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 16,
+     "page_num": 6,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": ""
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::第五步 安装硬盘",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "硬盘",
+    "3.5寸托架",
+    "扳手",
+    "螺丝",
+    "WD",
+    "Seagate"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 20,
+     "page": 7
+    },
+    {
+     "image_index": 21,
+     "page": 7
+    },
+    {
+     "image_index": 22,
+     "page": 8
+    },
+    {
+     "image_index": 23,
+     "page": 8
+    },
+    {
+     "image_index": 24,
+     "page": 8
+    },
+    {
+     "image_index": 25,
+     "page": 9
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 20,
+     "page_num": 7,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 21,
+     "page_num": 7,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": ""
+    },
+    {
+     "image_index": 22,
+     "page_num": 8,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 23,
+     "page_num": 8,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 24,
+     "page_num": 8,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": ""
+    },
+    {
+     "image_index": 25,
+     "page_num": 9,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "pdf_it_xxh_003::第六步 安装光驱、电源",
+   "kind": "binding",
+   "fmt": "pdf",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "光驱",
+    "电源",
+    "4.25寸托架",
+    "抽拉式",
+    "DVD",
+    "簧片"
+   ],
+   "expected_image_refs": [
+    {
+     "image_index": 27,
+     "page": 10
+    },
+    {
+     "image_index": 29,
+     "page": 10
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 27,
+     "page_num": 10,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 29,
+     "page_num": 10,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": ""
+    },
+    {
+     "image_index": 31,
+     "page_num": 11,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 0.6667
+  },
+  {
+   "qid": "xlsx_sop::步骤1-调水平",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "调水平",
+    "水平泡",
+    "中心圆圈",
+    "底角",
+    "使用前"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 10
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 0,
+     "anchor_row": 10,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_sop::步骤2-仪器开启",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "电源",
+    "on/off",
+    "启动",
+    "预热",
+    "30分钟"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 11
+    },
+    {
+     "block_index": 15
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 1,
+     "anchor_row": 11,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 3,
+     "anchor_row": 15,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": ""
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_sop::步骤4-天平调零",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "调零",
+    "0/T",
+    "归零",
+    "操作面板"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 12,
+     "filename": "xlsx_sop_sheet0_img0002.jpeg"
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 2,
+     "anchor_row": 12,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_sop::步骤5-样品称重",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "称重",
+    "读数",
+    "示值稳定",
+    "托盘"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 14
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 5,
+     "anchor_row": 14,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_sop::步骤6-仪器关闭",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "关闭",
+    "拔掉电源",
+    "长时间不使用"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 12,
+     "filename": "xlsx_sop_sheet0_img0004.jpeg"
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 4,
+     "anchor_row": 12,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_inspect::步骤1 外箱检验",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "外箱检验",
+    "生产日期",
+    "箱唛",
+    "标识卡"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 7,
+     "filename": "xlsx_inspect_sheet0_img0000.png"
+    }
+   ],
+   "produced_chunk_type": "step_card",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 0,
+     "anchor_row": 7,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_clean::片材机·控制面板清扫 (设备本体)",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "控制面板",
+    "无黑手印",
+    "按键标识清晰",
+    "重油清洗剂"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 8,
+     "filename": "xlsx_clean_sheet2_img0021.jpeg"
+    }
+   ],
+   "produced_chunk_type": "text_chunk",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 21,
+     "anchor_row": 8,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_clean::每班清扫·齿轮油点检",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "★齿轮油",
+    "不低于50",
+    "目视"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 13,
+     "filename": "xlsx_clean_sheet2_img0023.png"
+    }
+   ],
+   "produced_chunk_type": "text_chunk",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 23,
+     "anchor_row": 13,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": ""
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_clean::点检项目·链条总成 (目测松紧)",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "链条总成",
+    "丝杆，链条，链轨"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 22,
+     "filename": "xlsx_clean_sheet1_img0007.jpeg"
+    }
+   ],
+   "produced_chunk_type": "text_chunk",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 7,
+     "anchor_row": 22,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_clean::设备外观点检 (整机本体)",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "设备外观",
+    "门",
+    "防护罩",
+    "仪表",
+    "标识"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 1,
+     "filename": "xlsx_clean_sheet1_img0003.jpeg"
+    }
+   ],
+   "produced_chunk_type": "text_chunk",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 3,
+     "anchor_row": 1,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_clean::每班清扫·电机螺丝点检",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "电机",
+    "电机螺丝",
+    "无晃动"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 8,
+     "filename": "xlsx_clean_sheet1_img0004.jpeg"
+    },
+    {
+     "block_index": 13,
+     "filename": "xlsx_clean_sheet2_img0017.jpeg"
+    }
+   ],
+   "produced_chunk_type": "text_chunk",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 4,
+     "anchor_row": 8,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    },
+    {
+     "image_index": 17,
+     "anchor_row": 13,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": ""
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_clean::每班清扫·主机温度点检",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "主机温度",
+    "温度",
+    "测量值",
+    "设定值"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 4,
+     "filename": "xlsx_clean_sheet2_img0014.jpeg"
+    }
+   ],
+   "produced_chunk_type": "text_chunk",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 14,
+     "anchor_row": 4,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  },
+  {
+   "qid": "xlsx_clean::点检项目·电气系统 (空开/电机/烘箱)",
+   "kind": "binding",
+   "fmt": "xlsx",
+   "gt_label": "[正文已剥离·public repo]",
+   "gt_keywords": [
+    "电气系统",
+    "空开",
+    "线接头",
+    "温控表",
+    "烘箱"
+   ],
+   "expected_image_refs": [
+    {
+     "block_index": 23,
+     "filename": "xlsx_clean_sheet1_img0010.jpeg"
+    }
+   ],
+   "produced_chunk_type": "text_chunk",
+   "produced_chunk_text_excerpt": "[正文已剥离·public repo]",
+   "produced_image_refs": [
+    {
+     "image_index": 10,
+     "anchor_row": 23,
+     "visual_summary": "[正文已剥离·public repo]",
+     "ocr_text": "[正文已剥离·public repo]"
+    }
+   ],
+   "jaccard_score": 1.0
+  }
+ ],
+ "_scrubbed": "正文与真实人名已剥离（public repo）；结构化指标与文档标题保留，结论可复核"
+}

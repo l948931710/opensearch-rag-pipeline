@@ -9,6 +9,8 @@ import os
 import sys
 import types
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("RAG_ENV", "test")
 
@@ -135,6 +137,88 @@ def test_g9_fallback_when_migration_missing():
     legacy_sql, _ = cur.executed[0]
     assert "index_status='FAILED'" in legacy_sql
     assert "index_retry_count" not in legacy_sql
+
+
+# ═══════════════════ A4（2026-07-25）：重试预算 = 连续失败次数 ═══════════════════
+# 两处语义修正：① 干净成功路径把 index_retry_count 清零（此前只增不减 → "累计 3 次"
+# 而非"连续 3 次"即转 DEAD，旧版本停用被完整性闸永久推迟）；② PARITY_UNKNOWN
+# （HA3 读不到、无法确认）不消耗预算——一次读故障会把整批健康 chunk 打进 unknown 桶。
+
+def test_a4_unknown_bucket_does_not_consume_retry_budget():
+    import opensearch_pipeline.pipeline_nodes as pn
+    cur = _ScriptedCursor()
+    dead = pn._fail_chunks_with_retry_budget(
+        cur, ["c1", "c2"],
+        extra_set_sql=", index_error_code=%s, index_error_message=%s",
+        extra_params=["PARITY_UNKNOWN", "unconfirmable"], count_retry=False)
+    assert dead == []                              # 不计数 ⇒ 不产生死信
+    sql, params = cur.executed[0]
+    assert "index_retry_count" not in sql          # 既不 +1 也不判 DEAD
+    assert "index_status='FAILED'" in sql          # 但照常回写 FAILED（下轮重选）
+    assert params[0] == "PARITY_UNKNOWN"
+    assert len(cur.executed) == 1                  # 不计数路径无 DEAD 探测 SELECT
+
+
+def test_a4_unknown_bucket_keeps_all_or_nothing_semantics():
+    """count_retry=False 仍守 expect_all：部分写回会让 chunk 停在 INDEXED 永不重选。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    class _ShortWrite(_ScriptedCursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            self.rowcount = 1                      # 目标 2 行，只改到 1 行
+
+    with pytest.raises(RuntimeError, match="state-persistence failure"):
+        pn._fail_chunks_with_retry_budget(
+            _ShortWrite(), ["c1", "c2"], expect_all=True, count_retry=False)
+
+
+def test_a4_parity_unknown_call_site_passes_count_retry_false():
+    """调用点契约：三个桶里只有 UNKNOWN 不计数（DROP/DRIFT 必须照旧消耗预算）。"""
+    import inspect
+    import opensearch_pipeline.pipeline_nodes as pn
+    src = inspect.getsource(pn._persist_parity_failed_and_raise)
+    assert 'count_retry=(code != "PARITY_UNKNOWN")' in " ".join(src.split())
+
+
+def test_a4_clean_success_path_resets_retry_count():
+    """分组成功 UPDATE 必须清零；且只在这条路径清（逐条分支只收非 INDEXED / 带 error 的
+    chunk，在那里清零等于抹掉真失败的重试预算）。"""
+    import inspect
+    import opensearch_pipeline.pipeline_nodes as pn
+    src = inspect.getsource(pn.node_update_index_status)
+    flat = " ".join(src.split())
+    assert '"index_retry_count = 0," if _has_retry_col else ""' in flat
+    assert flat.count("index_retry_count = 0,") == 1, "只允许干净成功路径清零"
+    # 列是否存在必须【只读探测】，不得用"写失败再回退"（见下一条测试的理由）
+    assert "_has_retry_col = _chunk_meta_has_index_retry(cursor)" in flat
+
+
+def test_a4_column_probe_is_read_only_and_fail_closed():
+    """迁移 019 未应用时不能靠"先试带列的 UPDATE、1054 再回退"来探测：本连接栈上一条
+    失败语句会丢弃同一事务里已提交前的所有写（pymysql 1054→OperationalError→SteadyDB
+    透明重连→隐式回滚），会把同事务的 opensearch_bulk_job 状态更新一起蒸发。"""
+    import opensearch_pipeline.pipeline_nodes as pn
+
+    class _Cur:
+        def __init__(self, cnt=None, boom=False):
+            self.cnt, self.boom, self.sqls = cnt, boom, []
+
+        def execute(self, sql, params=None):
+            self.sqls.append(sql)
+            if self.boom:
+                raise RuntimeError("information_schema unavailable")
+
+        def fetchone(self):
+            return (self.cnt,)
+
+    cur = _Cur(cnt=1)
+    assert pn._chunk_meta_has_index_retry(cur) is True
+    assert "information_schema" in cur.sqls[0].lower()
+    assert cur.sqls[0].lstrip().upper().startswith("SELECT"), "探测必须只读"
+    assert pn._chunk_meta_has_index_retry(_Cur(cnt=0)) is False
+    # 探测本身失败 → 按"列不存在"处理（宁可不清零，也不能发出会炸事务的 SQL）
+    assert pn._chunk_meta_has_index_retry(_Cur(boom=True)) is False
 
 
 def test_g9_dead_chunks_mark_doc_needs_review():
@@ -276,7 +360,9 @@ def _funnel_with_category(monkeypatch, category, enabled):
     else:
         monkeypatch.delenv("RAG_IMAGE_STRUCT_EXTRACT", raising=False)
     p = ImageFunnelProcessor(simulate=True)
-    monkeypatch.setattr(p, "_static_heuristics", lambda path: (800, 600, 120.0))
+    monkeypatch.setattr(p, "screen_static",
+                        lambda path: {"width": 800, "height": 600, "file_size_kb": 120.0,
+                                      "aspect_ratio": 1.33, "verdict": "OK", "error": ""})
     monkeypatch.setattr(p.ocr_client, "ocr_image",
                         lambda path, doc_id: types.SimpleNamespace(combined_text="轴标签 数值"))
     monkeypatch.setattr(p, "_vlm_audit_and_summary",
@@ -356,9 +442,18 @@ def test_g8_daily_ledger_failopen(monkeypatch):
     assert abs(added[-1] + est.est_cost_rmb) < 1e-6              # 退款负记账
 
 
+def _isolate_ocr_page_cache(monkeypatch, tmp_path):
+    """A5（2026-07-25）：缓存路径已改为**绝对**（DataWorks 在临时解压目录跑，相对路径每次落到
+    不同位置）。因此测试不能再靠 chdir 隔离——那会让本用例写进仓库共享的
+    scratch/ocr_page_cache.sqlite3，下一次运行第一遍就命中缓存、断言 0 == 2。"""
+    import opensearch_pipeline.extraction.ocr_client as oc
+    monkeypatch.setattr(oc, "_ocr_page_cache_path",
+                        lambda: str(tmp_path / "scratch" / "ocr_page_cache.sqlite3"))
+
+
 def test_g8_ocr_page_cache_hits_skip_api(monkeypatch, tmp_path):
     from opensearch_pipeline.extraction.ocr_client import OCRClient
-    monkeypatch.chdir(tmp_path)                                  # scratch/ 落 tmp
+    _isolate_ocr_page_cache(monkeypatch, tmp_path)
     OCRClient._page_cache = None                                 # 隔离类级单例
     monkeypatch.setenv("RAG_OCR_PAGE_CACHE", "true")
     client = OCRClient(api_key="k", simulate=False, ocr_model="qwen-vl-test")
@@ -376,7 +471,7 @@ def test_g8_ocr_page_cache_hits_skip_api(monkeypatch, tmp_path):
 
 def test_g8_ocr_page_cache_disabled_flag(monkeypatch, tmp_path):
     from opensearch_pipeline.extraction.ocr_client import OCRClient
-    monkeypatch.chdir(tmp_path)
+    _isolate_ocr_page_cache(monkeypatch, tmp_path)
     OCRClient._page_cache = None
     monkeypatch.setenv("RAG_OCR_PAGE_CACHE", "false")
     client = OCRClient(api_key="k", simulate=False, ocr_model="qwen-vl-test")

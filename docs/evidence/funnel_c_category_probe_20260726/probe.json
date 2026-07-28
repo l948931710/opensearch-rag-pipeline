@@ -1,0 +1,132 @@
+[
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 12,
+  "group": "drift",
+  "note": "GT 第二步 安装散热器",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 23,
+  "group": "drift",
+  "note": "GT 第五步 安装硬盘",
+  "vlm_status": "CLEAN",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 29,
+  "group": "drift",
+  "note": "GT 第六步 安装光驱、电源",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 2,
+  "group": "drift",
+  "note": "GT 步骤2 打印纸质版发货单",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "decorative",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 13,
+  "group": "dark",
+  "note": "人眼=手插CPU风扇供电线，真步骤图",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 31,
+  "group": "dark",
+  "note": "人眼=装机手，GT 第七步 note 承认被漏斗弃",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 2,
+  "group": "dark",
+  "note": "白底 CPU 产品照（封面页）",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 4,
+  "group": "dark",
+  "note": "—",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 26,
+  "group": "dark",
+  "note": "—",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 35,
+  "group": "dark",
+  "note": "p13，第七步区间",
+  "vlm_status": "LOW_RELEVANCE",
+  "image_category": "unknown",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 8,
+  "group": "keep",
+  "note": "GT 第一步 安装CPU（今天保留）",
+  "vlm_status": "CLEAN",
+  "image_category": "visual_knowledge",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_it_xxh_003",
+  "image_index": 20,
+  "group": "keep",
+  "note": "GT 第五步（今天保留）",
+  "vlm_status": "CLEAN",
+  "image_category": "inspection_photo",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ },
+ {
+  "doc": "pdf_zs_wi_009",
+  "image_index": 5,
+  "group": "keep",
+  "note": "GT 步骤3（今天保留）",
+  "vlm_status": "CLEAN",
+  "image_category": "step_screenshot",
+  "caption": "[正文已剥离·public repo]",
+  "degraded": false
+ }
+]
