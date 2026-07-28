@@ -65,7 +65,8 @@ def _run_serving(cases: List[Dict], top_k: int, max_images: int,
             continue
         ans = gen["answer"]
         det = M.analyze_answer(ans, chunks, max_images=max_images,
-                               context=gen.get("context"))
+                               context=gen.get("context"),
+                               included_doc_indices=gen.get("included_doc_indices"))
         det_list.append(det)
         breadths.append(c.get("query_breadth") or "specific")
         per_query.append({"qid": c["qid"], "query": c["query"], "answer": ans, **det})
@@ -73,7 +74,9 @@ def _run_serving(cases: List[Dict], top_k: int, max_images: int,
             judge_bundle.append({
                 "qid": c["qid"], "query": c["query"],
                 "expected_images": c.get("expected_images", []),
-                "shown_image_captions": det.get("image_map_summary", {}),
+                # rubric 定义的是「卡片实际展示的图」⇒ 必须喂 post-rotation 的 shown_image_summary，
+                # 而不是全量候选 image_map_summary（codex BLOCKER-2）。
+                "shown_image_captions": det.get("shown_image_summary", {}),
                 "n_available": det["n_available"], "strategy": det["strategy"],
                 "answer": ans,
             })
@@ -149,7 +152,8 @@ def _run_history_arm(cases: List[Dict], top_k: int, max_images: int) -> Dict:
         mimic = bool(hist_ns & ans_ns)
         mimic_flags.append(mimic)
         det = M.analyze_answer(ans, chunks, max_images=max_images,
-                               context=gen.get("context"))
+                               context=gen.get("context"),
+                               included_doc_indices=gen.get("included_doc_indices"))
         per_query.append({
             "qid": c["qid"], "query": c["query"], "answer": ans,
             "history_marker_ns": sorted(hist_ns), "answer_marker_ns": sorted(ans_ns),

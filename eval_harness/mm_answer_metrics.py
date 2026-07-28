@@ -117,19 +117,33 @@ def dump_dangling_cases(per_answer: List[Dict[str, Any]],
     return out
 
 
-L4SRV_EVALUATOR_VERSION = "2.0.0"
-# 2.0.0 (2026-07-27)：orphan 分母收窄到「模型实际看得见的图」。见 analyze_answer 的
-# `context` 参数。旧口径同时保留为 orphan_rate_all，便于逐轮对照。
+L4SRV_EVALUATOR_VERSION = "3.0.0"
+# 2.0.0 (2026-07-27)：orphan 分母收窄到「模型实际看得见的图」。
+# 3.0.0 (2026-07-27, codex 复核后)：**全部** serving 主指标（marker_validity / n_shown /
+#   dangling / distinctness / strategy…）改按可见集判——2.0.0 只收窄了 orphan 分母,
+#   marker_validity 仍按全量算,于是"引用了未进 context 的图"被判合法而生产实渲染 0 张。
+#   同时拆出独立的 referenced_all（旧口径不再被主口径污染）、新增 post-rotation 的
+#   shown_image_summary 供 MM judge、可见集优先取结构化 included_doc_indices。
 
 # `<<IMG:N>>` 与其子下标形式 `<<IMG:N.m>>`（RAG_IMG_SUBINDEX 开时 context 发的是后者）。
 _VISIBLE_MARKER_TMPL = r"<{{1,2}}IMG:{n}(?:\.\d+)?>{{1,2}}"
 
 
-def _visible_indices(image_map: Dict[int, Any], context: Optional[str]) -> set:
-    """`image_map` 里**标记真的进了 context** 的那些文档号。
+def _visible_indices(image_map: Dict[int, Any], context: Optional[str],
+                     included_doc_indices: "Optional[List[int]]" = None) -> set:
+    """`image_map` 里**模型实际看得见**的那些文档号。
 
-    `context is None` → 退回全量（老调用方 / 回放旧 det 时的兼容路径）。
+    优先级（codex PROPOSED-3）：
+      1. `included_doc_indices` —— `_format_context_ex` 返回的**结构化**可见集，与生产
+         `build_content_blocks(..., included_indices=…)` 同源，是权威判据；
+      2. `context` 正则扫 —— 仅作**回放兼容**（老 det 没有结构化字段）。正则扫的是整个
+         context 串，文档正文若自带字面量 `<<IMG:N>>` 会污染判定（现网实测 0 例，但
+         结构化源不受此影响，故优先）；
+      3. 都没有 → 全量（老调用方语义不变）。
     """
+    if included_doc_indices is not None:
+        vis = set(included_doc_indices)
+        return {n for n in image_map if n in vis}
     if context is None:
         return set(image_map.keys())
     return {n for n in image_map
@@ -141,6 +155,7 @@ def analyze_answer(
     used_chunks: List[Dict[str, Any]],
     max_images: int = 6,
     context: Optional[str] = None,
+    included_doc_indices: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Per-answer deterministic placement metrics (referenced-only semantics).
 
@@ -171,24 +186,38 @@ def analyze_answer(
     """
     image_map = _extract_image_chunks(used_chunks)  # {1-based idx: [img dicts]}
     available_all = set(image_map.keys())
-    available = _visible_indices(image_map, context)
+    available = _visible_indices(image_map, context, included_doc_indices)
 
     markers = [int(m.group(1)) for m in _IMG_PLACEHOLDER_PATTERN.finditer(answer)]
-    invalid = [n for n in markers if n not in image_map]
-    # first-reference order (production referenced_order): drives rotation quota
+    # ── 两套集合，互不污染（codex BLOCKER-1）────────────────────────────────
+    # 主 serving 指标一律走 **visible**：生产 `build_content_blocks(..., included_indices=…)`
+    # 会把未进 context 的文档从 image_map 里删掉,引用它们**渲染不出任何图**。
+    # 旧口径（*_all）单独用 `referenced_all` 算,否则改一处就把对照基准也改了。
+    invalid = [n for n in markers if n not in available]          # 渲染不出图 ⇒ 非法
     referenced_in_order: List[int] = []
     for n in markers:
-        if n in image_map and n not in referenced_in_order:
+        if n in available and n not in referenced_in_order:
             referenced_in_order.append(n)
     referenced = set(referenced_in_order)
-    orphans = available - referenced  # NOT shown at all (referenced-only rendering)
+    orphans = available - referenced
+
+    # 旧口径（全量 image_map，不看可见性）——只供逐轮对照，不进任何闸门
+    referenced_all = {n for n in markers if n in image_map}
+    orphans_all = available_all - referenced_all
 
     # What the card actually renders (referenced-only): round-robin rotation over
     # the REFERENCED docs' images, capped at max_images — the same quota semantics
     # as production (plan_image_rotation is the shared single source).
-    n_referenced_images = sum(len(image_map[n]) for n in referenced_in_order)
-    n_shown = sum(plan_image_rotation(
-        [len(image_map[n]) for n in referenced_in_order], max_images))
+    _ref_counts = [len(image_map[n]) for n in referenced_in_order]
+    n_referenced_images = sum(_ref_counts)
+    _plan = plan_image_rotation(_ref_counts, max_images)
+    n_shown = sum(_plan)
+    # post-rotation 的**实际展示图**（codex BLOCKER-2）：MM judge 的 rubric 写的是
+    # "卡片实际展示的图",此前喂的却是全量 image_map ⇒ 语义通道也在测错东西。
+    shown_image_summary = {
+        n: [(im.get("visual_summary", "") or "")[:50] for im in image_map[n][:k]]
+        for n, k in zip(referenced_in_order, _plan) if k > 0
+    }
 
     has_fig_phrase = bool(_FIGURE_REF_RE.search(answer or ""))
     # under referenced-only, zero valid markers → card renders [] → a figure
@@ -208,8 +237,8 @@ def analyze_answer(
         "n_available": len(available),             # 可见集（模型真能引用的）
         # 旧口径（全量带图 chunk）—— 保留以便逐轮对照"收窄了多少"，不参与闸门。
         "n_available_all": len(available_all),
-        "n_orphan_all": len(available_all - referenced),
-        "orphan_rate_all": ((len(available_all - referenced) / len(available_all))
+        "n_orphan_all": len(orphans_all),
+        "orphan_rate_all": ((len(orphans_all) / len(available_all))
                             if available_all else None),
         "n_shown": n_shown,
         "n_referenced_images": n_referenced_images,
@@ -247,10 +276,13 @@ def analyze_answer(
         "dangling_ref": dangling,
         # context for the audit / judge
         "available_idxs": sorted(available),
+        # 全量候选图（诊断用）。⚠️ **不要**再把它当 "shown" 喂给 MM judge。
         "image_map_summary": {
             i: [(im.get("visual_summary", "") or "")[:50] for im in v]
             for i, v in image_map.items()
         },
+        # post-rotation 实际展示图 —— MM judge 的 shown_image_captions 应取这个
+        "shown_image_summary": shown_image_summary,
     }
 
 
@@ -272,8 +304,13 @@ def aggregate(per_answer: List[Dict[str, Any]]) -> Dict[str, Any]:
     total_available = sum(a["n_available"] for a in with_imgs)
     total_orphan = sum(a["n_orphan"] for a in with_imgs)
     # 旧口径合计（老 det 缺这两个键时退回新口径值，回放兼容）
-    total_available_all = sum(a.get("n_available_all", a["n_available"]) for a in with_imgs)
-    total_orphan_all = sum(a.get("n_orphan_all", a["n_orphan"]) for a in with_imgs)
+    # 旧口径必须用**独立**分母（codex BLOCKER-1 的后半）：沿用 with_imgs（按新口径
+    # n_available>0 过滤）会把"全部图都被截断"的题整题排除,逐题 orphan_rate_all=1.0
+    # 聚合却返回 None ⇒ 根本无法逐轮对照。
+    with_imgs_all = [a for a in per_answer
+                     if a.get("n_available_all", a.get("n_available", 0)) > 0]
+    total_available_all = sum(a.get("n_available_all", a["n_available"]) for a in with_imgs_all)
+    total_orphan_all = sum(a.get("n_orphan_all", a["n_orphan"]) for a in with_imgs_all)
     total_markers = sum(a["n_markers"] for a in per_answer)
     # in-range / distinct occurrences (fallbacks recompute from older stored dets lacking the new keys)
     total_inrange = sum(a.get("n_inrange_markers", a["n_markers"] - a["n_invalid_markers"])

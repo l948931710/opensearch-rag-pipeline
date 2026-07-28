@@ -38,7 +38,12 @@ def generate_answer_nothink(
         raise RuntimeError("LLM API Key 未配置")
 
     _pure = config.rag.pure_text if pure_text is None else pure_text
-    context = L._format_context(context_chunks, max_chars=max_context_chars, pure_text=_pure)
+    context, _included_chunks = L._format_context_ex(
+        context_chunks, max_chars=max_context_chars, pure_text=_pure)
+    # 与 llm_generator 逐字同款的算法：进了 context 的 chunk 的 1-based 文档号。
+    # L4 用它作**权威可见集**（比正则扫 context 串可靠：不受文档正文自带 <<IMG:N>> 干扰）。
+    _included_doc_indices = [i + 1 for i, c in enumerate(context_chunks)
+                             if any(c is x for x in _included_chunks)]
     # ⚠️ 必须走生产的 `_select_system_prompt`，**不要**在这里重抄一份
     # `TEXT_ONLY if _pure else DEFAULT`。原先抄的那份在 #F-mm14 落地当天就让 A/B 变成
     # 假 ON：flag 只改了 llm_generator 的两条生产路径，评测走的是这里的复制品，
@@ -79,4 +84,5 @@ def generate_answer_nothink(
         # 返回**实际喂给模型**的 context：L4-srv 的 orphan 分母要按它收窄到
         # "标记真的进了 context 的图"。让调用方重算会有参数漂移风险,故由生成方给出。
         "context": context,
+        "included_doc_indices": _included_doc_indices,
     }

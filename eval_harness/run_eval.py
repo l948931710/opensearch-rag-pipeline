@@ -111,6 +111,23 @@ def _l6_evaluator_version() -> "str | None":
         return None
 
 
+def _l4_serving_set_sha() -> "str | None":
+    """L4-serving 专用题集的内容指纹。解析路径必须与实际加载逻辑同源（默认/自定义/
+    置空关闭/文件不存在四种情况），否则指纹与真正跑的题集脱节。"""
+    import hashlib
+    try:
+        p = os.environ.get("EVAL_L4_SERVING_GOLDSET")
+        if p is None:
+            p = os.path.join(HERE, "goldset", "golden_l4_serving.json")
+        if not p:
+            return "disabled"                      # 显式置空 = 不并入
+        if not os.path.exists(p):
+            return "missing"
+        return hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
+    except Exception:
+        return None
+
+
 def _l4_serving_evaluator_version() -> "str | None":
     """L4-serving 判定口径的语义版本（单一来源在 mm_answer_metrics）。import 失败 fail-open。"""
     try:
@@ -219,6 +236,9 @@ def _regime(cfg, goldset_path: str) -> dict:
         # "标记真的进了 context 的图"，会移动 l4srv.orphan_rate —— 同 l4_ingestion/l6/l1
         # 三条先例，改尺子必须与"模型放图变好了"可区分。
         "l4_serving_evaluator_version": _l4_serving_evaluator_version(),
+        # L4-serving 的**专用题集**指纹：_regime 的 eval_set_sha 只哈希主 goldset，而 L4
+        # 运行时会并入 golden_l4_serving.json——改那份题集,旧基线仍被判"可比"。
+        "l4_serving_set_sha": _l4_serving_set_sha(),
         # 漏斗弃图判据指纹(2026-07-26 选项 C)：它决定**哪些图能进知识库**，是 l4ing.*
         # 与 L6 图指标的上游输入 —— 换判据后的分数与换判据前的不可直接比较（更要命的是
         # 方向会骗人：救回的图进 Jaccard 并集只会压低分，看起来像回归其实是修复）。

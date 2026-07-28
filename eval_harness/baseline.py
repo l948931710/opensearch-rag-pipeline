@@ -165,7 +165,8 @@ _REGIME_KEYS = ("eval_set_sha", "fusion", "rerank_enable", "llm_model",
                 "l4_ingestion_evaluator_version", "funnel_policy",
                 "l6_evaluator_version",
                 "l1_matcher_version",
-                "l4_serving_evaluator_version")
+                "l4_serving_evaluator_version",
+                "l4_serving_set_sha")
 # P2-24 向后兼容宽容窗口：judge_model / judge_rubric_version 是 2026-07 新增 regime 键,
 # 存量 baseline.json 里没有——老基线缺该键（None）视为匹配,新 freeze 起自动带上;
 # 一旦 baseline 里有值,就按普通键严格比较。refreeze 需在用户机器上跑 live eval

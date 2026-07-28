@@ -1,0 +1,25 @@
+{
+ "note": "L4SRV 2.0.0(全量口径) vs 3.0.0(可见集) 同一批答案重算，35 题图 case",
+ "full_criterion": {
+  "marker_validity": 0.9863,
+  "dangling_ref_rate": 0.0286,
+  "orphan_rate": 0.5658,
+  "answer_image_rate": 0.7931,
+  "marker_distinctness": 0.9167,
+  "over_cap_rate": 0.3103,
+  "avg_images_shown": 3.2069
+ },
+ "visible_criterion_v3": {
+  "marker_validity": 0.9863,
+  "dangling_ref_rate": 0.0286,
+  "orphan_rate": 0.4,
+  "answer_image_rate": 0.8214,
+  "marker_distinctness": 0.9167,
+  "over_cap_rate": 0.3214,
+  "avg_images_shown": 3.3214
+ },
+ "n_answers_referencing_invisible_image": 1,
+ "n_of_those_with_figure_phrase": 0,
+ "n_answers": 35,
+ "verdict": "两个硬门指标(marker_validity/dangling)读数完全不变;唯一实质变化是 advisory 的 orphan_rate 0.5658→0.4000。修复正确且反例真实(生产实渲 0 张),但当前语料几乎不触发。"
+}

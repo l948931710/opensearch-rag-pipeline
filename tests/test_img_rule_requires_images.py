@@ -130,9 +130,12 @@ def test_all_generation_paths_use_the_single_selector():
     import opensearch_pipeline.llm_generator as G
     from eval_harness import gen_nothink as N
 
+    # 第三项 2026-07-27 由 `_format_context` 改为 `_format_context_ex`：L4 需要它同时返回
+    # 结构化的 included chunks（权威可见集）。本测试钉的是**顺序不变量**（context 先于
+    # 选 prompt），不是具体函数名——改名时同步这里即可。
     targets = [(G, "generate_answer", "_format_context_ex"),
                (G, "generate_answer_stream", "_format_context_ex"),
-               (N, "generate_answer_nothink", "_format_context")]
+               (N, "generate_answer_nothink", "_format_context_ex")]
     for mod, fn, fmt_name in targets:
         tree = ast.parse(inspect.getsource(mod))
         node = next(n for n in ast.walk(tree)
