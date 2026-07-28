@@ -1,0 +1,453 @@
+{
+ "accepted": [
+  {
+   "dept": "人力资源部",
+   "query": "事故调查组组长由谁担任？",
+   "doc_id": "DOC_HR_20260514123026_B63FA8",
+   "title": "A7事故报告调查与处理程序.docx",
+   "permission_level": "public",
+   "owner_dept": "hr",
+   "entities": [
+    {
+     "entity": "事故调查组",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "组长",
+     "corpus_df": 62,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "人力资源部",
+   "query": "不可回收危险废弃物包含哪几类？",
+   "doc_id": "DOC_HR_20260514123019_31AE38",
+   "title": "A26废弃物管理程序.docx",
+   "permission_level": "public",
+   "owner_dept": "hr",
+   "entities": [
+    {
+     "entity": "不可回收",
+     "corpus_df": 4,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "危险废弃物",
+     "corpus_df": 3,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "人力资源部",
+   "query": "哪些疾病禁止从事登高作业？",
+   "doc_id": "DOC_HR_20260514123025_3B4CC5",
+   "title": "A57登高作业安全管理规定.docx",
+   "permission_level": "public",
+   "owner_dept": "hr",
+   "entities": [
+    {
+     "entity": "登高作业",
+     "corpus_df": 3,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "禁忌症",
+     "corpus_df": 4,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "人力资源部",
+   "query": "登高作业需要办理什么证件？",
+   "doc_id": "DOC_HR_20260514123025_3B4CC5",
+   "title": "A57登高作业安全管理规定.docx",
+   "permission_level": "public",
+   "owner_dept": "hr",
+   "entities": [
+    {
+     "entity": "登高作业证",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "人力资源部",
+   "query": "特种设备具体包括哪些设备类型？",
+   "doc_id": "DOC_HR_20260514123017_7CE80C",
+   "title": "A17特种设备管理程序.docx",
+   "permission_level": "public",
+   "owner_dept": "hr",
+   "entities": [
+    {
+     "entity": "特种设备",
+     "corpus_df": 5,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "客运索道",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 2,
+   "reject_reasons": []
+  },
+  {
+   "dept": "人力资源部",
+   "query": "突发性环境污染事故的报告分为哪三类？",
+   "doc_id": "DOC_HR_20260514123020_5C6099",
+   "title": "A29环境应急预案.docx",
+   "permission_level": "public",
+   "owner_dept": "hr",
+   "entities": [
+    {
+     "entity": "突发性环境污染",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "续报",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "人力资源部",
+   "query": "关务审计人员多久对保税货物做一次全面审计？",
+   "doc_id": "DOC_HR_20260514123025_DCF188",
+   "title": "A57内部审计制度(关务).docx",
+   "permission_level": "public",
+   "owner_dept": "hr",
+   "entities": [
+    {
+     "entity": "关务审计",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "保税货物",
+     "corpus_df": 4,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "人力资源部",
+   "query": "贮气装置的存放有哪些安全要求？",
+   "doc_id": "DOC_HR_20260514123021_05739E",
+   "title": "A36有害能源控制程序.docx",
+   "permission_level": "public",
+   "owner_dept": "hr",
+   "entities": [
+    {
+     "entity": "贮气装置",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "人力资源部",
+   "query": "签收外来包裹前要核对哪些信息？",
+   "doc_id": "DOC_HR_20260514123025_08FE0D",
+   "title": "A52外来包裹、邮件管理程序.docx",
+   "permission_level": "public",
+   "owner_dept": "hr",
+   "entities": [
+    {
+     "entity": "外来包裹",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "寄件人",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "人力资源部",
+   "query": "食品类废弃物料为什么要内部销毁？",
+   "doc_id": "DOC_HR_20260514123020_815CD9",
+   "title": "A27废弃物料管理程序.docx",
+   "permission_level": "public",
+   "owner_dept": "hr",
+   "entities": [
+    {
+     "entity": "废弃物料",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "牙签包",
+     "corpus_df": 3,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "行政部",
+   "query": "职能部门员工车辆停放在哪个区域？",
+   "doc_id": "DOC_ADMIN_20260513120217_64F432",
+   "title": "车辆停放示意图.xlsx",
+   "permission_level": "public",
+   "owner_dept": "admin",
+   "entities": [
+    {
+     "entity": "车辆停放",
+     "corpus_df": 5,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "职能部门",
+     "corpus_df": 26,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "研发部",
+   "query": "非技术部人员使用技术部电脑需要什么手续？",
+   "doc_id": "DOC_RD_20260611201420_8FF018",
+   "title": "企业研究开发的组织管理制度.pdf",
+   "permission_level": "public",
+   "owner_dept": "rd",
+   "entities": [
+    {
+     "entity": "技术部电脑",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "研发部",
+   "query": "公司人才引进有哪些渠道？",
+   "doc_id": "DOC_RD_20260611201420_61D861",
+   "title": "优秀人才引进管理制度.pdf",
+   "permission_level": "public",
+   "owner_dept": "rd",
+   "entities": [
+    {
+     "entity": "人才引进",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "退休返聘",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "资材部",
+   "query": "采购物资分为哪几类？A类物资指什么？",
+   "doc_id": "DOC_SUPPLY_20260611201420_410656",
+   "title": "采购控制程序（2019.8）.pdf",
+   "permission_level": "public",
+   "owner_dept": "supply",
+   "entities": [
+    {
+     "entity": "采购物资",
+     "corpus_df": 6,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "A类物资",
+     "corpus_df": 2,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "资材部",
+   "query": "设备验收由哪个部门组织、验收单由谁保管？",
+   "doc_id": "DOC_SUPPLY_20260611201420_38C7D1",
+   "title": "0-0-EQM02-09基础设施和工作环境控制程序.docx",
+   "permission_level": "public",
+   "owner_dept": "supply",
+   "entities": [
+    {
+     "entity": "设备验证",
+     "corpus_df": 2,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "验收单",
+     "corpus_df": 4,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "市场部",
+   "query": "亚马逊选品初选阶段的时效要求是多久？",
+   "doc_id": "DOC_MARKETING_20260611201419_AAA986",
+   "title": "亚马逊运营SOP（标准化流程）.docx",
+   "permission_level": "public",
+   "owner_dept": "marketing",
+   "entities": [
+    {
+     "entity": "选品",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "初选",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "市场部",
+   "query": "国际站业务员建立客户档案要填哪些字段？",
+   "doc_id": "DOC_MARKETING_20260611201419_9F4A04",
+   "title": "国际站业务员SOP（标准化流程）.docx",
+   "permission_level": "public",
+   "owner_dept": "marketing",
+   "entities": [
+    {
+     "entity": "客户档案",
+     "corpus_df": 12,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "客户标签",
+     "corpus_df": 2,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "市场部",
+   "query": "单瓦楞纸箱成本怎么估算？",
+   "doc_id": "DOC_MARKETING_20260611201419_C3CCB7",
+   "title": "成本核算培训.pptx",
+   "permission_level": "public",
+   "owner_dept": "marketing",
+   "entities": [
+    {
+     "entity": "单瓦楞",
+     "corpus_df": 2,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "纸箱成本",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  },
+  {
+   "dept": "市场部",
+   "query": "我国纸浆模塑制品出口均价的变化趋势如何？",
+   "doc_id": "DOC_MARKETING_20260611201419_DF1486",
+   "title": "甘蔗渣产品培训.pptx",
+   "permission_level": "public",
+   "owner_dept": "marketing",
+   "entities": [
+    {
+     "entity": "纸浆模塑",
+     "corpus_df": 10,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "出口均价",
+     "corpus_df": 1,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 0,
+   "gold_rank": 1,
+   "reject_reasons": []
+  }
+ ],
+ "rejected": [
+  {
+   "dept": "信息部",
+   "query": "显示屏亮度过高会有什么影响？",
+   "doc_id": "DOC_IT_20260513120632_28DB84",
+   "title": "FL-CW-XXH-002-《计算机日常维修》作业指导方案.pdf",
+   "permission_level": "public",
+   "owner_dept": "it",
+   "entities": [
+    {
+     "entity": "显示屏",
+     "corpus_df": 25,
+     "in_gold_doc": true
+    },
+    {
+     "entity": "亮度",
+     "corpus_df": 18,
+     "in_gold_doc": true
+    }
+   ],
+   "twins": 2,
+   "gold_rank": 1,
+   "reject_reasons": [
+    "疑似孪生：2 篇同前缀活跃文档"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,667 @@
+[
+ {
+  "qid": "SRC-26",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "人力资源部",
+  "query": "事故调查组组长由谁担任？",
+  "kind": "positive",
+  "expected_docs": [
+   "A7事故报告调查与处理程序"
+  ],
+  "expected_doc_ids": [
+   "DOC_HR_20260514123026_B63FA8"
+  ],
+  "resolution": [
+   {
+    "expected": "A7事故报告调查与处理程序",
+    "title": "A7事故报告调查与处理程序.docx",
+    "doc_id": "DOC_HR_20260514123026_B63FA8",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《A7事故报告调查与处理程序》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-27",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "人力资源部",
+  "query": "不可回收危险废弃物包含哪几类？",
+  "kind": "positive",
+  "expected_docs": [
+   "A26废弃物管理程序"
+  ],
+  "expected_doc_ids": [
+   "DOC_HR_20260514123019_31AE38"
+  ],
+  "resolution": [
+   {
+    "expected": "A26废弃物管理程序",
+    "title": "A26废弃物管理程序.docx",
+    "doc_id": "DOC_HR_20260514123019_31AE38",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《A26废弃物管理程序》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-28",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "人力资源部",
+  "query": "哪些疾病禁止从事登高作业？",
+  "kind": "positive",
+  "expected_docs": [
+   "A57登高作业安全管理规定"
+  ],
+  "expected_doc_ids": [
+   "DOC_HR_20260514123025_3B4CC5"
+  ],
+  "resolution": [
+   {
+    "expected": "A57登高作业安全管理规定",
+    "title": "A57登高作业安全管理规定.docx",
+    "doc_id": "DOC_HR_20260514123025_3B4CC5",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《A57登高作业安全管理规定》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-29",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "人力资源部",
+  "query": "登高作业需要办理什么证件？",
+  "kind": "positive",
+  "expected_docs": [
+   "A57登高作业安全管理规定"
+  ],
+  "expected_doc_ids": [
+   "DOC_HR_20260514123025_3B4CC5"
+  ],
+  "resolution": [
+   {
+    "expected": "A57登高作业安全管理规定",
+    "title": "A57登高作业安全管理规定.docx",
+    "doc_id": "DOC_HR_20260514123025_3B4CC5",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《A57登高作业安全管理规定》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-30",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "人力资源部",
+  "query": "特种设备具体包括哪些设备类型？",
+  "kind": "positive",
+  "expected_docs": [
+   "A17特种设备管理程序"
+  ],
+  "expected_doc_ids": [
+   "DOC_HR_20260514123017_7CE80C"
+  ],
+  "resolution": [
+   {
+    "expected": "A17特种设备管理程序",
+    "title": "A17特种设备管理程序.docx",
+    "doc_id": "DOC_HR_20260514123017_7CE80C",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《A17特种设备管理程序》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-31",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "人力资源部",
+  "query": "突发性环境污染事故的报告分为哪三类？",
+  "kind": "positive",
+  "expected_docs": [
+   "A29环境应急预案"
+  ],
+  "expected_doc_ids": [
+   "DOC_HR_20260514123020_5C6099"
+  ],
+  "resolution": [
+   {
+    "expected": "A29环境应急预案",
+    "title": "A29环境应急预案.docx",
+    "doc_id": "DOC_HR_20260514123020_5C6099",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《A29环境应急预案》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-32",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "人力资源部",
+  "query": "关务审计人员多久对保税货物做一次全面审计？",
+  "kind": "positive",
+  "expected_docs": [
+   "A57内部审计制度(关务)"
+  ],
+  "expected_doc_ids": [
+   "DOC_HR_20260514123025_DCF188"
+  ],
+  "resolution": [
+   {
+    "expected": "A57内部审计制度(关务)",
+    "title": "A57内部审计制度(关务).docx",
+    "doc_id": "DOC_HR_20260514123025_DCF188",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《A57内部审计制度(关务)》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-33",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "人力资源部",
+  "query": "贮气装置的存放有哪些安全要求？",
+  "kind": "positive",
+  "expected_docs": [
+   "A36有害能源控制程序"
+  ],
+  "expected_doc_ids": [
+   "DOC_HR_20260514123021_05739E"
+  ],
+  "resolution": [
+   {
+    "expected": "A36有害能源控制程序",
+    "title": "A36有害能源控制程序.docx",
+    "doc_id": "DOC_HR_20260514123021_05739E",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《A36有害能源控制程序》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-34",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "人力资源部",
+  "query": "签收外来包裹前要核对哪些信息？",
+  "kind": "positive",
+  "expected_docs": [
+   "A52外来包裹、邮件管理程序"
+  ],
+  "expected_doc_ids": [
+   "DOC_HR_20260514123025_08FE0D"
+  ],
+  "resolution": [
+   {
+    "expected": "A52外来包裹、邮件管理程序",
+    "title": "A52外来包裹、邮件管理程序.docx",
+    "doc_id": "DOC_HR_20260514123025_08FE0D",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《A52外来包裹、邮件管理程序》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-35",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "人力资源部",
+  "query": "食品类废弃物料为什么要内部销毁？",
+  "kind": "positive",
+  "expected_docs": [
+   "A27废弃物料管理程序"
+  ],
+  "expected_doc_ids": [
+   "DOC_HR_20260514123020_815CD9"
+  ],
+  "resolution": [
+   {
+    "expected": "A27废弃物料管理程序",
+    "title": "A27废弃物料管理程序.docx",
+    "doc_id": "DOC_HR_20260514123020_815CD9",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "hr"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《A27废弃物料管理程序》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-36",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "行政部",
+  "query": "职能部门员工车辆停放在哪个区域？",
+  "kind": "positive",
+  "expected_docs": [
+   "车辆停放示意图"
+  ],
+  "expected_doc_ids": [
+   "DOC_ADMIN_20260513120217_64F432"
+  ],
+  "resolution": [
+   {
+    "expected": "车辆停放示意图",
+    "title": "车辆停放示意图.xlsx",
+    "doc_id": "DOC_ADMIN_20260513120217_64F432",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "admin"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《车辆停放示意图》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-37",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "研发部",
+  "query": "非技术部人员使用技术部电脑需要什么手续？",
+  "kind": "positive",
+  "expected_docs": [
+   "企业研究开发的组织管理制度"
+  ],
+  "expected_doc_ids": [
+   "DOC_RD_20260611201420_8FF018"
+  ],
+  "resolution": [
+   {
+    "expected": "企业研究开发的组织管理制度",
+    "title": "企业研究开发的组织管理制度.pdf",
+    "doc_id": "DOC_RD_20260611201420_8FF018",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "rd"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《企业研究开发的组织管理制度》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-38",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "研发部",
+  "query": "公司人才引进有哪些渠道？",
+  "kind": "positive",
+  "expected_docs": [
+   "优秀人才引进管理制度"
+  ],
+  "expected_doc_ids": [
+   "DOC_RD_20260611201420_61D861"
+  ],
+  "resolution": [
+   {
+    "expected": "优秀人才引进管理制度",
+    "title": "优秀人才引进管理制度.pdf",
+    "doc_id": "DOC_RD_20260611201420_61D861",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "rd"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《优秀人才引进管理制度》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-39",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "资材部",
+  "query": "采购物资分为哪几类？A类物资指什么？",
+  "kind": "positive",
+  "expected_docs": [
+   "采购控制程序（2019.8）"
+  ],
+  "expected_doc_ids": [
+   "DOC_SUPPLY_20260611201420_410656"
+  ],
+  "resolution": [
+   {
+    "expected": "采购控制程序（2019.8）",
+    "title": "采购控制程序（2019.8）.pdf",
+    "doc_id": "DOC_SUPPLY_20260611201420_410656",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "supply"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《采购控制程序（2019.8）》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-40",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "资材部",
+  "query": "设备验收由哪个部门组织、验收单由谁保管？",
+  "kind": "positive",
+  "expected_docs": [
+   "0-0-EQM02-09基础设施和工作环境控制程序"
+  ],
+  "expected_doc_ids": [
+   "DOC_SUPPLY_20260611201420_38C7D1"
+  ],
+  "resolution": [
+   {
+    "expected": "0-0-EQM02-09基础设施和工作环境控制程序",
+    "title": "0-0-EQM02-09基础设施和工作环境控制程序.docx",
+    "doc_id": "DOC_SUPPLY_20260611201420_38C7D1",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "supply"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《0-0-EQM02-09基础设施和工作环境控制程序》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-41",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "市场部",
+  "query": "亚马逊选品初选阶段的时效要求是多久？",
+  "kind": "positive",
+  "expected_docs": [
+   "亚马逊运营SOP（标准化流程）"
+  ],
+  "expected_doc_ids": [
+   "DOC_MARKETING_20260611201419_AAA986"
+  ],
+  "resolution": [
+   {
+    "expected": "亚马逊运营SOP（标准化流程）",
+    "title": "亚马逊运营SOP（标准化流程）.docx",
+    "doc_id": "DOC_MARKETING_20260611201419_AAA986",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "marketing"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《亚马逊运营SOP（标准化流程）》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-42",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "市场部",
+  "query": "国际站业务员建立客户档案要填哪些字段？",
+  "kind": "positive",
+  "expected_docs": [
+   "国际站业务员SOP（标准化流程）"
+  ],
+  "expected_doc_ids": [
+   "DOC_MARKETING_20260611201419_9F4A04"
+  ],
+  "resolution": [
+   {
+    "expected": "国际站业务员SOP（标准化流程）",
+    "title": "国际站业务员SOP（标准化流程）.docx",
+    "doc_id": "DOC_MARKETING_20260611201419_9F4A04",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "marketing"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《国际站业务员SOP（标准化流程）》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-43",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "市场部",
+  "query": "单瓦楞纸箱成本怎么估算？",
+  "kind": "positive",
+  "expected_docs": [
+   "成本核算培训"
+  ],
+  "expected_doc_ids": [
+   "DOC_MARKETING_20260611201419_C3CCB7"
+  ],
+  "resolution": [
+   {
+    "expected": "成本核算培训",
+    "title": "成本核算培训.pptx",
+    "doc_id": "DOC_MARKETING_20260611201419_C3CCB7",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "marketing"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《成本核算培训》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ },
+ {
+  "qid": "SRC-44",
+  "source": "authored_20260727",
+  "module": "source_attribution",
+  "subtype": "文档级标注",
+  "dept": "市场部",
+  "query": "我国纸浆模塑制品出口均价的变化趋势如何？",
+  "kind": "positive",
+  "expected_docs": [
+   "甘蔗渣产品培训"
+  ],
+  "expected_doc_ids": [
+   "DOC_MARKETING_20260611201419_DF1486"
+  ],
+  "resolution": [
+   {
+    "expected": "甘蔗渣产品培训",
+    "title": "甘蔗渣产品培训.pptx",
+    "doc_id": "DOC_MARKETING_20260611201419_DF1486",
+    "sim": 1.0,
+    "permission_level": "public",
+    "owner_dept": "marketing"
+   }
+  ],
+  "answer_points": "答案需准确标注来源为《甘蔗渣产品培训》",
+  "pass_criteria": "来源文档级标注正确",
+  "keyword_gt": [],
+  "difficulty": null,
+  "expect_images": false,
+  "expected_images": [],
+  "expected_permission": [
+   "public"
+  ],
+  "live_scorable": true
+ }
+]
