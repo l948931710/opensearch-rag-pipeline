@@ -474,6 +474,64 @@ def _expected_family_from_meta(doc: Dict) -> Optional[set]:
     return _MODE_EXPECTED_FAMILY["text"] | _MODE_EXPECTED_FAMILY["step"]
 
 
+# ── Family D 附属：chunker 静默降级检测（消费 B17 路由留痕）──────────────────
+#
+# 为什么要单独测：`routing_match_rate` 把**两件事**混在一个数里 ——
+#   (1) 路由选错模式（router 的问题）
+#   (2) 路由选对了，但 chunker 在该模式下**空命中、静默回退**（chunker 的问题）
+# 2026-05 那批 120 篇「制度类文档产出 text_chunk」全是 (2)：`_CLAUSE_RE` 旧版漏掉真实
+# 制度编号，clause 模式切不出边界就默默降级 text（见 chunker.py `_CLAUSE_RE` 注释与
+# docs/audits/clause_routing_inconsistency_scope_2026-06-15.md，当时估 ~47% 制度文档受影响）。
+# 该缺陷**潜伏约一个月**，靠人写审计才发现——因为没有任何指标区分 (1) 和 (2)。
+#
+# B17（2026-07-25）已在摄取侧记下 route_final_mode/route_initial_mode/step_detector_matched，
+# 但**唯一的消费方是它自己的单元测试**：生产写、测试验、闸门不看 ⇒ 对质量保障贡献为零。
+# 本函数是那条留痕的第一个真实消费点。
+#
+# 降级签名 = `route_final_mode` 说的家族 ∩ 实际产出的 chunk_type 家族 = ∅。
+# 无留痕的文档（2026-07-25 之前摄取的存量）一律**弃权**，不计入分子分母 —— 把"看不见"
+# 当"通过"是今天反复踩过的坑。
+_ROUTE_OBS_KEYS = ("route_final_mode", "route_initial_mode", "step_detector_matched")
+
+
+def _mode_downgrade_stats(chunks: List[Dict]) -> Dict:
+    """按文档统计「路由选定的模式」与「实际产出家族」是否脱节。"""
+    by_doc_types: Dict[str, set] = defaultdict(set)
+    by_doc_mode: Dict[str, Optional[str]] = {}
+    for c in chunks:
+        d = c.get("doc_id")
+        by_doc_types[d].add(c.get("chunk_type"))
+        if by_doc_mode.get(d) is None:
+            extra = c.get("extra_json") or c.get("extra") or {}
+            if isinstance(extra, str):
+                try:
+                    extra = json.loads(extra)
+                except Exception:      # noqa: BLE001 — 坏 JSON 视为无留痕
+                    extra = {}
+            if isinstance(extra, dict) and extra.get("route_final_mode"):
+                by_doc_mode[d] = str(extra["route_final_mode"])
+
+    observed = [d for d in by_doc_types if by_doc_mode.get(d)]
+    downgraded = []
+    for d in observed:
+        mode = by_doc_mode[d]
+        exp = _MODE_EXPECTED_FAMILY.get(mode)
+        if not exp:
+            continue                    # 未知模式 → 弃权
+        if not (by_doc_types[d] & exp):
+            downgraded.append({"doc_id": d, "route_final_mode": mode,
+                               "observed": sorted(x for x in by_doc_types[d] if x)})
+    n = len(observed)
+    return {
+        "n_docs_with_route_trace": n,
+        "route_trace_coverage": _round_nan(n / len(by_doc_types)) if by_doc_types else None,
+        # None（而非 0.0）= 无留痕可测。0.0 会被误读成"零降级"。
+        "mode_downgrade_rate": _round_nan(len(downgraded) / n) if n else None,
+        "mode_downgrade_count": len(downgraded) if n else None,
+        "mode_downgrade_sample": downgraded[:10],
+    }
+
+
 def family_routing(chunks: List[Dict], d3: Optional[Dict]) -> Dict:
     """Soft round-1 routing check: per-doc observed chunk-type family vs the
     metadata-derivable expectation, plus D3's under-chunk candidate count."""
@@ -507,6 +565,7 @@ def family_routing(chunks: List[Dict], d3: Optional[Dict]) -> Dict:
         "mismatch_sample": mismatches[:10],
         "note": "metadata-level (xlsx/pptx + step-detect abstained — need canonical, phase-2)",
     }
+    out.update(_mode_downgrade_stats(chunks))
     if d3:
         out["d3_under_chunk_candidates"] = (d3.get("routed_total", 0)
                                             - d3.get("routed_with_step", 0))
@@ -657,6 +716,20 @@ def build_gates_and_verdict(fam: Dict, d7: Optional[Dict], h: Dict) -> Dict:
          (e.get("near_dup_cross_factor") <= 1.10)
          if e.get("near_dup_cross_factor") is not None else None, "<= 1.10")
     d = fam["routing"]
+    # B17 留痕的第一个真实消费点。**覆盖率为 0 时必须弃权**（值为 None）——
+    # 把"没有留痕所以看不见降级"报成"零降级"，正是本指标要防的那类静默。
+    _dg = d.get("mode_downgrade_rate")
+    if _dg is None:
+        gates["[L6-soft] chunker 静默降级率 (D2)"] = {
+            "target": "<= 0.05 soft（route_final_mode 家族 ∩ 实产 chunk_type = ∅）",
+            "value": f"无路由留痕可测（覆盖率 {d.get('route_trace_coverage')}）—— "
+                     f"B17 留痕自 2026-07-25 起写入，存量文档弃权",
+            "pass": None, "hard": False, "na_reason": "expected_na", "advisory": True,
+        }
+    else:
+        soft("[L6-soft] chunker 静默降级率 (D2)", _dg, _dg <= 0.05,
+             "<= 0.05 soft（route_final_mode 家族 ∩ 实产 chunk_type = ∅）")
+
     soft("routing-family match rate (D)", d.get("routing_match_rate"),
          (d.get("routing_match_ci_lower") >= 0.95)
          if d.get("routing_match_ci_lower") is not None else None,
