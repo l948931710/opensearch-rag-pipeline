@@ -1148,6 +1148,10 @@ def generate_answer_via_stream(
     """
     collected: List[str] = []
     sources: List[Dict[str, Any]] = []
+    # None = 本轮没收到 sources 帧（异常/mock）。**不能默认成 []** —— 空列表在渲染器里
+    # 意味着"零文档进 context、一张图都不该出"，会把正常回答的图全吃掉；None 才是
+    # "此路不提供该信息，按旧行为走"，与 api.py 的 .get() 语义一致。
+    included_doc_indices: Optional[List[int]] = None
     model = ""
     usage: Dict[str, Any] = {}
     # P2-20/21/22：经 meta_out 出参截留生成元数据（mock 生成器不回填 → .get 得 None，不炸）
@@ -1172,6 +1176,13 @@ def generate_answer_via_stream(
             collected.append(frame["content"])
         elif ftype == "sources":
             sources = frame.get("sources") or []
+            # 批次9 的 included_doc_indices 与 sources 同帧下发。此前这里只收 sources、
+            # 把它丢了 ⇒ 返回体缺该键 ⇒ api.py 的 `result.get("included_doc_indices")`
+            # 拿到 None ⇒ build_mini_program_blocks 退回**全量** image map，把被
+            # max_context_chars 截掉、模型根本没看见的图渲染给员工。
+            # 受影响的是 thinking=True 的 /api/ask（走本包装器）；非流式 generate_answer
+            # 与 SSE 直连路径都带了该字段，只有这条 buffered 包装器漏了。
+            included_doc_indices = frame.get("included_doc_indices")
         elif ftype == "done":
             model = frame.get("model") or model
             usage = frame.get("usage") or {}
@@ -1180,6 +1191,8 @@ def generate_answer_via_stream(
     return {
         "answer": strip_doc_citations("".join(collected)),
         "sources": sources,
+        # 与 generate_answer 的返回体对齐：api.py 两条路径都用同一个键取可见文档号。
+        "included_doc_indices": included_doc_indices,
         "model": model or get_config().llm.model,
         "usage": usage,
         "gen_meta": _meta.get("gen_meta"),
