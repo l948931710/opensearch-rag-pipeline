@@ -1,6 +1,6 @@
 {
- "frozen_at": "20260727_160518",
- "run_id": "eval_refreeze_20260727",
+ "frozen_at": "20260727_235836",
+ "run_id": "eval_refreeze_20260727b",
  "delta": 0.03,
  "regime": {
   "eval_set_sha": "07be5aed621f5ca0",
@@ -18,9 +18,10 @@
   "l4_ingestion_evaluator_version": "2.0.0",
   "l6_evaluator_version": "2.0.0",
   "l1_matcher_version": "2.0.0",
-  "l4_serving_evaluator_version": "2.0.0",
+  "l4_serving_evaluator_version": "3.0.0",
+  "l4_serving_set_sha": "4dab01066ec5482b",
   "funnel_policy": "c1",
-  "code_commit": "cc30033"
+  "code_commit": "6c88ffa"
  },
  "metrics": {
   "l1.ranking.recall@1": 0.8704,
@@ -63,20 +64,20 @@
   "l1.n_positive_public": 165.0,
   "l3.over_refusal_rate": 0.0,
   "l3.source_leak_rate": 0.0044,
-  "l3.mean_keyword_coverage": 0.7152,
+  "l3.mean_keyword_coverage": 0.706,
   "l4ing.jaccard.pdf": 0.9131958333333333,
   "l4ing.jaccard.xlsx": 1.0,
   "l4ing.jaccard.docx": 0.9898,
   "l4ing.img_dup_p95": 1.0,
-  "l4srv.marker_validity": 1.0,
+  "l4srv.marker_validity": 0.9878048780487805,
   "l4srv.dangling_ref_rate": 0.02857142857142857,
-  "l4srv.orphan_rate": 0.41818181818181815,
-  "l4srv.answer_image_rate": 0.8214285714285714,
-  "l4srv.marker_distinctness": 0.8311688311688312,
-  "judge.faithfulness": 4.938,
-  "judge.correctness": 4.462,
-  "judge.completeness": 4.218,
-  "judge.mm.image_relevance": 3.886,
+  "l4srv.orphan_rate": 0.35454545454545455,
+  "l4srv.answer_image_rate": 0.8571428571428571,
+  "l4srv.marker_distinctness": 0.8765432098765432,
+  "judge.faithfulness": 4.939,
+  "judge.correctness": 4.444,
+  "judge.completeness": 4.204,
+  "judge.mm.image_relevance": 3.838,
   "l0.dense_self_query_rate": 1.0,
   "l0.sparse_presence_rate": 1.0,
   "l0.vector_fidelity_cos_mean": 1.0,
@@ -92,9 +93,9 @@
   "l6.dedup.near_dup_cross_factor": 1.0271,
   "l6.image_binding.img_dup_factor_p95": 1.0,
   "l6.routing.routing_match_rate": 0.897,
-  "l6.judge_chunk.repr_pass_rate_ge4": 0.446,
+  "l6.judge_chunk.repr_pass_rate_ge4": 0.432,
   "judge.negatives.fabrication_rate": 0.0,
-  "judge.negatives.overall": 4.293,
+  "judge.negatives.overall": 4.394,
   "judge.positives_fabrication_rate": 0.009
  }
 }
