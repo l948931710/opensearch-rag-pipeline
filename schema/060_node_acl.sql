@@ -26,16 +26,40 @@
 -- @DB fuling_knowledge
 
 -- ── 1. 文档 ACL 模式 + 归属节点 + 并发替换的 CAS 版本号 ──────────────────────
-CALL _add_column_if_not_exists('document_meta', 'acl_mode',
-    "VARCHAR(16) NOT NULL DEFAULT 'legacy' COMMENT 'legacy=组码语义(现状) | node=组织树节点语义'");
-CALL _add_column_if_not_exists('document_meta', 'owner_dept_id',
-    "BIGINT UNSIGNED DEFAULT NULL COMMENT '归属组织节点(钉钉 dept_id)；node 模式权威，legacy 模式为 NULL'");
-CALL _add_column_if_not_exists('document_meta', 'acl_revision',
-    "INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '可见范围整体替换的 CAS 版本；并发保存靠它串行化'");
+-- ⚠️ 幂等加列用【内联 SET @+PREPARE】(同 schema/020)，**不用** CALL _add_column_if_not_exists
+--   —— 那两个 helper 过程由 002_feedback_system.sql 建在 **fuling_operation**，
+--   knowledge 库(含 _stg)里根本不存在，CALL 会直接 1305 PROCEDURE does not exist。
+--   (2026-07-29 实测 fuling_knowledge_stg：helper 过程为空。dry-run 只解析不执行，抓不到。)
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='document_meta' AND COLUMN_NAME='acl_mode');
+SET @ddl = IF(@c = 0,
+    "ALTER TABLE document_meta ADD COLUMN acl_mode VARCHAR(16) NOT NULL DEFAULT 'legacy' COMMENT 'legacy=组码语义(现状) | node=组织树节点语义'",
+    'SELECT 1');
+PREPARE s FROM @ddl; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='document_meta' AND COLUMN_NAME='owner_dept_id');
+SET @ddl = IF(@c = 0,
+    "ALTER TABLE document_meta ADD COLUMN owner_dept_id BIGINT UNSIGNED DEFAULT NULL COMMENT '归属组织节点(钉钉 dept_id)；node 模式权威，legacy 模式为 NULL'",
+    'SELECT 1');
+PREPARE s FROM @ddl; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='document_meta' AND COLUMN_NAME='acl_revision');
+SET @ddl = IF(@c = 0,
+    "ALTER TABLE document_meta ADD COLUMN acl_revision INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '可见范围整体替换的 CAS 版本；并发保存靠它串行化'",
+    'SELECT 1');
+PREPARE s FROM @ddl; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- dept_admin 作用域 SQL 会按 (acl_mode, owner_dept_id) 过滤 node 文档
-CALL _add_index_if_not_exists('document_meta', 'idx_acl_mode_owner_node',
-    '(acl_mode, owner_dept_id)');
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+          WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='document_meta'
+            AND INDEX_NAME='idx_acl_mode_owner_node');
+SET @ddl = IF(@c = 0,
+    'ALTER TABLE document_meta ADD INDEX idx_acl_mode_owner_node (acl_mode, owner_dept_id)',
+    'SELECT 1');
+PREPARE s FROM @ddl; EXECUTE s; DEALLOCATE PREPARE s;
 
 
 -- ── 2. 文档 → 授权节点（可见度权威，与 kb_access_request 并列为两个权威源）────
