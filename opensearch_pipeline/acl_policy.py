@@ -43,7 +43,15 @@ logger = logging.getLogger(__name__)
 # 2026-07-28 现网核验:chunk_meta.owner_dept 值域仅 13 个(全为组码,无下划线前缀),无碰撞。
 NODE_OWNER_SENTINEL = "__acl_node_mode_v1__"
 
+# 两种节点值(值域都含冒号 ⇒ 与组码不相交):
+#   d:<id>  = 该节点 + 整棵子树   → 匹配用户【祖先链】
+#   dx:<id> = 仅直挂本节点的人     → 匹配用户【直属部门】
+# 为什么需要后者(2026-07-29 Sam 提出 + 实测):**26 个节点有子部门却仍有直挂人员,
+# 合计 172 人(全员 14.6%)** —— 获胜生产中心 38 / 国际贸易部 28 / 国内营销部 20 …
+# 纯子树语义下,"要部分子部门 + 直挂人员、但不要其他子部门"无法表达:选父节点太宽
+# (带上不想要的子部门),选子部门又漏掉直挂的人。
 NODE_VALUE_PREFIX = "d:"
+NODE_EXACT_PREFIX = "dx:"
 
 ACL_MODE_LEGACY = "legacy"
 ACL_MODE_NODE = "node"
@@ -63,31 +71,45 @@ MAX_DOC_NODES = 32          # 单文档授权节点数(一级部门仅 17 个)
 
 
 # ── 值域编解码(严格,不走净化器)──────────────────────────────────────────────
-def format_node_value(dept_id: int) -> str:
-    """dept_id → `d:<id>`。**严格**:非正整数一律 ValueError,绝不静默产出坏值。"""
+def format_node_value(dept_id: int, *, exact: bool = False) -> str:
+    """dept_id → `d:<id>`(子树)或 `dx:<id>`(仅本节点)。
+
+    **严格**:非正整数一律 ValueError,绝不静默产出坏值。
+    """
     n = int(dept_id)
     if n <= 0:
         raise ValueError(f"非法 dept_id: {dept_id!r}")
-    return f"{NODE_VALUE_PREFIX}{n}"
+    return f"{NODE_EXACT_PREFIX if exact else NODE_VALUE_PREFIX}{n}"
+
+
+def _parse_with_prefix(value: object, prefix: str) -> Optional[int]:
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s.startswith(prefix):
+        return None
+    tail = s[len(prefix):]
+    if not tail.isdigit():          # isdigit ⇒ 排除负号/小数点/空白/全角
+        return None
+    n = int(tail)
+    return n if n > 0 else None
 
 
 def parse_node_value(value: object) -> Optional[int]:
-    """`d:<id>` → dept_id;不是合法节点值(组码 / 坏串 / 前缀缺失 / 非正整数)→ None。
+    """`d:<id>` → dept_id(**子树语义**);其余一律 None(含 `dx:` —— 那是另一种语义)。
 
     **不做任何"净化后接受"** —— 与组码路径的 `_sanitize_ha3_filter_value`(删非法字符后
     继续用)是刻意相反的策略:节点值是服务端自产的结构化标识,任何偏差都该丢弃 + 告警,
     而不是修补。
     """
-    if not isinstance(value, str):
-        return None
-    s = value.strip()
-    if not s.startswith(NODE_VALUE_PREFIX):
-        return None
-    tail = s[len(NODE_VALUE_PREFIX):]
-    if not tail.isdigit():          # isdigit ⇒ 排除负号/小数点/空白/全角
-        return None
-    n = int(tail)
-    return n if n > 0 else None
+    if isinstance(value, str) and value.strip().startswith(NODE_EXACT_PREFIX):
+        return None                 # `dx:` 归 parse_exact_node_value,绝不混淆两种语义
+    return _parse_with_prefix(value, NODE_VALUE_PREFIX)
+
+
+def parse_exact_node_value(value: object) -> Optional[int]:
+    """`dx:<id>` → dept_id(**仅直挂本节点**语义);其余一律 None。"""
+    return _parse_with_prefix(value, NODE_EXACT_PREFIX)
 
 
 def normalize_node_ids(raw: Iterable[object], *, limit: int = MAX_DOC_NODES) -> Tuple[List[int], bool]:
@@ -135,6 +157,7 @@ class AclContext:
     """
     groups: Tuple[str, ...] = ()
     ancestor_dept_ids: Tuple[int, ...] = ()
+    direct_dept_ids: Tuple[int, ...] = ()      # 直属部门(不含祖先)——匹配 `dx:` 仅本节点授权
     node_channel_ok: bool = True
     org_wide_reader: bool = False
 
@@ -150,7 +173,8 @@ class DocAcl:
     permission_level: str = ""
     owner_dept: str = ""                       # legacy 权威;node 模式忽略
     groups: Tuple[str, ...] = ()               # legacy:approved 跨部门组码
-    node_ids: Tuple[int, ...] = ()             # node:授权节点(子树语义)
+    node_ids: Tuple[int, ...] = ()             # node:授权节点(**子树**语义,配 `d:`)
+    exact_node_ids: Tuple[int, ...] = ()       # node:授权节点(**仅本节点**语义,配 `dx:`)
 
 
 class InvalidFlagPosture(RuntimeError):
@@ -173,12 +197,13 @@ def project_doc_acl(
     real_owner: str,
     groups: Sequence[str] = (),
     node_ids: Sequence[int] = (),
+    exact_node_ids: Sequence[int] = (),
 ) -> Tuple[str, List[str]]:
-    """(mode, 真实 owner, 组码, 节点) → (检索投影轴 owner_dept, allowed_depts)。
+    """(mode, 真实 owner, 组码, 子树节点, 仅本节点) → (检索投影轴 owner_dept, allowed_depts)。
 
     **模式互斥**:
       legacy → (真实 owner, [组码...])
-      node   → (哨兵,       [d:<id>...])   ← 绝不含组码
+      node   → (哨兵,       [d:<id>... , dx:<id>...])   ← 绝不含组码
 
     未知 mode ⇒ 按 legacy 处理并告警(fail-safe:退回现状语义,绝不误升级为 node)。
     """
@@ -187,8 +212,12 @@ def project_doc_acl(
         logger.warning("project_doc_acl: 未知 acl_mode=%r,按 legacy 投影", mode)
         m = ACL_MODE_LEGACY
     if m == ACL_MODE_NODE:
-        ids, _overflow = normalize_node_ids(node_ids)
-        return NODE_OWNER_SENTINEL, [format_node_value(i) for i in ids]
+        sub, _ov1 = normalize_node_ids(node_ids)
+        exact, _ov2 = normalize_node_ids(exact_node_ids)
+        return NODE_OWNER_SENTINEL, (
+            [format_node_value(i) for i in sub]
+            + [format_node_value(i, exact=True) for i in exact]
+        )
     clean = [g for g in (str(x).strip() for x in groups or ()) if g]
     seen: Set[str] = set()
     ordered = [g for g in clean if not (g in seen or seen.add(g))]
@@ -255,9 +284,10 @@ def can_read_doc(
         return False                        # 祖先链不可信 ⇒ fail-closed
     if ctx.org_wide_reader:
         return True                         # 全库读角色(总经办 `*`),仅在 GRANT 开时
-    if not doc.node_ids:
-        return False
-    return bool(set(ctx.ancestor_dept_ids) & set(doc.node_ids))
+    # 子树授权配【祖先链】;仅本节点授权配【直属部门】—— 两条并集
+    if set(ctx.ancestor_dept_ids) & set(doc.node_ids):
+        return True
+    return bool(set(ctx.direct_dept_ids) & set(doc.exact_node_ids))
 
 
 # ── 过滤器项(供 retriever 拼 HA3 表达式)──────────────────────────────────────
@@ -268,11 +298,14 @@ def node_filter_terms(ctx: AclContext) -> List[str]:
     **也绝不回退 legacy 口径**。判定式是纯正向的"交集非空",通道被丢只会**少命中**,
     不可能多命中 —— 前提正是"不回退到另一条更宽的通道"。
     """
-    if not ctx.node_channel_ok or not ctx.ancestor_dept_ids:
+    if not ctx.node_channel_ok:
         return []
-    ids, overflow = normalize_node_ids(ctx.ancestor_dept_ids, limit=MAX_NODE_OR_TERMS)
-    if overflow:
-        logger.warning("node_filter_terms: 祖先链 %d 项超上限 %d ⇒ 丢弃整个节点通道(fail-closed)",
-                       len(ids), MAX_NODE_OR_TERMS)
+    anc, ov1 = normalize_node_ids(ctx.ancestor_dept_ids, limit=MAX_NODE_OR_TERMS)
+    direct, ov2 = normalize_node_ids(ctx.direct_dept_ids, limit=MAX_NODE_OR_TERMS)
+    terms = ([format_node_value(i) for i in anc]
+             + [format_node_value(i, exact=True) for i in direct])
+    if ov1 or ov2 or len(terms) > MAX_NODE_OR_TERMS:
+        logger.warning("node_filter_terms: 节点项 %d 超上限 %d ⇒ 丢弃整个节点通道(fail-closed)",
+                       len(terms), MAX_NODE_OR_TERMS)
         return []
-    return [format_node_value(i) for i in ids]
+    return terms

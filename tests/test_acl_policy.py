@@ -22,6 +22,7 @@ from opensearch_pipeline.acl_policy import (
     format_node_value,
     node_filter_terms,
     normalize_node_ids,
+    parse_exact_node_value,
     parse_node_value,
     project_doc_acl,
 )
@@ -206,3 +207,56 @@ def test_filter_terms_drop_whole_channel_on_overflow():
 
 def test_filter_terms_empty_when_channel_untrusted():
     assert node_filter_terms(AclContext(ancestor_dept_ids=(5,), node_channel_ok=False)) == []
+
+
+# ── ⑤「仅本节点」语义(dx:)——直挂上级、未进下级部门的人 ─────────────────────
+# 实测动机:26 个节点有子部门却仍有直挂人员,合计 172 人(全员 14.6%)。
+def test_exact_and_subtree_values_are_distinct_namespaces():
+    assert format_node_value(7) == "d:7"
+    assert format_node_value(7, exact=True) == "dx:7"
+    assert parse_node_value("dx:7") is None, "dx: 绝不能被当作子树值解析"
+    assert parse_exact_node_value("d:7") is None, "d: 绝不能被当作仅本节点值解析"
+    assert parse_exact_node_value("dx:7") == 7
+
+
+def test_exact_grant_matches_direct_dept_not_ancestors():
+    """★ 直挂综合管理中心(599502818)的人能看到 dx: 授权;其子部门的人**看不到**。"""
+    doc = DocAcl(mode=ACL_MODE_NODE, permission_level="dept_internal",
+                 exact_node_ids=(599502818,))
+    hang_on_center = AclContext(ancestor_dept_ids=(599502818,), direct_dept_ids=(599502818,))
+    in_child = AclContext(ancestor_dept_ids=(34274162, 599502818), direct_dept_ids=(34274162,))
+    assert can_read_doc(hang_on_center, doc, grant_enabled=True, enforce_enabled=True) is True
+    assert can_read_doc(in_child, doc, grant_enabled=True, enforce_enabled=True) is False
+
+
+def test_subtree_grant_covers_direct_hangers_too():
+    """澄清:选父节点 = 父节点直挂 + 整棵子树,直挂人员**本来就被覆盖**。"""
+    doc = DocAcl(mode=ACL_MODE_NODE, permission_level="dept_internal", node_ids=(599502818,))
+    hang_on_center = AclContext(ancestor_dept_ids=(599502818,), direct_dept_ids=(599502818,))
+    in_child = AclContext(ancestor_dept_ids=(34274162, 599502818), direct_dept_ids=(34274162,))
+    for ctx in (hang_on_center, in_child):
+        assert can_read_doc(ctx, doc, grant_enabled=True, enforce_enabled=True) is True
+
+
+def test_combined_grant_expresses_partial_children_plus_hangers():
+    """★ 目标用例:要「行政部子树 + 直挂中心的人」,但**不要**中心下其他子部门。"""
+    doc = DocAcl(mode=ACL_MODE_NODE, permission_level="dept_internal",
+                 node_ids=(34274162,), exact_node_ids=(599502818,))
+    admin_child = AclContext(ancestor_dept_ids=(34274162, 599502818), direct_dept_ids=(34274162,))
+    center_hanger = AclContext(ancestor_dept_ids=(599502818,), direct_dept_ids=(599502818,))
+    other_child = AclContext(ancestor_dept_ids=(34265162, 599502818), direct_dept_ids=(34265162,))
+    assert can_read_doc(admin_child, doc, grant_enabled=True, enforce_enabled=True) is True
+    assert can_read_doc(center_hanger, doc, grant_enabled=True, enforce_enabled=True) is True
+    assert can_read_doc(other_child, doc, grant_enabled=True, enforce_enabled=True) is False
+
+
+def test_node_projection_emits_both_kinds_and_still_no_group_codes():
+    owner, allowed = project_doc_acl(ACL_MODE_NODE, "admin", ["hr"], [34274162], [599502818])
+    assert owner == NODE_OWNER_SENTINEL
+    assert allowed == ["d:34274162", "dx:599502818"]
+    assert all(":" in v for v in allowed), "node 投影不得混入组码"
+
+
+def test_filter_terms_include_both_kinds():
+    ctx = AclContext(ancestor_dept_ids=(34274162, 599502818), direct_dept_ids=(34274162,))
+    assert node_filter_terms(ctx) == ["d:34274162", "d:599502818", "dx:34274162"]
