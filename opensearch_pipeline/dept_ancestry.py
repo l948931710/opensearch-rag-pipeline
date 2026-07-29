@@ -21,7 +21,7 @@
 RAG_ACL_ANCESTRY（默认关）在 dingtalk_identity，本模块不读环境。
 """
 
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 # 钉钉根部门恒为 1；department/get 对根返回 parent_id=0。
 ROOT_DEPT_ID = 1
@@ -168,3 +168,63 @@ def parent_getter_from_index(index: Dict[int, int]) -> ParentGetter:
     def _get(dept_id: int) -> Optional[int]:
         return index.get(dept_id)
     return _get
+
+
+# ── node-ACL：物理祖先链（与上面的"组码解析"是两条独立通道）────────────────────
+def resolve_ancestor_chains(
+    dept_ids: Iterable[int],
+    get_parent_id: ParentGetter,
+    *,
+    max_hops: int = _MAX_HOPS_DEFAULT,
+    max_direct_depts: int = 8,
+) -> Tuple[List[int], bool]:
+    """把用户的直属 dept_id 列表展开为【物理祖先链并集】→ (id 列表, ok)。
+
+    node-ACL 的读侧展开(设计稿 §2):可见 ⟺ 祖先链 ∩ 文档授权节点集 ≠ ∅。文档只存被勾
+    节点、查询发用户祖先链 ⇒ 新建叶子部门自动继承、改名免疫、**零文档重推**。
+
+    ⚠️ **与 `resolve_dept_ids` 是两条独立通道,语义刻意不同**:
+      · `resolve_dept_ids` 走锚点表求【组码】,显式 `[]` 锚 = "组码解析到此为止"(截断继承);
+      · 本函数求【物理链】,**任何锚点都不截断它** —— 否则授权某个根节点将覆盖不到该部门,
+        直接违反纯子树语义。故本函数根本不读 `ANCHOR_GROUPS_BY_DEPT_ID`。
+
+    返回 ok=False(节点通道整体不可用,调用方 fail-closed 仅 public,**绝不回退名字/组码口径**):
+      · 直属部门数超 `max_direct_depts`;
+      · 任一跳 `get_parent_id` 返回 None(查询失败/快照缺该节点);
+      · 环 / 自指 / 超 `max_hops`。
+    链含节点自身,**不含虚拟根 ROOT_DEPT_ID**(授权到根 = 全员可见,那是 public 的语义,
+    不该由节点表达)。输出按首次出现顺序去重。
+    """
+    raw = [d for d in (dept_ids or [])]
+    if len(raw) > max_direct_depts:
+        return [], False
+
+    out: List[int] = []
+    seen: Set[int] = set()
+    for item in raw:
+        try:
+            dept_id = int(item)
+        except (TypeError, ValueError):
+            return [], False                  # 异常 id：整条通道不可信
+        if dept_id <= 0 or dept_id == ROOT_DEPT_ID:
+            continue
+        visited: Set[int] = set()
+        cur: Optional[int] = dept_id
+        hops = 0
+        while cur is not None and cur != ROOT_DEPT_ID and cur > 0:
+            if cur in visited:
+                return [], False              # 环
+            visited.add(cur)
+            if cur not in seen:
+                seen.add(cur)
+                out.append(cur)
+            hops += 1
+            if hops > max_hops:
+                return [], False              # 深度异常
+            parent = get_parent_id(cur)
+            if parent is None:
+                return [], False              # 父链查询失败
+            if parent == cur:
+                return [], False              # 自指
+            cur = parent
+    return out, True
