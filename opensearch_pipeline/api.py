@@ -521,6 +521,22 @@ class Identity:
     role: str = "employee"  # 知识库写授权角色【UI 提示】——非边界；写接口须 DB 现查 resolve_kb_identity
 
 
+def _build_acl_ctx(identity: Optional["Identity"], user_id: Optional[str] = None):
+    """Identity → acl_policy.AclContext(node-ACL 读身份)。**绝不抛**。
+
+    节点通道所需的祖先链来自 RDS 组织快照(dept_dim/staff_dim);快照缺失/过期/解析失败
+    一律降级为 node_channel_ok=False —— 只关掉增量的节点通道,legacy 组码语义分毫不动。
+    """
+    try:
+        from opensearch_pipeline.dingtalk_identity import resolve_acl_context
+        sid = (identity.user_id if identity else None) or user_id or ""
+        groups = list(identity.acl_groups) if identity else []
+        return resolve_acl_context(sid, groups)
+    except Exception as e:   # noqa: BLE001 — 增量能力,绝不把现状检索打挂
+        logger.warning("构造 AclContext 失败(节点通道关闭): %s", e)
+        return None
+
+
 def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Identity]:
     """从 Authorization: Bearer <token> 解析已验证身份；无/无效令牌返回 None。
 
@@ -966,10 +982,13 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
     effective_query = rewritten_query or req.question
 
     # 2. 检索
+    # node-ACL：读身份含祖先链/直属部门（组织快照缺失或过期 ⇒ 节点通道自动关闭，
+    # legacy 组码通道不受影响）。GRANT 默认关时全链路仍与历史逐字节一致。
+    _acl_ctx = _build_acl_ctx(identity, uid)
     try:
         chunks = retrieve_and_enrich(
             effective_query, top_k=req.top_k, user_dept=user_dept,
-            cosurface_images=cosurface_images,
+            cosurface_images=cosurface_images, acl_ctx=_acl_ctx,
         )
     except Exception as e:
         trace_id = get_request_id()

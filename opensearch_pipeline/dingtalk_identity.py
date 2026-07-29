@@ -912,3 +912,123 @@ def resolve_kb_identity(staff_id: str):
         user_id=staff_id, name=name, role=role,
         acl_groups=acl_groups, granted_owner_depts=managed,
     )
+
+
+# ── node-ACL：从 RDS 组织快照(dept_dim/staff_dim)构造读身份 ────────────────────
+#
+# 为什么走 RDS 而不是现有的 scratch/dingtalk_org_tree.json：那个文件同时被 .gitignore
+# 与 .dockerignore 排除、Dockerfile 只 COPY opensearch_pipeline/ ⇒ **2026-07-23 起的镜像
+# 应用里根本不存在**，/api/kb/org-tree 的 org_tree 在生产恒为 null。
+#
+# 快照过期(>48h)⇒ 节点通道整体不可用(node_channel_ok=False)，fail-closed 仅 public；
+# legacy 组码通道**不受影响**(两条通道独立，绝不因节点通道失效而收紧现状行为)。
+_DEPT_SNAPSHOT_MAX_AGE_H = 48
+_org_snapshot_cache: dict = {}
+_org_snapshot_lock = threading.Lock()
+
+
+def _org_snapshot_ttl_s() -> float:
+    try:
+        return float(os.environ.get("RAG_ORG_SNAPSHOT_TTL_S", "300") or 0)
+    except ValueError:
+        return 300.0
+
+
+def _load_org_snapshot() -> dict:
+    """读 dept_dim → {"parents": {id: parent_id}, "fresh": bool}。进程内 TTL 缓存。
+
+    表不存在 / 空表 / 最新 synced_at 超 48h ⇒ fresh=False（调用方据此关掉节点通道）。
+    任何异常都不上抛 —— 节点通道是增量能力，绝不能因它把现状检索打挂。
+    """
+    ttl = _org_snapshot_ttl_s()
+    now = time.monotonic()
+    with _org_snapshot_lock:
+        hit = _org_snapshot_cache.get("v")
+        if hit and ttl > 0 and now - hit[0] < ttl:
+            return hit[1]
+    snap = {"parents": {}, "fresh": False}
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT dept_id, parent_id FROM dept_dim WHERE is_active=1")
+                snap["parents"] = {int(r[0]): int(r[1]) for r in cur.fetchall()}
+                cur.execute(
+                    "SELECT TIMESTAMPDIFF(HOUR, MAX(synced_at), NOW()) FROM dept_dim")
+                row = cur.fetchone()
+                age_h = row[0] if row and row[0] is not None else None
+            snap["fresh"] = bool(snap["parents"]) and age_h is not None \
+                and age_h <= _DEPT_SNAPSHOT_MAX_AGE_H
+            if snap["parents"] and not snap["fresh"]:
+                logger.warning("dept_dim 快照过期(%sh > %sh)⇒ 节点通道 fail-closed",
+                               age_h, _DEPT_SNAPSHOT_MAX_AGE_H)
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 — 表未 apply / DB 抖动 ⇒ 节点通道关，legacy 不受影响
+        logger.debug("dept_dim 不可用（node 通道关闭，legacy 不受影响）: %s", e)
+    with _org_snapshot_lock:
+        _org_snapshot_cache["v"] = (now, snap)
+    return snap
+
+
+def _load_direct_dept_ids(staff_id: str) -> Optional[List[int]]:
+    """staff_dim → 该员工的直属部门 id 列表；表不可用/无该人 → None（节点通道关）。"""
+    if not staff_id:
+        return None
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT dept_ids FROM staff_dim WHERE staff_id=%s AND is_active=1",
+                    (staff_id,))
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001
+        logger.debug("staff_dim 不可用（node 通道关闭）: %s", e)
+        return None
+    if not row or not row[0]:
+        return None
+    out = []
+    for part in str(row[0]).split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.append(int(part))
+    return out or None
+
+
+def resolve_acl_context(staff_id: str, acl_groups: Optional[List[str]] = None):
+    """staff_id(+已解析组码) → `acl_policy.AclContext`。两条入口(API / 钉钉机器人)共用。
+
+    · groups            —— 沿用现有解析(未传则现查)，legacy 语义完全不变；
+    · ancestor/direct   —— 来自 RDS 组织快照；快照缺失/过期/解析失败 ⇒ node_channel_ok=False；
+    · org_wide_reader   —— 持有全部合法组 = 现行 `*` 哨兵语义(总经办)，与 legacy 判定一致。
+
+    **绝不抛异常**：节点通道是增量能力，任何故障都只让它降级为不可用，不影响现状检索。
+    """
+    from opensearch_pipeline.acl_policy import AclContext
+    from opensearch_pipeline.dept_ancestry import resolve_ancestor_chains
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+
+    groups = list(acl_groups) if acl_groups is not None else list(_resolve_user_dept(staff_id))
+    org_wide = bool(groups) and set(groups) >= set(_VALID_ACL_GROUPS)
+    try:
+        snap = _load_org_snapshot()
+        direct = _load_direct_dept_ids(staff_id) if snap.get("fresh") else None
+        if not snap.get("fresh") or not direct:
+            return AclContext(groups=tuple(groups), node_channel_ok=False,
+                              org_wide_reader=org_wide)
+        parents = snap["parents"]
+        chain, ok = resolve_ancestor_chains(direct, lambda d: parents.get(d))
+        return AclContext(
+            groups=tuple(groups), ancestor_dept_ids=tuple(chain),
+            direct_dept_ids=tuple(direct), node_channel_ok=ok, org_wide_reader=org_wide,
+        )
+    except Exception as e:   # noqa: BLE001 — 任何异常 ⇒ 节点通道关，legacy 照常
+        logger.warning("resolve_acl_context 失败（节点通道关闭，legacy 不受影响）: %s", e)
+        return AclContext(groups=tuple(groups), node_channel_ok=False,
+                          org_wide_reader=org_wide)

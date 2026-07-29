@@ -15,7 +15,7 @@ import hashlib
 import hmac
 import os
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from starlette.testclient import TestClient
@@ -351,7 +351,7 @@ class TestBackgroundRAGProcessing:
 
         _process_rag_query("年假几天", "https://webhook/test", "张三", "cid1")
 
-        mock_search.assert_called_once_with("年假几天", user_dept=None)
+        mock_search.assert_called_once_with("年假几天", user_dept=None, acl_ctx=ANY)  # node-ACL:读身份随检索透传(内容与本用例无关)
         mock_gen.assert_called_once()
         mock_reply.assert_called_once()
         # 验证 Markdown 内容

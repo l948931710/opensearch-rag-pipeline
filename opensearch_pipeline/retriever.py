@@ -1057,6 +1057,7 @@ def search_chunks(
     output_fields: Optional[List[str]] = None,
     user_dept: Union[str, List[str], None] = None,
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """
     端到端检索：query → embedding → HA3 search → 标准化结果。
@@ -1113,7 +1114,7 @@ def search_chunks(
     _output_fields = output_fields or list(_DEFAULT_OUTPUT_FIELDS)
 
     # ── 权限过滤（安全边界，统一实现）──
-    filter_expr = _build_permission_filter(user_dept)
+    filter_expr = _build_permission_filter(user_dept, acl_ctx=acl_ctx)
 
     logger.info("Permission filter: user_dept=%s, filter=%s", user_dept, filter_expr)
 
@@ -1125,7 +1126,7 @@ def search_chunks(
     if not _full_cfg.alibaba_vector.endpoint and getattr(_full_cfg.opensearch, "host", ""):
         return _revalidate_main_hits(_deny_revoked_cross_dept(
             _search_chunks_opensearch(query, dense, top_k, user_dept, degraded=degraded),
-            user_dept))
+            user_dept, acl_ctx=acl_ctx))
 
     client = _get_ha3_client()
 
@@ -1221,7 +1222,7 @@ def search_chunks(
         _mark_degraded_results(results)   # P2-4：打标 + 分级失效处理（见 helper 注释）
 
     # 4b. 查询侧拒绝（Phase D 读侧 fail-closed 复核）：撤销跨部门授权后即时生效，不等 HA3 投影收回。
-    results = _deny_revoked_cross_dept(results, user_dept)
+    results = _deny_revoked_cross_dept(results, user_dept, acl_ctx=acl_ctx)
 
     # 4c. 主命中 RDS 复核（P3-1）：is_active/权限轴与权威表不一致的陈旧投影不投放。
     results = _revalidate_main_hits(results)
@@ -2254,6 +2255,7 @@ def _multi_query_search(
     multimodal: bool,
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
     primary_supplier: Optional[Any] = None,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """多意图 fan-out：原查询 + 子查询并行检索（各自重排），轮转交错合并去重。
 
@@ -2283,6 +2285,7 @@ def _multi_query_search(
                 chs = search_chunks(
                     q, top_k=fetch_k, user_dept=user_dept,
                     query_embedding=query_embedding if idx == 0 else None,
+                    acl_ctx=acl_ctx,
                 )
             if rerank_enable and chs:
                 if get_config().rag.rerank_img_probe:
@@ -2307,7 +2310,7 @@ def _multi_query_search(
         logger.warning("multi-query 全部 %d 路无结果（%d 路异常），回退原查询单路检索",
                        len(queries), n_errored)
         chs = search_chunks(query, top_k=fetch_k, user_dept=user_dept,
-                            query_embedding=query_embedding)
+                            query_embedding=query_embedding, acl_ctx=acl_ctx)
         if rerank_enable and chs:
             if get_config().rag.rerank_img_probe:
                 chs = _probe_pool_image_refs(chs)   # 回退单路同样探测（#F-mm10a）
@@ -2348,6 +2351,7 @@ def retrieve_and_enrich(
     user_dept: Union[str, List[str], None] = None,
     stitch_window: int = 1,
     cosurface_images: bool = False,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """统一检索 + 后处理入口，供 API 和 DingTalk 共用。
 
@@ -2413,13 +2417,14 @@ def retrieve_and_enrich(
             # lambda 体内按模块全局名解析 search_chunks（monkeypatch 兼容，不做 import 期快照）
             _primary_future = _px.submit(
                 lambda: search_chunks(query, top_k=_fetch_k, user_dept=user_dept,
-                                      query_embedding=_emb))
+                                      query_embedding=_emb, acl_ctx=acl_ctx))
         finally:
             _px.shutdown(wait=False)   # 不阻塞：future 照常完成，线程随后回收
         _sub_queries = maybe_decompose(query)
     if _sub_queries:
         chunks = _multi_query_search(
             query, _sub_queries, fetch_k=_fetch_k, top_k=top_k, user_dept=user_dept,
+            acl_ctx=acl_ctx,
             rerank_enable=_av.rerank_enable, multimodal=bool(cosurface_images),
             query_embedding=_emb,
             primary_supplier=(_primary_future.result if _primary_future is not None else None),
@@ -2429,7 +2434,7 @@ def retrieve_and_enrich(
         # 与历史同步调用的传播语义一致）；mode=off 走原同步路径。
         chunks = (_primary_future.result() if _primary_future is not None
                   else search_chunks(query, top_k=_fetch_k, user_dept=user_dept,
-                                     query_embedding=_emb))
+                                     query_embedding=_emb, acl_ctx=acl_ctx))
         _cap = get_config().rag.doc_diversity_cap
         if _av.rerank_enable and chunks:
             # #F-mm10a：探测让 VL 重排看见 step_card 的绑定图（_img_key 取

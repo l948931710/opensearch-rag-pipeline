@@ -1280,7 +1280,14 @@ def _process_rag_query(
             return
 
         # 1. 统一检索 + 邻居拼接（top_k=7, stitch window=±1）
-        chunks = retrieve_and_enrich(question, user_dept=user_dept)
+        # node-ACL:机器人入口同样构造读身份(快照不可用 ⇒ 节点通道自动关,legacy 不变)
+        try:
+            from opensearch_pipeline.dingtalk_identity import resolve_acl_context
+            _acl_ctx = resolve_acl_context(sender_staff_id, list(user_dept or []))
+        except Exception as _ae:   # noqa: BLE001 — 增量能力,绝不打挂机器人主链路
+            logger.warning("构造 AclContext 失败(节点通道关闭): %s", _ae)
+            _acl_ctx = None
+        chunks = retrieve_and_enrich(question, user_dept=user_dept, acl_ctx=_acl_ctx)
         t_retrieval = time.time()
         retrieval_latency_ms = int((t_retrieval - t0) * 1000)
 
