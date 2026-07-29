@@ -523,20 +523,45 @@ def test_fetch_present_but_zero_vector_invisible_is_present(monkeypatch):
         assert c.index_status == "INDEXED"
 
 
-def test_settle_is_fixed_wait_no_early_exit(monkeypatch):
-    """F#56 的轮询早退已有意回退：缺跨平面时序证据时，不让单 PK canary 提前放行
-    不可逆的 deactivate。断言=每轮补推前后各固定 sleep 一次，且不再有早退探测读。"""
+def test_settle_early_exits_when_fetch_sees_probe(monkeypatch):
+    """F#56 早退已解禁（2026-07-30 生产实测：push 返回时 fetch/query/倒排三平面均已可见，
+    平面间差值 1-2ms ≪ 分辨率下界 0.58s ⇒ 无可测跨平面窗口）。探针与权威判据同用 fetch。
+    断言=探针可见即刻返回，一次 sleep 都不发生。"""
     chunks = [_mk_chunk(10), _mk_chunk(11)]
-    client = FakeHA3(present={10}, never_heal={11})
-    conn = FakeConn()
-    ctx = _setup(monkeypatch, client, chunks, conn=conn,
-                 RAG_STAGE3_PARITY_SETTLE_SEC=7, RAG_STAGE3_PARITY_MAX_RETRIES=2)
+    client = FakeHA3(present={10, 11})          # 探针 pk=max=11 立即可见
+    ctx = _setup(monkeypatch, client, chunks, RAG_STAGE3_PARITY_SETTLE_SEC=7)
     slept = []                                  # 必须在 _setup 之后：它自带 sleep no-op 桩
     monkeypatch.setattr(pn.time, "sleep", lambda s: slept.append(s))
+    pn.node_verify_and_repush(ctx)
+    assert slept == [], "探针已可见就不该睡"
+    assert 11 in client.fetched_pks, "settle 探针必须走 fetch（与权威同平面）"
+
+
+def test_settle_falls_back_to_full_wait_when_never_visible(monkeypatch):
+    """探针始终不可见 → 轮询至 settle 上限才放行（上限是最终兜底，不能被早退绕过）。
+
+    用**假时钟**（sleep 推进 time.time）：否则 sleep 被桩掉而真实时钟照走，循环会空转
+    整整 settle 秒；假时钟既快又能精确断言轮询节奏。"""
+    chunks = [_mk_chunk(10)]
+    client = FakeHA3(present=set(), never_heal={10})   # 永不可见
+    conn = FakeConn()
+    ctx = _setup(monkeypatch, client, chunks, conn=conn,
+                 RAG_STAGE3_PARITY_SETTLE_SEC=7, RAG_STAGE3_PARITY_SETTLE_POLL_SEC=3,
+                 RAG_STAGE3_PARITY_MAX_RETRIES=1)
+    clock = {"t": 1000.0}
+    slept = []
+
+    def _sleep(s):
+        slept.append(s)
+        clock["t"] += s
+
+    monkeypatch.setattr(pn.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(pn.time, "sleep", _sleep)
     with pytest.raises(RuntimeError, match="parity"):
         pn.node_verify_and_repush(ctx)
-    # 初次 1 次 + 两轮补推各 1 次 = 3 次，且每次都是完整 settle 值（无早退缩短）
-    assert slept == [7, 7, 7]
+    # 每次 settle：poll=3 → 3+3+1 恰好用满 7s 上限，末次被 remaining 截断
+    assert slept[:3] == [3, 3, 1]
+    assert sum(slept[:3]) == 7, "轮询总时长不得超过 settle 上限"
 
 
 def test_settle_zero_skips_wait(monkeypatch):

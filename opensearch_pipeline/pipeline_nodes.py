@@ -8590,6 +8590,7 @@ def node_verify_and_repush(ctx: dict):
             return default
 
     settle = _envf("RAG_STAGE3_PARITY_SETTLE_SEC", 30.0)
+    settle_poll = _envf("RAG_STAGE3_PARITY_SETTLE_POLL_SEC", 5.0)
     max_retries = _envi("RAG_STAGE3_PARITY_MAX_RETRIES", 2)
 
     # 字段清单 pin 为 parity 专属最小集（HA3_PARITY_OUTPUT_FIELDS），不共享 serving 默认清单：
@@ -8637,17 +8638,46 @@ def node_verify_and_repush(ctx: dict):
         return present, unknown
 
     def _settle_wait(candidate_pks):
-        """吸收实时索引滞后：固定等待 settle 秒（settle<=0 跳过）。
+        """吸收实时索引滞后：轮询早退（探针=**官方 fetch**，与权威判据同平面），
+        最长仍等 settle 秒；settle<=0 直接跳过。
 
-        ⚠️ F#56 的"轮询早退"已**有意暂时回退**（RAG_STAGE3_PARITY_SETTLE_POLL_SEC 随之成为
-        废弃旋钮）。原早退探针探的是 **query 平面**可见性；本次把权威判据换成 fetch 后，若
-        改用 fetch 探针早退，等于把闸门平面从 query 悄悄换成 fetch——而我方**没有任何证据**
-        支持「fetch 可见 ⇒ serving query 已可见」。在缺跨平面时序证据的情况下，不值得让一个
-        单 PK canary 提前放行**不可逆的旧版本 deactivate**。
-        解禁条件：完成真实 HA3 push 后时序实验（同一 PK 轮询 fetch / 真实非零向量 query /
-        纯倒排 search 各自的首次可见时间），确认平面间不存在"fetch 早于 query"的窗口。"""
-        if settle > 0:
+        跨平面时序实证（2026-07-30 生产实测，scratch/crossplane_timing_probe_20260727.py，
+        3 轮独立合成探针 push→并发轮询三平面→即删）：
+
+            轮   fetch    query    inverted      分辨率下界(最大单探 RTT) ≈ 0.58s
+            1    0.006s   0.008s   0.009s        query−fetch = [0.002, 0.001, 0.002]
+            2    0.001s   0.002s   0.005s        → 差值比下界小两个数量级
+            3    0.001s   0.003s   0.005s        → **不存在可测的跨平面窗口**
+
+        即 push 返回时三个平面（fetch / 真实非零向量 query / 纯倒排 search）**已全部可见**。
+        C2 当初禁用早退的理由是「无证据支持 fetch 可见 ⇒ query 可见」——该理由已被实证
+        推翻，故解禁；探针与权威判据同用 fetch，不再有"闸门平面偷换"的问题。
+
+        ⚠️ 方法论教训（第一版实验栽过）：顺序探测三平面 + 把时间戳记在探测**返回后**，
+        会凭空造出一个与 RTT 同量级的递增阶梯（当时误读为 fetch 早 0.294s）。必须并发探测
+        且时间戳记在**发起前**。
+
+        ⚠️ 未验证面：上述实验是**单文档**推送；真实批最多 100 文档/子批、1000 PK/轮，
+        大批建索引延迟未测。本探针也只查**一个** PK（`max(candidate_pks)`），它可见不代表
+        整批可见——但这是既有形态，且权威判据（_present_unknown 全量 fetch）在后面兜底：
+        探早了最坏是白跑一轮补推，不会误放行 deactivate。settle 上限仍是最终兜底。"""
+        if settle <= 0:
+            return
+        probe_pk = max(candidate_pks) if candidate_pks else None
+        if probe_pk is None:
             time.sleep(settle)
+            return
+        deadline = time.time() + settle
+        while True:
+            # ha3_fetch_by_pks 契约上绝不 raise；探测失败按"未就绪"继续等，
+            # 不写 text_by_pk/unknown，不影响后续权威三态结论。
+            fr = _ha3_fetch_by_pks(client, cfg.table_name, [probe_pk], output_fields=["id"])
+            if probe_pk in fr["rows_by_pk"]:
+                return                      # 已可见 → 早退
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(max(settle_poll, 0.1), remaining))
 
     t0 = time.time()
 
