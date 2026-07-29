@@ -338,6 +338,11 @@ def ha3_fetch_by_pks(client, table_name: str, pks, output_fields: List[str] = No
     返回 {"rows_by_pk": {pk: {...}}, "missing_pks": [...], "unknown_pks": [...],
           "errors": [str]}。批异常/畸形整批归 unknown（**绝不误判为 missing**）。
     绝不 raise。
+
+    **批级原子**：每批先写局部 `batch_rows`，整批全部校验通过才并入 `rows_by_pk`；
+    任一异常整批丢弃并计 unknown。否则"合法首行 + 后续越集/重复行"会让同一批的前半段
+    已进 present、后半段又把整批标 unknown ⇒ 同一 PK 同时 present 与 unknown，
+    破坏调用方（stage-3 parity）赖以成立的三态互斥。
     """
     from alibabacloud_ha3engine_vector.models import FetchRequest
 
@@ -370,7 +375,7 @@ def ha3_fetch_by_pks(client, table_name: str, pks, output_fields: List[str] = No
             if not isinstance(res, list):
                 raise RuntimeError(f"result 非 list: {type(res).__name__}")
             want = set(sub)
-            seen_batch = set()
+            batch_rows: Dict[int, Dict[str, Any]] = {}   # 批级原子：校验全过才并入全局
             for it in res:
                 f = it.get("fields", it) if isinstance(it, dict) else {}
                 try:
@@ -379,10 +384,10 @@ def ha3_fetch_by_pks(client, table_name: str, pks, output_fields: List[str] = No
                     raise RuntimeError(f"PK 不可解析: {str(it)[:120]}")
                 if pk not in want:
                     raise RuntimeError(f"返回 PK={pk} 不在请求集合内")
-                if pk in seen_batch:
+                if pk in batch_rows:
                     raise RuntimeError(f"同批重复 PK={pk}")
-                seen_batch.add(pk)
-                rows_by_pk[pk] = dict(f, id=str(pk))
+                batch_rows[pk] = dict(f, id=str(pk))
+            rows_by_pk.update(batch_rows)                # 仅在整批无异常后生效
         except Exception as e:  # noqa: BLE001 — 单批失败只废该批，绝不染成 missing
             unknown.extend(sub)
             errors.append(f"batch@{i}: {type(e).__name__}: {e}"[:200])

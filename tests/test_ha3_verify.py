@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Tests for the G30 harness fix: authoritative self-query presence + loop-until-stable enum."""
+"""ha3_verify(serving 可检索性 self-query 探针)+ ha3_reconcile 倒排枚举器的单测。
+
+⚠️ 定位已按 2026-07-22 实证更正:self-query 走 ANN+融合+ACL,**不是物理存在性判据**
+(未命中可能只是排序/阈值/权限);物理存在性唯官方 fetch 为准,发现未知 PK 唯倒排枚举为准。
+枚举器侧的 loop-until-stable 亦已废除——盲区是确定性的,重扫无效。"""
 import pytest
 
 from opensearch_pipeline.ha3_verify import verify_chunks_present

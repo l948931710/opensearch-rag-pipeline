@@ -88,10 +88,13 @@ def _classify_stale(ha3_map: dict, rds_active_ids: set, rds_active_chunkid: dict
 class Ha3EnumerationUnhealthy(RuntimeError):
     """倒排枚举协议不健康（见 clients.ha3_enumerate_bucket 的健康判据）。
 
-    **故意抛异常而非返回结构体**：本函数的返回契约（普通 dict）被 DAG-3 的
-    `suspects = expected_pks - set(seen)` 直接消费（pipeline_nodes.py），改成结构体会
-    把 dict 的键当 PK 用。抛异常则命中该调用点现成的 `except` → 降级为全量 point-read
-    （保守方向）。删除侧 reconcile_ha3_orphan_pks 捕获后 **零删除**。"""
+    **故意抛异常而非返回结构体**：保持返回契约为普通 dict（调用方可直接 `set(...)`），
+    结构体会把 dict 的键当 PK 用。
+
+    唯一生产消费方 = `reconcile_ha3_orphan_pks`：捕获本异常后 **零删除**（不可信的候选集 ×
+    不可逆删除 = 绝不允许）。
+    注（2026-07-22 C2）：stage-3 推送后校验此前也消费本函数作"廉价 hint"、并靠 except
+    降级为逐 PK point-read——该分支已随 C2 删除（改为对全部已知 PK 直接官方 fetch）。"""
 
 
 def _enumerate_ha3_pks(client, cfg, parse, output_fields, query_cls, id_hi: int,
@@ -110,8 +113,8 @@ def _enumerate_ha3_pks(client, cfg, parse, output_fields, query_cls, id_hi: int,
     +filter 返回 0 命中而 fetch 正常取回，那种 point-read 会把在场行误判为缺失。
     （原注释称 point-read "authoritative" 是错的，已按实证更正。）
 
-    id_lo: 起始 PK（默认 0）。Stage-3 推送后校验只需扫本批 [min_pk, max_pk] 窗口，
-    传 id_lo=min(expected) 避免从 0 扫整个 id 空间（"廉价 hint" 才真的廉价）。
+    id_lo: 起始 PK（默认 0）。当前唯一生产消费方 reconcile_ha3_orphan_pks 走 id_lo=0
+    全扫（孤儿 PK 可能低于当前 MIN(chunk_meta.id)）。
 
     Raises: Ha3EnumerationUnhealthy —— 任一桶协议不健康。**绝不回退零向量**。
     """
