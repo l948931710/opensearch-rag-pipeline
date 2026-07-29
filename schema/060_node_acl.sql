@@ -47,7 +47,12 @@ CALL _add_index_if_not_exists('document_meta', 'idx_acl_mode_owner_node',
 CREATE TABLE IF NOT EXISTS kb_doc_node_grant (
     id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     doc_id        VARCHAR(128) NOT NULL COMMENT '被授权的文档（document_meta.doc_id）',
-    dept_id       BIGINT UNSIGNED NOT NULL COMMENT '被授权的钉钉组织节点；子树语义',
+    dept_id       BIGINT UNSIGNED NOT NULL COMMENT '被授权的钉钉组织节点',
+    -- scope=subtree：该节点 + 整棵子树（投影 d:<id>，匹配用户祖先链）——UI「含下级」开
+    -- scope=exact  ：仅直挂本节点的人（投影 dx:<id>，匹配用户直属部门）——UI「含下级」关
+    -- 为什么需要 exact：实测 26 个节点有子部门却仍有直挂人员、合计 172 人（全员 14.6%）；
+    -- 纯子树语义下「要部分子部门 + 直挂本级的人、但不要其他子部门」无法表达。
+    scope         VARCHAR(16)  NOT NULL DEFAULT 'subtree' COMMENT 'subtree=含整棵子树 | exact=仅直挂本节点',
     granted_by    VARCHAR(128) DEFAULT NULL COMMENT '操作人 staffId',
     granted_at    DATETIME     DEFAULT CURRENT_TIMESTAMP,
     revoked_at    DATETIME     DEFAULT NULL COMMENT 'NULL=生效中；非空=已撤销（软撤销，保留审计）',
@@ -55,11 +60,13 @@ CREATE TABLE IF NOT EXISTS kb_doc_node_grant (
     note          VARCHAR(255) DEFAULT NULL,
     created_at    DATETIME     DEFAULT CURRENT_TIMESTAMP,
     updated_at    DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uk_doc_dept (doc_id, dept_id),
+    -- (doc_id, dept_id, scope) 唯一：同一节点可同时以两种 scope 授权（少见但合法：
+    -- 「子树全给 + 本级另有说明」），撤销后再授权走 ON DUPLICATE 复活同一行。
+    UNIQUE KEY uk_doc_dept_scope (doc_id, dept_id, scope),
     INDEX idx_doc_active (doc_id, revoked_at),
     INDEX idx_dept (dept_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  COMMENT='文档→组织节点授权（可见度权威）；子树语义、软撤销、(doc_id,dept_id) 唯一';
+  COMMENT='文档→组织节点授权（可见度权威）；subtree/exact 双 scope、软撤销';
 
 
 -- ── 3. dept_admin 管辖子树（管理轴，与读组正交；三分授权原则不变）────────────

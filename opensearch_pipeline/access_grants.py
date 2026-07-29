@@ -70,6 +70,94 @@ def resolve_allowed_depts(doc_ids: Iterable[str], cursor) -> Dict[str, List[str]
     return out
 
 
+# ── node-ACL：结构化权威解析（两个权威源【分别】解析，只在投影边界编码）──────────
+def _node_acl_columns_present(cursor) -> bool:
+    """schema/060 是否已 apply（`document_meta.acl_mode` 存在）。
+
+    未 apply → 全库恒 legacy，node 分支彻底惰化（与 049 的 1054 回退同型：代码可先部署，
+    apply 是 user-gated）。**结果不缓存**——apply 是一次性事件，多查一次 information_schema
+    的代价远小于"部署后 apply 却要重启才生效"。
+    """
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='document_meta' AND COLUMN_NAME='acl_mode'",
+            (_kb_db(),))
+        row = cursor.fetchone()
+        return bool(row and row[0])
+    except Exception as e:   # noqa: BLE001 — 查不出 ⇒ 保守当作未 apply（fail-safe 退回现状）
+        logger.warning("node-ACL 列探测失败，按未 apply 处理（全库 legacy）: %s", e)
+        return False
+
+
+def resolve_doc_acl(doc_ids: Iterable[str], cursor) -> Dict[str, "object"]:
+    """聚合给定 doc 的【结构化 ACL 权威】→ {doc_id: acl_policy.DocAcl}。
+
+    ⚠️ **两个权威源分别解析、各自校验**，只在 RDS/HA3 投影边界才由
+    `acl_policy.project_doc_acl` 编码成混合集合 —— 绝不能先把组码与 `d:`/`dx:` 混进一个
+    列表再送 `sanitize_owner_depts`（组码白名单会把节点值静默丢光）。
+
+      · kb_access_request(status='approved') → groups（过组码白名单，legacy 语义）
+      · kb_doc_node_grant(revoked_at IS NULL) → node_ids / exact_node_ids（node 语义）
+      · document_meta → acl_mode / permission_level / owner_dept（模式与敏感级权威）
+
+    schema/060 未 apply ⇒ 恒返回 legacy 形态（node 字段为空），行为与现状逐字节一致。
+    """
+    from opensearch_pipeline.acl_policy import (
+        ACL_MODE_LEGACY, ACL_MODE_NODE, DocAcl, normalize_node_ids,
+    )
+    ids = [d for d in dict.fromkeys(doc_ids) if d]
+    if not ids:
+        return {}
+    ph = ",".join(["%s"] * len(ids))
+    has_node = _node_acl_columns_present(cursor)
+
+    # 1. 文档自身（模式 / 敏感级 / 真实 owner）
+    cols = "doc_id, permission_level, owner_dept" + (", acl_mode" if has_node else "")
+    cursor.execute(f"SELECT {cols} FROM {_kb_db()}.document_meta WHERE doc_id IN ({ph})", tuple(ids))
+    meta: Dict[str, tuple] = {}
+    for row in cursor.fetchall():
+        mode = (row[3] if has_node and len(row) > 3 else None) or ACL_MODE_LEGACY
+        meta[row[0]] = ((row[1] or ""), (row[2] or ""), str(mode).strip().lower())
+
+    # 2. legacy 权威：approved 跨部门组码（复用既有单一注入点，白名单/去重/告警口径不变）
+    groups_by_doc = resolve_allowed_depts(ids, cursor)
+
+    # 3. node 权威：active 节点授权，按 scope 分流
+    nodes: Dict[str, List[int]] = {}
+    exacts: Dict[str, List[int]] = {}
+    if has_node:
+        try:
+            cursor.execute(
+                f"SELECT doc_id, dept_id, scope FROM {_kb_db()}.kb_doc_node_grant "
+                f"WHERE revoked_at IS NULL AND doc_id IN ({ph})", tuple(ids))
+            for doc_id, dept_id, scope in cursor.fetchall():
+                bucket = exacts if str(scope or "").strip().lower() == "exact" else nodes
+                bucket.setdefault(doc_id, []).append(dept_id)
+        except Exception as e:   # noqa: BLE001 — 节点权威读失败 ⇒ fail-closed（空集，不放行）
+            logger.warning("kb_doc_node_grant 读取失败，节点授权按空集处理（fail-closed）: %s", e)
+            nodes, exacts = {}, {}
+
+    out: Dict[str, object] = {}
+    for doc_id in ids:
+        perm, owner, mode = meta.get(doc_id, ("", "", ACL_MODE_LEGACY))
+        if mode not in (ACL_MODE_LEGACY, ACL_MODE_NODE):
+            logger.warning("doc=%s 未知 acl_mode=%r ⇒ 按 legacy 解析", doc_id, mode)
+            mode = ACL_MODE_LEGACY
+        n_ids, n_ov = normalize_node_ids(nodes.get(doc_id, ()))
+        e_ids, e_ov = normalize_node_ids(exacts.get(doc_id, ()))
+        if n_ov or e_ov:
+            # 权威表里的既存超限脏数据：取确定性安全子集（normalize 已按首次出现截序）
+            # 并高优告警——不静默放行全部，也不整篇拒绝。
+            logger.error("doc=%s 节点授权超上限（脏数据）⇒ 取安全子集并告警", doc_id)
+        out[doc_id] = DocAcl(
+            mode=mode, permission_level=perm, owner_dept=owner,
+            groups=tuple(groups_by_doc.get(doc_id, ())),
+            node_ids=tuple(n_ids), exact_node_ids=tuple(e_ids),
+        )
+    return out
+
+
 def resolve_allowed_depts_one(doc_id: str, cursor) -> List[str]:
     """单文档便利：该 doc 的授权组码列表（无授权 → []）。"""
     if not doc_id:
