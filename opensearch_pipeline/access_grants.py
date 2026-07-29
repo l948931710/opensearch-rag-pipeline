@@ -102,6 +102,11 @@ def resolve_doc_acl(doc_ids: Iterable[str], cursor) -> Dict[str, "object"]:
       · document_meta → acl_mode / permission_level / owner_dept（模式与敏感级权威）
 
     schema/060 未 apply ⇒ 恒返回 legacy 形态（node 字段为空），行为与现状逐字节一致。
+
+    ⚠️ cursor 契约 = **tuple 游标**（与本模块其余函数一致；serving 路径 `db._get_db_conn()`
+    实测返回 tuple）。**别传 `prod_access.get_prod_readonly_conn()` 的游标** —— 它默认
+    `DictCursor`，行按列名取值，这里的 `row[1]` 会 KeyError（2026-07-29 核查脚本踩过）。
+    需用 prod_access 核查时传 `dict_cursor=False`。
     """
     from opensearch_pipeline.acl_policy import (
         ACL_MODE_LEGACY, ACL_MODE_NODE, DocAcl, normalize_node_ids,
