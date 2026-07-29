@@ -455,7 +455,16 @@ def _normalize_acl_groups(user_dept: Union[str, List[str], None]) -> List[str]:
     return out
 
 
-def _build_permission_filter(user_dept: Union[str, List[str], None]) -> str:
+def _node_acl_flags() -> Tuple[bool, bool]:
+    """(grant, enforce)。启动/首用即校验姿态:GRANT=true && ENFORCE=false 非法。"""
+    from opensearch_pipeline.acl_policy import assert_flag_posture
+    cfg = get_config().rag
+    grant, enforce = bool(cfg.node_acl_grant), bool(cfg.node_acl_enforce)
+    assert_flag_posture(grant_enabled=grant, enforce_enabled=enforce)
+    return grant, enforce
+
+
+def _build_permission_filter(user_dept: Union[str, List[str], None], *, acl_ctx=None) -> str:
     """构建 HA3 权限过滤表达式（安全边界，单一实现）。
 
     放行 public；对用户所属的每个 ACL 组额外放行该组的 dept_internal。入参经
@@ -483,6 +492,24 @@ def _build_permission_filter(user_dept: Union[str, List[str], None]) -> str:
     if get_config().rag.allowed_depts_acl:
         allowed_clause = " OR ".join('allowed_depts="' + g + '"' for g in groups)
         base = base + ' OR (permission_level="dept_internal" AND (' + allowed_clause + '))'
+    # node-ACL（RAG_NODE_ACL_GRANT，默认关）：追加祖先链/直属部门的节点 OR 分支。
+    # acl_ctx=None（当前全部调用点）⇒ 整段不执行，返回串与历史逐字节一致。
+    # ⚠️ 节点值由 acl_policy 自行严格拼接，**绝不流经 _sanitize_ha3_filter_value**
+    #   （该净化器会删掉冒号，d:123 会被打成 d123）。值域只含 d:/dx: + 正整数，无注入面。
+    # org_wide_reader（总经办 `*`）：单靠事后 can_read_doc 放行不够——HA3 主过滤器压根
+    #   不会把 node 文档召回来（其 owner 是哨兵、祖先链也不含被勾节点），事后判定轮不到
+    #   执行。故给该角色一条候选分支：直接放行全部 dept_internal，召回后统一走权威复核。
+    if acl_ctx is not None:
+        grant, _enforce = _node_acl_flags()
+        if grant:
+            if getattr(acl_ctx, "org_wide_reader", False):
+                base = base + ' OR (permission_level="dept_internal")'
+            else:
+                from opensearch_pipeline.acl_policy import node_filter_terms
+                terms = node_filter_terms(acl_ctx)
+                if terms:
+                    node_clause = " OR ".join('allowed_depts="' + t + '"' for t in terms)
+                    base = base + ' OR (permission_level="dept_internal" AND (' + node_clause + '))'
     return base
 
 
@@ -512,7 +539,48 @@ def invalidate_deny_cache(doc_id: Optional[str] = None) -> None:
             _deny_cache.pop(doc_id, None)
 
 
-def _deny_revoked_cross_dept(results, user_dept):
+def _deny_revoked_node_hits(results, acl_ctx, cross_idx):
+    """node-ACL 的查询侧复核:对【全部非 public 跨部门命中】按当前权威 + 真值表判定。
+
+    ⚠️ 为什么必须有这条:`RAG_ALLOWED_DEPTS_ACL` 现网已开 ⇒ 下方 legacy 复核是**活代码**,
+    它做的是**纯组码相交**;node 授权命中的 doc 没有任何组码 ⇒ 会被它整批**误丢**,
+    node 文档在生产上根本查不出来。这不是设计缺陷而是阻断项(codex 增量评审)。
+
+    ⚠️ 过渡期**不能靠哨兵识别 node 命中**:`acl_mode` 不进 HA3,而未收敛的投影里旧 owner
+    可能还在、哨兵尚未写下 ⇒ 必须对全部候选**批量查当前 acl_mode**(这里与权威解析一次
+    往返合并完成,不额外加 DB 往返)。
+
+    返回需要丢弃的下标集合。权威不可达 ⇒ 丢弃全部候选(fail-closed,机密性优先)。
+    """
+    from opensearch_pipeline.acl_policy import can_read_doc
+    grant, enforce = _node_acl_flags()
+    doc_ids = {results[i].get("doc_id") for i in cross_idx if results[i].get("doc_id")}
+    if not doc_ids:
+        return set()
+    try:
+        from opensearch_pipeline.access_grants import resolve_doc_acl
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                acls = resolve_doc_acl(doc_ids, cur)
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 — 权威不可达 ⇒ fail-closed 丢弃全部跨部门命中
+        logger.warning("node-ACL 查询侧复核失败,fail-closed 丢弃 %d 条跨部门命中: %s",
+                       len(cross_idx), e)
+        return set(cross_idx)
+    drop = set()
+    for i in cross_idx:
+        acl = acls.get(results[i].get("doc_id"))
+        if acl is None or not can_read_doc(acl_ctx, acl, grant_enabled=grant, enforce_enabled=enforce):
+            drop.add(i)
+    if drop:
+        logger.info("node-ACL 查询侧拒绝:丢弃 %d 条无在册授权的命中", len(drop))
+    return drop
+
+
+def _deny_revoked_cross_dept(results, user_dept, *, acl_ctx=None):
     """查询侧拒绝（Phase D 读侧 fail-closed 复核）——撤销即时生效，不等 HA3 投影收回。
 
     HA3 的 allowed_depts 过滤依赖【投影】（chunk_meta→HA3，由 stage-3 drain 物化）。撤销跨部门授权后
@@ -529,6 +597,19 @@ def _deny_revoked_cross_dept(results, user_dept):
     if not get_config().rag.allowed_depts_acl or not results:
         return results
     norm = _normalize_acl_groups(user_dept)
+    if acl_ctx is not None:
+        # node-ACL 接线后:候选口径与 legacy 一致(非 public 且 owner 不在自有集——node 文档
+        # 的哨兵 owner 天然落在这里),但判定改走统一真值表,不再做纯组码相交。
+        _owners = set(_expand_groups_to_owners(norm))
+        _cross = [
+            i for i, r in enumerate(results)
+            if r.get("permission_level") != "public"
+            and r.get("owner_dept") and r.get("owner_dept") not in _owners
+        ]
+        if not _cross:
+            return results
+        _drop = _deny_revoked_node_hits(results, acl_ctx, _cross)
+        return [r for i, r in enumerate(results) if i not in _drop]
     groups = set(norm)
     owner_set = set(_expand_groups_to_owners(norm))
     # P2-02：从「仅 dept_internal」放宽到「任何非 public」——这样字段漂移→restricted 兜底的
