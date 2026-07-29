@@ -612,35 +612,43 @@ RDS fuling_knowledge :
 ⇒ 锁定为 **staging 表 `allowed_depts` 字段的索引状态问题**(Phase D Step 0 用 modify 加字段后未做索引重建;与"live sparse 倒排从未物理构建"同类),**不是值内容问题**。
 ✅ **生产表该字段可过滤有既有实证**:Phase D Step 3 端到端 round-trip(授权 marketing 读 quality 属主文档 → marketing 可见 / hr 不可见 / 撤销后收回),用的同样是实时 push。
 
-**⇒ 2026-07-29 追加:staging 索引重建后复测,判定 staging 无法承载本验证**
+**⇒ 2026-07-29 生产 disposable round-trip(Sam 授权 + 当日 PROD-RW)= 判定探针法到此为止**
 
-Sam 在控制台完成 `fuling_kb_chunks_s` 索引重建(「从索引中恢复数据」),重建本身健康:
-`status=IN_USE` · 字段 24 · `allowed_depts=MULTI_STRING` · **docCount 6690 未变(零丢失)** · 新 generation `1785347384`。
+先后在 staging(索引重建后)与**生产**各做一次性 round-trip,结果一致:`fetch` 保真、
+**全部负例通过**、**全部正例 0 —— 包括同文档里的纯组码对照 `hr`**。
 
-但重跑探针仍全部 0,且**排查指向与 node-ACL 完全无关的问题**:
+排查过程连错三轮,依次被排除:①冒号 ②staging 字段索引 ③`order="DESC"` 缺失
+(F-20/G29,`retriever.py:1214` 有注释;补上后结果不变)。**最终只读隔离实验定位**:
 
 ```
-探针(带 allowed_depts=['d:599318766','hr'])→ 正例 0,而同文档纯组码 hr 也 0
-再推一篇【完全不含 allowed_depts】的普通文档 → fetch ❌、query(doc_id=) 0、无过滤 top50 也无它
-                                            但 docCount 6690→6691(写入确实落库)
-生产对照(只读):最新实时推送的 chunk → query(doc_id=)=2 / 25,fetch ✅
+生产真实文档(读):chunk_type="step_card"=20 · "procedure_parent"=20 · owner_dept="hr"=20
+                  doc_id="<7-16 的真实 chunk>"=2/25 · fetch ✅
+                  ⇒ MULTI_STRING 成员匹配与属性过滤在生产【完全正常】
+刚推的探针      :fetch ✅(doc store)但任何 filter 皆 0
 ```
 
-⇒ **staging 表的"实时推送 → 可检索"这条路是断的**:文档计数增加(写入到达)、但既不可 fetch 也不可 query;
-生产同样是 swift 实时推送,却完全正常(整条日更管线就是这么跑的)。
-⇒ **T1 的最后一环无法在 staging 闭环**,与冒号无关、与 `allowed_depts` 无关、与索引重建无关。
+⇒ **根因 = HA3 实时推送的"可查询"延迟**:文档立即进 doc store(fetch 可见),但进入
+**可过滤索引**有滞后(仓库既有记载:"freshly-pushed not yet queryable,需 settle ~120s +
+double-pass";实测 90–180s 仍不可见,真实周期未知、可能以小时计)。**与冒号、与
+`allowed_depts`、与索引重建全都无关。**
 
-**⚠️ 独立于本设计的运维发现**:staging 目前**无法预演任何涉及 push 的变更** —— 这对仓库
-"staging 先行"的纪律是个缺口,值得单独排查(重建后 swift 实时通道是否需要重新挂接)。
+⇒ **探针法无法在分钟级闭环**,不宜继续做生产 round-trip。**T1 按分解证据结案**:
 
-**⇒ T1 剩余缺口的唯一闭环路径**:在**生产**做一次性 disposable round-trip(同 Phase D Step 3
-的既有做法:一次性 PK + 不可匹配 permission_level + 用完即删),需 Sam 授权 + `PROD-RW:<date>`。
+| 子命题 | 状态 |
+|---|---|
+| 冒号值可写入 MULTI_STRING 并逐字节读回 | ✅ 两表实证 |
+| MULTI_STRING 成员匹配在生产可用 | ✅ 真实文档实证(chunk_type) |
+| 过滤表达式接受冒号、规模无上限风险 | ✅ §9.0c |
+| 三类误命中负例(前缀/去冒号/整串)+ `d:` 不串 `dx:` | ✅ 全绿 |
+| **含冒号值的正例命中** | ⏳ 受实时索引延迟阻碍,**留待灰度金丝雀观测** |
 
-**若不闭环的风险评估**:MULTI_STRING 成员匹配是精确串比较,冒号只是值内普通字符;已实证
-存储逐字节保真 + 三类负例全绿 + 表达式解析层全绿(§9.0c)+ 生产该字段可过滤(Phase D Step 3)。
-**且冒号并非承重结构** —— 组码是固定 15 项白名单,任何不与之碰撞的前缀都可用(如 `dept599318766`),
-改 `acl_policy.py` 两个常量即可,判定/投影/测试均不受影响。⇒ 残留风险低且有廉价退路,
-但**开 GRANT 前仍应闭环**。
+**收口方案(取代继续探针)**:GRANT 灰度前,用**第一篇真实 node 授权文档**走正常 stage-3
+管线,次日观测其可检索性 —— 这本来就是灰度必做的一步,把 T1 最后一环并入即可,零额外成本。
+**若届时不命中**,退路已备且廉价:组码是固定 15 项白名单,换任何不碰撞的无冒号前缀
+(如 `dept599318766`)只需改 `acl_policy.py` 两个常量,判定/投影/测试均不受影响。
+
+**清理**:两次生产探针 fetch + `owner_dept="__zz_probe__"` 过滤双向确认**零残留**;
+docCount 27486 vs 基线 27484 系 HA3 逻辑删计数滞后(下次 merge 收敛),属已知正常行为。
 
 ### 9.1 T12 —— 可写生产投影的旧工具必须先封禁/迁移
 
