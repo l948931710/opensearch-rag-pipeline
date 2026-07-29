@@ -650,6 +650,24 @@ double-pass";实测 90–180s 仍不可见,真实周期未知、可能以小时�
 **清理**:两次生产探针 fetch + `owner_dept="__zz_probe__"` 过滤双向确认**零残留**;
 docCount 27486 vs 基线 27484 系 HA3 逻辑删计数滞后(下次 merge 收敛),属已知正常行为。
 
+### 9.0f schema 059 + 060 已 apply 生产(2026-07-29,Sam 授权 + 当日 PROD-RW)
+
+```
+staging fuling_knowledge_stg : 059(1 条) + 060(24 条) ✅  存量 566 篇 acl_mode 全 legacy
+生产    fuling_knowledge     : 059(1 条) + 060(24 条) ✅  台账 14:35:24 / 14:35:41
+  document_meta 新列  acl_mode='legacy'(NOT NULL) · owner_dept_id=NULL · acl_revision=0
+  ★ 存量 1938 篇文档 acl_mode 全为 legacy   kb_doc_node_grant 行数 0
+  新表 dept_admin_node_grant / dept_dim / kb_doc_node_grant / staff_dim / image_funnel_verdict
+  生产实跑 resolve_doc_acl → 全 legacy、节点集空 ⇒ 检索行为与 apply 前逐字节一致 ✅
+```
+
+⚠️ **apply 时遇到的两个门与正确处置**:
+1. 本机不带 `RAG_ENV` 会解析到 **localhost**,必须 `RAG_ENV=production` 才指向生产。
+2. production 安全守卫要求 `RAG_REQUIRE_AUTH`/`RAG_ACL_FAIL_CLOSED`(SAE 注入,本机
+   `.env.production` 未声明)。正确处置 = **显式声明这两个安全值为 true**(与现网 07-23
+   镜像实际姿态一致);**不得**用 `RAG_ALLOW_LEGACY_OPEN_PROD=ack:<date>` 豁免 —— 那是
+   放宽姿态的令牌且属 Sam 专有。
+
 ### 9.1 T12 —— 可写生产投影的旧工具必须先封禁/迁移
 
 这些工具**不在镜像里**(`.gitignore:22`/`.dockerignore:8`),但可从运维机持生产 RW token 直接写投影,**不能因"不在镜像中"而忽略**:
