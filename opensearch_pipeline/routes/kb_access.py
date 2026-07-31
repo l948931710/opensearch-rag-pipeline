@@ -113,6 +113,185 @@ class KbAccessGrantCreateResponse(BaseModel):
     ok: bool = True
 
 
+# ── node-ACL：组织树节点授权（可见范围「整体替换」）─────────────────────────
+class KbNodeGrantItem(BaseModel):
+    dept_id: int
+    subtree: bool = True          # True=含整棵子树(投影 d:) | False=仅直挂本节点(投影 dx:)
+
+
+class KbNodeGrantsSave(BaseModel):
+    """管理员在组织树上勾选后的【整体替换】保存。"""
+    doc_id: str
+    nodes: List[KbNodeGrantItem] = Field(default_factory=list)
+    # 并发整体替换的 CAS:传入端上读到的 acl_revision;与库中不一致 ⇒ 409(有人先改了)
+    acl_revision: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class KbNodeGrantsSaveResponse(BaseModel):
+    doc_id: str = ""
+    acl_mode: str = ""
+    acl_revision: int = 0
+    granted: List[str] = Field(default_factory=list)   # "d:<id>" / "dx:<id>"
+    revoked: List[str] = Field(default_factory=list)
+    ok: bool = True
+
+
+@router.post("/api/kb/doc-node-grants", response_model=KbNodeGrantsSaveResponse)
+def kb_doc_node_grants_save(req: KbNodeGrantsSave, request: Request,
+                            identity: Optional[Identity] = Depends(current_identity)):
+    """保存文档的组织树节点可见范围 —— **整体替换,不是追加**。
+
+    语义(设计稿 §5「保存=替换」):未勾选的节点 soft-revoke、已勾选的 upsert/复活,
+    文档同时切到 `acl_mode='node'`。切换后该文档的 **legacy 组码授权对检索失效**
+    (`project_doc_acl` 模式互斥:node 投影只出 `d:`/`dx:`,绝不含组码) —— 既有
+    `kb_access_request` 行**保留作审计**,不删。
+
+    同事务完成(缺一不可):
+      ①`document_meta ... FOR UPDATE` 行锁 + `acl_revision` CAS —— 并发两个"整体替换"
+        必须串行化,否则后提交者会把先提交者的勾选静默丢掉;
+      ②切 `acl_mode` + `acl_revision+1`;③节点集整体替换;④审计;
+      ⑤`enqueue_acl_projection` 持久入队(权威变更与投影意图原子提交);
+      ⑥内联 `materialize_doc_allowed_depts` best-effort(失败有 outbox + reconcile 兜底)。
+    提交后失效 deny 缓存(撤销即时生效)。
+
+    硬规则(fail-closed):
+      - 只 `dept_internal` 可设节点可见范围(public 本就全司可读→400;restricted 绝不外露→403);
+      - 非在线文档不可改(400);
+      - 必须 `_kb_can_manage(document_meta.owner_dept)` —— **管理轴仍是真实 owner**
+        (node 模式只改检索投影轴,归属/管理轴不动),故此处授权判定无需等 T5;
+      - 节点数超上限 → **422 拒绝**,绝不静默截断后让 UI 以为已完整保存;
+      - dept_id 必须是**在册**组织节点(`dept_dim.is_active=1`)—— 授权给已消失/不存在的
+        节点等于该文档对所有人不可见,且事后无从解释。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.access_grants import (
+        enqueue_acl_projection, materialize_doc_allowed_depts,
+    )
+    from opensearch_pipeline.acl_policy import (
+        ACL_MODE_NODE, MAX_DOC_NODES, format_node_value, normalize_node_ids,
+    )
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    ids, overflow = normalize_node_ids([n.dept_id for n in req.nodes], limit=MAX_DOC_NODES)
+    if overflow:
+        raise HTTPException(status_code=422,
+                            detail=f"授权节点数超上限 {MAX_DOC_NODES}（请改选更上层节点）")
+    if len(ids) != len({n.dept_id for n in req.nodes}):
+        raise HTTPException(status_code=400, detail="含非法 dept_id（须为正整数）")
+    scope_by_id = {int(n.dept_id): ("subtree" if n.subtree else "exact") for n in req.nodes}
+
+    assert_metadata_write_allowed("kb_doc_node_grants_save", get_config().rds.host, kind="rds")
+    trace_id = get_request_id()
+    granted: List[str] = []
+    revoked: List[str] = []
+    new_rev = 0
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # ① 行锁 + 前置校验(与并发退役/升版串行化)
+                cur.execute(
+                    f"SELECT owner_dept, permission_level, status, acl_mode, acl_revision "
+                    f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, perm, status, cur_mode, cur_rev = (
+                    row[0] or "", (row[1] or "").lower(), (row[2] or "active").lower(),
+                    row[3] or "legacy", int(row[4] or 0))
+                if status != "active":
+                    raise HTTPException(status_code=400, detail="文档不在线,无法设置可见范围")
+                if perm == "restricted":
+                    raise HTTPException(status_code=403, detail="restricted 文档不可对外放行")
+                if perm != "dept_internal":
+                    raise HTTPException(status_code=400,
+                                        detail="仅 dept_internal 文档可设节点可见范围")
+                if not _kb_can_manage(kb, owner_dept):
+                    raise HTTPException(status_code=403, detail="无权管理该文档（非属主部门管理员）")
+                if req.acl_revision is not None and int(req.acl_revision) != cur_rev:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"可见范围已被他人修改（当前版本 {cur_rev}），请刷新后重试")
+
+                # dept_id 必须在册 —— 授权给不存在/已消失的节点 = 该文档对所有人不可见
+                if ids:
+                    ph = ",".join(["%s"] * len(ids))
+                    cur.execute(
+                        f"SELECT dept_id FROM {_kb_db()}.dept_dim "
+                        f"WHERE is_active=1 AND dept_id IN ({ph})", tuple(ids))
+                    live = {int(r[0]) for r in cur.fetchall()}
+                    missing = [i for i in ids if i not in live]
+                    if missing:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"节点不存在或已停用: {missing}（组织快照可能过期，请稍后重试）")
+
+                # ③ 整体替换:未勾选的 soft-revoke、勾选的 upsert/复活
+                cur.execute(
+                    f"SELECT dept_id, scope FROM {_kb_db()}.kb_doc_node_grant "
+                    "WHERE doc_id=%s AND revoked_at IS NULL", (req.doc_id,))
+                before = {(int(r[0]), str(r[1] or "subtree")) for r in cur.fetchall()}
+                after = {(i, scope_by_id[i]) for i in ids}
+                for dept_id, scope in sorted(before - after):
+                    cur.execute(
+                        f"UPDATE {_kb_db()}.kb_doc_node_grant SET revoked_at=NOW(), revoked_by=%s "
+                        "WHERE doc_id=%s AND dept_id=%s AND scope=%s AND revoked_at IS NULL",
+                        (kb.user_id, req.doc_id, dept_id, scope))
+                    revoked.append(format_node_value(dept_id, exact=(scope == "exact")))
+                for dept_id, scope in sorted(after - before):
+                    cur.execute(
+                        f"INSERT INTO {_kb_db()}.kb_doc_node_grant "
+                        "(doc_id, dept_id, scope, granted_by, note) VALUES (%s,%s,%s,%s,%s) "
+                        "ON DUPLICATE KEY UPDATE revoked_at=NULL, revoked_by=NULL, "
+                        "granted_by=VALUES(granted_by), granted_at=NOW(), note=VALUES(note)",
+                        (req.doc_id, dept_id, scope, kb.user_id, (req.reason or "")[:255]))
+                    granted.append(format_node_value(dept_id, exact=(scope == "exact")))
+
+                # ② 切模式 + CAS 版本 +1(即便节点集未变也推进,便于端上察觉并发)
+                new_rev = cur_rev + 1
+                cur.execute(
+                    f"UPDATE {_kb_db()}.document_meta SET acl_mode=%s, acl_revision=%s, "
+                    "updated_at=NOW() WHERE doc_id=%s",
+                    (ACL_MODE_NODE, new_rev, req.doc_id))
+
+                # ⑤⑥ 投影:持久入队(不吞异常)+ 内联标脏 best-effort
+                enqueue_acl_projection(cur, req.doc_id, reason="node_grants_save")
+                try:
+                    materialize_doc_allowed_depts(cur, req.doc_id)
+                except Exception as _pe:   # noqa: BLE001 — outbox + reconcile 兜底
+                    logger.warning("node 授权内联标脏失败（outbox 兜底）doc=%s: %s", req.doc_id, _pe)
+
+                write_audit(doc_id=req.doc_id, version_no=None, action_type="ACL_NODE_GRANTS_SAVE",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=(f"mode {cur_mode}→node rev {cur_rev}→{new_rev} "
+                                     f"+{granted} -{revoked}"), cursor=cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_doc_node_grants_save 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"保存失败 (trace: {trace_id})")
+
+    # 撤销即时生效:提交后失效查询侧授权复核缓存
+    try:
+        from opensearch_pipeline.retriever import invalidate_deny_cache
+        invalidate_deny_cache(req.doc_id)
+    except Exception as _ce:   # noqa: BLE001
+        logger.warning("失效 deny 缓存失败（TTL 兜底）doc=%s: %s", req.doc_id, _ce)
+
+    return KbNodeGrantsSaveResponse(
+        doc_id=req.doc_id, acl_mode=ACL_MODE_NODE, acl_revision=new_rev,
+        granted=granted, revoked=revoked, ok=True)
+
+
 # ── Phase F：成员/角色管理（kb_admin 维护 dept_admin 写授权；三分授权 读≠管理≠授权）──
 class KbAdminItem(BaseModel):
     user_id: str = ""
