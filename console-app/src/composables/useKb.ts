@@ -1317,6 +1317,29 @@ async function submitShare(depts: string[], reason: string): Promise<string | nu
   } finally { shareBusy.value = false }
 }
 
+/** node-ACL：保存文档的组织树节点可见范围 —— **整体替换**（POST /api/kb/doc-node-grants）。
+ * 未勾选的节点会被撤销；acl_revision 做 CAS，并发保存时后到者收 409（绝不静默丢勾选）。
+ * 返回 null=成功；string=错误文案。 */
+async function saveNodeGrants(
+  docId: string, nodes: { dept_id: number; subtree: boolean }[],
+  aclRevision: number | null, reason = ''): Promise<string | null> {
+  if (!docId) return '缺少文档'
+  shareBusy.value = true
+  try {
+    await apiJson('/api/kb/doc-node-grants', {
+      method: 'POST', auth: true,
+      body: JSON.stringify({ doc_id: docId, nodes, acl_revision: aclRevision, reason }),
+    })
+    shareCtx.value = null
+    await loadDocs()
+    return null
+  } catch (e: any) {
+    if (e?.status === 409) return e.detail || '可见范围已被他人修改，请刷新后重试'
+    if (e?.status === 422) return e.detail || '所选节点过多，请改选更上层节点'
+    return e?.status === 403 ? (e.detail || '无权管理该文档') : uploadErrText(e)
+  } finally { shareBusy.value = false }
+}
+
 /** 重设基础可见范围（dept_internal / public / restricted）：POST /api/kb/set-visibility。
  * 成功后即时反映行的 permission_level + 权威 loadDocs 纠正徽章（restricted 会离开检索）。
  * opts.reload=false 供批量路径抑制逐篇重拉（_bulkRun 批末已有一次权威 loadDocs——否则
@@ -1491,7 +1514,7 @@ export function useKb() {
     // 方法
     loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, openHistory, closeHistory, openDocPreview, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,
-    openShare, closeShare, submitShare, grantedDeptsOf, grantedLabelsByDoc, docGrantRows, setVisibility,
+    openShare, closeShare, submitShare, saveNodeGrants, grantedDeptsOf, grantedLabelsByDoc, docGrantRows, setVisibility,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     feedbackReview, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
     reviewTasks, loadReviewTasks, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,

@@ -2813,7 +2813,23 @@ def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
 
 
 def _load_org_tree_snapshot() -> Optional[Dict[str, Any]]:
-    """读取 org 树快照（scratch/dingtalk_org_tree.json）；缺失/异常 → None（fail open）。"""
+    """org 树快照 —— **2026-07-31 起改读 RDS `dept_dim`**(node-ACL 组织同步 job 产出)。
+
+    ⚠️ 为什么必须改:原实现读 `scratch/dingtalk_org_tree.json`,而 scratch/ 同时被
+    `.gitignore` 与 `.dockerignore` 排除、Dockerfile 只 COPY `opensearch_pipeline/`
+    ⇒ **2026-07-23 起的镜像应用里该文件根本不存在,生产恒返回 null**(管理台的组织
+    选择器因此一直是空的)。RDS 快照对镜像可见,且与祖先链解析用的是同一份数据。
+    """
+    try:
+        from opensearch_pipeline.org_sync import load_org_tree
+        return load_org_tree()
+    except Exception as e:   # noqa: BLE001 — 组织数据不可用不得打挂管理台
+        logger.warning("org 树读取失败（返回 None）: %s", e)
+        return None
+
+
+def _load_org_tree_snapshot_legacy_file() -> Optional[Dict[str, Any]]:
+    """旧实现(读 scratch 文件)——保留供本地无 DB 时调试;生产路径已不再使用。"""
     try:
         from pathlib import Path
         p = Path(__file__).resolve().parent.parent / "scratch" / "dingtalk_org_tree.json"

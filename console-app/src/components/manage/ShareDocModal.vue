@@ -4,19 +4,34 @@ import { X, Loader2, Lock } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
 import { useKb, type AccessGrantItem, type DocItem } from '@/composables/useKb'
 import { useDialog } from '@/composables/useDialog'
+import OrgTreePicker, { type PickedNode } from './OrgTreePicker.vue'
 
 // 文档权限弹窗（owner 侧）：
 //   上 = 基础可见范围（仅本部门 / 全公司 / 受限，POST set-visibility；公开需 kb_admin）；
 //   下 = 跨部门共享（仅 dept_internal 时显示）：已共享逐行可撤销 + 新增目标 chips。
-const { shareCtx, shareBusy, shareTargets, isBusy, isKbAdmin, grantedDeptsOf, docGrantRows, submitShare, revokeAccess, setVisibility, closeShare } = useKb()
+const { shareCtx, shareBusy, shareTargets, isBusy, isKbAdmin, grantedDeptsOf, docGrantRows, submitShare, saveNodeGrants, revokeAccess, setVisibility, closeShare } = useKb()
 const { confirm, promptText, dialog } = useDialog()
 
 const picked = ref<string[]>([])
 const reason = ref('')
 const err = ref('')
+// node-ACL：按组织树勾选的可见范围（整体替换语义 —— 取消勾选即撤销）
+const nodePicked = ref<PickedNode[]>([])
+const nodeErr = ref('')
+async function saveNodes() {
+  const d = shareCtx.value
+  if (!d) return
+  nodeErr.value = ''
+  const e = await saveNodeGrants(d.doc_id, nodePicked.value, (d as any).acl_revision ?? null,
+                                 reason.value.trim())
+  if (e) nodeErr.value = e
+}
 const visBusy = ref('')           // 正在切换的目标级别（禁用按钮 + 转圈）
 
-watch(shareCtx, () => { picked.value = []; reason.value = ''; err.value = ''; visBusy.value = '' })
+watch(shareCtx, () => {
+  picked.value = []; reason.value = ''; err.value = ''; visBusy.value = ''
+  nodePicked.value = []; nodeErr.value = ''
+})
 
 const curLevel = computed(() => shareCtx.value?.permission_level || '')
 const isDeptInternal = computed(() => curLevel.value === 'dept_internal')
@@ -148,6 +163,28 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         </div>
         <p v-if="!isKbAdmin" class="mb-4 text-[11px] text-faint">「全公司」涉及全员可见，需知识库管理员操作。</p>
         <p v-else class="mb-4 text-[11px] text-faint">改「受限」= 下线归档、离开检索（可再改回恢复）。</p>
+
+        <!-- node-ACL：按组织架构设可见范围（整体替换；取消勾选即撤销） -->
+        <template v-if="isDeptInternal">
+          <p class="mb-2 text-[11px] font-bold uppercase tracking-[0.04em] text-faint">
+            按组织架构设置可见范围
+          </p>
+          <div class="mb-2 rounded-[11px] border border-border bg-surface p-3">
+            <OrgTreePicker v-model="nodePicked" :disabled="shareBusy" />
+          </div>
+          <p class="mb-2 text-[11px] text-faint">
+            保存为<b>整体替换</b>：未勾选的部门会被撤销。「含下级」关掉 = 仅直挂本部门的人可见。
+          </p>
+          <p v-if="nodeErr" class="mb-2 text-[11px] text-danger">{{ nodeErr }}</p>
+          <button
+            type="button"
+            class="mb-5 inline-flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-[13px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
+            :disabled="shareBusy || isBusy"
+            @click="saveNodes"
+          ><Loader2 v-if="shareBusy" :size="13" :stroke-width="2" class="animate-spin" />{{
+            shareBusy ? '保存中…' : (nodePicked.length ? `保存可见范围（${nodePicked.length} 个部门）` : '保存可见范围（清空）')
+          }}</button>
+        </template>
 
         <!-- 跨部门共享：仅 dept_internal 文档可共享（public 已全员可读，restricted 不外露） -->
         <template v-if="isDeptInternal">

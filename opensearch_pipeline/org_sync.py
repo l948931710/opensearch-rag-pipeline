@@ -208,3 +208,84 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ── 组织树读侧(管理台选择器 / 奖励统计分母共用)────────────────────────────────
+_TREE_CACHE: dict = {}
+
+
+def _tree_cache_ttl_s() -> float:
+    try:
+        return float(os.environ.get("RAG_ORG_TREE_TTL_S", "300") or 0)
+    except ValueError:
+        return 300.0
+
+
+def load_org_tree() -> dict:
+    """RDS 快照 → 管理台组织树选择器载荷(**扁平列表**,前端自行建树)。
+
+    返回 {"nodes":[{dept_id,parent_id,name,depth,staff_count}], "snapshot_rev", "synced_at",
+          "stale": bool, "staff_total"}。表空/异常 → nodes=[] 且 stale=True(前端据此提示
+    "组织数据未同步",而不是画一棵空树让人以为公司没部门)。
+
+    ⚠️ `staff_count` 是**子树总人数**(含本节点直属 + 全部后代),不是直属人数 —— 授权是
+    子树语义,管理员要看到的是"勾这个节点会给多少人看"。**这个数就是防呆的关键**:
+    授权到比员工挂载点更深的空节点时,这里会显示 0,当场就能发现(实测 119 个部门里
+    L4/L5 共 17 个,人都挂在更浅的层)。
+    """
+    ttl = _tree_cache_ttl_s()
+    now = time.monotonic()
+    hit = _TREE_CACHE.get("v")
+    if hit and ttl > 0 and now - hit[0] < ttl:
+        return hit[1]
+
+    out = {"nodes": [], "snapshot_rev": 0, "synced_at": "", "stale": True, "staff_total": 0}
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT dept_id, parent_id, name, depth, snapshot_rev, "
+                    "  TIMESTAMPDIFF(HOUR, synced_at, NOW()), synced_at "
+                    "FROM dept_dim WHERE is_active=1")
+                rows = cur.fetchall()
+                cur.execute("SELECT dept_ids FROM staff_dim WHERE is_active=1")
+                staff_rows = [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 — 表未 apply / DB 抖动 ⇒ stale 空树,不抛
+        logger.warning("load_org_tree 失败(返回空树 + stale): %s", e)
+        return out
+    if not rows:
+        return out
+
+    parent = {int(r[0]): int(r[1]) for r in rows}
+    # 子树人数:每个人沿自己每个直属部门的父链一路 +1(按人去重,避免多部门重复计)
+    direct: Dict[int, Set[str]] = {}
+    for idx, csv in enumerate(staff_rows):
+        for part in str(csv or "").split(","):
+            part = part.strip()
+            if part.isdigit():
+                direct.setdefault(int(part), set()).add(str(idx))
+    subtree: Dict[int, Set[str]] = {}
+    for did, people in direct.items():
+        cur_id, hops = did, 0
+        while cur_id and cur_id != ROOT_DEPT_ID and hops <= _MAX_DEPTH:
+            subtree.setdefault(cur_id, set()).update(people)
+            cur_id = parent.get(cur_id, ROOT_DEPT_ID)
+            hops += 1
+
+    age_h = rows[0][5] if rows and rows[0][5] is not None else None
+    out["nodes"] = sorted(
+        ({"dept_id": int(r[0]), "parent_id": int(r[1]), "name": r[2] or "",
+          "depth": int(r[3] or 0), "staff_count": len(subtree.get(int(r[0]), ()))}
+         for r in rows),
+        key=lambda n: (n["depth"], -n["staff_count"], n["dept_id"]))
+    out["snapshot_rev"] = int(rows[0][4] or 0)
+    out["synced_at"] = str(rows[0][6] or "")
+    out["staff_total"] = len({p for s in subtree.values() for p in s})
+    # 与 dingtalk_identity 同门槛:>48h 视为过期(节点通道届时亦 fail-closed)
+    out["stale"] = age_h is None or age_h > 48
+    _TREE_CACHE["v"] = (now, out)
+    return out
