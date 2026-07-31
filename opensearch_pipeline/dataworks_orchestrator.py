@@ -549,18 +549,49 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                     # Phase D（RAG_ALLOWED_DEPTS_ACL，默认关）：重推路径也必须经唯一 helper 从 approved
                     # 授权【重解析】allowed_depts（约束 2：不读可能过时的 chunk_meta 投影；约束 3：按
                     # doc_id 聚合、跟随 current version）。fail-closed：失败置空，不放行。
+                    # ── node-ACL 投影(与 stage-2 同一唯一注入点)────────────────────
+                    # ⚠️ stage-3 reload 从 chunk_meta 读回 owner 后直接重推 HA3;若 node 文档
+                    # 不在此改写成哨兵,一次重推就把真实 owner 送回检索面 = 权限重开。
+                    _node_docs = set()
+                    if valid_chunks:
+                        try:
+                            from opensearch_pipeline.access_grants import (
+                                resolve_acl_modes, resolve_doc_acl,
+                            )
+                            from opensearch_pipeline.acl_policy import ACL_MODE_NODE, project_doc_acl
+                            _modes = resolve_acl_modes({c.doc_id for c in valid_chunks}, cursor)
+                            _node_docs = {d for d, m in _modes.items() if m == ACL_MODE_NODE}
+                            if _node_docs:
+                                _nacl = resolve_doc_acl(_node_docs, cursor)
+                                for c in valid_chunks:
+                                    if c.doc_id not in _node_docs:
+                                        continue
+                                    _a = _nacl.get(c.doc_id)
+                                    c.owner_dept, c.allowed_depts = project_doc_acl(
+                                        ACL_MODE_NODE, c.owner_dept, (),
+                                        getattr(_a, "node_ids", ()) if _a else (),
+                                        getattr(_a, "exact_node_ids", ()) if _a else ())
+                                print(f"[Orchestrator] 🔐 node-ACL 投影:{len(_node_docs)} 篇写哨兵 owner")
+                        except Exception as _nae:
+                            # fail-closed:绝不退回"推真实 owner"。中止本批,交下轮重试。
+                            raise RuntimeError(
+                                f"node-ACL 投影失败,中止 stage-3 装载(绝不退回真实 owner): {_nae}")
+
                     if config.rag.allowed_depts_acl and valid_chunks:
                         try:
                             from opensearch_pipeline.access_grants import (
                                 resolve_allowed_depts, gate_by_permission,
                             )
-                            _allowed = resolve_allowed_depts({c.doc_id for c in valid_chunks}, cursor)
+                            _allowed = resolve_allowed_depts(
+                                {c.doc_id for c in valid_chunks} - _node_docs, cursor)
                             # 纵深守卫：只有 permission_level=='dept_internal' 的文档物化 allowed_depts
                             # （用 chunk 自身权威 permission_level；审计 Step 4 backstop a）。
                             _allowed = gate_by_permission(
                                 _allowed, {c.doc_id: c.permission_level for c in valid_chunks}
                             )
                             for c in valid_chunks:
+                                if c.doc_id in _node_docs:
+                                    continue   # 已投影为哨兵+d:/dx:,绝不被组码覆盖
                                 c.allowed_depts = _allowed.get(c.doc_id, [])
                         except Exception as _ade:
                             print(f"[Orchestrator] ⚠️ allowed_depts 重解析失败（fail-closed 置空）: {_ade}")

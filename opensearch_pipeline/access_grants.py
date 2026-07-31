@@ -90,6 +90,33 @@ def _node_acl_columns_present(cursor) -> bool:
         return False
 
 
+def resolve_acl_modes(doc_ids: Iterable[str], cursor) -> Dict[str, str]:
+    """轻量批查 {doc_id: acl_mode}（写路径热路径用；060 未 apply / 查不到 → 全 legacy）。
+
+    为什么单列一个函数:写路径(ingestion / 升版 / re-chunk / stage-3 reload)**每批都要**
+    知道模式才能决定投影形态,但绝大多数批次 100% 是 legacy —— 只做一次 document_meta
+    单列 SELECT 即可判定,避免为此把 `resolve_doc_acl` 的三次查询摊到每批。
+    """
+    from opensearch_pipeline.acl_policy import ACL_MODE_LEGACY, ACL_MODE_NODE
+    ids = [d for d in dict.fromkeys(doc_ids) if d]
+    if not ids:
+        return {}
+    out = {d: ACL_MODE_LEGACY for d in ids}
+    if not _node_acl_columns_present(cursor):
+        return out
+    try:
+        ph = ",".join(["%s"] * len(ids))
+        cursor.execute(
+            f"SELECT doc_id, acl_mode FROM {_kb_db()}.document_meta WHERE doc_id IN ({ph})",
+            tuple(ids))
+        for doc_id, mode in cursor.fetchall():
+            m = str(mode or "").strip().lower()
+            out[doc_id] = m if m in (ACL_MODE_LEGACY, ACL_MODE_NODE) else ACL_MODE_LEGACY
+    except Exception as e:   # noqa: BLE001 — 读不到 ⇒ 按 legacy(退回现状语义,绝不误升 node)
+        logger.warning("resolve_acl_modes 失败，按 legacy 处理: %s", e)
+    return out
+
+
 def resolve_doc_acl(doc_ids: Iterable[str], cursor) -> Dict[str, "object"]:
     """聚合给定 doc 的【结构化 ACL 权威】→ {doc_id: acl_policy.DocAcl}。
 
@@ -230,6 +257,21 @@ def gate_by_permission(
     return out
 
 
+def _current_owner_for_doc(cursor, doc_id: str, version_no: int) -> str:
+    """该 doc 指定版本 active chunk 的**检索投影轴** owner_dept(不一致时返回首个,供 diff)。
+
+    ⚠️ 读的是 `chunk_meta.owner_dept`(检索投影轴),**不是** `document_meta.owner_dept`
+    (归属/管理轴,node 模式下保持真实属主不变)。
+    """
+    cursor.execute(
+        f"SELECT DISTINCT owner_dept FROM {_kb_db()}.chunk_meta "
+        "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+        (doc_id, version_no),
+    )
+    vals = sorted({(r[0] or "") for r in cursor.fetchall()})
+    return vals[0] if vals else ""
+
+
 def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) -> Dict[str, object]:
     """把单篇文档的 approved 授权【物化】到 chunk_meta.allowed_depts 投影——decide 端点与
     allowed_depts_reconcile 对账共用的【唯一写实现】（与上面 resolve/gate/current 读原语配套）。
@@ -267,7 +309,35 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
     if not row:
         return {"status": "skipped_locked", "reset_chunks": 0, "version_no": None}
     ver = int(row[0] or 1)
-    # 2. authority → 该版本 permission_level 版本限定 gate 到 dept_internal
+
+    # 2a. node-ACL:模式决定投影形态(唯一注入点 acl_policy.project_doc_acl)。
+    #     ⚠️ 本函数是 ACL 变更的【唯一写实现】(decide 端点 + reconcile 共用),node 文档
+    #     必须在这里把检索投影轴的 owner 一并改成哨兵 —— 只改 allowed_depts 而留着真实
+    #     owner,legacy owner 分支照样放行,等于没收权(codex 评审 BLOCKER-1 的同一根因)。
+    from opensearch_pipeline.acl_policy import ACL_MODE_NODE, project_doc_acl
+    if resolve_acl_modes([doc_id], cursor).get(doc_id) == ACL_MODE_NODE:
+        _acl = resolve_doc_acl([doc_id], cursor).get(doc_id)
+        _owner, want = project_doc_acl(
+            ACL_MODE_NODE, "", (),
+            getattr(_acl, "node_ids", ()) if _acl else (),
+            getattr(_acl, "exact_node_ids", ()) if _acl else ())
+        have = current_allowed_for_doc(cursor, doc_id, ver)
+        _cur_owner = _current_owner_for_doc(cursor, doc_id, ver)
+        if sorted(want) == have and _cur_owner == _owner:
+            return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
+        status = "materialized" if want else "retracted"
+        if not apply:
+            return {"status": status, "reset_chunks": 0, "version_no": ver}
+        aj = _json.dumps(want, ensure_ascii=False) if want else None
+        cursor.execute(
+            f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, owner_dept=%s, "
+            f"index_status='{ChunkIndexStatus.NOT_INDEXED}' "
+            "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+            (aj, _owner, doc_id, ver),
+        )
+        return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver}
+
+    # 2. legacy:authority → 该版本 permission_level 版本限定 gate 到 dept_internal
     raw_want = resolve_allowed_depts_one(doc_id, cursor)
     cursor.execute(
         f"SELECT GROUP_CONCAT(DISTINCT permission_level) FROM {_kb_db()}.chunk_meta "

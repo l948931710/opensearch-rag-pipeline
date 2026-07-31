@@ -6023,12 +6023,45 @@ def node_write_chunk_meta(ctx: dict):
                 # allowed_depts（唯一注入点 access_grants.resolve_allowed_depts；约束 2/3）→ 设到内存
                 # chunk（供 ctx 流/首推）+ 下方写 chunk_meta.allowed_depts 列。flag 关 → 不查、写 NULL。
                 # fail-closed：解析失败 → 置空（无授权，绝不放行），不阻断入库。先于 DELETE 的纯读。
+                # ── node-ACL 投影(唯一注入点 acl_policy.project_doc_acl)────────────────
+                # ⚠️ 必须在【所有】写路径执行:chunk.owner_dept 继承自 document_meta 的真实
+                # owner,若 node 模式文档升版 / re-chunk 时不改写,真实 owner 会被写回**检索
+                # 投影轴**,legacy owner 分支静默复活 = **权限重开**(codex 评审 BLOCKER-1)。
+                # 模式互斥:legacy →(真实 owner, 组码);node →(哨兵, 仅 d:/dx:,绝不含组码)。
+                # 廉价路径:先单列批查 acl_mode;全 legacy(今天 100%)时只多一次 SELECT,
+                # 且完全不改 chunk 字段 ⇒ 行为与历史逐字节一致。
+                _node_docs = set()
+                if valid_chunks:
+                    try:
+                        from opensearch_pipeline.access_grants import resolve_acl_modes, resolve_doc_acl
+                        from opensearch_pipeline.acl_policy import ACL_MODE_NODE, project_doc_acl
+                        _modes = resolve_acl_modes({c.doc_id for c in valid_chunks}, cursor)
+                        _node_docs = {d for d, m in _modes.items() if m == ACL_MODE_NODE}
+                        if _node_docs:
+                            _node_acls = resolve_doc_acl(_node_docs, cursor)
+                            for chunk in valid_chunks:
+                                if chunk.doc_id not in _node_docs:
+                                    continue
+                                _a = _node_acls.get(chunk.doc_id)
+                                _owner, _allowed = project_doc_acl(
+                                    ACL_MODE_NODE, chunk.owner_dept, (),
+                                    getattr(_a, "node_ids", ()) if _a else (),
+                                    getattr(_a, "exact_node_ids", ()) if _a else ())
+                                chunk.owner_dept = _owner            # ← 哨兵进检索投影轴
+                                chunk.allowed_depts = _allowed
+                            print(f"    🔐 node-ACL 投影:{len(_node_docs)} 篇文档写哨兵 owner")
+                    except Exception as _nae:   # noqa: BLE001
+                        # fail-closed:投影失败绝不退回"写真实 owner"(那等于重开权限)。
+                        # 抛出中止本批 —— 宁可整批失败重试,也不产出会越权的投影。
+                        raise RuntimeError(f"node-ACL 投影失败,中止写入(绝不退回真实 owner): {_nae}")
+
                 if get_config().rag.allowed_depts_acl and valid_chunks:
                     try:
                         from opensearch_pipeline.access_grants import (
                             resolve_allowed_depts, gate_by_permission,
                         )
-                        _allowed_by_doc = resolve_allowed_depts({c.doc_id for c in valid_chunks}, cursor)
+                        _legacy_ids = {c.doc_id for c in valid_chunks} - _node_docs
+                        _allowed_by_doc = resolve_allowed_depts(_legacy_ids, cursor)
                         # 纵深守卫：只有 permission_level=='dept_internal' 的文档物化 allowed_depts
                         # （用 chunk 自身=新版本权威 permission_level；restricted/public 即便有 approved
                         # 行也不放行——审计 Step 4 backstop a）。
@@ -6036,6 +6069,8 @@ def node_write_chunk_meta(ctx: dict):
                             _allowed_by_doc, {c.doc_id: c.permission_level for c in valid_chunks}
                         )
                         for chunk in valid_chunks:
+                            if chunk.doc_id in _node_docs:
+                                continue      # node 文档已由上方投影(哨兵+d:/dx:),绝不被组码覆盖
                             chunk.allowed_depts = _allowed_by_doc.get(chunk.doc_id, [])
                     except Exception as _ade:
                         print(f"    ⚠️ allowed_depts 解析失败（fail-closed 置空，不放行）: {_ade}")
