@@ -1058,6 +1058,8 @@ def _run_stage_drained_locked(stage, bizdate, simulate, run_metrics,
     from opensearch_pipeline.extraction.cost_breaker import CostBreaker
     shared_cost_breaker = CostBreaker(get_config())
 
+    _meta_claims: list = []   # 阶段 B doc-meta 投影 claims（仅 stage-3 pre-drain 填充）
+
     if stage == 3:
         # ── 搁浅版本对账：上一次部分失败可能留下「新版本已全量 INDEXED 但旧版本仍 active」
         # 的文档（双版本同时被检索）。必须在 drain 循环之前跑：这类文档没有待处理 chunk，
@@ -1122,6 +1124,21 @@ def _run_stage_drained_locked(stage, bizdate, simulate, run_metrics,
                       f"locked={ob['locked']} failed={ob['failed']} (processed={ob['processed']})")
         except Exception as e:
             print(f"[Orchestrator] WARNING: ACL projection outbox drain failed (non-fatal): {e}",
+                  file=sys.stderr)
+        # 阶段 B：doc-meta 投影 outbox pre-drain（改标题/分类的持久意图，schema/061）——
+        # 同步 chunk_meta.category + 标 NOT_INDEXED，由本轮 drain 循环载入重推（title 走
+        # loader 的 document_meta JOIN 现读）。claims 只在 drain 循环**成功**后按
+        # (id, generation) CAS 收尾（见循环出口）；失败/中断不收尾 ⇒ 下轮重投影。
+        # 窗口中途的新编辑 generation+1 ⇒ CAS 落空 ⇒ 同样留到下轮（丢更新关死）。
+        try:
+            from opensearch_pipeline.access_grants import pre_drain_meta_projection
+            mp = pre_drain_meta_projection()
+            _meta_claims = mp.get("claims") or []
+            if not mp.get("skipped") and _meta_claims:
+                print(f"[Orchestrator] doc-meta projection pre-drain: claims={len(_meta_claims)} "
+                      f"marked_chunks={mp['marked']} errors={len(mp['errors'])}")
+        except Exception as e:
+            print(f"[Orchestrator] WARNING: doc-meta projection pre-drain failed (non-fatal): {e}",
                   file=sys.stderr)
         # Phase D（flag 开）：跨部门授权投影对账——从 approved authority 重算 allowed_depts，drift
         # 文档标脏（chunk_meta.allowed_depts + index_status='NOT_INDEXED'），交本轮 drain 推 HA3。
@@ -1198,6 +1215,18 @@ def _run_stage_drained_locked(stage, bizdate, simulate, run_metrics,
         prev_remaining = remaining
         _batch_ctx = run_stage(stage, bizdate, simulate, cost_breaker=shared_cost_breaker)
         accumulate_metrics(run_metrics, extract_run_metrics(_batch_ctx))
+
+    # 阶段 B：doc-meta 投影收尾——**只在成功路径到达**（drain 循环内任何失败都 raise，
+    # 走不到这里 ⇒ claims 不收尾、下轮重投影；049 同款「成功才 CAS 完成」前提条款）。
+    if stage == 3 and _meta_claims:
+        try:
+            from opensearch_pipeline.access_grants import complete_meta_projection
+            mc = complete_meta_projection(_meta_claims)
+            print(f"[Orchestrator] doc-meta projection complete: done={mc['completed']} "
+                  f"superseded={mc['superseded']}（superseded=窗口中途再编辑，下轮重投影）")
+        except Exception as e:
+            print(f"[Orchestrator] WARNING: doc-meta projection complete failed (non-fatal，"
+                  f"下轮按未处理重投影): {e}", file=sys.stderr)
 
     return run_metrics
 

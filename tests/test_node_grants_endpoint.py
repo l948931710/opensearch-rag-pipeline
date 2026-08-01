@@ -22,16 +22,19 @@ def client(monkeypatch):
         user_id, name, role = "adm", "管理员", "kb_admin"
 
     monkeypatch.setattr(kb_access, "_require_kb_console", lambda i: _Kb())
-    monkeypatch.setattr(kb_access, "_kb_can_manage", lambda kb, owner: owner != "other")
+    monkeypatch.setattr(kb_access, "_kb_can_manage_doc",
+                        lambda kb, mode, owner, oid: oid != 999999)
     monkeypatch.setattr(kb_access, "_enforce_rate_limit", lambda *a, **k: None)
     return TestClient(api.app)
 
 
 class Cur:
-    def __init__(self, *, owner="production", perm="dept_internal", status="active",
-                 mode="legacy", rev=3, live=(10, 11, 12), before=()):
+    # 阶段 B 契约：本端点只服务已迁移的 node 文档（owner_dept=None + owner_dept_id 有值）；
+    # legacy/半迁移态由专门测试锚 409。
+    def __init__(self, *, owner=None, perm="dept_internal", status="active",
+                 mode="node", rev=3, oid=110, live=(10, 11, 12), before=()):
         self.owner, self.perm, self.status, self.mode, self.rev = owner, perm, status, mode, rev
-        self.live, self.before = live, before
+        self.oid, self.live, self.before = oid, live, before
         self._rows, self.sql = [], []
         self.rowcount = 1
 
@@ -39,7 +42,7 @@ class Cur:
         s = " ".join(sql.split())
         self.sql.append((s, args))
         if "FOR UPDATE" in s:
-            self._rows = [(self.owner, self.perm, self.status, self.mode, self.rev)]
+            self._rows = [(self.owner, self.perm, self.status, self.mode, self.rev, self.oid)]
         elif "dept_dim" in s:
             self._rows = [(d,) for d in self.live]
         elif "SELECT dept_id, scope FROM" in s:
@@ -120,47 +123,63 @@ def test_stale_revision_conflicts(client, monkeypatch):
     assert _post(client, nodes=[{"dept_id": 10}], acl_revision=3).status_code == 409
 
 
-def test_missing_revision_is_allowed(client, monkeypatch):
-    """不传 revision = 不做 CAS(首次保存/脚本场景),仍照常推进版本。"""
+def test_missing_revision_rejected(client, monkeypatch):
+    """阶段 B 改锚(codex M5):CAS 必填——node 文档必经 register/doc-meta 创建,revision
+    永远可读;继续允许缺省 = 并发整体替换互相丢勾选的保护形同虚设。"""
     _wire(monkeypatch, Cur(rev=7))
-    assert _post(client, nodes=[{"dept_id": 10}]).json()["acl_revision"] == 8
+    assert _post(client, nodes=[{"dept_id": 10}]).status_code == 400
+
+
+def test_legacy_doc_rejected_use_doc_meta(client, monkeypatch):
+    """阶段 B:legacy 文档 409——「保存即切 mode」废除(会产生缺 owner 的半迁移态),
+    迁移唯一入口 = doc-meta 端点。"""
+    _wire(monkeypatch, Cur(mode="legacy", owner="production", oid=None))
+    r = _post(client, nodes=[{"dept_id": 10}], acl_revision=3)
+    assert r.status_code == 409 and "编辑信息" in r.json()["detail"]
+
+
+def test_node_doc_missing_owner_id_rejected(client, monkeypatch):
+    """半迁移态(acl_mode=node + owner_dept_id NULL)⇒ 409 引导补齐归属。"""
+    _wire(monkeypatch, Cur(mode="node", oid=None))
+    r = _post(client, nodes=[{"dept_id": 10}], acl_revision=3)
+    assert r.status_code == 409 and "归属" in r.json()["detail"]
 
 
 def test_too_many_nodes_rejected_not_truncated(client, monkeypatch):
     """★ 超上限必须 422 拒绝 —— 静默截断会让 UI 以为已完整保存。"""
     from opensearch_pipeline.acl_policy import MAX_DOC_NODES
     _wire(monkeypatch, Cur(live=tuple(range(1, MAX_DOC_NODES + 10))))
-    r = _post(client, nodes=[{"dept_id": i} for i in range(1, MAX_DOC_NODES + 3)])
+    r = _post(client, nodes=[{"dept_id": i} for i in range(1, MAX_DOC_NODES + 3)], acl_revision=3)
     assert r.status_code == 422 and "上限" in r.json()["detail"]
 
 
 def test_unknown_dept_rejected(client, monkeypatch):
     """授权给不在册节点 = 文档对所有人不可见且无从解释 ⇒ 必须当场拒。"""
     _wire(monkeypatch, Cur(live=(10,)))
-    r = _post(client, nodes=[{"dept_id": 10}, {"dept_id": 999}])
+    r = _post(client, nodes=[{"dept_id": 10}, {"dept_id": 999}], acl_revision=3)
     assert r.status_code == 400 and "999" in r.json()["detail"]
 
 
 @pytest.mark.parametrize("perm,code", [("restricted", 403), ("public", 400)])
 def test_permission_level_gate(client, monkeypatch, perm, code):
     _wire(monkeypatch, Cur(perm=perm))
-    assert _post(client, nodes=[{"dept_id": 10}]).status_code == code
+    assert _post(client, nodes=[{"dept_id": 10}], acl_revision=3).status_code == code
 
 
 def test_retired_doc_rejected(client, monkeypatch):
     _wire(monkeypatch, Cur(status="retired"))
-    assert _post(client, nodes=[{"dept_id": 10}]).status_code == 400
+    assert _post(client, nodes=[{"dept_id": 10}], acl_revision=3).status_code == 400
 
 
 def test_non_manager_rejected(client, monkeypatch):
-    """管理轴仍是真实 owner(node 模式只改检索投影轴)⇒ 授权判定无需等 T5。"""
-    _wire(monkeypatch, Cur(owner="other"))
-    assert _post(client, nodes=[{"dept_id": 10}]).status_code == 403
+    """阶段 B:授权判定走 _kb_can_manage_doc(mode 隔离)——node 文档按归属节点判。"""
+    _wire(monkeypatch, Cur(oid=999999))
+    assert _post(client, nodes=[{"dept_id": 10}], acl_revision=3).status_code == 403
 
 
 def test_negative_dept_id_rejected(client, monkeypatch):
     _wire(monkeypatch, Cur())
-    assert _post(client, nodes=[{"dept_id": -5}]).status_code == 400
+    assert _post(client, nodes=[{"dept_id": -5}], acl_revision=3).status_code == 400
 
 
 def test_empty_selection_revokes_all_and_still_switches_mode(client, monkeypatch):

@@ -44,6 +44,9 @@ class Cur:
             self._rows = [(a,) for a in self.cur_allowed]
         elif "DISTINCT owner_dept" in s:
             self._rows = [(self.cur_owner,)]
+        elif "SELECT owner_dept FROM" in s:
+            # 归属轴现值（阶段 B 对称投影：legacy 分支也读 document_meta.owner_dept）
+            self._rows = [("production",)]
         elif s.startswith("UPDATE"):
             self.updates.append((s, args))
         else:
@@ -103,12 +106,37 @@ def test_materialize_node_unchanged_only_when_owner_also_matches():
     assert cur.updates, "owner 漂移未触发重投影"
 
 
-def test_materialize_legacy_does_not_touch_owner():
-    """legacy 路径行为逐字节不变:UPDATE 只碰 allowed_depts,不含 owner_dept。"""
+def test_materialize_legacy_symmetric_owner_projection():
+    """阶段 B（codex 评审 blocker 改锚,2026-08-01）:legacy 分支改 mode 对称投影——
+    UPDATE **同时写 owner**。此前"legacy 不碰 owner"的旧锚被推翻:node→legacy 迁移后
+    chunk 的哨兵永远洗不掉,legacy owner 过滤召不回文档。
+    对纯 legacy 存量的安全性由下一条 unchanged 测试锚住(owner 已一致 ⇒ 零写)。"""
     cur = Cur(mode="legacy", grants=[("D1", "marketing")], perm="dept_internal")
     materialize_doc_allowed_depts(cur, "D1")
     assert cur.updates, "legacy 应有写入"
-    assert "owner_dept=%s" not in cur.updates[-1][0]
+    sql, args = cur.updates[-1]
+    assert "owner_dept=%s" in sql and "production" in args
+
+
+def test_materialize_legacy_unchanged_zero_write():
+    """纯 legacy 存量恒等锚:allowed 与 owner 都一致 ⇒ unchanged、零写——
+    对称投影对既有语料是无操作。"""
+    cur = Cur(mode="legacy", grants=[("D1", "marketing")], perm="dept_internal",
+              cur_allowed=['["marketing"]'], cur_owner="production")
+    out = materialize_doc_allowed_depts(cur, "D1")
+    assert out["status"] == "unchanged" and not cur.updates
+
+
+def test_materialize_legacy_restores_sentinel_to_real_owner():
+    """node→legacy 回滚链路:chunk 残留哨兵 ⇒ legacy 投影把 owner 恢复为真实组码
+    (这正是 codex 点名的回滚断链——materializer 不写回,哨兵永久残留)。"""
+    from opensearch_pipeline.acl_policy import NODE_OWNER_SENTINEL as _S
+    cur = Cur(mode="legacy", grants=[("D1", "marketing")], perm="dept_internal",
+              cur_allowed=['["marketing"]'], cur_owner=_S)
+    out = materialize_doc_allowed_depts(cur, "D1")
+    assert out["status"] == "materialized"
+    sql, args = cur.updates[-1]
+    assert "production" in args and _S not in args
 
 
 def test_materialize_node_revoked_retracts_and_keeps_sentinel():

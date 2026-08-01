@@ -66,6 +66,12 @@ class _Cur:
             d = p[0]
             cur = self.st["have"].get(d) or []
             self._r = [(json.dumps(cur),)] if cur else []
+        elif "distinct owner_dept" in s:                            # _current_owner_for_doc（投影轴）
+            d = p[0]
+            self._r = [(self.st.get("chunk_owner", {}).get(d, ""),)]
+        elif "select owner_dept from" in s and "document_meta" in s:  # 归属轴（阶段 B 对称投影）
+            d = p[0]
+            self._r = [(self.st.get("owner", {}).get(d, ""),)]
         elif s.startswith("update"):                                # 写
             self.st.setdefault("updates", []).append(p)
             self.rowcount = 1
@@ -137,9 +143,10 @@ def test_reconcile_materialize_and_retract(monkeypatch):
     }
     out = _run(monkeypatch, st)
     assert out["materialized"] == 1 and out["retracted"] == 1
-    ups = {u[1]: u[0] for u in st.get("updates", [])}    # {doc_id: allowed_depts_json|None}
-    assert ups["D1"] == json.dumps(["finance"], ensure_ascii=False)   # 物化 finance
-    assert ups["D2"] is None                                          # 清空（撤销残留）
+    # 阶段 B：投影 UPDATE 现在同时写 owner（mode 对称投影，params=(aj, owner, doc, ver)）
+    ups = {u[2]: (u[0], u[1]) for u in st.get("updates", [])}   # {doc_id: (allowed_json|None, owner)}
+    assert ups["D1"][0] == json.dumps(["finance"], ensure_ascii=False)   # 物化 finance
+    assert ups["D2"][0] is None                                          # 清空（撤销残留）
 
 
 def test_reconcile_gate_drops_restricted(monkeypatch):
@@ -152,8 +159,8 @@ def test_reconcile_gate_drops_restricted(monkeypatch):
     }
     out = _run(monkeypatch, st)
     assert out["retracted"] == 1 and out["materialized"] == 0
-    ups = {u[1]: u[0] for u in st.get("updates", [])}
-    assert ups["D3"] is None                                          # restricted → 清空
+    ups = {u[2]: (u[0], u[1]) for u in st.get("updates", [])}
+    assert ups["D3"][0] is None                                          # restricted → 清空
 
 
 def test_reconcile_unchanged_no_write(monkeypatch):

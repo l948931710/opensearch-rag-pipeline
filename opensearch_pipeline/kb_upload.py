@@ -15,6 +15,7 @@ kb_upload.py — 知识库自助上传的纯helper（doc_id/ULID、raw_key、文
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Optional, Tuple
 
@@ -114,6 +115,8 @@ def build_raw_key(owner_dept: str, doc_id: str, upload_id: str, filename: str,
     owner_dept 始终第 2 段（_dept_from_raw_key 依赖）；可见范围段（internal/restricted）是第 3 段,
     不影响部门解析。permission_level 省略/public → 扁平（= 旧行为,向后兼容）。
     各段拒绝空值/内嵌 '/'（调用方须先过 kb_authz.sanitize_owner_dept 等净化）。
+    阶段 B：node 文档的第 2 段 = ``node-<dept_id>``（node_storage_segment 构造），
+    经 parse_raw_owner 自描述解析；perm 段语义不变（路径启发式照常工作）。
     """
     owner_dept = _require_clean_seg("owner_dept", owner_dept)
     doc_id = _require_clean_seg("doc_id", doc_id)
@@ -121,6 +124,41 @@ def build_raw_key(owner_dept: str, doc_id: str, upload_id: str, filename: str,
     seg = _PERM_PATH_SEG.get((permission_level or "").strip().lower())
     head = f"{owner_dept}/{seg}" if seg else owner_dept
     return f"raw/{head}/{doc_id}/{upload_id}/{safe_filename(filename)}"
+
+
+# ── 阶段 B：node 归属的 raw-key 命名空间 ─────────────────────────────────────
+# 组码白名单全部 [a-z_]，与 node-<数字> 值域不相交 ⇒ 第 2 段自描述、零歧义。
+# 严格正整数规范形（禁前导零/符号/空白）——路径段是安全输入面，宽松解析 = 伪造面。
+_NODE_SEG_RE = re.compile(r"^node-([1-9][0-9]{0,18})$")
+
+
+def node_storage_segment(owner_dept_id: int) -> str:
+    """归属节点 → raw-key 第 2 段。非法 id 直接抛（调用方须先过 dept_dim active 校验）。"""
+    v = int(owner_dept_id)
+    if v <= 1:
+        raise ValueError(f"非法归属节点 id：{owner_dept_id!r}（不得 ≤1/根节点）")
+    return f"node-{v}"
+
+
+def parse_raw_owner(raw_key: str) -> dict:
+    """raw key → 结构化归属（codex 阶段 B major：**不改 _dept_from_raw_key 的返回语义**——
+    图片对象路径等 8 处消费方继续拿第 2 段原文当 storage_segment 用，路径布局不变）。
+
+    返回 {"mode": "legacy"|"node", "storage_segment": <第2段原文>,
+          "legacy_owner": <组码或 None>, "owner_dept_id": <int 或 None>}。
+    非 raw/ 前缀 → mode='legacy'、全空值（与 _dept_from_raw_key 的 default 腿同语义）。
+    """
+    seg = ""
+    if raw_key and raw_key.startswith("raw/"):
+        parts = raw_key.split("/")
+        if len(parts) > 1:
+            seg = parts[1]
+    m = _NODE_SEG_RE.match(seg)
+    if m:
+        return {"mode": "node", "storage_segment": seg,
+                "legacy_owner": None, "owner_dept_id": int(m.group(1))}
+    return {"mode": "legacy", "storage_segment": seg,
+            "legacy_owner": seg or None, "owner_dept_id": None}
 
 
 def perm_from_raw_key(raw_key: str) -> str:

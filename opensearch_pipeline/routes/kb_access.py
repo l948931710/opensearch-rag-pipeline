@@ -25,6 +25,7 @@ from opensearch_pipeline.api import (
     Identity,
     _enforce_rate_limit,
     _kb_can_manage,
+    _kb_can_manage_doc,
     _kb_db,
     _require_kb_admin,
     _require_kb_console,
@@ -197,14 +198,16 @@ def kb_doc_node_grants_save(req: KbNodeGrantsSave, request: Request,
             with conn.cursor() as cur:
                 # ① 行锁 + 前置校验(与并发退役/升版串行化)
                 cur.execute(
-                    f"SELECT owner_dept, permission_level, status, acl_mode, acl_revision "
-                    f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
+                    f"SELECT owner_dept, permission_level, status, acl_mode, acl_revision, "
+                    f"owner_dept_id FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE",
+                    (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm, status, cur_mode, cur_rev = (
                     row[0] or "", (row[1] or "").lower(), (row[2] or "active").lower(),
                     row[3] or "legacy", int(row[4] or 0))
+                owner_dept_id = row[5]
                 if status != "active":
                     raise HTTPException(status_code=400, detail="文档不在线,无法设置可见范围")
                 if perm == "restricted":
@@ -212,9 +215,25 @@ def kb_doc_node_grants_save(req: KbNodeGrantsSave, request: Request,
                 if perm != "dept_internal":
                     raise HTTPException(status_code=400,
                                         detail="仅 dept_internal 文档可设节点可见范围")
-                if not _kb_can_manage(kb, owner_dept):
+                # 阶段 B 契约收紧（codex 共识）：本端点只做【已是 node 且归属完整】文档的
+                # 可见集整体替换。legacy→node 迁移唯一入口 = doc-meta 端点（须同时给
+                # owner_dept_id + visible_nodes）——阶段 A 的「保存即切 mode」产生过
+                # 缺 owner 的半迁移态（acl_mode=node + owner_dept_id NULL ⇒ 仅 kb_admin
+                # 可管），现网无 node 文档、无兼容负担，直接废除。
+                if (cur_mode or "legacy") != ACL_MODE_NODE:
+                    raise HTTPException(status_code=409,
+                                        detail="该文档仍是组码授权模式，请先在「编辑信息」中迁移归属到组织树")
+                if not owner_dept_id:
+                    raise HTTPException(status_code=409,
+                                        detail="该文档缺归属节点（半迁移态），请先在「编辑信息」中补齐归属")
+                if not _kb_can_manage_doc(kb, cur_mode, owner_dept, owner_dept_id):
                     raise HTTPException(status_code=403, detail="无权管理该文档（非属主部门管理员）")
-                if req.acl_revision is not None and int(req.acl_revision) != cur_rev:
+                # CAS 必填（codex major M5）：node 文档必经 register/doc-meta 创建，revision
+                # 永远可读——继续允许缺省 = 并发整体替换互相丢勾选的保护形同虚设。
+                if req.acl_revision is None:
+                    raise HTTPException(status_code=400,
+                                        detail="缺少 acl_revision（请从文档详情读取当前版本后提交）")
+                if int(req.acl_revision) != cur_rev:
                     raise HTTPException(
                         status_code=409,
                         detail=f"可见范围已被他人修改（当前版本 {cur_rev}），请刷新后重试")

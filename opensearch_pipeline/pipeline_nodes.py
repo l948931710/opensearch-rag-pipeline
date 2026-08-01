@@ -109,7 +109,7 @@ def node_scan_raw_files(ctx: dict):
                     # 扩展名排除片段来自 ingest_policy.STAGE1_SQL_EXCLUDED_EXTS（单一来源）——
                     # 必须与 dataworks_orchestrator._count_pending_rows 的 stage-1 计数完全一致，
                     # 否则排空守卫会因"计得到却领不走"误判 stage-1 无进展而中止。
-                    cursor.execute(f"""
+                    _base_sql = f"""
                         SELECT
                             dv.doc_id,
                             dv.version_no,
@@ -117,7 +117,7 @@ def node_scan_raw_files(ctx: dict):
                             dv.raw_key,
                             dv.file_ext,
                             dm.title,
-                            dm.owner_dept
+                            dm.owner_dept{{mode_cols}}
                         FROM document_version dv
                         LEFT JOIN document_meta dm ON dv.doc_id = dm.doc_id
                         WHERE dv.content_process_status = 'NOT_STARTED'
@@ -126,9 +126,19 @@ def node_scan_raw_files(ctx: dict):
                           AND dv.status = 'active'
                         ORDER BY dv.created_at ASC
                         LIMIT 100
-                    """)
+                    """
+                    # 阶段 B：带上 acl_mode/owner_dept_id（060 未 apply → 1054 回退旧列集）。
+                    # node 行的 dept **不得**兜成 "unknown"——那会顺着注册/分类回写把归属轴
+                    # 写脏（codex 阶段 B major：NULL 立刻变 truthy "unknown" 后就再也不会
+                    # 从 raw key 解析）。
+                    _has_mode = _exec_node_guarded(
+                        cursor,
+                        _base_sql.format(mode_cols=", dm.acl_mode, dm.owner_dept_id"),
+                        _base_sql.format(mode_cols=""), (), ())
                     rows = cursor.fetchall()
                     for row in rows:
+                        _mode = (row[7] or "legacy") if _has_mode else "legacy"
+                        _oid = row[8] if _has_mode else None
                         tasks.append({
                             "doc_id": row[0],
                             "version_no": row[1],
@@ -136,7 +146,9 @@ def node_scan_raw_files(ctx: dict):
                             "raw_key": row[3],
                             "file_ext": row[4] or (row[3].split(".")[-1] if row[3] and "." in row[3] else ""),
                             "filename": row[5] or (row[3].split("/")[-1] if row[3] else ""),
-                            "dept": row[6] or "unknown",
+                            "dept": (row[6] or "") if _mode == "node" else (row[6] or "unknown"),
+                            "acl_mode": _mode,
+                            "owner_dept_id": _oid,
                         })
                     print(f"    [Scanner] Scanned {len(tasks)} pending raw tasks from RDS")
             except Exception as e:
@@ -162,8 +174,30 @@ def node_scan_raw_files(ctx: dict):
         dept = task.get("dept")
         filename = task.get("filename")
         file_ext = task.get("file_ext")
-        
-        if raw_key and (not dept or not filename or not file_ext):
+
+        # 阶段 B：node 命名空间（raw/node-<id>/…）——第 2 段是 storage_segment 不是组码，
+        # 绝不能补进 dept（否则注册/分类会把 "node-123" 写进归属轴）。结构化解析一次，
+        # task 补齐 acl_mode/owner_dept_id；node 任务的 dept 固定空串。
+        if raw_key and task.get("acl_mode") != "node":
+            from opensearch_pipeline.kb_upload import parse_raw_owner
+            _ro = parse_raw_owner(raw_key)
+            if _ro["mode"] == "node":
+                task["acl_mode"] = "node"
+                task["owner_dept_id"] = _ro["owner_dept_id"]
+                dept = ""
+
+        if task.get("acl_mode") == "node":
+            dept = ""
+            if raw_key and (not filename or not file_ext):
+                parts = raw_key.split("/")
+                if not filename:
+                    filename = parts[-1]
+                if not file_ext:
+                    file_ext = filename.split(".")[-1] if "." in filename else ""
+            task["dept"] = dept
+            task["filename"] = filename
+            task["file_ext"] = file_ext
+        elif raw_key and (not dept or not filename or not file_ext):
             parts = raw_key.split("/")
             # 如果是 raw/{dept}/{filename} 的结构
             if len(parts) >= 3 and parts[0] == "raw":
@@ -181,7 +215,7 @@ def node_scan_raw_files(ctx: dict):
                     filename = parts[-1]
                 if not file_ext:
                     file_ext = filename.split(".")[-1] if "." in filename else ""
-            
+
             task["dept"] = dept
             task["filename"] = filename
             task["file_ext"] = file_ext
@@ -258,11 +292,33 @@ def node_register_metadata(ctx: dict):
                     doc_id = task["doc_id"]
                     version_no = task["version_no"]
                     title = task.get("filename", "")
-                    owner_dept = task.get("dept", "unknown")
+                    _is_node = task.get("acl_mode") == "node"
+                    # 阶段 B：node 任务的归属轴 = owner_dept_id，legacy 列写 NULL（不是空串，
+                    # 也绝不是路径 dept——codex 阶段 B BLOCKER-2：此处的 ON DUPLICATE 覆写
+                    # 正是「register 写好的 NULL 被 stage-1 重登记冲掉」的第一现场）。
+                    owner_dept = None if _is_node else task.get("dept", "unknown")
 
-                    # 1. 写入 document_meta 表
-                    cursor.execute("""
-                        INSERT INTO document_meta 
+                    # 1. 写入 document_meta 表。守卫版：已是 node 的行 owner_dept/owner_dept_id
+                    # 永不被任务值覆写；acl_mode 保持现值（scanner 永不翻转 mode——迁移唯一
+                    # 入口是 doc-meta 端点）。060 未 apply → 1054 回退旧 SQL（行为逐字节不变）。
+                    _exec_node_guarded(
+                        cursor,
+                        """
+                        INSERT INTO document_meta
+                        (doc_id, title, original_filename, owner_dept, acl_mode, owner_dept_id,
+                         status, current_version_no)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'active', %s)
+                        ON DUPLICATE KEY UPDATE
+                        title = VALUES(title),
+                        original_filename = VALUES(original_filename),
+                        owner_dept = IF(acl_mode='node' OR VALUES(acl_mode)='node',
+                                        owner_dept, VALUES(owner_dept)),
+                        owner_dept_id = IF(acl_mode='node' OR VALUES(acl_mode)='node',
+                                           owner_dept_id, VALUES(owner_dept_id)),
+                        current_version_no = GREATEST(current_version_no, VALUES(current_version_no))
+                        """,
+                        """
+                        INSERT INTO document_meta
                         (doc_id, title, original_filename, owner_dept, status, current_version_no)
                         VALUES (%s, %s, %s, %s, 'active', %s)
                         ON DUPLICATE KEY UPDATE
@@ -270,7 +326,10 @@ def node_register_metadata(ctx: dict):
                         original_filename = VALUES(original_filename),
                         owner_dept = VALUES(owner_dept),
                         current_version_no = GREATEST(current_version_no, VALUES(current_version_no))
-                    """, (doc_id, title, title, owner_dept, version_no))
+                        """,
+                        (doc_id, title, title, owner_dept,
+                         "node" if _is_node else "legacy", task.get("owner_dept_id"), version_no),
+                        (doc_id, title, title, owner_dept or "unknown", version_no))
                     
                     # 2. document_version：先 UPDATE（已存在的记录），无匹配再 INSERT
                     cursor.execute("""
@@ -1539,12 +1598,41 @@ def _dept_from_raw_key(source_key: str, default: str = "unknown") -> str:
     owner_dept 安全相关（驱动 HA3 dept_internal 权限过滤），只认 raw/ 前缀，杜绝把
     processing/、s3:// 等非 raw 路径的第二段误当部门——消除原先 8 处拷贝里 line 573
     缺 startswith("raw/") guard 的漂移。
+    ⚠️ 阶段 B：node 文档的第 2 段是 ``node-<dept_id>``——本函数**语义不变**（图片对象
+    路径等消费方拿它当 storage_segment 用，路径布局照旧）；需要区分归属轴的调用方
+    改用 kb_upload.parse_raw_owner 的结构化结果。
     """
     if source_key and source_key.startswith("raw/"):
         parts = source_key.split("/")
         if len(parts) > 1:
             return parts[1]
     return default
+
+
+# ── 阶段 B：060 mode 列的双路 SQL 执行（1054 TTL 负缓存，与 contribution._exec_gap_sql
+#    同型）——摄取侧对「060 未 apply 的环境」回退旧 SQL，行为逐字节不变；apply 后无须
+#    重启自动恢复带守卫版本。──────────────────────────────────────────────────
+_NODE_MODE_COLS_MISSING_UNTIL = 0.0
+_NODE_MODE_RETRY_SECONDS = 600.0
+
+
+def _exec_node_guarded(cursor, sql_with_mode: str, sql_without: str, params_with, params_without) -> bool:
+    """优先执行带 acl_mode 守卫的 SQL；1054（列缺失）→ TTL 负缓存并回退无守卫版本。
+    返回 True=守卫版已执行。仅 1054 走降级，其他 SQL 错误照抛。"""
+    global _NODE_MODE_COLS_MISSING_UNTIL
+    if time.time() >= _NODE_MODE_COLS_MISSING_UNTIL:
+        try:
+            cursor.execute(sql_with_mode, params_with)
+            return True
+        except Exception as e:   # noqa: BLE001 — 仅 1054 降级
+            errno = e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], int) else None
+            if errno != 1054:
+                raise
+            _NODE_MODE_COLS_MISSING_UNTIL = time.time() + _NODE_MODE_RETRY_SECONDS
+            print("    ⚠️ [node-acl] acl_mode 列缺失（060 未 apply），"
+                  f"{_NODE_MODE_RETRY_SECONDS:.0f}s 内回退无守卫 SQL")
+    cursor.execute(sql_without, params_without)
+    return False
 
 
 def _perm_level_from_path(path: str) -> str:
@@ -2233,9 +2321,14 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     _cm = _get_db_conn(select_db=True)
                     with _cm.cursor() as _cur:
-                        _cur.execute(
+                        # 阶段 B：node 行的归属轴绝不被分类回写覆盖（owner_dept 是 legacy 轴）
+                        _exec_node_guarded(
+                            _cur,
+                            "UPDATE document_meta SET category_l1=%s, category_l2=%s, "
+                            "owner_dept=IF(acl_mode='node', owner_dept, %s) WHERE doc_id=%s",
                             "UPDATE document_meta SET category_l1=%s, category_l2=%s, owner_dept=%s "
                             "WHERE doc_id=%s",
+                            (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["doc_id"]),
                             (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["doc_id"]))
                         _cur.execute(
                             "UPDATE document_version SET classification_method='FROZEN_MAINTENANCE', "
@@ -2265,9 +2358,15 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     _cm = _get_db_conn(select_db=True)
                     with _cm.cursor() as _cur:
-                        _cur.execute(
+                        _exec_node_guarded(
+                            _cur,
+                            "UPDATE document_meta SET category_l1=%s, category_l2=%s, "
+                            "owner_dept=IF(acl_mode='node', owner_dept, %s), "
+                            "permission_level=%s, kb_type=%s WHERE doc_id=%s",
                             "UPDATE document_meta SET category_l1=%s, category_l2=%s, owner_dept=%s, "
                             "permission_level=%s, kb_type=%s WHERE doc_id=%s",
+                            (doc["category_l1"], doc["category_l2"], doc["owner_dept"],
+                             doc["permission_level"], doc["kb_type"], doc["doc_id"]),
                             (doc["category_l1"], doc["category_l2"], doc["owner_dept"],
                              doc["permission_level"], doc["kb_type"], doc["doc_id"]))
                         _cur.execute(
@@ -2426,7 +2525,20 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     conn = _get_db_conn(select_db=True)
                     with conn.cursor() as cursor:
-                        cursor.execute("""
+                        # 阶段 B：node 行的归属轴绝不被 LLM 分类回写覆盖
+                        _exec_node_guarded(
+                            cursor,
+                            """
+                            UPDATE document_meta
+                            SET category_l1 = %s,
+                                category_l2 = %s,
+                                owner_dept = IF(acl_mode='node', owner_dept, %s),
+                                summary = %s,
+                                permission_level = %s,
+                                kb_type = %s
+                            WHERE doc_id = %s
+                            """,
+                            """
                             UPDATE document_meta
                             SET category_l1 = %s,
                                 category_l2 = %s,
@@ -2435,8 +2547,11 @@ def node_classify_and_risk_assess(ctx: dict):
                                 permission_level = %s,
                                 kb_type = %s
                             WHERE doc_id = %s
-                        """, (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
-                              doc["permission_level"], doc["kb_type"], doc["doc_id"]))
+                            """,
+                            (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
+                             doc["permission_level"], doc["kb_type"], doc["doc_id"]),
+                            (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
+                             doc["permission_level"], doc["kb_type"], doc["doc_id"]))
 
                         cursor.execute("""
                             UPDATE document_version

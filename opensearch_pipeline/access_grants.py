@@ -423,21 +423,33 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         (doc_id, ver),
     )
     prow = cursor.fetchone()
-    want = gate_by_permission(
+    gated = gate_by_permission(
         {doc_id: raw_want}, {doc_id: (prow[0] if prow else None)},
     ).get(doc_id, [])
-    # 3. diff vs 现存投影
+    # 阶段 B（codex 评审 BLOCKER，2026-08-01）：legacy 分支同样走 project_doc_acl 投影
+    # **owner 一并比较与写回**——此前只写 allowed_depts，node→legacy 迁移后 chunk 的
+    # owner 永远留着哨兵，legacy owner 过滤召不回文档（access_grants.py 旧 :437-442）。
+    # 对纯 legacy 存量这是无操作：chunk owner 本就是真实值 → owner 比较恒等，
+    # unchanged 路径与改动前逐字节一致。
+    cursor.execute(
+        f"SELECT owner_dept FROM {_kb_db()}.document_meta WHERE doc_id=%s", (doc_id,))
+    orow = cursor.fetchone()
+    from opensearch_pipeline.acl_policy import ACL_MODE_LEGACY
+    _owner, want = project_doc_acl(ACL_MODE_LEGACY, (orow[0] if orow else "") or "", gated)
+    # 3. diff vs 现存投影（owner 与集合都比：owner 漂移也必须触发重投影）
     have = current_allowed_for_doc(cursor, doc_id, ver)
-    if sorted(want) == have:
+    _cur_owner = _current_owner_for_doc(cursor, doc_id, ver)
+    if sorted(want) == have and _cur_owner == _owner:
         return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
     status = "materialized" if want else "retracted"
     if not apply:
         return {"status": status, "reset_chunks": 0, "version_no": ver}
     aj = _json.dumps(want, ensure_ascii=False) if want else None
     cursor.execute(
-        f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
+        f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, owner_dept=%s, "
+        f"index_status='{ChunkIndexStatus.NOT_INDEXED}' "
         "WHERE doc_id=%s AND version_no=%s AND is_active=1",
-        (aj, doc_id, ver),
+        (aj, _owner, doc_id, ver),
     )
     return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver}
 
@@ -576,3 +588,113 @@ def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
     finally:
         conn.close()
     return result
+
+
+# ── 阶段 B：doc-meta 投影 outbox（schema/061 kb_doc_meta_projection_outbox）─────
+# 为什么必须持久意图（codex 阶段 B blocker）：stage-3 的 loader 在 dag.run()（锁获取）
+# **之前**把 title/category/chunk_text 读进内存（dataworks_orchestrator.py:454-605→:610），
+# 推完又按 chunk_id 无条件回写 INDEXED（pipeline_nodes.py:8271-8288）——窗口内直接落的
+# NOT_INDEXED 标记会被本轮吞掉。outbox 行 + generation CAS 让被吞的编辑下轮重投影。
+def enqueue_meta_projection(cursor, doc_id: str, reason: str = "") -> None:
+    """doc-meta 端点【同事务】入队（仅 title/category 变更需要；owner/可见集走 ACL outbox）。
+    刻意不吞异常：061 未 apply 时抛 1146 → 端点整笔回滚——改标题/分类的能力以 061 为前置，
+    半提交（元数据改了、投影意图丢了）比诚实失败更糟。**不提交事务**。"""
+    if not doc_id:
+        return
+    cursor.execute(
+        f"INSERT INTO {_kb_db()}.kb_doc_meta_projection_outbox (doc_id, reason) VALUES (%s, %s) "
+        "ON DUPLICATE KEY UPDATE processed_at=NULL, attempts=0, last_error=NULL, "
+        "generation=generation+1, reason=VALUES(reason), updated_at=NOW()",
+        (doc_id, (reason or "")[:64]),
+    )
+
+
+def pre_drain_meta_projection(limit: int = 200) -> dict:
+    """stage-3 在 loader **之前**调用：对每条未处理行同步 chunk_meta 的 category 列
+    （stage-3 载荷的 category 取自 chunk_meta 而非 JOIN document_meta —— 只改 document_meta
+    分类永远推不进 HA3）+ 把 active chunk 标 NOT_INDEXED（title 由 loader 的 JOIN 现读）。
+    返回 {"claims": [(id, doc_id, generation)], ...}——调用方在本轮 DAG **成功推送后**
+    把 claims 交给 complete_meta_projection 按 CAS 收尾；失败/中断则不收尾，下轮重投影
+    （幂等：category 同步与标脏都可重放）。表不存在（061 未 apply）→ skipped。"""
+    out = {"claims": [], "marked": 0, "skipped": False, "errors": []}
+    from opensearch_pipeline.db import _get_db_conn
+    try:
+        conn = _get_db_conn()
+    except Exception as e:   # noqa: BLE001
+        out["errors"].append(f"DB connect failed: {e}")
+        return out
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    f"SELECT id, doc_id, generation FROM {_kb_db()}.kb_doc_meta_projection_outbox "
+                    "WHERE processed_at IS NULL ORDER BY enqueued_at ASC LIMIT %s", (limit,))
+                rows = cur.fetchall() or []
+            except Exception:   # noqa: BLE001 — 1146 表不存在 = 061 未 apply
+                out["skipped"] = True
+                return out
+            for rid, doc_id, gen in rows:
+                try:
+                    cur.execute(
+                        f"UPDATE {_kb_db()}.chunk_meta cm "
+                        f"JOIN {_kb_db()}.document_meta dm ON dm.doc_id = cm.doc_id "
+                        "SET cm.category_l1 = dm.category_l1, cm.category_l2 = dm.category_l2, "
+                        f"    cm.index_status = '{ChunkIndexStatus.NOT_INDEXED}' "
+                        "WHERE cm.doc_id = %s AND cm.is_active = 1",
+                        (doc_id,))
+                    out["marked"] += cur.rowcount
+                    cur.execute(
+                        f"UPDATE {_kb_db()}.kb_doc_meta_projection_outbox "
+                        "SET attempts = attempts + 1, updated_at = NOW() WHERE id = %s", (rid,))
+                    out["claims"].append((int(rid), doc_id, int(gen or 0)))
+                except Exception as e:   # noqa: BLE001 — 单行失败不拖垮整轮
+                    out["errors"].append(f"{doc_id}: {e}")
+                    try:
+                        cur.execute(
+                            f"UPDATE {_kb_db()}.kb_doc_meta_projection_outbox "
+                            "SET attempts = attempts + 1, last_error = %s, updated_at = NOW() "
+                            "WHERE id = %s", (str(e)[:512], rid))
+                    except Exception:   # noqa: BLE001
+                        pass
+        conn.commit()
+    except Exception as e:   # noqa: BLE001
+        out["errors"].append(str(e))
+    finally:
+        conn.close()
+    return out
+
+
+def complete_meta_projection(claims) -> dict:
+    """本轮 DAG 成功推送后按 (id, generation) CAS 标 processed。CAS 落空 = 窗口中途该行被
+    doc-meta 再次入队（generation 已 +1）——行保持待处理，下轮按新代次重投影（丢更新关死）。
+    ⚠️ 只允许在**成功**路径调用（DAG 失败/中断不收尾，049 同款前提条款）。"""
+    out = {"completed": 0, "superseded": 0, "errors": []}
+    if not claims:
+        return out
+    from opensearch_pipeline.db import _get_db_conn
+    try:
+        conn = _get_db_conn()
+    except Exception as e:   # noqa: BLE001
+        out["errors"].append(f"DB connect failed: {e}")
+        return out
+    try:
+        with conn.cursor() as cur:
+            for rid, _doc_id, gen in claims:
+                try:
+                    cur.execute(
+                        f"UPDATE {_kb_db()}.kb_doc_meta_projection_outbox "
+                        "SET processed_at = NOW(), last_error = NULL, updated_at = NOW() "
+                        "WHERE id = %s AND generation = %s AND processed_at IS NULL",
+                        (rid, gen))
+                    if cur.rowcount:
+                        out["completed"] += 1
+                    else:
+                        out["superseded"] += 1
+                except Exception as e:   # noqa: BLE001
+                    out["errors"].append(f"#{rid}: {e}")
+        conn.commit()
+    except Exception as e:   # noqa: BLE001
+        out["errors"].append(str(e))
+    finally:
+        conn.close()
+    return out
