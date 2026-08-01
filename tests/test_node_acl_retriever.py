@@ -8,6 +8,7 @@
 """
 import pytest
 
+from opensearch_pipeline import retriever as r_mod
 from opensearch_pipeline.acl_policy import (
     ACL_MODE_LEGACY, ACL_MODE_NODE, AclContext, DocAcl, InvalidFlagPosture,
 )
@@ -21,8 +22,23 @@ def _stub(monkeypatch, *, phase_d=True, grant=False, enforce=True):
         node_acl_grant = grant
         node_acl_enforce = enforce
 
+    class _AV:                     # cosurface 在拼过滤器【之前】会读 alibaba_vector
+        table_name = "t"
+        pk_field = "id"
+
+    class _OS:                     # 本地回退链在拼过滤器【之前】会读 opensearch
+        host = "localhost"
+        port = 9200
+        index_name = "t"
+        auth_user = None
+        auth_password = None
+        use_ssl = False
+        verify_certs = False
+
     class _Cfg:
         rag = _Rag()
+        alibaba_vector = _AV()
+        opensearch = _OS()
 
     monkeypatch.setattr(retriever, "get_config", lambda: _Cfg())
     return retriever
@@ -263,6 +279,86 @@ def test_serving_recheck_passes_strict_true(monkeypatch):
         mode=ACL_MODE_NODE, permission_level="dept_internal", node_ids=(34265162,))})
     r._deny_revoked_cross_dept([NODE_HIT], "hr", acl_ctx=CTX)
     assert seen_strict == [True]
+
+
+# ── cosurface / 本地回退：node 通道必须同样接通 ──────────────────────────────
+def test_cosurface_filter_carries_node_branch(monkeypatch):
+    """★ 补图查询必须带节点分支 —— 漏传 acl_ctx ⇒ node 文档【正文可见但配图召不回】。
+
+    cosurface 的过滤器与主检索共用 `_build_permission_filter`，这里钉死它收到了 acl_ctx
+    （而不是像此前那样固定用裸 user_dept 调）。用 spy 记录后立刻抛出中断，避免真发 HA3。
+    """
+    r = _stub(monkeypatch, grant=True)
+    seen = {}
+
+    class _Stop(Exception):
+        pass
+
+    def _spy(user_dept, *, acl_ctx=None):
+        seen["user_dept"], seen["acl_ctx"] = user_dept, acl_ctx
+        raise _Stop()
+
+    monkeypatch.setattr(r, "_build_permission_filter", _spy)
+    monkeypatch.setattr(r, "get_query_embedding", lambda q: ([0.0], [], []))
+    with pytest.raises(_Stop):
+        r._fetch_cosurface_images("q", ["D1"], "hr", ([0.0], [], []), acl_ctx=CTX)
+    assert seen["acl_ctx"] is CTX, "cosurface 没把 acl_ctx 传给权限过滤器"
+    assert seen["user_dept"] == "hr"
+
+
+def test_cosurface_prefetch_uses_same_acl_ctx():
+    """★ F#53 预取路径必须与串行同参：预取命中时其结果被**直接采用**（只比对 doc_ids），
+    漏传 acl_ctx 就成了"预取时没图、串行时有图"这种随并发时序漂移的缺图。"""
+    import inspect
+    src = inspect.getsource(r_mod.retrieve_and_enrich)
+    assert "_fetch_cosurface_images, query, _pre_ids, user_dept, _emb" in src
+    assert "acl_ctx=acl_ctx" in src.split("_fetch_cosurface_images")[1][:200]
+
+
+def test_local_opensearch_fallback_has_node_branch(monkeypatch):
+    """★ 本地 OpenSearch 回退链的权限子句也要有节点分支（写侧 to_opensearch_doc 已输出该字段）。
+
+    节点分支与组码**互相独立**：无组码映射的员工拿到节点授权后，在回退链上同样必须可见。
+    """
+    from opensearch_pipeline.acl_policy import AclContext
+    r = _stub(monkeypatch, grant=True)
+    captured = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _FakeOS:
+        def __init__(self, *a, **kw): pass
+        def search(self, index=None, body=None):
+            captured["body"] = body
+            raise _Stop()
+
+    # `OpenSearch` 是函数内惰性导入（`from opensearchpy import OpenSearch`）⇒ 必须打**源模块**，
+    # 打 retriever.OpenSearch 不生效（那样只会静默跳过、测试形同虚设）。
+    import opensearchpy
+    monkeypatch.setattr(opensearchpy, "OpenSearch", _FakeOS)
+    ctx = AclContext(groups=(), ancestor_dept_ids=(7,), direct_dept_ids=(9,))
+    with pytest.raises(_Stop):
+        r._search_chunks_opensearch("q", [0.1], 5, None, acl_ctx=ctx)
+    import json as _json
+    # 只看**权限 filter**那一段（body 里还有 _source 字段清单，含 owner_dept 字面量）
+    perm = _json.dumps(captured["body"]["query"]["bool"]["filter"], ensure_ascii=False)
+    assert '"allowed_depts": ["d:7", "dx:9"]' in perm, f"回退链权限子句缺节点分支: {perm}"
+    assert "owner_dept" not in perm, "无组码时权限子句不应出现 owner 分支"
+
+
+def test_to_opensearch_doc_emits_allowed_depts():
+    """★ 写侧：本地回退索引必须带 allowed_depts，否则查询侧的节点分支永远匹配不上。"""
+    from opensearch_pipeline.chunker import Chunk
+
+    def _mk(cid):
+        return Chunk(chunk_id=cid, doc_id="D1", version_no=1, chunk_index=0,
+                     chunk_type="text_chunk", chunk_text="x", token_count=1)
+
+    c = _mk("c1")
+    c.allowed_depts = ["d:7", "dx:9"]
+    assert c.to_opensearch_doc()["allowed_depts"] == ["d:7", "dx:9"]
+    assert _mk("c2").to_opensearch_doc()["allowed_depts"] == []      # 默认空，不是缺键
 
 
 # ── groups_that_can_read_owner：_expand_groups_to_owners 的反向 ──────────────

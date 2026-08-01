@@ -864,6 +864,7 @@ def _search_chunks_opensearch(
     top_k: int,
     user_dept: Union[str, List[str], None] = None,
     degraded: bool = False,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """本地开发回退检索：标准 OpenSearch dense kNN(0.7) + BM25(0.3)。
 
@@ -901,6 +902,22 @@ def _search_chunks_opensearch(
                 {"term": {"permission_level": "dept_internal"}},
                 {"terms": {"allowed_depts": groups}},
             ]}})
+    # node-ACL（2026-07-31）：节点分支与组码**互相独立** —— 与 HA3 侧 `_node_filter_suffix`
+    # 同构地放在 `if groups:` **之外**。无组码映射的员工（现网部门映射缺口 26/131）拿到节点
+    # 授权后，在本地回退链上同样必须可见；写侧 `to_opensearch_doc` 已输出 allowed_depts。
+    if acl_ctx is not None:
+        _grant, _enforce = _node_acl_flags()
+        if _grant and getattr(acl_ctx, "node_channel_ok", False):
+            if getattr(acl_ctx, "org_wide_reader", False):
+                perm_should.append({"term": {"permission_level": "dept_internal"}})
+            else:
+                from opensearch_pipeline.acl_policy import node_filter_terms
+                _terms = node_filter_terms(acl_ctx)
+                if _terms:
+                    perm_should.append({"bool": {"must": [
+                        {"term": {"permission_level": "dept_internal"}},
+                        {"terms": {"allowed_depts": _terms}},
+                    ]}})
 
     fetch_k = max(top_k * 2, top_k + 5)
     # P2-4 降级：零向量不进 kNN（部分引擎对零范数向量报错），纯 BM25 match 排序
@@ -1195,7 +1212,8 @@ def search_chunks(
     _full_cfg = get_config()
     if not _full_cfg.alibaba_vector.endpoint and getattr(_full_cfg.opensearch, "host", ""):
         return _revalidate_main_hits(_deny_revoked_cross_dept(
-            _search_chunks_opensearch(query, dense, top_k, user_dept, degraded=degraded),
+            _search_chunks_opensearch(query, dense, top_k, user_dept, degraded=degraded,
+                                      acl_ctx=acl_ctx),
             user_dept, acl_ctx=acl_ctx))
 
     client = _get_ha3_client()
@@ -2053,6 +2071,7 @@ def _fetch_cosurface_images(
     user_dept: Union[str, List[str], None],
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
     max_images: int = 3,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """cosurface 的 HA3 补图查询（F#53 拆出：可在 stitch/expand 期间由 future 并发预取）。
 
@@ -2073,7 +2092,11 @@ def _fetch_cosurface_images(
         f'doc_id="{_sanitize_ha3_filter_value(d)}"' for d in doc_ids
     )
     # 权限子句与 search_chunks 共用同一实现（安全边界单一来源）
-    perm = _build_permission_filter(user_dept)
+    # ⚠️ 必须同样透传 acl_ctx（2026-07-31）：漏传时节点分支不会出现在这条过滤器里，
+    # 于是 node 文档【正文可见但补图召不回】——用户看到答案却永远没有配图，而
+    # step-card 的价值高度依赖配图。方向是 fail-closed（少召回、不越权），故此前
+    # 定性为可用性缺陷；但 node-ACL 一旦放量它就是"图全没了"。
+    perm = _build_permission_filter(user_dept, acl_ctx=acl_ctx)
     filter_expr = f'chunk_type="image" AND ({doc_clause}) AND ({perm})'
 
     req = QueryRequest(
@@ -2098,6 +2121,7 @@ def cosurface_doc_images(
     max_images: int = 3,
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
     prefetched: Optional[Tuple[List[str], Any]] = None,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """图片召回增强：为已检索高分文档补充其最相关的 image chunk。
 
@@ -2148,7 +2172,8 @@ def cosurface_doc_images(
                 img_results = fut.result()
         if img_results is None:
             img_results = _fetch_cosurface_images(
-                query, doc_ids, user_dept, query_embedding, max_images=max_images)
+                query, doc_ids, user_dept, query_embedding, max_images=max_images,
+                acl_ctx=acl_ctx)
     except Exception as e:
         logger.warning("图片召回补充失败 (non-fatal): %s", e)
         return chunks
@@ -2545,8 +2570,12 @@ def retrieve_and_enrich(
 
                 _cx = ThreadPoolExecutor(max_workers=1)
                 try:
+                    # ⚠️ acl_ctx 必须与串行路径同参（2026-07-31）：预取命中时其结果被**直接采用**
+                    # （下方仅比对 doc_ids 是否一致，不重算），漏传就变成"预取时没图、串行时有图"
+                    # 这种随并发时序漂移的 node 文档配图缺失。
                     _cos_pref = (_pre_ids, _cx.submit(
-                        _fetch_cosurface_images, query, _pre_ids, user_dept, _emb))
+                        _fetch_cosurface_images, query, _pre_ids, user_dept, _emb,
+                        acl_ctx=acl_ctx))
                 finally:
                     _cx.shutdown(wait=False)
             except Exception as e:   # noqa: BLE001 — 预取起不来 → 回退串行（fail-open）
@@ -2580,7 +2609,7 @@ def retrieve_and_enrich(
     # P2-4 嵌入降级时跳过，理由见上方 _cos_pref 注释）
     if chunks and cosurface_images and get_config().rag.image_cosurface and not _emb_degraded:
         chunks = cosurface_doc_images(query, chunks, user_dept=user_dept, query_embedding=_emb,
-                                      prefetched=_cos_pref)
+                                      prefetched=_cos_pref, acl_ctx=acl_ctx)
     # P2-31（盲区审计）：附文档日期（版本落库日，RDS 现查、fail-open）——此前索引→上下文→
     # 来源整条链无任何时间信号，模型与用户都无法区分 2023 版与 2025 版 SOP。
     _attach_doc_dates(chunks)

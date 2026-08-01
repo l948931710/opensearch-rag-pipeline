@@ -470,6 +470,10 @@ def _ensure_opensearch_index(client, index_name: str, dimension: int):
                     },
                     "chunk_type": {"type": "keyword"},
                     "owner_dept": {"type": "keyword"},
+                    # node-ACL：节点值 d:<id>/dx:<id> 与 legacy 组码共用该多值字段
+                    # （与 HA3 的 allowed_depts MULTI_STRING 同语义）。keyword 数组 ⇒
+                    # term 查询即成员匹配；不声明会走 dynamic mapping 变 text 而 term 失配。
+                    "allowed_depts": {"type": "keyword"},
                     "permission_level": {"type": "keyword"},
                     "is_active": {"type": "boolean"}
                 }

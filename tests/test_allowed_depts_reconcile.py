@@ -53,6 +53,10 @@ class _Cur:
         elif "group_concat(distinct permission_level)" in s:        # gate 守卫 perm 查询（helper 单列、版本限定）
             d = p[0]
             self._r = [(self.st["perm"][d],)] if d in self.st.get("perm", {}) else []
+        elif "kb_doc_node_grant" in s:                              # node 权威候选（零投影那一类）
+            if self.st.get("node_grant_table_missing"):
+                raise RuntimeError("Table 'kb_doc_node_grant' doesn't exist")
+            self._r = [(d,) for d in self.st.get("node_granted", [])]
         elif "allowed_depts is not null" in s:                      # have_ad（retract 候选）
             self._r = [(d,) for d, a in self.st["have"].items() if a]
         elif "current_version_no" in s:                             # per-doc 版本 + 反抢锁
@@ -163,3 +167,51 @@ def test_reconcile_unchanged_no_write(monkeypatch):
     out = _run(monkeypatch, st)
     assert out["unchanged"] == 1 and out["materialized"] == 0 and out["retracted"] == 0
     assert "updates" not in st                                        # 零写
+
+
+# ── node-ACL：候选集必须纳入 kb_doc_node_grant（设计稿 §4）──────────────────
+def _spy_targets(monkeypatch):
+    """spy 掉逐文档物化 helper —— 本组测试只关心【候选集选了谁】，不关心物化结果。"""
+    from opensearch_pipeline import access_grants
+    seen = []
+
+    def _fake(cur, doc_id, *, apply=True):
+        seen.append(doc_id)
+        return {"status": "unchanged", "reset_chunks": 0, "version_no": 1}
+
+    monkeypatch.setattr(access_grants, "materialize_doc_allowed_depts", _fake)
+    return seen
+
+
+def test_reconcile_covers_never_projected_node_doc(monkeypatch):
+    """★ 零投影的 node 文档必须进候选。
+
+    它既没有 kb_access_request 行（那是 legacy 权威），chunk_meta.allowed_depts 也还是
+    NULL（decide 端点漏入队 / outbox 没 drain / 直接改库授权）⇒ 旧的
+    `approved ∪ have_ad` 正好跳过它 ⇒ 管理员勾了组织节点，文档却永远搜不到。
+    """
+    seen = _spy_targets(monkeypatch)
+    st = {"approved": {}, "have": {}, "ver": {"DN": 1}, "perm": {"DN": "dept_internal"},
+          "node_granted": ["DN"]}
+    _run(monkeypatch, st)
+    assert "DN" in seen, "零投影的 node 文档没有进入对账候选"
+
+
+def test_reconcile_candidate_set_is_the_union(monkeypatch):
+    """候选 = approved ∪ 有残留投影 ∪ node 授权（三源并集，互不遮蔽）。"""
+    seen = _spy_targets(monkeypatch)
+    st = {"approved": {"DA": ["hr"]}, "have": {"DH": ["hr"]}, "node_granted": ["DN"],
+          "ver": {"DA": 1, "DH": 1, "DN": 1},
+          "perm": {"DA": "dept_internal", "DH": "dept_internal", "DN": "dept_internal"}}
+    _run(monkeypatch, st)
+    assert set(seen) == {"DA", "DH", "DN"}
+
+
+def test_reconcile_survives_missing_node_grant_table(monkeypatch):
+    """schema/060 未 apply ⇒ 表不存在，只跳过该候选源，不阻断整轮对账。"""
+    seen = _spy_targets(monkeypatch)
+    st = {"approved": {"D1": ["hr"]}, "have": {}, "ver": {"D1": 1},
+          "perm": {"D1": "dept_internal"}, "node_grant_table_missing": True}
+    out = _run(monkeypatch, st)
+    assert out["skipped"] is False and not out["errors"]
+    assert seen == ["D1"], "legacy 候选仍应照常处理"
