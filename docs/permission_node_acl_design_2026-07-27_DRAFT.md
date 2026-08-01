@@ -544,6 +544,7 @@ HA3:**无 schema 变更、无重建表**(§2.1)。
 | ~~T8~~ | ✅ 2026-07-28 通过(见 §9.0b):树深 5 · 直属部门数 ≤5 · **节点 OR 项数最大 8 / P99 5** ⇒ §3.3 上限已锁定 |
 | ~~T11~~ | ✅ 2026-07-28 通过:现网 owner_dept 值域 13 个全为组码,`__acl_node_mode_v1__` 无碰撞 |
 | — | staging 实证 `allowed_depts="d:123"` 中**冒号**的写入/查询/过滤解析(不能假定与纯字母同行为) |
+| **T13** | ⚠️ **2026-07-31 新增(盘 DataWorks 才发现,原门槛表没有这条)**:`RAG_ALLOWED_DEPTS_ACL` 在**摄取侧**必须为 true —— 节点值 `d:`/`dx:` 就住在 `allowed_depts` 字段里,而推送侧受该 flag 门控(`pipeline_nodes.py:7652`),关着就**根本不进 HA3**,`reconcile_allowed_depts` 也直接 skipped ⇒ 节点授权全盘失效(RDS 有值、HA3 没有)。stage-2/3 生成器已改**显式直赋 true**,⚠️ **须重贴 DataWorks 节点并发布**才生效 |
 | **T12** | ⚠️ **PARTIAL(2026-07-31)** —— 本机 15 个 `scratch/` 工具 + 仓内 `scripts/export_full_to_oss_for_v2.py` 已 tombstone(执行即 `SystemExit`,有效性被单测钉死);tracked 面 CI 扫描 + 运维机本地审计落地 `tests/test_acl_projection_writers.py`。**未闭环**:tombstone 位于 `.gitignore` 的 `scratch/`,无法随仓库分发到其他运维机;且 `env_guard` 对 `environment=production` 在校验 ACK **之前**就 return,故**不存在跨机技术性阻断**。真正闭环见下 |
 | **T9-a** | **图片重签 + 系统重投旧答案**必须先过当前 ACL(业务裁决只保留"历史文字是否永久可见"这一项) |
 

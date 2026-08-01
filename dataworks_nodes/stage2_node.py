@@ -40,6 +40,14 @@ os.environ["RAG_ACL_FAIL_CLOSED"] = "true"
 os.environ.setdefault("RAG_CHUNK_EXPLOSION_GATE", "true")
 os.environ.setdefault("RAG_IMAGE_OCR_PII", "true")
 
+# ── node-ACL 双端对齐（2026-07-31）：与 stage-3 保持同一口径，避免再出「半条链」 ──
+# write_chunk_meta 在 **DAG 2**（本阶段）：node 文档的 d:/dx: 投影不受本 flag 门控（无条件
+# 跑、失败即抛），但 **legacy 的 approved 组码物化受它门控**（pipeline_nodes.py:6058）。
+# stage-3 已直赋 true；这里若仍为 OFF，chunk_meta 的 legacy allowed_depts 不写、stage-3 却
+# 照推，两阶段口径不一致 —— 今天 approved=0 看不出来，等真有跨部门授权就会表现为
+# 「审批通过了但检索不到」。趁 approved=0（2026-07-31 只读实测）先对齐。
+os.environ["RAG_ALLOWED_DEPTS_ACL"] = "true"
+
 if not SIMULATE:
     # 生产凭证：由 DataWorks 调度参数注入
     required_vars = [

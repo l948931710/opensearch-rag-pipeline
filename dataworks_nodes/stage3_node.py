@@ -70,6 +70,27 @@ os.environ["RAG_ACL_FAIL_CLOSED"] = "true"
 os.environ.setdefault("RAG_STAGE3_PARITY_VERIFY", "true")
 os.environ.setdefault("RAG_STAGE3_PARITY_DRIFT", "true")
 
+# ── node-ACL 必须开（2026-07-31）：⚠️ 这不再是「Phase D 的可选加固」，而是节点通道的命脉 ──
+# 节点授权值 `d:<id>` / `dx:<id>` **就住在 allowed_depts 字段里**（设计稿 §2.1：复用现有
+# MULTI_STRING 字段 ⇒ HA3 零 schema 变更）。而推送侧受本 flag 门控：
+#     pipeline_nodes.py:7652   _incl_ad = get_config().rag.allowed_depts_acl
+#     → to_ha3_doc(include_allowed_depts=_incl_ad)
+# flag 关 ⇒ 该字段**根本不进 HA3 文档** ⇒ node 文档的 d:/dx: 永远到不了检索侧
+# ⇒ 检索器的 `allowed_depts="d:123"` 分支永远匹配不上 ⇒ **节点授权全盘失效**
+#   （RDS 里有值、HA3 里没有；write_chunk_meta 的 node 投影不受本 flag 门控，故只断这一头）。
+# 而 `reconcile_allowed_depts` 在 flag 关时**直接 skipped 返回**，自愈路径也兜不住。
+#
+# 原注释写「不在此设默认，由 DataWorks 环境注入（双端 flip 前为 OFF）」——那是 Phase D 时代的
+# 谨慎，但 serving 侧早已 ON（T7 控制台确认），摄取侧一直没跟上 = T7 记的「少一边即半条链」。
+# 2026-07-31 只读实测现网，四个受影响集合全为空 ⇒ **此刻打开的行为变化为零**：
+#     approved 跨部门授权 0 · chunk_meta.allowed_depts 非空 0 · acl_mode='node' 文档 0 ·
+#     kb_doc_node_grant 在册 0   （唯一变化＝新推 chunk 多带一个空 allowed_depts，字段本就存在）
+# 等 node 文档出现再开，就变成「两个变量同时动」——所以趁零半径先固化。
+#
+# 用 [] 直赋而非 setdefault：与上方 REQUIRE_AUTH/ACL_FAIL_CLOSED 同理——这是「必须确定为真」
+# 的安全通道，setdefault 在外部注入 false 时会失守，而失守的表现是 node 文档**静默不可见**。
+os.environ["RAG_ALLOWED_DEPTS_ACL"] = "true"
+
 if not SIMULATE:
     # 生产凭证：由 DataWorks 调度参数注入
     required_vars = [
@@ -211,8 +232,7 @@ else:
 #    （Phase D 撤销·授权投影自愈，RAG_ALLOWED_DEPTS_ACL 关时 skipped no-op）。这些对账只在
 #    run_stage_drained 里；旧的单批 run_stage 既不排空也不跑对账。SIMULATE=True 时 drained 内部
 #    退化为单次 run_stage（行为不变）。
-# ⚠️ RAG_ALLOWED_DEPTS_ACL 不在此设默认——保持由 DataWorks 环境注入（双端 flip 前为 OFF），
-#    避免在 serving 侧之前单边激活 Phase D。
+#    ⚠️ RAG_ALLOWED_DEPTS_ACL 见上方【node-ACL 必须开】段落——它现在是显式直赋 true。
 print(f"=== 4. 启动 Stage 3 排空（{'模拟' if SIMULATE else '生产'}）===")
 from opensearch_pipeline.dataworks_orchestrator import run_stage_drained
 run_stage_drained(stage=3, bizdate=bizdate, simulate=SIMULATE)
