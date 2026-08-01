@@ -224,14 +224,19 @@ def _tree_cache_ttl_s() -> float:
 def load_org_tree() -> dict:
     """RDS 快照 → 管理台组织树选择器载荷(**扁平列表**,前端自行建树)。
 
-    返回 {"nodes":[{dept_id,parent_id,name,depth,staff_count}], "snapshot_rev", "synced_at",
-          "stale": bool, "staff_total"}。表空/异常 → nodes=[] 且 stale=True(前端据此提示
-    "组织数据未同步",而不是画一棵空树让人以为公司没部门)。
+    返回 {"nodes":[{dept_id,parent_id,name,depth,staff_count,direct_staff_count}],
+          "snapshot_rev", "synced_at", "stale": bool, "staff_total"}。表空/异常 → nodes=[]
+    且 stale=True(前端据此提示"组织数据未同步",而不是画一棵空树让人以为公司没部门)。
 
-    ⚠️ `staff_count` 是**子树总人数**(含本节点直属 + 全部后代),不是直属人数 —— 授权是
-    子树语义,管理员要看到的是"勾这个节点会给多少人看"。**这个数就是防呆的关键**:
-    授权到比员工挂载点更深的空节点时,这里会显示 0,当场就能发现(实测 119 个部门里
-    L4/L5 共 17 个,人都挂在更浅的层)。
+    **两个人数各对应一种授权语义,前端两个都要用**:
+
+    · `staff_count` = **子树总人数**(本节点直属 + 全部后代),对应「含下级」= `d:<id>`。
+      **这个数是防呆的关键**:授权到比员工挂载点更深的空节点时显示 0,当场就能发现
+      (实测 119 个部门里 L4/L5 共 17 个,人都挂在更浅的层)。
+    · `direct_staff_count` = **仅直挂本节点**的人数,对应「仅本级」= `dx:<id>`。
+      2026-08-01 补:此前只回子树数 ⇒ 前端把「仅本级」项一律按 0 计入人数估算,
+      勾了中心「仅本级」人数纹丝不动、看着像白勾(生产中心直挂 4 人、注塑事业部 8 人,
+      全被显示成 0)。**现网 26 个节点有子部门却仍有直挂人员、合计 171 人次**,这不是边角。
     """
     ttl = _tree_cache_ttl_s()
     now = time.monotonic()
@@ -279,7 +284,9 @@ def load_org_tree() -> dict:
     age_h = rows[0][5] if rows and rows[0][5] is not None else None
     out["nodes"] = sorted(
         ({"dept_id": int(r[0]), "parent_id": int(r[1]), "name": r[2] or "",
-          "depth": int(r[3] or 0), "staff_count": len(subtree.get(int(r[0]), ()))}
+          "depth": int(r[3] or 0), "staff_count": len(subtree.get(int(r[0]), ())),
+          # `direct` 本来就为算子树顺带建好了,这里只是把它也回出去(零额外查询)
+          "direct_staff_count": len(direct.get(int(r[0]), ()))}
          for r in rows),
         key=lambda n: (n["depth"], -n["staff_count"], n["dept_id"]))
     out["snapshot_rev"] = int(rows[0][4] or 0)

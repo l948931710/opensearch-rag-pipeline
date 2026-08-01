@@ -21,7 +21,10 @@ export interface OrgNode {
   parent_id: number
   name: string
   depth: number
+  /** 子树总人数（本节点直属 + 全部后代）—— 对应「含下级」= d:<id> */
   staff_count: number
+  /** 仅直挂本节点的人数 —— 对应「仅本级」= dx:<id>。旧后端无此字段，按 0 兜底 */
+  direct_staff_count?: number
 }
 export interface PickedNode { dept_id: number; subtree: boolean }
 
@@ -126,14 +129,55 @@ const subtreeLabel = (n: OrgNode) =>
     ? `${n.name}：当前含下级，点击改为仅本级`
     : `${n.name}：当前仅本级，点击改为含下级`
 
-/** 已选节点覆盖的总人数(按子树/仅本节点分别计;仅供概览,不去重跨节点重叠) */
+const directOf = (n: OrgNode) => n.direct_staff_count ?? 0
+
+/** 已选节点覆盖的总人数(仅供概览,不去重跨节点重叠)。
+ *
+ * ⚠️ 两种勾法取**不同的数**（2026-08-01 修）：
+ *   含下级 = d:<id>  → 子树数 staff_count
+ *   仅本级 = dx:<id> → 直挂数 direct_staff_count
+ * 旧实现对「仅本级」一律按 0 计 ⇒ 勾了中心仅本级人数纹丝不动，看着像白勾，
+ * 而实际是真放行了那些直挂的人（生产中心直挂 4 人、注塑事业部 8 人）。
+ */
 const coverHint = computed(() => {
   if (!props.modelValue.length) return ''
   const n = props.modelValue.reduce((s, p) => {
     const node = byId.value.get(p.dept_id)
-    return s + (node ? (p.subtree ? node.staff_count : 0) : 0)
+    if (!node) return s
+    return s + (p.subtree ? node.staff_count : directOf(node))
   }, 0)
-  return n ? `约 ${n} 人可见` : '⚠️ 所选节点子树人数为 0 —— 可能没有人能看到'
+  return n ? `约 ${n} 人可见` : '⚠️ 所选节点人数为 0 —— 可能没有人能看到'
+})
+
+/** 「勾了子部门、却漏掉父节点直挂的人」——最容易踩且完全无声的坑。
+ *
+ * 现网 26 个节点有子部门却仍有直挂人员、合计 171 人次；一级中心自己也直挂人
+ * （获胜包装 14 人、生产中心 4 人）。管理员勾齐了几个子部门却没勾父节点时，
+ * 那些直挂的人一个都看不到，而人数估算是"对的"（它只是没算他们），
+ * 光看数字发现不了 —— 必须显式点名。
+ */
+const uncoveredDirect = computed(() => {
+  if (!props.modelValue.length) return [] as { name: string; n: number }[]
+  // 已被覆盖 = 该节点本身被勾（任一模式），或它的某个祖先被勾且是「含下级」
+  const covered = (id: number): boolean => {
+    let cur: number | undefined = id
+    let hops = 0
+    while (cur && hops++ < 20) {
+      const p = pickedMap.value.get(cur)
+      if (p && (cur === id || p.subtree)) return true
+      cur = byId.value.get(cur)?.parent_id
+    }
+    return false
+  }
+  const out: { name: string; n: number }[] = []
+  for (const p of props.modelValue) {
+    const node = byId.value.get(p.dept_id)
+    if (!node) continue
+    const par = byId.value.get(node.parent_id)
+    if (!par || directOf(par) === 0 || covered(par.dept_id)) continue
+    if (!out.some(o => o.name === par.name)) out.push({ name: par.name, n: directOf(par) })
+  }
+  return out
 })
 </script>
 
@@ -232,6 +276,10 @@ const coverHint = computed(() => {
 
       <div v-if="coverHint" class="op-cover" :class="{ warn: coverHint.startsWith('⚠️') }">
         {{ coverHint }}
+      </div>
+      <!-- 勾了子部门却漏掉父节点直挂的人：人数估算看不出来，必须显式点名 -->
+      <div v-for="u in uncoveredDirect" :key="u.name" class="op-cover warn">
+        ⚠️ 「{{ u.name }}」直挂的 {{ u.n }} 人不在可见范围内 —— 需要的话请勾上它并选「仅本级」
       </div>
     </template>
   </div>

@@ -150,3 +150,69 @@ def test_staff_dept_ids_serialized_sorted(monkeypatch):
     by_id = {r[0]: r for r in staff_rows}
     assert by_id["u2"][1] == "10,11"          # 有序、去重、CSV
     assert by_id["u2"][2] == 10               # primary_dept
+
+
+# ── load_org_tree：两种人数各对应一种授权语义（2026-08-01）────────────────────
+class _TreeCur:
+    """load_org_tree 的最小游标替身：dept_dim 元数据 + staff_dim 的 dept_ids CSV。"""
+
+    def __init__(self, dept_rows, staff_csv):
+        self._dept, self._staff, self._rows = dept_rows, staff_csv, []
+
+    def execute(self, sql, args=()):
+        s = " ".join(sql.split())
+        if "FROM dept_dim" in s:
+            self._rows = self._dept
+        elif "FROM staff_dim" in s:
+            self._rows = [(c,) for c in self._staff]
+        else:
+            self._rows = []
+
+    def fetchall(self):
+        return self._rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _tree(monkeypatch, dept_rows, staff_csv):
+    from opensearch_pipeline import db, org_sync as m
+    m._TREE_CACHE.clear()                       # 进程内 TTL 缓存，逐测清
+    monkeypatch.setattr(db, "_get_db_conn", lambda: Conn(_TreeCur(dept_rows, staff_csv)))
+    return m.load_org_tree()
+
+
+# (dept_id, parent_id, name, depth, snapshot_rev, age_hours, synced_at)
+_TREE_DEPTS = [
+    (100, 1, "生产中心", 1, 7, 0, "2026-08-01 00:00:00"),
+    (110, 100, "注塑事业部", 2, 7, 0, "2026-08-01 00:00:00"),
+    (111, 110, "注塑制程检", 3, 7, 0, "2026-08-01 00:00:00"),
+    (120, 100, "吸塑事业部", 2, 7, 0, "2026-08-01 00:00:00"),
+]
+# 4 人：1 个直挂生产中心、1 个直挂注塑、1 个在注塑制程检、1 个在吸塑
+_TREE_STAFF = ["100", "110", "111", "120"]
+
+
+def test_org_tree_reports_direct_and_subtree_counts(monkeypatch):
+    """★ 两个人数必须都回、且语义不同：
+    子树数(含下级 d:) vs 直挂数(仅本级 dx:)。此前只回子树数 ⇒ 前端把「仅本级」
+    一律按 0 计，勾了中心仅本级人数纹丝不动、看着像白勾。"""
+    out = _tree(monkeypatch, _TREE_DEPTS, _TREE_STAFF)
+    by = {n["dept_id"]: n for n in out["nodes"]}
+    assert by[100]["staff_count"] == 4 and by[100]["direct_staff_count"] == 1   # 生产中心
+    assert by[110]["staff_count"] == 2 and by[110]["direct_staff_count"] == 1   # 注塑事业部
+    assert by[111]["staff_count"] == 1 and by[111]["direct_staff_count"] == 1   # 叶子：两者相等
+    assert by[120]["staff_count"] == 1 and by[120]["direct_staff_count"] == 1
+    assert out["staff_total"] == 4
+
+
+def test_org_tree_direct_count_zero_for_pure_container(monkeypatch):
+    """纯容器节点（有子部门但无人直挂）⇒ direct=0 而 subtree>0。
+    这正是「勾了子部门却漏掉父节点直挂人员」提示的判据来源 —— direct=0 时不该报警。"""
+    out = _tree(monkeypatch, _TREE_DEPTS, ["111", "120"])   # 没人直挂 100/110
+    by = {n["dept_id"]: n for n in out["nodes"]}
+    assert by[100]["direct_staff_count"] == 0 and by[100]["staff_count"] == 2
+    assert by[110]["direct_staff_count"] == 0 and by[110]["staff_count"] == 1
