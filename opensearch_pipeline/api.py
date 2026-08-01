@@ -2613,6 +2613,13 @@ class KbDocItem(BaseModel):
     title: str = ""
     original_filename: str = ""
     owner_dept: str = ""
+    # 阶段 B owner DTO（codex M1/M2）：稳定分桶键 + 展示名。key=legacy:<code> | node:<id>
+    # ——**不用中文名当键**（重名/改名即破「改名免疫」目标）；label 供直出（legacy 组码由
+    # 前端 deptLabel 转中文，node 节点名后端 JOIN dept_dim 直给）。旧字段 owner_dept 保留
+    # （legacy 兼容），node 文档该字段为空串。
+    acl_mode: str = "legacy"
+    owner_key: str = ""
+    owner_label: str = ""
     permission_level: str = "public"
     current_version_no: int = 1
     status: str = "active"
@@ -2637,6 +2644,9 @@ class KbMyDocsResponse(BaseModel):
     # faceted 状态计数（2026-07-16）：与本次查询同筛选（除 badge 自身）的按徽章计数——
     # 前端 chips/标题总数跟随下拉筛选。None=计数失败/旧后端（前端回退全库口径）。additive。
     badge_counts: Optional[Dict[str, int]] = None
+    # 阶段 B（codex M7/T6）：管辖后代集不可得（组织快照过期/读失败）⇒ node 腿失效、
+    # node 文档对该管理员隐身——fail-closed 是对的，但**不能无声**：前端据此挂 banner。
+    scope_degraded: bool = False
 
 
 class KbVersionItem(BaseModel):
@@ -2944,9 +2954,11 @@ def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                _cap = _kb_node_capability(cur)
+                _mc = ", m.acl_mode, m.owner_dept_id" if _cap == "present" else ""
                 cur.execute(
                     f"""
-                    SELECT m.doc_id, m.title, m.owner_dept
+                    SELECT m.doc_id, m.title, m.owner_dept{_mc}
                     FROM {_kb_db()}.document_meta m
                     JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -2961,10 +2973,17 @@ def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
     except Exception as e:
         logger.info("content-dup 查询失败（fail-open，不报警）: %s", e)
         return [], 0
+    # 阶段 B：详情 vs 只计数的隐私分级改 mode 隔离——node 文档绝不因 owner_dept 残值
+    # 把详情泄给 legacy 管理员（后代集整批解析一次）
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN as _RKA
+    from opensearch_pipeline.kb_authz import can_manage_doc as _cmd
+    _descendants = None if kb.role == _RKA else _kb_managed_descendants(kb)
     visible, other = [], 0
     for r in rows:
         doc_id, title, owner = (r[0] or ""), (r[1] or ""), (r[2] or "")
-        if _kb_can_manage(kb, owner):
+        _mode, _oid = ((r[3] or "legacy"), r[4]) if len(r) > 3 else ("legacy", None)
+        _ok = (kb.role == _RKA) or _cmd(kb, _mode, owner, _oid, _descendants)
+        if _ok:
             visible.append(KbDupDoc(doc_id=doc_id, title=title, owner_dept=owner))
         else:
             other += 1

@@ -2018,7 +2018,9 @@ def _stub_dept_usage(monkeypatch, wow_rows="ok"):
             sql = getattr(self, "_sql", "")
             if "qa_session_log" in sql and "INTERVAL 14 DAY" in sql:
                 return [("marketing", 9, 5)]          # 近7天=9 · 前7天=5
-            if "qa_session_log" in sql and "GROUP BY m.owner_dept" in sql:
+            # 阶段 B：分桶键改稳定表达式（GROUP BY 1），30 天窗口查询以 INTERVAL %s DAY 区分
+            if "qa_session_log" in sql and ("GROUP BY m.owner_dept" in sql
+                                            or ("GROUP BY 1" in sql and "INTERVAL %s DAY" in sql)):
                 return [("marketing", 30, 3)]         # 近30天=30 · REFUSAL=3
             return []
 

@@ -43,6 +43,7 @@ from opensearch_pipeline.api import (
     _kb_content_dups,
     _kb_db,
     _kb_doc_owner_scope_sql,
+    _kb_managed_descendants,
     _kb_node_capability,
     _kb_read_doc_triplet,
     _kb_status_badge,
@@ -193,15 +194,47 @@ def _kb_ledger_filter_sql(perm: str = "", badge: str = "", cited: str = ""):
 
 
 def _kb_owner_facet_sql(owner_dept: str):
-    """按归属部门精确筛选（含生产子线，如 production_mold）→ (SQL 片段, 参数)。
+    """按归属精确筛选 → (SQL 片段, 参数)。阶段 B：额外接受稳定键形态 `node:<id>`
+    （owner DTO 单一键语义——中文名不当键）；legacy 传组码不变（含生产子线）。
     参数化本身防注入，这里再剥离注入字符 + 限长做纵深防御。返回 (None, None) = 非法 facet（fail-closed）。"""
+    raw = (owner_dept or "").strip()
+    if raw.startswith("node:"):
+        tail = raw[5:]
+        if not (tail.isdigit() and tail[0] != "0"):
+            return None, None
+        return "AND m.acl_mode = 'node' AND m.owner_dept_id = %s", [int(tail)]
     from opensearch_pipeline.kb_authz import _SANITIZE_RE
-    facet = _SANITIZE_RE.sub("", (owner_dept or "").strip())[:64]
+    facet = _SANITIZE_RE.sub("", raw)[:64]
     if owner_dept and not facet:
         return None, None   # 传了但清洗后为空 = 非法 → 调用方 fail-closed 空
     if facet:
         return "AND m.owner_dept = %s", [facet]
     return "", []
+
+
+def _kb_node_names(cur, dept_ids) -> Dict[int, str]:
+    """批量 dept_id → 现名（LEFT 语义：失活/缺行回 id 串）。列表页每页 ≤50 行一次往返。"""
+    ids = sorted({int(i) for i in dept_ids if i})
+    if not ids:
+        return {}
+    out = {i: str(i) for i in ids}
+    try:
+        ph = ",".join(["%s"] * len(ids))
+        cur.execute(f"SELECT dept_id, name FROM {_kb_db()}.dept_dim WHERE dept_id IN ({ph})",
+                    tuple(ids))
+        for r in cur.fetchall():
+            if r and r[0]:
+                out[int(r[0])] = r[1] or str(r[0])
+    except Exception as e:   # noqa: BLE001 — 展示 enrichment，失败回 id 串
+        logger.debug("节点名批量解析失败（回 id 串）: %s", e)
+    return out
+
+
+def _kb_owner_dto(mode: str, owner: str, oid, node_names: Dict[int, str]):
+    """(acl_mode, owner_dept, owner_dept_id) → (owner_key, owner_label)。"""
+    if (mode or "legacy") == "node" and oid:
+        return f"node:{int(oid)}", node_names.get(int(oid), str(oid))
+    return (f"legacy:{owner}" if owner else ""), (owner or "")
 
 
 def _kb_badge_counts(cur, base_from_where: str, base_params: tuple,
@@ -261,12 +294,13 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     "ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no "
                     f"WHERE 1=1 {clause} {search_clause} {owner_clause}",
                     (*params, *search_params, *owner_params), perm, cited)
+                _mc = ", m.acl_mode, m.owner_dept_id" if cap == "present" else ""
                 cur.execute(
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status,
-                           v.chunk_status, v.content_process_error
+                           v.chunk_status, v.content_process_error{_mc}
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -278,6 +312,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                 )
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
+                node_names = _kb_node_names(
+                    cur, [r[14] for r in rows[:limit] if len(r) > 14 and r[14]])
         finally:
             conn.close()
     except HTTPException:
@@ -290,11 +326,14 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     has_more = len(rows) > limit
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks, cpe) = r
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks, cpe) = r[:13]
+        _mode, _oid = ((r[13] or "legacy"), r[14]) if len(r) > 13 else ("legacy", None)
+        _okey, _olabel = _kb_owner_dto(_mode, owner or "", _oid, node_names)
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
-            owner_dept=owner or "", permission_level=perm or "public",
+            owner_dept=owner or "", acl_mode=_mode, owner_key=_okey, owner_label=_olabel,
+            permission_level=perm or "public",
             current_version_no=int(cur_ver or 1), status=status or "active",
             status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
             updated_at=str(updated) if updated else "",
@@ -303,7 +342,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
             # 驳回原因只在被驳回态外露（其他失败态的 content_process_error 是内部诊断文案，不外发）
             reject_reason=(str(cpe)[:200] if (cps == "REJECTED" and cpe) else ""),
         ))
-    return KbMyDocsResponse(items=items, has_more=has_more, badge_counts=badge_counts)
+    return KbMyDocsResponse(items=items, has_more=has_more, badge_counts=badge_counts,
+                            scope_degraded=_deg)
 
 
 @router.get("/api/kb/browse", response_model=KbMyDocsResponse)
@@ -342,6 +382,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                _bcap = _kb_node_capability(cur)
+                _mc = ", m.acl_mode, m.owner_dept_id" if _bcap == "present" else ""
                 # faceted 计数先行（主查询保持「最后一次 execute」——既有 SQL 捕获类测试的锚点）
                 badge_counts = _kb_badge_counts(
                     cur,
@@ -357,7 +399,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status,
-                           v.chunk_status
+                           v.chunk_status{_mc}
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -371,6 +413,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                 )
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
+                node_names = _kb_node_names(
+                    cur, [r[13] for r in rows[:limit] if len(r) > 13 and r[13]])
         finally:
             conn.close()
     except HTTPException:
@@ -381,26 +425,34 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
         raise HTTPException(status_code=500, detail=f"全部门浏览查询失败 (trace: {trace_id})")
 
     has_more = len(rows) > limit
-    # 阶段 B：browse 行级 can_manage 改 mode 隔离——node 文档绝不因 owner_dept 残值
-    # 显示为"可管理"。行里没有三元组（browse SELECT 未取 acl_mode），此处按批量补查
-    # 成本不值（每页 ≤50 行且只是 UI 提示位，真边界在写端点的 _kb_can_manage_doc）；
-    # 取保守面：browse 是全部门视图，legacy 判定照旧，acl_mode 列由 WP4 的 owner DTO
-    # 统一时一并进 SELECT 后切 _kb_can_manage_doc。
+    # 阶段 B：browse 行级 can_manage 走 mode 隔离判定——node 文档绝不因 owner_dept 残值
+    # 显示为"可管理"。后代集整页解析一次（不逐行）；真边界仍在写端点。
+    from opensearch_pipeline.kb_authz import can_manage_doc as _cmd
+    _descendants = _kb_managed_descendants(kb)
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r[:12]
+        _mode, _oid = ((r[12] or "legacy"), r[13]) if len(r) > 12 else ("legacy", None)
+        _okey, _olabel = _kb_owner_dto(_mode, owner or "", _oid, node_names)
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
-            owner_dept=owner or "", permission_level=perm or "dept_internal",
+            owner_dept=owner or "", acl_mode=_mode, owner_key=_okey, owner_label=_olabel,
+            permission_level=perm or "dept_internal",
             current_version_no=int(cur_ver or 1), status=status or "active",
             status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
             updated_at=str(updated) if updated else "",
-            can_manage=_kb_can_manage(kb, owner or ""),
+            can_manage=_cmd(kb, _mode, owner or "", _oid, _descendants),
             cited_count=(None if usage is None else (_u[0] if _u else 0)),
             last_cited_at=(_u[1] if _u else ""),
         ))
     return KbMyDocsResponse(items=items, has_more=has_more, badge_counts=badge_counts)
+
+
+class KbOwnerFacet(BaseModel):
+    """阶段 B owner DTO：稳定键（legacy:<code> | node:<id>）+ 展示名。"""
+    key: str = ""
+    label: str = ""
 
 
 class KbStatsResponse(BaseModel):
@@ -413,6 +465,10 @@ class KbStatsResponse(BaseModel):
     # 归属部门 facet（全作用域去重，含生产子线）：台账「按归属筛选」下拉的全库口径来源，
     # 不再只从已加载页派生（否则 >50 篇时下拉漏掉未翻到的部门）。#7
     owner_depts: List[str] = Field(default_factory=list)
+    # 阶段 B：双轴 facet（legacy 组码 + node 节点，稳定键防重名/改名）；owner_depts 保留
+    # 兼容（仅 legacy）。scope_degraded 同 my-docs 语义（进缓存值，TTL 内陈旧可接受）。
+    owner_facets: List[KbOwnerFacet] = Field(default_factory=list)
+    scope_degraded: bool = False
 
 
 @router.get("/api/kb/stats", response_model=KbStatsResponse)
@@ -457,21 +513,26 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                 cap = _kb_node_capability(cur)
                 clause, params, _deg = _kb_doc_owner_scope_sql(kb, cap)
                 ck_clause, ck_params = clause, params   # 归属轴（JOIN document_meta，同 alias m）
+                _mgc = ", m.acl_mode, m.owner_dept_id" if cap == "present" else ""
                 # perf（2026-07-16）：状态分布改【服务端 GROUP BY】——此前整表 1936 行拉回
                 # Python 分桶（实测该查询 1.2s，传输占大头），现只回 status×徽章×归属 的几十行。
                 # 徽章走 _KB_BADGE_CASE_SQL（与 _kb_status_badge 的奇偶校验测试钉死同义）。
+                # 阶段 B：GROUP BY 追加 mode/owner_dept_id——node 文档（owner_dept=NULL）按
+                # 节点分桶进 owner_facets，绝不用中文名当键（重名/改名破分桶）。
                 cur.execute(
                     f"""
-                    SELECT m.status, ({_KB_BADGE_CASE_SQL}) AS b, m.owner_dept, COUNT(*)
+                    SELECT m.status, ({_KB_BADGE_CASE_SQL}) AS b, m.owner_dept, COUNT(*){_mgc}
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
                     WHERE 1=1 {clause}
-                    GROUP BY m.status, b, m.owner_dept
+                    GROUP BY m.status, b, m.owner_dept{_mgc}
                     """,
                     tuple(params),
                 )
                 rows = cur.fetchall()
+                _stats_node_names = _kb_node_names(
+                    cur, [r[5] for r in rows if len(r) > 5 and r[5]])
                 # 当前已索引分块总数（设计「全库已索引 chunk」口径）；取数失败仅置 0，不拖垮主统计。
                 # kb_admin（无作用域 clause）走无 JOIN 的原查询：JOIN 会把没有 document_meta 行的
                 # 孤儿分块从全库口径里悄悄减掉，那是治理端的信号、不该由统计端替它抹平。
@@ -511,7 +572,10 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     total = active = retired = 0
     by_badge: Dict[str, int] = {}
     owner_set = set()
-    for status, badge, owner, n in rows:
+    node_facets: Dict[str, str] = {}     # key(node:<id>) → label
+    for r in rows:
+        status, badge, owner, n = r[0], r[1], r[2], r[3]
+        _mode, _oid = ((r[4] or "legacy"), r[5]) if len(r) > 4 else ("legacy", None)
         n = int(n or 0)
         total += n
         # 语义与旧 Python 逐行分桶逐字节一致：active 判定 (status or 'active')=='active'；
@@ -521,11 +585,16 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
         else:
             retired += n
         by_badge[str(badge or "")] = by_badge.get(str(badge or ""), 0) + n
-        if owner:
+        if _mode == "node" and _oid:
+            node_facets[f"node:{int(_oid)}"] = _stats_node_names.get(int(_oid), str(_oid))
+        elif owner:
             owner_set.add(owner)
+    facets = ([KbOwnerFacet(key=f"legacy:{o}", label=o) for o in sorted(owner_set)]
+              + [KbOwnerFacet(key=k, label=v) for k, v in sorted(node_facets.items())])
     out = KbStatsResponse(total=total, active=active, retired=retired, chunks=chunks,
                           new_this_month=new_this_month, by_badge=by_badge,
-                          owner_depts=sorted(owner_set))
+                          owner_depts=sorted(owner_set), owner_facets=facets,
+                          scope_degraded=_deg)
     if aux_fails == 0:   # 与 insights 同纪律：降级响应（辅计数失败置 0）不缓存，下一请求重试全量
         _dashboard_cache_put(cache_key, out)
     return out
@@ -647,6 +716,7 @@ class KbGapQueryItem(BaseModel):
 
 class KbInsightsResponse(BaseModel):
     scope: str = "dept"                  # 'global'（kb_admin 全库）| 'dept'（dept_admin 本部门）
+    scope_degraded: bool = False         # 阶段 B：node 管辖腿失效（快照过期/读失败）——前端挂 banner
     window_days: int = _KB_INSIGHTS_WINDOW_DAYS
     questions: int = 0                   # 命中所辖文档的提问数（DISTINCT message_id，去 JSON 扇出重复）
     askers: int = 0
@@ -698,6 +768,7 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
             # 阶段 B：mode 隔离作用域（连接内构造；absent 环境与旧 SQL 逐字节同构）
             _cap = _kb_node_capability(cur)
             scope_clause, scope_params, _deg = _kb_doc_owner_scope_sql(kb, _cap)
+            out.scope_degraded = _deg
             base = _kb_qa_owner_join() + (" " + scope_clause if scope_clause else "")
             args = tuple([win] + list(scope_params))
             # 1) 使用聚合：提问数 / 提问人 / 成功 / 拒答（DISTINCT message_id 去 JSON 扇出）
@@ -1135,7 +1206,8 @@ class KbEmbedRunItem(BaseModel):
 
 
 class KbDeptCoverageItem(BaseModel):
-    owner_dept: str = ""
+    owner_dept: str = ""                 # 分桶键：组码 | node:<id>（阶段 B，稳定键不用中文名）
+    owner_label: str = ""                # 展示名（legacy 组码原样由前端 deptLabel 转；node 给节点名）
     docs: int = 0                        # 已上线（active）文档数
     new_month: int = 0                   # 本月新增
     qa_hits: int = 0                     # 使用量（命中本部门文档的提问数）
@@ -1444,17 +1516,25 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             try:
                 from datetime import date as _date
                 ms = _date.today().replace(day=1).isoformat()
+                # 阶段 B：稳定分桶键——node 文档（owner_dept=NULL）按 node:<id> 分桶
+                # （不用中文名当键，M2）；legacy 键 = 组码，行为逐字节不变。半迁移态
+                # （两列皆 NULL）落 "unknown" 桶（_cell 的既有兜底）。
+                _gcap = _kb_node_capability(cur)
+                _own_m = ("COALESCE(m.owner_dept, CONCAT('node:', m.owner_dept_id))"
+                          if _gcap == "present" else "m.owner_dept")
+                _own_b = ("COALESCE(owner_dept, CONCAT('node:', owner_dept_id))"
+                          if _gcap == "present" else "owner_dept")
                 cov: Dict[str, Dict[str, int]] = {}
 
                 def _cell(d):
                     return cov.setdefault(d or "unknown", {"docs": 0, "new_month": 0, "qa_hits": 0, "refusal": 0, "pii": 0, "new7": 0, "ret7": 0, "qa7": 0, "qa_prev7": 0})
 
-                cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
-                            " WHERE status='active' GROUP BY owner_dept")
+                cur.execute(f"SELECT {_own_b}, COUNT(*) FROM {_kb_db()}.document_meta"
+                            " WHERE status='active' GROUP BY 1")
                 for dept, docs in cur.fetchall():
                     _cell(dept)["docs"] = int(docs or 0)
-                cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
-                            " WHERE status='active' AND created_at >= %s GROUP BY owner_dept", (ms,))
+                cur.execute(f"SELECT {_own_b}, COUNT(*) FROM {_kb_db()}.document_meta"
+                            " WHERE status='active' AND created_at >= %s GROUP BY 1", (ms,))
                 for dept, n in cur.fetchall():
                     _cell(dept)["new_month"] = int(n or 0)
                 # 文档总量周环比：本周 active 新增；本周退役只计【上周末前已存在】者（created_at < 7d），
@@ -1462,47 +1542,47 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 # updated_at 近似退役时点（无独立 retired_at）。
                 wow_ok = True
                 try:
-                    cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
-                                " WHERE status='active' AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY owner_dept")
+                    cur.execute(f"SELECT {_own_b}, COUNT(*) FROM {_kb_db()}.document_meta"
+                                " WHERE status='active' AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY 1")
                     for dept, n in cur.fetchall():
                         _cell(dept)["new7"] = int(n or 0)
-                    cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
+                    cur.execute(f"SELECT {_own_b}, COUNT(*) FROM {_kb_db()}.document_meta"
                                 " WHERE status='retired' AND updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)"
-                                " AND created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY owner_dept")
+                                " AND created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY 1")
                     for dept, n in cur.fetchall():
                         _cell(dept)["ret7"] = int(n or 0)
                 except Exception as e:
                     wow_ok = False; logger.warning("kb_governance dept wow 失败: %s", e)
                 from opensearch_pipeline.qa_facts import qa_docs_join_sql
                 cur.execute(
-                    "SELECT m.owner_dept, COUNT(DISTINCT q.message_id),"
+                    f"SELECT {_own_m}, COUNT(DISTINCT q.message_id),"
                     " COUNT(DISTINCT CASE WHEN q.answer_status='REFUSAL' THEN q.message_id END)"
                     f" FROM {_op_db()}.qa_session_log q"
                     + qa_docs_join_sql()
-                    + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY m.owner_dept", (win,))
+                    + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY 1", (win,))
                 for dept, hits, refu in cur.fetchall():
                     cell = _cell(dept); cell["qa_hits"] = int(hits or 0); cell["refusal"] = int(refu or 0)
                 # 各部门使用量周环比：近7天 vs 前7天 命中提问数（与 qa_hits 同 DISTINCT message_id 去 chunk 扇出口径）。
                 qa_wow_ok = True
                 try:
                     cur.execute(
-                        "SELECT m.owner_dept,"
+                        f"SELECT {_own_m},"
                         " COUNT(DISTINCT CASE WHEN q.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN q.message_id END),"
                         " COUNT(DISTINCT CASE WHEN q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)"
                         "   AND q.created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) THEN q.message_id END)"
                         f" FROM {_op_db()}.qa_session_log q"
                         + qa_docs_join_sql()
-                        + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) GROUP BY m.owner_dept")
+                        + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) GROUP BY 1")
                     for dept, q7, qp7 in cur.fetchall():
                         cell = _cell(dept); cell["qa7"] = int(q7 or 0); cell["qa_prev7"] = int(qp7 or 0)
                 except Exception as e:
                     qa_wow_ok = False; logger.warning("kb_governance dept usage wow 失败: %s", e)
                 cur.execute(
-                    "SELECT m.owner_dept, COUNT(DISTINCT f.doc_id)"
+                    f"SELECT {_own_m}, COUNT(DISTINCT f.doc_id)"
                     f" FROM {_kb_db()}.document_sensitive_finding f"
                     f" JOIN {_kb_db()}.document_meta m"
                     "   ON m.doc_id = CONVERT(f.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
-                    " WHERE f.action IN ('QUARANTINED','REDACTED') GROUP BY m.owner_dept")
+                    " WHERE f.action IN ('QUARANTINED','REDACTED') GROUP BY 1")
                 for dept, n in cur.fetchall():
                     _cell(dept)["pii"] = int(n or 0)
                 def _wow_net(v):                          # 本周净变化「篇数」
@@ -1519,9 +1599,16 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                     if not qa_wow_ok:
                         return None
                     return round((v["qa7"] - v["qa_prev7"]) / v["qa_prev7"], 4) if v["qa_prev7"] > 0 else None
+                _cov_names = _kb_node_names(
+                    cur, [int(k[5:]) for k in cov if k.startswith("node:") and k[5:].isdigit()])
+                def _cov_label(k):
+                    if k.startswith("node:") and k[5:].isdigit():
+                        return _cov_names.get(int(k[5:]), k)
+                    return k
                 out.dept_coverage = sorted(
                     [KbDeptCoverageItem(
-                        owner_dept=k, docs=v["docs"], new_month=v["new_month"], qa_hits=v["qa_hits"],
+                        owner_dept=k, owner_label=_cov_label(k),
+                        docs=v["docs"], new_month=v["new_month"], qa_hits=v["qa_hits"],
                         no_answer_rate=round(v["refusal"] / v["qa_hits"], 4) if v["qa_hits"] else 0.0,
                         pii_docs=v["pii"], wow_net=_wow_net(v), wow_total=_wow_pct(v),
                         qa_wow_net=_qa_wow_net(v), qa_wow=_qa_wow(v),
