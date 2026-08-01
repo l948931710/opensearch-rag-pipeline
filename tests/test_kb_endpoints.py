@@ -1668,13 +1668,34 @@ def test_stats_owner_depts_facet_and_chunk_status_badge(monkeypatch):
         ("active", "未入索引", "production", 1),   # 0-chunk 经 CASE 归「未入索引」
         ("active", "已上线", "hr", 1),
     ]
-    _stub_multi(monkeypatch, [rows, (7,), (2,)])   # 主 fetchall + chunks fetchone + new_month fetchone
+    sink = _stub_multi(monkeypatch, [rows, (7,), (2,)])   # 主 fetchall + chunks fetchone + new_month fetchone
     from opensearch_pipeline import api
     resp = api.kb_stats(request=None, identity=api.Identity(user_id="dev1"))
     assert resp.owner_depts == ["hr", "marketing", "production"]      # 去重 + 排序
     assert resp.by_badge.get("未入索引") == 1                          # chunk_status 生效（此前漏传会误记「处理中」）
     assert resp.by_badge.get("已上线") == 2
     assert resp.chunks == 7 and resp.new_this_month == 2
+    # kb_admin（无作用域 clause）分块计数保持无 JOIN 原查询：JOIN 会把孤儿分块悄悄减掉
+    chunk_sql = [s for s, _ in sink["calls"] if "chunk_meta" in s][0]
+    assert "document_meta" not in chunk_sql
+
+
+def test_stats_chunk_count_scopes_via_document_meta(monkeypatch):
+    """node-ACL：dept_admin 的分块计数按 document_meta.owner_dept 作用域（JOIN），
+    **不得**按 chunk_meta.owner_dept —— 那是检索投影轴，node 文档在该列上是哨兵
+    `__acl_node_mode_v1__`，按它过滤会让整篇 node 文档的分块从部门统计里消失。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [[("active", "已上线", "marketing", 1)], (7,), (2,)])
+    from opensearch_pipeline import api
+    resp = api.kb_stats(request=None, identity=api.Identity(user_id="da1"))
+    assert resp.chunks == 7
+    chunk_sql = [s for s, _ in sink["calls"] if "chunk_meta" in s][0]
+    assert "JOIN" in chunk_sql and "document_meta m" in chunk_sql
+    assert "m.owner_dept IN" in chunk_sql
+    # 哨兵所在的列绝不可再出现在作用域条件里（回归钉死）
+    assert "c.owner_dept" not in chunk_sql
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

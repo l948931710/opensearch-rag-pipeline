@@ -408,7 +408,12 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
-    ck_clause, ck_params = _kb_owner_scope_sql(kb, "owner_dept")   # chunk_meta.owner_dept 同口径作用域
+    # node-ACL（2026-07-31）：分块作用域**必须走 document_meta.owner_dept**，不能用
+    # chunk_meta.owner_dept —— 后者是【检索投影轴】，node 模式文档在那一列上是哨兵
+    # `__acl_node_mode_v1__`（acl_policy.project_doc_acl 的模式互斥不变量），按它过滤会让
+    # 整篇 node 文档的分块从 dept_admin 的部门统计里静默消失（归属轴 document_meta.owner_dept
+    # 仍是真实部门，文档级计数因此不受影响 —— 只有这一处分块计数会分叉）。
+    ck_clause, ck_params = _kb_owner_scope_sql(kb, "m.owner_dept")  # 归属轴（JOIN document_meta）
     dm_clause, dm_params = _kb_owner_scope_sql(kb, "owner_dept")   # document_meta.owner_dept（本月新增计数）
     from datetime import date
     month_start = date.today().replace(day=1).isoformat()         # 当月首日；以参数传入避免 % 转义坑
@@ -435,12 +440,18 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                 )
                 rows = cur.fetchall()
                 # 当前已索引分块总数（设计「全库已索引 chunk」口径）；取数失败仅置 0，不拖垮主统计。
+                # kb_admin（无作用域 clause）走无 JOIN 的原查询：JOIN 会把没有 document_meta 行的
+                # 孤儿分块从全库口径里悄悄减掉，那是治理端的信号、不该由统计端替它抹平。
+                ck_sql = (
+                    f"SELECT COUNT(*) FROM {_kb_db()}.chunk_meta c "
+                    f"JOIN {_kb_db()}.document_meta m ON m.doc_id = c.doc_id "
+                    f"WHERE c.is_active=1 AND c.index_status='{ChunkIndexStatus.INDEXED}' {ck_clause}"
+                ) if ck_clause else (
+                    f"SELECT COUNT(*) FROM {_kb_db()}.chunk_meta "
+                    f"WHERE is_active=1 AND index_status='{ChunkIndexStatus.INDEXED}'"
+                )
                 try:
-                    cur.execute(
-                        f"SELECT COUNT(*) FROM {_kb_db()}.chunk_meta "
-                        f"WHERE is_active=1 AND index_status='{ChunkIndexStatus.INDEXED}' {ck_clause}",
-                        tuple(ck_params),
-                    )
+                    cur.execute(ck_sql, tuple(ck_params))
                     chunks = int((cur.fetchone() or (0,))[0] or 0)
                 except Exception as e:
                     aux_fails += 1
