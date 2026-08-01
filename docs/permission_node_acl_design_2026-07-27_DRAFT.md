@@ -731,7 +731,9 @@ tracked allowlist **5 项**:`access_grants.py`(2)、`pipeline_nodes.py`(5)、`da
 
 | 项 | 内容 | 为什么本轮不做 |
 |---|---|---|
-| **cosurface 透传 `acl_ctx`** | `retriever.cosurface_doc_images` 签名里没有 `acl_ctx`,内部 `_build_permission_filter(user_dept)` 丢掉节点身份 ⇒ node 文档**正文可见但补图召不回**(§改动范围原本要求同步改) | 方向是 fail-closed(少召回、不越权),且 `doc_ids` 来自已授权的主命中 ⇒ 属可用性缺陷而非机密性缺陷,不阻塞安全闭环 |
+| ~~**cosurface 透传 `acl_ctx`**~~ | ✅ **2026-07-31 已做**(含 F#53 预取路径同参 —— 预取命中时结果被直接采用,漏传会变成"预取时没图、串行时有图"的时序漂移) | — |
+| ~~**本地 OpenSearch 回退链**~~ | ✅ **2026-07-31 已做**:`to_opensearch_doc` 输出 `allowed_depts`(不按 flag 门控)+ index mapping 声明 keyword + `_search_chunks_opensearch` 加节点分支(与 HA3 同构地放在 `if groups:` 之外) | — |
+| ~~**全扫对账候选集**~~ | ✅ **2026-07-31 已做**:候选 = approved ∪ 有残留投影 ∪ **`kb_doc_node_grant`**,补上"从未投影过的 node 文档"那一类;060 未 apply 时跳过该源不阻断整轮 | — |
 | **push 边界强制重投影** | 见 §9.1 残留风险第 3 段的路径 ② —— 唯一能跨机生效的 T12 机制性闭环 | 改动面最大,用户裁决本轮不做 |
 | **B-2 的延迟实测** | 复核候选扩为"全部非 public"后,原本"命中全为本部门 ⇒ 不建连"的检索现在会建连。结构上**不增加往返**(`resolve_doc_acl` 批量解析,单测钉死 cold=4 / warm=3 次 execute、每次检索只 checkout 一次连接) | 需真实流量档位才有意义;⚠️ 既有 `RAG_ACL_DENY_CACHE_TTL_S` **不能**当回退旋钮 —— 它只在 legacy 分支使用,node 分支在此之前已返回 |
 
