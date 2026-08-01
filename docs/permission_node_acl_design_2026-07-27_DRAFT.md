@@ -523,7 +523,11 @@ HA3:**无 schema 变更、无重建表**(§2.1)。
 | 节点删除 → 孤儿授权静默不可见 | 同步 job 检测孤儿 dept_id 并告警(不自动删授权) |
 | 新旧双栈期语义混淆 | 两套值命名空间不相交 + 看板分别统计 + 逐文档迁移可回滚 |
 
-**回滚**:见 §5 的**双开关**表 —— 关 `RAG_NODE_ACL_GRANT` 只停正向放行,`RAG_NODE_ACL_ENFORCE` **保持常开**使 node 文档非 public 命中全部被拒 = 真 public-only。legacy 文档全程不受影响(它们的组码通道未动)。⚠️ 不可只关一个总开关就宣称回滚安全 —— 那会让未收敛投影里的旧 owner / 旧组码通道复活。
+**回滚**:见 §5 的**双开关**表 —— 关 `RAG_NODE_ACL_GRANT` 只停正向放行,`RAG_NODE_ACL_ENFORCE` **保持常开**使 node 文档非 public 命中全部被拒 = 真 public-only。⚠️ 不可只关一个总开关就宣称回滚安全 —— 那会让未收敛投影里的旧 owner / 旧组码通道复活。
+
+**⚠️ 2026-07-31 更正(实测发现该承诺此前兑现不了)**:上一段的"关 GRANT ⇒ node 非 public 命中全部被拒"曾是**空头承诺**。复核候选集按"owner ∉ 调用者自有集"筛选,而一篇投影未收敛的 node 文档在 HA3 里可能**还带着旧的真实 owner**;该 owner 恰等于调用者组码时它根本不进候选,`can_read_doc` 没机会执行。实测:`GRANT=false` + 陈旧 owner `hr` + 调用者组码 `hr` ⇒ 文档照常投放。同期还发现 ENFORCE 整段被挂在 legacy 开关 `RAG_ALLOWED_DEPTS_ACL`(代码默认 false)之下,违反"ENFORCE 不得随正向开关关闭"。两处已修:候选集改为**全部非 public 命中**,且 node 分支先于 legacy flag 判定。
+
+**legacy 文档的准确表述**(替代原先"全程不受影响"):legacy 的授权规则、以及 authority 可达时的正常结果**不变** —— 确认为 legacy 且 owner ∈ 调用者自有集的命中一律保留原语义,不引入"owner 漂移即拒"这类新拒绝面。但 node ENFORCE 启用后,为识别陈旧 node 投影,**所有非 public 命中都必须查询当前 mode**;mode 权威不可达时无法安全区分 node 与 legacy,故统一只留 public。
 
 ---
 
@@ -537,7 +541,7 @@ HA3:**无 schema 变更、无重建表**(§2.1)。
 | ~~T8~~ | ✅ 2026-07-28 通过(见 §9.0b):树深 5 · 直属部门数 ≤5 · **节点 OR 项数最大 8 / P99 5** ⇒ §3.3 上限已锁定 |
 | ~~T11~~ | ✅ 2026-07-28 通过:现网 owner_dept 值域 13 个全为组码,`__acl_node_mode_v1__` 无碰撞 |
 | — | staging 实证 `allowed_depts="d:123"` 中**冒号**的写入/查询/过滤解析(不能假定与纯字母同行为) |
-| **T12** | **旧运维写工具封禁**(见下) |
+| **T12** | ⚠️ **PARTIAL(2026-07-31)** —— 本机 15 个 `scratch/` 工具 + 仓内 `scripts/export_full_to_oss_for_v2.py` 已 tombstone(执行即 `SystemExit`,有效性被单测钉死);tracked 面 CI 扫描 + 运维机本地审计落地 `tests/test_acl_projection_writers.py`。**未闭环**:tombstone 位于 `.gitignore` 的 `scratch/`,无法随仓库分发到其他运维机;且 `env_guard` 对 `environment=production` 在校验 ACK **之前**就 return,故**不存在跨机技术性阻断**。真正闭环见下 |
 | **T9-a** | **图片重签 + 系统重投旧答案**必须先过当前 ACL(业务裁决只保留"历史文字是否永久可见"这一项) |
 
 ### 9.0 2026-07-28 现网只读实测结果(prod_ro)
@@ -680,7 +684,52 @@ staging fuling_knowledge_stg : 059(1 条) + 060(24 条) ✅  存量 566 篇 acl_
 
 处置:**删除、或加永久拒绝执行的 tombstone、或改调受控 `project_doc_acl`**。同时加 **CI 扫描**:任何新增的"直接写 `chunk_meta.owner_dept`/`allowed_depts`"或"直接构造 HA3 `cmd:add`"入口必须进 allowlist。
 
+**⚠️ 2026-07-31 落地情况 —— 结论 PARTIAL,不是闭环**(codex 评审推翻了初版"✅ 完成"的表述):
+
+**处置的入口(16 个 = 15 个 `scratch/` + 1 个 tracked)**。设计稿原表只列了 4 个,实扫又找出 12 个,其中两类是原表完全没覆盖的:
+
+| 入口 | 形态 | 处置 |
+|---|---|---|
+| `scratch/backfill_allowed_depts.py` | 直接 UPDATE `allowed_depts` | tombstone;替代 = `access_grants.materialize_doc_allowed_depts` + `allowed_depts_reconcile` |
+| `scratch/repush_doc_phase_d.py` | 直推 HA3 | tombstone;替代 = 置 `NOT_INDEXED` 后走既有 stage-3 |
+| `scratch/export_jsonl_v2.py`、`scratch/tier3_sandbox.py` | 手工构造记录 | tombstone |
+| **`scripts/export_full_to_oss_for_v2.py`** | 手工镜像 `to_ha3_doc`、**完全不带 `allowed_depts`** | ⚠️ **仓内 tracked 文件**(不在原表里):据此离线重建的表里 node 文档谁也搜不到。tombstone,拦在 import 期读 `.env.production` 之前 |
+| **`scratch/canary_stage3.py`、`batch_stage3.py`、`dc3_pilot_stage3.py`** | ⚠️ **语义绕过**:本地没有任何 `cmd:add` 字面量,而是 `SELECT cm.owner_dept` → 自建 `Chunk` → 直跑 `build_dag3_chunk_to_opensearch()`,绕过 orchestrator 的按权威重投影 | tombstone。**词法扫描抓不到这一类**,扫描器因此加了 AST 规则 |
+| `scratch/probe_node_acl_t1_prod_20260729.py`、`crossplane_timing_probe_20260727.py`、`t1_recheck_sparse_differential_20260730.py` | 一次性生产写探针,实验均已完成 | tombstone(证据是产出与本设计稿记录,不需要保留可执行能力) |
+| `scratch/abtest_adsampling.py`、`step0_exp2_modify_staging.py`、`step0_exp2b_field_filter.py`、`step0_exp3_staging.py` | 手工 `cmd:add` / 动态 `cmd="add"` 默认参数 | tombstone |
+| `scratch/probe_node_acl_t1_20260728.py` | staging 硬锁 + 合成 PK + 自清理 | 初判"保留 + allowlist",**复审后改 tombstone**:字符串存在性的 allowlist 守不住(断言挪进注释/死代码、`delete` 移出 `finally` 都照样绿),且它 PK 预检异常时仍会继续执行 add;T1 实验已完成,证据在 §9.0c |
+
+**扫描器 = `tests/test_acl_projection_writers.py`**,两类规则:
+
+- **词法**:写 `chunk_meta` 投影列的 UPDATE/INSERT;`cmd:add` 记录(**大小写不敏感**,兼容 `cmd="add"` 默认参数形态);
+- **AST 语义**:对 `build_dag3_chunk_to_opensearch` / `_push_chunks_to_ha3` 的任何**引用**(不是调用)——名字出现在 `Name` 载入 / 属性名 / 字面量字符串(含 `"a"+"b"`)/ `ImportFrom` 即计入。
+  ⚠️ **为什么是"引用"而不是"调用"**:初版追调用点 + 补别名,被 codex 两轮实测各打穿一批(第一轮 3 种、第二轮 6 种:`AnnAssign`、海象、属性赋值、`getattr` 常量串、变量存名字、函数默认参数…),SCAN 全为空。补一种冒一种 ⇒ 改为**宁可多报、不可漏放**。多报的代价只是在 allowlist 里写清理由。
+
+三道断言:未登记写点红 / 已登记文件**新增**写点也红(计数钉死,防 allowlist 退化成整文件豁免) / 带 `T12-TOMBSTONE` 的文件豁免,**但 tombstone 必须真拦得住**——首个语句(仅 docstring 与 `from __future__` 例外)须是无条件 `raise SystemExit`。⚠️ **import 也不放行**:初版把 import 当无副作用跳过,而 `import dangerous_side_effect` + `raise` 曾被判为有效 tombstone —— Python 的 import 会执行任意模块级副作用,这批脚本恰恰习惯在 import 期读 `.env.production` 并建连接。
+
+tracked allowlist **5 项**:`access_grants.py`(2)、`pipeline_nodes.py`(5)、`dag_definitions.py`(1)、`dataworks_orchestrator.py`(2 = import + 调用)、`run_simulation.py`(2,本地 sim 运行器)。后两项的计数变化正是"保守标记引用"带来的多报,已逐项登记理由。
+
+**❌ 未闭环的残留风险(必须如实记账)**:
+
+1. **tombstone 无法跨机分发**。`scratch/` 被 `.gitignore` + `.dockerignore` 排除,上述 15 个 tombstone 只存在于本机;其他运维机上的同名副本依然可执行。
+2. **不存在跨机技术性阻断**。原以为 `RAG_DESTRUCTIVE_PROD_ACK` 当日制能兜底 —— **该判断是错的**:`env_guard.py::assert_destructive_write_allowed` 对 `cfg.environment == "production"` 在检查 ACK **之前**就 `return`,而这些脚本正是把环境设成 production 的。`prod_access.py` 也只是文档规定的官方入口,并非技术上强制的单一入口。
+3. **扫描器的静态覆盖边界**(两条,都是已知且刻意接受的):
+   - **动态构造列名**:如 `scratch/local_e2e_old_mirror.py` 那样按游标 `description` 复制全部列 —— 不产生命中。该脚本经核为"生产只读 → 本地写",本轮不处置。
+   - **动态函数分派**:push 入口的识别已从"追调用点"改为**保守标记任何引用**。覆盖别名赋值、`AnnAssign`、海象、属性赋值、import 别名、`getattr`/`globals()` 常量串、变量存名字、字面量 `+` 拼接、函数默认参数、多级别名链(逐条有 fixture 回归)。
+     ⚠️ **明确漏报**(常量折叠只做 str 字面量与 `+`):`globals()["".join([...])]()`、`getattr(m, "..._{}".format("ha3"))()` 之类静态可求值但需更复杂折叠的写法,以及一切运行期才定的分派(字典派发、`exec`、模块 `__getattr__`)。前两种已用 fixture **钉成"已知漏报"**——若将来扩展折叠规则,该测试会红并提示同步更新本条。
+     ⚠️ 这条边界是主动选择:先前"追调用点+补别名"的路线每补一种形态,codex 就复现出下一种(两轮实测各打穿 3-6 种),故改为"**对已识别的规范入口引用**宁可多报、不可漏放"（注意这只是对已知入口名的保守化，不等于覆盖全部动态形态）。多报的代价只是在 allowlist 里写清理由。
+
+**真正闭环的路径(二选一,本轮用户明确不做,记为跟进项)**:①对所有运维机完成用户确认的清理/封禁并留执行证据;或 ②**在 tracked 的生产 push 边界按权威强制重投影/校验**,使旧 loader 即使仍存在也无法把未经验证的 `Chunk` 推进生产 HA3。②是唯一能跨机生效的机制性方案。
+
 已核验**安全**的路径(只标脏/只删,不生成投影):`scripts/rebuild_from_rds.py:163-181`(标 NOT_INDEXED 后走 stage-3)、`scripts/reset_for_rechunk.py:89-104`(复位后走 stage-2)、`ha3_reconcile.py:272-276`(只删 orphan)。
+
+### 9.1a 2026-07-31 评审后的跟进项(本轮不做,已定性)
+
+| 项 | 内容 | 为什么本轮不做 |
+|---|---|---|
+| **cosurface 透传 `acl_ctx`** | `retriever.cosurface_doc_images` 签名里没有 `acl_ctx`,内部 `_build_permission_filter(user_dept)` 丢掉节点身份 ⇒ node 文档**正文可见但补图召不回**(§改动范围原本要求同步改) | 方向是 fail-closed(少召回、不越权),且 `doc_ids` 来自已授权的主命中 ⇒ 属可用性缺陷而非机密性缺陷,不阻塞安全闭环 |
+| **push 边界强制重投影** | 见 §9.1 残留风险第 3 段的路径 ② —— 唯一能跨机生效的 T12 机制性闭环 | 改动面最大,用户裁决本轮不做 |
+| **B-2 的延迟实测** | 复核候选扩为"全部非 public"后,原本"命中全为本部门 ⇒ 不建连"的检索现在会建连。结构上**不增加往返**(`resolve_doc_acl` 批量解析,单测钉死 cold=4 / warm=3 次 execute、每次检索只 checkout 一次连接) | 需真实流量档位才有意义;⚠️ 既有 `RAG_ACL_DENY_CACHE_TTL_S` **不能**当回退旋钮 —— 它只在 legacy 分支使用,node 分支在此之前已返回 |
 
 ### 9.2 DocAcl 正授权缓存
 

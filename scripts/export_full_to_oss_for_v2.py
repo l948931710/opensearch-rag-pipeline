@@ -1,15 +1,35 @@
-"""Export all 3,669 active chunks to a single JSONL file on OSS, ready for the v2
-table's offline build. Per-record shape mirrors Chunk.to_ha3_doc() exactly (the same
-mapping production push uses today).
+"""⛔ T12-TOMBSTONE(2026-07-31,node-ACL 阶段 A)—— 本脚本已**永久停用**,直接执行即退出。
 
-Output: oss://fuling-knowledge-base/opensearch/fuling-kb-chunks-v2-<ts>/data.json
+原用途:把全部 active chunk 导成一份 JSONL 上 OSS,供 v2 表离线构建(一次性迁移,已完成)。
 
-Run AFTER tier1_preflight.py has confirmed cache complete + drift OK.
+为什么封禁:下方 `fields` 是**手工镜像** `Chunk.to_ha3_doc()` 的结果,它
+  · 把 `chunk_meta.owner_dept` 原样写进 `owner_dept` —— 而那是【检索投影轴】,node 模式
+    文档在该列上是哨兵 `__acl_node_mode_v1__`;
+  · **完全不带 `allowed_depts`** —— node 文档的 `d:`/`dx:` 授权值全部丢失。
+两者合起来:用本脚本重建出来的表里,node 文档【谁也搜不到】;而若在投影收敛前跑,又会把
+真实 owner 固化进新表、legacy owner 分支静默复活 = 权限重开。手工镜像必然随
+`to_ha3_doc` 漂移,这正是 T12 要消灭的一类入口(设计稿 §9.1)。
+
+要重新启用:**不要**改这里的字段字典。走受控路径 —— 投影值一律由
+`acl_policy.project_doc_acl` 产出、记录形状一律由 `Chunk.to_ha3_doc(include_allowed_depts=True)`
+产出,并同步更新 `tests/test_acl_projection_writers.py` 的 allowlist。
+
+设计稿:`docs/permission_node_acl_design_2026-07-27_DRAFT.md` §9.1。
 """
+# 无条件拦在一切副作用之前 —— **连 import 都不放行**:Python 的 import 会执行任意模块级
+# 副作用，而本脚本下方原本就在 import 期读 .env.production 并连生产 RDS。
+raise SystemExit(
+    "⛔ scripts/export_full_to_oss_for_v2.py 已按 T12 永久停用:手工镜像 to_ha3_doc 会丢 "
+    "allowed_depts 并把 node 哨兵 owner 固化进新表(重建后 node 文档无人可见)。\n"
+    "   需要离线重建请改走 project_doc_acl + Chunk.to_ha3_doc(include_allowed_depts=True)。"
+)
+
 import os
 import json
 import hashlib
 import datetime
+
+
 def _load(p):
     if os.path.exists(p):
         for ln in open(p, encoding="utf-8"):
