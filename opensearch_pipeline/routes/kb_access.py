@@ -27,6 +27,7 @@ from opensearch_pipeline.api import (
     _kb_can_manage,
     _kb_can_manage_doc,
     _kb_db,
+    _kb_node_capability,
     _require_kb_admin,
     _require_kb_console,
     current_identity,
@@ -408,12 +409,20 @@ def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
-                            "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
+                # 阶段 B（M6）：node 文档禁止**新增** legacy 组码授权——申请/共享/审批的组码
+                # 通道对 node 文档全部关死（隐形组码会在 node→legacy 回滚时突然复活）；
+                # 收权动作（reject/revoke）仍允许（decide 端点放行）。
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status{_mc} "
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm, status = (row[0] or ""), (row[1] or ""), (row[2] or "active")
+                if len(row) > 3 and (row[3] or "legacy") == "node":
+                    raise HTTPException(status_code=400,
+                                        detail="该文档为组织树授权模式，请联系属主管理员在可见范围中添加你的部门")
                 if str(status).lower() != "active":
                     raise HTTPException(status_code=400, detail="该文档非在线状态，无法申请")
                 if perm == "public":
@@ -606,13 +615,21 @@ def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
-                            "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
+                # 阶段 B：锁内读齐三元组、mode 隔离授权；node 文档禁止新增 legacy 共享
+                # （组码通道对 node 文档关死，可见范围走节点授权——M6/设计稿 :326）。
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status{_mc} "
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm, status = (row[0] or ""), (row[1] or ""), (row[2] or "active")
-                if not _kb_can_manage(kb, owner_dept):
+                _mode, _oid = ((row[3] or "legacy"), row[4]) if _cap == "present" else ("legacy", None)
+                if _mode == "node":
+                    raise HTTPException(status_code=400,
+                                        detail="该文档为组织树授权模式，请在「可见范围」中按组织节点共享")
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权共享该文档（非文档所属部门管理员）")
                 if str(status).lower() != "active":
                     raise HTTPException(status_code=400, detail="该文档非在线状态，无法共享")
@@ -675,15 +692,18 @@ def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
 
 
 class KbVisibilityReader(BaseModel):
-    """有效可见范围里的一个读者组：dept=组码（前端 deptLabel 转中文），via=来源。"""
+    """有效可见范围里的一个读者组：dept=组码/节点名（前端 deptLabel 对组码转中文，
+    节点名直出），via=来源。"""
     dept: str = ""
-    via: str = "owner"        # owner=归属部门 / umbrella=生产伞组 / shared_policy=营销共享面 / grant=跨部门授权
+    via: str = "owner"        # owner=归属部门 / umbrella=生产伞组 / shared_policy=营销共享面 /
+    #                           grant=跨部门授权 / node_subtree=节点(含下级) / node_exact=节点(仅本级)
 
 
 class KbVisibilityExplainResponse(BaseModel):
     doc_id: str = ""
     owner_dept: str = ""
     permission_level: str = "dept_internal"
+    acl_mode: str = "legacy"  # 阶段 B：node 文档的可见范围来自组织树授权，不再有组码语义
     everyone: bool = False    # public：全公司可检索
     nobody: bool = False      # restricted / 非在线 / 隔离：不进检索
     quarantined: bool = False # 安全隔离（chunk 停用；唯一出路=脱敏重灌）
@@ -708,26 +728,30 @@ def kb_visibility_explain(request: Request, doc_id: str = "",
         raise HTTPException(status_code=400, detail="缺少 doc_id")
     trace_id = get_request_id()
     grant_depts: List[str] = []
+    node_readers: List[KbVisibilityReader] = []
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status, current_version_no{_mc} "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm = (row[0] or ""), (row[1] or "dept_internal")
                 status, cur_ver = (row[2] or "active"), int(row[3] or 1)
-                if not _kb_can_manage(kb, owner_dept):
+                _mode, _oid = ((row[4] or "legacy"), row[5]) if _cap == "present" else ("legacy", None)
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权查看该文档的可见范围明细")
                 cur.execute(f"SELECT publish_status, gate_status FROM {_kb_db()}.document_version "
                             "WHERE doc_id=%s AND version_no=%s", (doc_id, cur_ver))
                 vrow = cur.fetchone()
                 quarantined = bool(vrow and (str(vrow[0] or "").upper() == "QUARANTINED"
                                              or str(vrow[1] or "").lower() == "quarantined"))
-                if perm == "dept_internal":
+                if perm == "dept_internal" and _mode != "node":
                     cur.execute(f"SELECT requester_depts FROM {_kb_db()}.kb_access_request "
                                 "WHERE doc_id=%s AND status='approved'", (doc_id,))
                     _seen_g = set()
@@ -737,6 +761,22 @@ def kb_visibility_explain(request: Request, doc_id: str = "",
                             if p and p not in _seen_g:
                                 _seen_g.add(p)
                                 grant_depts.append(p)
+                elif perm == "dept_internal" and _mode == "node":
+                    # 阶段 B（codex 缺口②）：node 文档解释节点授权——LEFT JOIN dept_dim 取现名，
+                    # **含失活节点并明确标注**（active INNER JOIN 会把授权意图悄悄隐藏——
+                    # 授权还在、节点没了，正是「文档不可见且无从解释」要解释的那种情况）。
+                    cur.execute(
+                        f"SELECT g.dept_id, g.scope, d.name, d.is_active "
+                        f"FROM {_kb_db()}.kb_doc_node_grant g "
+                        f"LEFT JOIN {_kb_db()}.dept_dim d ON d.dept_id = g.dept_id "
+                        "WHERE g.doc_id=%s AND g.revoked_at IS NULL ORDER BY g.dept_id", (doc_id,))
+                    for r in cur.fetchall():
+                        _name = r[2] or str(r[0])
+                        if r[3] is None or not r[3]:
+                            _name += "（节点已失效，无人经此可见）"
+                        node_readers.append(KbVisibilityReader(
+                            dept=_name,
+                            via=("node_subtree" if (r[1] or "subtree") == "subtree" else "node_exact")))
         finally:
             conn.close()
     except HTTPException:
@@ -748,12 +788,17 @@ def kb_visibility_explain(request: Request, doc_id: str = "",
     active = str(status).lower() == "active"
     resp = KbVisibilityExplainResponse(doc_id=doc_id, owner_dept=owner_dept,
                                        permission_level=perm, active=active,
-                                       quarantined=quarantined)
+                                       acl_mode=_mode, quarantined=quarantined)
     if quarantined or not active or perm == "restricted":
         resp.nobody = True        # 隔离/退役/受限：不在检索中（优先级最高，覆盖一切授权）
         return resp
     if perm == "public":
         resp.everyone = True
+        return resp
+    if _mode == "node":
+        # node 文档：可见范围 = 节点授权全集（组码语义不存在；授权空集 = 无人可见，如实）
+        resp.readers = node_readers
+        resp.nobody = not node_readers
         return resp
     # dept_internal：与检索同源反查——owner 组自身 / production 伞 / marketing 共享面
     from opensearch_pipeline.retriever import _VALID_ACL_GROUPS, _expand_groups_to_owners
@@ -1157,8 +1202,24 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
                 if not row:
                     raise HTTPException(status_code=404, detail="申请不存在")
                 owner_dept, status, doc_id = (row[0] or ""), (row[1] or ""), (row[2] or "")
-                # 审批权：文档所属部门管理员（owner_dept ∈ managed）或 kb_admin
-                if not _kb_can_manage(kb, owner_dept):
+                # 阶段 B（codex 缺口③）：审批权按**当前文档三元组**现裁，不再只信申请行的
+                # owner_dept 快照——归属迁移后旧属主管理员经快照仍能操作正是要堵的洞。
+                # 快照列降级为纯展示/审计。文档行被删（极端）→ 回退快照判定（收权动作仍可执行）。
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, status{_mc} FROM {_kb_db()}.document_meta "
+                            "WHERE doc_id=%s FOR UPDATE", (doc_id,))
+                drow = cur.fetchone()
+                if drow:
+                    _d_owner = drow[0] or ""
+                    _mode, _oid = ((drow[2] or "legacy"), drow[3]) if _cap == "present" else ("legacy", None)
+                    if not _kb_can_manage_doc(kb, _mode, _d_owner, _oid):
+                        raise HTTPException(status_code=403, detail="无权操作该申请（非文档所属部门管理员）")
+                    # M6：node 文档禁止**新增/扩大** legacy 授权（approve）；收权（reject/revoke）放行
+                    if _mode == "node" and decision == "approved":
+                        raise HTTPException(status_code=400,
+                                            detail="该文档已迁组织树授权模式，组码申请不可批准（请驳回并改用可见范围）")
+                elif not _kb_can_manage(kb, owner_dept):
                     raise HTTPException(status_code=403, detail="无权操作该申请（非文档所属部门管理员）")
                 if status != from_status:
                     conn.commit()       # 幂等：非目标前态（已决 / 非 approved）→ 返回既有态

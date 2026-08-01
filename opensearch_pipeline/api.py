@@ -1978,6 +1978,32 @@ def _resign_visible_doc_ids(doc_ids: set, identity: Optional[Identity]) -> set:
                 f"SELECT doc_id, permission_level, owner_dept FROM {_kb_db()}.document_meta "
                 f"WHERE doc_id IN ({ph})", tuple(ids))
             meta = {r[0]: ((r[1] or "").strip().lower(), (r[2] or "")) for r in cur.fetchall()}
+            # 阶段 B（codex 缺口/阶段 A 残差）：node 文档改走 can_read_doc + 调用者 AclContext。
+            # 此前手写 legacy 判定对 node 文档恒拒（owner=NULL 不在组展开）——不越权但功能断：
+            # node 文档的图片在卡片/console 全部加载失败。批量 resolve（一次往返）、
+            # AclContext 只构造一次；resolve 失败按该批 node 文档全拒（fail-closed，产出可读
+            # 图字节的接口绝不 fail-open）。
+            _modes = {}
+            try:
+                from opensearch_pipeline.access_grants import resolve_acl_modes
+                _modes = resolve_acl_modes(ids, cur)
+            except Exception as _me:   # noqa: BLE001 — 模式判不出 ⇒ 全按 legacy（现状语义）
+                logger.warning("resign-images acl_mode 批查失败（按 legacy 处理）: %s", _me)
+            _node_ids = [d for d in ids if _modes.get(d) == "node"]
+            _node_ok: set = set()
+            if _node_ids:
+                try:
+                    from opensearch_pipeline.access_grants import resolve_doc_acl
+                    from opensearch_pipeline.acl_policy import can_read_doc
+                    _acls = resolve_doc_acl(_node_ids, cur, strict=True)
+                    _ctx = _build_acl_ctx(identity)
+                    if _ctx is not None:
+                        for d in _node_ids:
+                            _acl = _acls.get(d)
+                            if _acl is not None and can_read_doc(_ctx, _acl):
+                                _node_ok.add(d)
+                except Exception as _ne:   # noqa: BLE001 — 权威不可达 ⇒ 该批 node 全拒
+                    logger.warning("resign-images node 判定失败（node 文档全拒）: %s", _ne)
             for d in ids:
                 pl, owner = meta.get(d, (None, None))
                 if pl is None:
@@ -1986,6 +2012,10 @@ def _resign_visible_doc_ids(doc_ids: set, identity: Optional[Identity]) -> set:
                     visible.add(d); continue
                 if pl == "restricted":
                     continue                       # 永不服务
+                if _modes.get(d) == "node":        # node：统一判定点已裁决
+                    if d in _node_ok:
+                        visible.add(d)
+                    continue
                 if owner in owners:                # dept_internal 等：owner 展开命中
                     visible.add(d); continue
                 if phase_d and groups:             # Phase D 跨部门授权
