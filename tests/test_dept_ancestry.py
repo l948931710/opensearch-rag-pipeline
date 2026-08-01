@@ -18,6 +18,7 @@ from opensearch_pipeline.dept_ancestry import (
     build_parent_index,
     parent_getter_from_index,
     resolve_dept_ids,
+    resolve_descendant_ids,
 )
 from opensearch_pipeline.dingtalk_identity import _normalize_dept_to_codes
 
@@ -345,3 +346,51 @@ def test_flag_on_sentinel_compresses_cache_to_star(monkeypatch):
     assert cached == "*"                                    # 不是 104 字符 CSV
     assert len(cached) <= 64                                # VARCHAR(64) 契约
     assert di._normalize_dept_to_codes(cached) == sorted(_VALID_ACL_GROUPS)   # 读回展开无损
+
+
+# ── 阶段 B WP0：resolve_descendant_ids（管辖根 → 后代集，含根自身）──────────────
+_IDX = {1: [2, 3], 2: [4, 5], 3: [6], 6: [7]}
+
+
+def test_descendants_include_root_itself():
+    got, ok = resolve_descendant_ids(_IDX, [2])
+    assert ok and got == {2, 4, 5}
+
+
+def test_descendants_union_multiple_roots():
+    got, ok = resolve_descendant_ids(_IDX, [2, 3])
+    assert ok and got == {2, 3, 4, 5, 6, 7}
+
+
+def test_descendants_empty_roots_is_legal_no_grant():
+    """空 roots = 该 dept_admin 尚未获授节点轴，合法：空集匹配空 = 天然无权，非失败。"""
+    got, ok = resolve_descendant_ids(_IDX, [])
+    assert ok and got == set()
+
+
+def test_descendants_virtual_root_fails_closed():
+    """管辖根 = 钉钉根 1（全库语义）非法——那是 kb_admin 的语义，不该由节点表达。"""
+    assert resolve_descendant_ids(_IDX, [1]) == (set(), False)
+
+
+def test_descendants_bad_id_fails_closed():
+    assert resolve_descendant_ids(_IDX, ["x"]) == (set(), False)
+    assert resolve_descendant_ids(_IDX, [0]) == (set(), False)
+    assert resolve_descendant_ids(_IDX, [-3]) == (set(), False)
+
+
+def test_descendants_leaf_not_in_index_returns_self():
+    """根无子女（叶子）≠ 失败：返回 {root}。失活节点检出归 org_sync 孤儿报告。"""
+    got, ok = resolve_descendant_ids(_IDX, [9])
+    assert ok and got == {9}
+
+
+def test_descendants_cycle_and_diamond_defused_by_dedup():
+    """脏数据环/菱形被去重集消化：下行 BFS 终止且展开完整，不失效整条通道。"""
+    got, ok = resolve_descendant_ids({10: [11], 11: [10]}, [10])
+    assert ok and got == {10, 11}
+
+
+def test_descendants_oversize_fails_closed_not_truncated():
+    """超上限 fail-closed 不截断——截断 = dept_admin 静默少管一片，比失效更难发现。"""
+    assert resolve_descendant_ids(_IDX, [2], max_nodes=2) == (set(), False)

@@ -99,6 +99,7 @@ def _refuse_prod_targets():
                       ("opensearch_pipeline.dingtalk_identity", "_bot_dept_cache_clear"),
                       ("opensearch_pipeline.routes.kb_console", "_dashboard_cache_clear"),
                       ("opensearch_pipeline.routes.contribution", "_gaps_cache_clear"),
+                      ("opensearch_pipeline.org_sync", "_children_cache_clear"),
                       ("opensearch_pipeline.qa_facts", "_fact_state_clear")):
         try:
             m = _sys.modules.get(_mod)

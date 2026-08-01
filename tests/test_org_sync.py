@@ -216,3 +216,80 @@ def test_org_tree_direct_count_zero_for_pure_container(monkeypatch):
     by = {n["dept_id"]: n for n in out["nodes"]}
     assert by[100]["direct_staff_count"] == 0 and by[100]["staff_count"] == 2
     assert by[110]["direct_staff_count"] == 0 and by[110]["staff_count"] == 1
+
+
+# ── 阶段 B WP0：load_children_index 原子三元组（2026-08-01）───────────────────
+class _ChildrenCur:
+    """load_children_index 的最小游标替身：(dept_id, parent_id, snapshot_rev, age_hours)。"""
+
+    def __init__(self, rows):
+        self._src, self._rows = rows, []
+
+    def execute(self, sql, args=()):
+        s = " ".join(sql.split())
+        self._rows = self._src if "FROM dept_dim" in s else []
+
+    def fetchall(self):
+        return self._rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _children(monkeypatch, rows):
+    from opensearch_pipeline import db, org_sync as m
+    m._children_cache_clear()
+    monkeypatch.setattr(db, "_get_db_conn", lambda: Conn(_ChildrenCur(rows)))
+    return m.load_children_index()
+
+
+def test_children_index_atomic_triple(monkeypatch):
+    """一次查询产出 (rev, fresh, children) 整组值——rev 与索引永远同源。"""
+    rev, fresh, idx = _children(monkeypatch, [
+        (100, 1, 7, 0), (110, 100, 7, 0), (111, 110, 7, 0), (120, 100, 7, 0)])
+    assert rev == 7 and fresh is True
+    assert sorted(idx[100]) == [110, 120] and idx[110] == [111]
+
+
+def test_children_index_stale_after_48h(monkeypatch):
+    """>48h ⇒ fresh=False（调用方视同不可用：自动根与后代展开同时失效）。"""
+    _, fresh, _ = _children(monkeypatch, [(100, 1, 7, 49)])
+    assert fresh is False
+
+
+def test_children_index_empty_raises(monkeypatch):
+    """表空 = 快照未灌 ⇒ 抛 OrgSnapshotUnavailable，绝不返回半截数据。"""
+    from opensearch_pipeline.org_sync import OrgSnapshotUnavailable
+    with pytest.raises(OrgSnapshotUnavailable):
+        _children(monkeypatch, [])
+
+
+def test_children_index_db_failure_raises(monkeypatch):
+    from opensearch_pipeline import db, org_sync as m
+    m._children_cache_clear()
+
+    def _boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(db, "_get_db_conn", _boom)
+    with pytest.raises(m.OrgSnapshotUnavailable):
+        m.load_children_index()
+
+
+def test_children_index_cached_within_ttl(monkeypatch):
+    """TTL 内第二次调用不再触发 DB（与 load_org_tree 同旋钮）。"""
+    from opensearch_pipeline import db, org_sync as m
+    m._children_cache_clear()
+    calls = []
+
+    def _conn():
+        calls.append(1)
+        return Conn(_ChildrenCur([(100, 1, 7, 0)]))
+
+    monkeypatch.setattr(db, "_get_db_conn", _conn)
+    a = m.load_children_index()
+    b = m.load_children_index()
+    assert a == b and len(calls) == 1

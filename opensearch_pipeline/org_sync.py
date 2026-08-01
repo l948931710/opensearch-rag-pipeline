@@ -221,6 +221,65 @@ def _tree_cache_ttl_s() -> float:
         return 300.0
 
 
+# ── 后代展开读侧(阶段 B 管理轴:dept_admin 管辖根 → 子树后代集)─────────────────
+# 缓存值是**原子三元组** (snapshot_rev, fresh, children_index)——一次查询一次赋值,
+# 绝不分字段更新:组织同步落新 rev 的瞬间,读到的要么整套旧、要么整套新,不存在
+# "rev 是新的、children 还是旧的"的混合态(混合态会把已移出子树的部门交给旧管理员)。
+_CHILDREN_CACHE: dict = {}
+
+
+class OrgSnapshotUnavailable(RuntimeError):
+    """组织快照不可用(表空/读失败/>48h 过期)——调用方 fail-closed:
+    dept_admin 的 node 管辖腿整体失效(kb_admin 不受影响),**绝不回退 legacy 管辖**。"""
+
+
+def load_children_index() -> Tuple[int, bool, Dict[int, List[int]]]:
+    """dept_dim(is_active=1)→ (snapshot_rev, fresh, parent→children 索引)。
+
+    fresh=False ⇔ 快照 >48h(与 dingtalk_identity/load_org_tree 同门槛)——调用方须视同
+    不可用(设计裁决:快照过期时自动根与后代展开**同时失效**)。表空/读失败直接抛
+    OrgSnapshotUnavailable,不返回半截数据。TTL 进程缓存与 load_org_tree 同旋钮
+    (RAG_ORG_TREE_TTL_S);缓存的是含 fresh 的整组值,fresh 判定在**入缓存前**做——
+    TTL(默认 300s)远小于 48h 门槛,过期误差最多一个 TTL,可接受。
+    """
+    ttl = _tree_cache_ttl_s()
+    now = time.monotonic()
+    hit = _CHILDREN_CACHE.get("v")
+    if hit and ttl > 0 and now - hit[0] < ttl:
+        return hit[1]
+
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT dept_id, parent_id, snapshot_rev, "
+                    "  TIMESTAMPDIFF(HOUR, synced_at, NOW()) "
+                    "FROM dept_dim WHERE is_active=1")
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        raise OrgSnapshotUnavailable(f"dept_dim 读取失败: {e}") from e
+    if not rows:
+        raise OrgSnapshotUnavailable("dept_dim 为空(组织快照未灌)")
+
+    children: Dict[int, List[int]] = {}
+    for r in rows:
+        children.setdefault(int(r[1]), []).append(int(r[0]))
+    age_h = rows[0][3]
+    value = (int(rows[0][2] or 0), bool(age_h is not None and age_h <= 48), children)
+    _CHILDREN_CACHE["v"] = (now, value)
+    return value
+
+
+def _children_cache_clear() -> None:
+    """测试/组织同步后复位(conftest 每测清空复用)。"""
+    _CHILDREN_CACHE.clear()
+    _TREE_CACHE.clear()
+
+
 def load_org_tree() -> dict:
     """RDS 快照 → 管理台组织树选择器载荷(**扁平列表**,前端自行建树)。
 
