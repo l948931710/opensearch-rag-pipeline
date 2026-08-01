@@ -9,6 +9,12 @@ import OrgTreePicker, { type PickedNode } from './OrgTreePicker.vue'
 // 文档权限弹窗（owner 侧）：
 //   上 = 基础可见范围（仅本部门 / 全公司 / 受限，POST set-visibility；公开需 kb_admin）；
 //   下 = 跨部门共享（仅 dept_internal 时显示）：已共享逐行可撤销 + 新增目标 chips。
+// ⚠️ `isBusy` 是**函数** `isBusy(key)`（useKb.ts:242，按行/用户加锁），**必须带 key 调用**
+// （见下方撤销按钮 `isBusy(\`grant:${g.id}\`)`）。
+// 2026-07-31 实测踩过：「保存可见范围」曾写成 `:disabled="shareBusy || isBusy"` —— shareBusy 为
+// false 时表达式求值成那个**函数对象**（truthy）⇒ 按钮**永久禁用**，管理员根本存不了节点可见
+// 范围。vue-tsc 当场就报 TS2322，但被当噪声放过。`saveNodeGrants` 只用 shareBusy、不往 inflight
+// 注册，故那里根本不该出现 isBusy。
 const { shareCtx, shareBusy, shareTargets, isBusy, isKbAdmin, grantedDeptsOf, docGrantRows, submitShare, saveNodeGrants, revokeAccess, setVisibility, closeShare } = useKb()
 const { confirm, promptText, dialog } = useDialog()
 
@@ -179,7 +185,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           <button
             type="button"
             class="mb-5 inline-flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-[13px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
-            :disabled="shareBusy || isBusy"
+            :disabled="shareBusy"
             @click="saveNodes"
           ><Loader2 v-if="shareBusy" :size="13" :stroke-width="2" class="animate-spin" />{{
             shareBusy ? '保存中…' : (nodePicked.length ? `保存可见范围（${nodePicked.length} 个部门）` : '保存可见范围（清空）')

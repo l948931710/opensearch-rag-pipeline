@@ -111,6 +111,21 @@ const shown = (id: number) => !visibleIds.value || visibleIds.value.has(id)
 // 搜索时强制展开,否则命中的深层节点仍被折叠隐藏
 const isOpen = (id: number) => !!visibleIds.value || expanded.value.has(id)
 
+// ── 无障碍名（2026-07-31）───────────────────────────────────────────────────
+// 勾选框与展开箭头此前只有图标/裸 input，读屏软件念出来是 "复选框 选中" —— 听不出勾的是
+// 哪个部门、有多少人。人数是这个选择器的**核心判断依据**（授权是子树语义），必须进无障碍名；
+// 0 人节点还要把"没人能看到"这条防呆一并念出来，否则视觉标红对读屏用户等于不存在。
+const nodeLabel = (n: OrgNode) =>
+  n.staff_count === 0
+    ? `${n.name}，子树 0 人（授权后可能没有人能看到）`
+    : `${n.name}，子树 ${n.staff_count} 人`
+const caretLabel = (n: OrgNode) =>
+  `${isOpen(n.dept_id) ? '收起' : '展开'} ${n.name} 的下级部门`
+const subtreeLabel = (n: OrgNode) =>
+  pickedMap.value.get(n.dept_id)?.subtree
+    ? `${n.name}：当前含下级，点击改为仅本级`
+    : `${n.name}：当前仅本级，点击改为含下级`
+
 /** 已选节点覆盖的总人数(按子树/仅本节点分别计;仅供概览,不去重跨节点重叠) */
 const coverHint = computed(() => {
   if (!props.modelValue.length) return ''
@@ -141,11 +156,13 @@ const coverHint = computed(() => {
           <li v-if="shown(r.dept_id)">
             <div class="op-row" :class="{ picked: isPicked(r.dept_id) }">
               <button class="op-caret" :class="{ open: isOpen(r.dept_id) }" type="button"
-                      :disabled="!hasKids(r.dept_id)" @click="toggleExpand(r.dept_id)">
+                      :disabled="!hasKids(r.dept_id)" :aria-label="caretLabel(r)"
+                      :aria-expanded="isOpen(r.dept_id)" @click="toggleExpand(r.dept_id)">
                 <ChevronRight v-if="hasKids(r.dept_id)" :size="13" />
               </button>
               <label class="op-label">
                 <input :type="multiple ? 'checkbox' : 'radio'" :checked="isPicked(r.dept_id)"
+                       :aria-label="nodeLabel(r)"
                        :disabled="disabled" @change="toggle(r)" />
                 <span class="op-name">{{ r.name }}</span>
                 <span class="op-count" :class="{ zero: r.staff_count === 0 }">
@@ -154,6 +171,7 @@ const coverHint = computed(() => {
               </label>
               <button v-if="multiple && isPicked(r.dept_id)" type="button" class="op-sub"
                       :class="{ on: pickedMap.get(r.dept_id)?.subtree }" :disabled="disabled"
+                      :aria-label="subtreeLabel(r)"
                       @click="toggleSubtree(r.dept_id)">
                 {{ pickedMap.get(r.dept_id)?.subtree ? '含下级' : '仅本级' }}
               </button>
@@ -163,11 +181,13 @@ const coverHint = computed(() => {
                 <li v-if="shown(c.dept_id)">
                   <div class="op-row" :class="{ picked: isPicked(c.dept_id) }">
                     <button class="op-caret" :class="{ open: isOpen(c.dept_id) }" type="button"
-                            :disabled="!hasKids(c.dept_id)" @click="toggleExpand(c.dept_id)">
+                            :disabled="!hasKids(c.dept_id)" :aria-label="caretLabel(c)"
+                      :aria-expanded="isOpen(c.dept_id)" @click="toggleExpand(c.dept_id)">
                       <ChevronRight v-if="hasKids(c.dept_id)" :size="13" />
                     </button>
                     <label class="op-label">
                       <input :type="multiple ? 'checkbox' : 'radio'" :checked="isPicked(c.dept_id)"
+                       :aria-label="nodeLabel(c)"
                              :disabled="disabled" @change="toggle(c)" />
                       <span class="op-name">{{ c.name }}</span>
                       <span class="op-count" :class="{ zero: c.staff_count === 0 }">
@@ -176,6 +196,7 @@ const coverHint = computed(() => {
                     </label>
                     <button v-if="multiple && isPicked(c.dept_id)" type="button" class="op-sub"
                             :class="{ on: pickedMap.get(c.dept_id)?.subtree }" :disabled="disabled"
+                      :aria-label="subtreeLabel(c)"
                             @click="toggleSubtree(c.dept_id)">
                       {{ pickedMap.get(c.dept_id)?.subtree ? '含下级' : '仅本级' }}
                     </button>
@@ -186,6 +207,7 @@ const coverHint = computed(() => {
                         <span class="op-caret" />
                         <label class="op-label">
                           <input :type="multiple ? 'checkbox' : 'radio'" :checked="isPicked(g.dept_id)"
+                       :aria-label="nodeLabel(g)"
                                  :disabled="disabled" @change="toggle(g)" />
                           <span class="op-name">{{ g.name }}</span>
                           <span class="op-count" :class="{ zero: g.staff_count === 0 }">
@@ -194,6 +216,7 @@ const coverHint = computed(() => {
                         </label>
                         <button v-if="multiple && isPicked(g.dept_id)" type="button" class="op-sub"
                                 :class="{ on: pickedMap.get(g.dept_id)?.subtree }" :disabled="disabled"
+                      :aria-label="subtreeLabel(g)"
                                 @click="toggleSubtree(g.dept_id)">
                           {{ pickedMap.get(g.dept_id)?.subtree ? '含下级' : '仅本级' }}
                         </button>
