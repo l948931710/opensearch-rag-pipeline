@@ -11,8 +11,18 @@ on:
   push:
     # 批次8（ultra ci.yml:12）：阻断门必须跑在**实际出包的分支**上——生产工作直推
     # claude/ontology-p0（SAE/DataWorks 包从它切）且无 PR，此前 main-only 触发让
-    # 测试/lint/gitleaks/CVE 审计对 shipped 代码全豁免。claude/** 覆盖全部工作分支。
-    branches: [main, "claude/**"]
+    # 测试/lint/gitleaks/CVE 审计对 shipped 代码全豁免。
+    #
+    # ⚠️ 2026-08-01：原先写 `branches: [main, "claude/**"]` 并注释「claude/** 覆盖全部工作
+    # 分支」——**那个假设早就破了，而且破得无声**。实测仓库分支前缀分布：
+    #     claude 21 · fix 13 · feat 10 · chore 2 · feature 1 · 其它 2
+    # fix/ + feat/ 合计 23 个，比 claude/ 还多 ⇒ **多数工作分支从来没跑过 CI**。
+    # 本次 node-ACL 阶段 A 全程在 feat/node-acl-phase-a 上，一次门都没过，直接后果是
+    # 一个 vue-tsc 类型错误（TS2322，导致「保存可见范围」按钮永久禁用）随提交上了线。
+    #
+    # 故改为**不做分支过滤 = 跑全部分支**：再加前缀只会把同一个坑往后推。
+    # 代价：Actions 分钟。本仓当前 PUBLIC（分钟免费）；若按 D5 转为私有，届时再按
+    # 实际用量决定是否收窄——但收窄时必须同步改本注释，别再留"覆盖全部"的空话。
   pull_request:
 
 permissions:

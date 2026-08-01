@@ -6,8 +6,10 @@ name: Frontend
 
 on:
   push:
-    # 批次8（ultra ci.yml:12 同族）：前端门同样覆盖实际出包的工作分支
-    branches: [main, "claude/**"]
+    # ⚠️ 2026-08-01：去掉 `branches: [main, "claude/**"]` 过滤，改为**全部分支**。
+    # 理由同 ci.yml：实测 fix/+feat/ 合计 23 个分支比 claude/ 的 21 个还多，多数工作
+    # 分支从来没跑过前端门；本次 feat/node-acl-phase-a 全程未触发，一个 vue-tsc TS2322
+    # 就这么上了线（「保存可见范围」按钮永久禁用）。paths 过滤仍在 ⇒ 纯后端推送不白跑。
     paths:
       - "console-app/**"
       - "fuling-rag-miniapp/**"
@@ -45,7 +47,14 @@ jobs:
         run: npm ci
       - name: Test (vitest)
         run: npm run test
-      - name: Build (vue-tsc 类型检查 + vite build)
+      # ⚠️ 独立一步跑 typecheck，**不要**只依赖下面 build 里的 `vue-tsc -b`：
+      #   ① `-b` 是 build 模式、带 .tsbuildinfo 增量缓存，本地极易出现"没真跑却 exit 0"；
+      #   ② 失败时这一步的报错直指类型问题，而 build 失败会混进 vite/压缩的噪声；
+      #   ③ console-app/CLAUDE.md 的 done bar 本就写着 `npm run typecheck`，CI 该与之一致。
+      # 2026-08-01：TS2322（「保存可见范围」按钮永久禁用）就是在只有 build 的情况下漏掉的。
+      - name: Typecheck (vue-tsc --noEmit)
+        run: npm run typecheck
+      - name: Build (vite build + 压缩产物)
         run: npm run build
 
   # δ4a（M14，Majors 批次 δ，codex 共识 2026-07-21）：Playwright UX 硬门进 CI——
