@@ -77,6 +77,8 @@ class _FakeCur:
             return c.ctx_msg_row
         if "hit_mine" in s and "WHERE q.message_id=" in s:   # 缺口上下文：REFUSAL 可见性
             return c.ctx_vis_row
+        if "staff_dim" in s and "staff_id=%s" in s:          # 三榜：请求者本部门
+            return c.staff_me_row
         return None
 
     def fetchall(self):
@@ -95,6 +97,10 @@ class _FakeCur:
             return c.coverage_rows
         if "GROUP BY c.author_id" in s:        # ε-2 R2 heroes 引用数聚合（先于泛 author_id 分支）
             return c.hero_hits_rows
+        if "staff_dim" in s and "IN (" in s:            # 三榜：积分池组织归属
+            return c.staff_pool_rows
+        if "FROM" in s and "dept_dim" in s:             # 三榜：组织树（一级上溯）
+            return c.dept_dim_rows
         if "handled_status='RESOLVED'" in s and "GROUP_CONCAT" in s:   # 总积分榜：有效反馈聚合
             if c.boom_feedback:
                 raise Exception("simulated feedback aggregation failure")
@@ -147,6 +153,9 @@ class _FakeConn:
         self.hero_rows = kw.get("hero_rows", [])
         self.hero_hits_rows = kw.get("hero_hits_rows", [])
         self.hero_feedback_rows = kw.get("hero_feedback_rows", [])
+        self.staff_pool_rows = kw.get("staff_pool_rows", [])
+        self.dept_dim_rows = kw.get("dept_dim_rows", [])
+        self.staff_me_row = kw.get("staff_me_row")
         self.boom_feedback = kw.get("boom_feedback", False)
         self.user_role_rows = kw.get("user_role_rows", [])
         self.doc_hits_rows = kw.get("doc_hits_rows", [])
@@ -1692,3 +1701,61 @@ def test_heroes_fact_off_score_counts_hits_as_zero_honest_none(monkeypatch):
     from opensearch_pipeline import api
     resp = api.kb_contribution_heroes(request=None, identity=_ident())
     assert resp.items[0].hits is None and resp.items[0].score == 30
+
+
+# ── 三榜切换（2026-08-01）：部门榜 = 同分按一级部门求和；本部门榜 = 归属过滤 ────
+_DEPT_TREE = [
+    (100, 1, "生产中心", 1), (110, 100, "注塑事业部", 2), (111, 110, "注塑制程检", 3),
+    (200, 1, "综合管理中心", 1), (210, 200, "人力资源部", 2),
+]
+
+
+def test_heroes_dept_board_sums_by_l1(monkeypatch):
+    """u1(注塑制程检,深3)与 u2(注塑事业部,深2)都上溯到生产中心求和；u3 归综合管理中心。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    _install_conn(monkeypatch, _FakeConn(
+        hero_rows=[("u1", "李娜", 3), ("u2", "王伟", 2), ("u3", "张三", 1)],
+        staff_pool_rows=[("u1", 111), ("u2", 110), ("u3", 210)],
+        dept_dim_rows=_DEPT_TREE))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    got = [(d.dept_name, d.score, d.members) for d in resp.dept_items]
+    assert got == [("生产中心", 50, 2), ("综合管理中心", 10, 1)]
+    assert [d.rank for d in resp.dept_items] == [1, 2]
+
+
+def test_heroes_my_dept_board_filters_by_requester_l1(monkeypatch):
+    """请求者挂注塑事业部 → 本部门榜只含生产中心成员（u3 不在）；部门内重排名次。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    _install_conn(monkeypatch, _FakeConn(
+        hero_rows=[("u1", "李娜", 3), ("u2", "王伟", 2), ("u3", "张三", 5)],
+        staff_pool_rows=[("u1", 111), ("u2", 110), ("u3", 210)],
+        dept_dim_rows=_DEPT_TREE,
+        staff_me_row=(110,)))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    assert resp.my_dept_name == "生产中心"
+    assert [(i.author_id, i.rank, i.score) for i in resp.my_dept_items] == [
+        ("u1", 1, 30), ("u2", 2, 20)]
+    # 全公司榜不受影响（u3 50 分居首）
+    assert resp.items[0].author_id == "u3"
+
+
+def test_heroes_unattributed_user_skips_dept_board_keeps_company(monkeypatch):
+    """未在册（不在 staff_dim）的人：全公司/本部门个人榜照常，只是不计入部门榜。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    _install_conn(monkeypatch, _FakeConn(
+        hero_rows=[("u1", "李娜", 3), ("ghost", "外部号", 9)],
+        staff_pool_rows=[("u1", 111)],
+        dept_dim_rows=_DEPT_TREE))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    assert resp.items[0].author_id == "ghost"                       # 全公司榜照常
+    assert [(d.dept_name, d.score) for d in resp.dept_items] == [("生产中心", 30)]
+    assert resp.my_dept_items == [] and resp.my_dept_name == ""     # 请求者未在册 → 诚实空

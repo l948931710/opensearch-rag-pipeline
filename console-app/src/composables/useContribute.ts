@@ -65,6 +65,9 @@ export interface ContributionItem {
 // 采纳前修订（批次ε-1）：后端 KbContributionAcceptRequest 既有契约——缺省字段=保留原值，
 // 故只放【实际变更】的键，绝不传空串覆盖原文（后端 strip 后空文本会 400）。
 export interface ContributionRevision { question?: string; content?: string; category_dept?: string }
+export interface DeptScoreItem {
+  rank: number; dept_id: number; dept_name: string; members: number; score: number
+}
 export interface HeroItem {
   rank: number; author_id: string; author_name: string; count: number
   hits?: number | null   // 被引用数：null=算不出 → 构成里显「—」，分数按 0 如实少算
@@ -91,6 +94,9 @@ const myContribs = ref<ContributionItem[]>([])
 const pendingContribs = ref<ContributionItem[]>([])
 const pendingHasMore = ref(false)   // 批次ε-1：>50 条时后端 has_more 此前被静默丢弃（假满员）
 const heroes = ref<HeroItem[]>([])
+const deptHeroes = ref<DeptScoreItem[]>([])       // 部门榜（同分按一级部门求和）
+const myDeptHeroes = ref<HeroItem[]>([])          // 本部门个人榜
+const myDeptName = ref('')
 const loadingGaps = ref(false)
 const loadErrors = ref<Record<string, string>>({})
 const inflight = ref<Set<string>>(new Set())
@@ -222,9 +228,14 @@ async function loadHeroes() {
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') { heroes.value = _previewHeroes(); return }
   try {
-    const r = await apiJson<{ items: HeroItem[] }>('/api/kb/contributions/heroes', { auth: true })
+    const r = await apiJson<{ items: HeroItem[]; dept_items?: DeptScoreItem[]
+                              my_dept_items?: HeroItem[]; my_dept_name?: string }>(
+      '/api/kb/contributions/heroes', { auth: true })
     heroes.value = r.items || []
-  } catch { heroes.value = [] }
+    deptHeroes.value = r.dept_items || []
+    myDeptHeroes.value = r.my_dept_items || []
+    myDeptName.value = r.my_dept_name || ''
+  } catch { heroes.value = []; deptHeroes.value = []; myDeptHeroes.value = []; myDeptName.value = '' }
 }
 
 // ── 弹窗 / 提交 ──
@@ -380,6 +391,7 @@ export function useContribute() {
   const reviewCount = computed(() => pendingContribs.value.length)
   return {
     gaps, gapsSummary, gapsWindowDays, myContribs, pendingContribs, pendingHasMore, heroes, loadingGaps, loadErrors, isBusy,
+    deptHeroes, myDeptHeroes, myDeptName,
     modalOpen, formQuestion, formContent, formDept, formWarning, submitBusy, submitErr, submitOk,
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
     loadGaps, toggleGapContext, loadMine, loadPending, loadHeroes,

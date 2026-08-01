@@ -291,8 +291,24 @@ class KbHeroItem(BaseModel):
     score: int = 0
 
 
+class KbDeptScoreItem(BaseModel):
+    """部门总积分行（2026-08-01 三榜切换）：同一套 10/1/3 个人分按**一级部门（中心）**求和
+    ——不引入新指标，不依赖奖励办法的部门口径（周活跃/有效问答占比那套等办法二稿）。
+    取总和不取人均：人均会奖励「少参与保均值」（口径⑧同类顾虑），总和 + 参与人数并示。"""
+    rank: int = 0
+    dept_id: int = 0
+    dept_name: str = ""
+    members: int = 0                     # 有积分的参与人数（非在册总人数）
+    score: int = 0
+
+
 class KbHeroesResponse(BaseModel):
-    items: List[KbHeroItem] = Field(default_factory=list)
+    items: List[KbHeroItem] = Field(default_factory=list)          # 全公司个人 TOP10（兼容字段）
+    # 三榜切换（2026-08-01）：归属来自 staff_dim.primary_dept → dept_dim 上溯到一级部门。
+    # 组织快照缺失/账号未在册 → 对应榜为空（全公司榜不受影响，优雅降级）。
+    dept_items: List[KbDeptScoreItem] = Field(default_factory=list)   # 部门榜 TOP10
+    my_dept_items: List[KbHeroItem] = Field(default_factory=list)     # 本部门个人 TOP10
+    my_dept_name: str = ""                                            # 请求者的一级部门名（空=未在册）
 
 
 def _contrib_item(row) -> "KbContributionItem":
@@ -1174,8 +1190,69 @@ def kb_contribution_heroes(request: Request, identity: Optional[Identity] = Depe
                                + HERO_SCORE_W_FEEDBACK * fb, a, uid, fb))
             scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
             top = scored[:10]
-            # 只反馈没贡献的人没有 author_name → user_role 批量回填展示名（best-effort）
-            missing = [uid for _, _, uid, _ in top if not names.get(uid)]
+            # ── 三榜切换（2026-08-01）：组织归属聚合 ─────────────────────────────
+            # 归属 = staff_dim.primary_dept（⚠️ 现实现=min(dept_ids)，多部门者取最小 id——
+            # 已知近似，见 ai_reward_metrics §3）→ dept_dim 上溯到一级部门（中心，depth==1）。
+            # 快照缺失/查询失败 → 部门两榜为空、全公司榜不受影响（榜单绝不被组织数据拖垮）。
+            dept_items: List[KbDeptScoreItem] = []
+            my_dept_items: List[KbHeroItem] = []
+            my_dept_name = ""
+            my_l1 = None
+            l1_of: Dict[str, tuple] = {}           # uid → (l1_dept_id, l1_name)
+            try:
+                if scored:
+                    ph = ",".join(["%s"] * len(scored))
+                    cur.execute(
+                        f"SELECT staff_id, primary_dept FROM {_kb_db()}.staff_dim"
+                        f" WHERE is_active=1 AND primary_dept IS NOT NULL AND staff_id IN ({ph})",
+                        tuple(uid for _, _, uid, _ in scored))
+                    prim = {r[0]: int(r[1]) for r in (cur.fetchall() or []) if r and r[1]}
+                    cur.execute(f"SELECT dept_id, parent_id, name, depth FROM {_kb_db()}.dept_dim"
+                                " WHERE is_active=1")
+                    dmap = {int(r[0]): (int(r[1]), r[2] or "", int(r[3] or 0))
+                            for r in (cur.fetchall() or [])}
+
+                    def _l1(did):
+                        hops = 0
+                        while did in dmap and hops < 15:
+                            parent, name, depth = dmap[did]
+                            if depth <= 1:
+                                return did, name
+                            did = parent
+                            hops += 1
+                        return None, ""
+
+                    for uid, did in prim.items():
+                        l1_id, l1_name = _l1(did)
+                        if l1_id:
+                            l1_of[uid] = (l1_id, l1_name)
+                    # 请求者本部门（可能不在积分池里，单查一次）
+                    cur.execute(f"SELECT primary_dept FROM {_kb_db()}.staff_dim"
+                                " WHERE staff_id=%s AND is_active=1", (identity.user_id,))
+                    mrow = cur.fetchone()
+                    if mrow and mrow[0]:
+                        my_l1, my_dept_name = _l1(int(mrow[0]))
+                    # 部门榜：同分求和 + 参与人数（未在册者不计入部门榜，个人榜照常）
+                    agg: Dict[int, List] = {}
+                    for score, a, uid, fb in scored:
+                        got = l1_of.get(uid)
+                        if not got:
+                            continue
+                        cell = agg.setdefault(got[0], [got[1], 0, 0])
+                        cell[1] += score
+                        cell[2] += 1
+                    ranked = sorted(agg.items(), key=lambda kv: (-kv[1][1], kv[1][0]))[:10]
+                    dept_items = [KbDeptScoreItem(rank=i + 1, dept_id=did, dept_name=v[0],
+                                                  members=v[2], score=v[1])
+                                  for i, (did, v) in enumerate(ranked)]
+            except Exception as e:   # noqa: BLE001 — 组织数据绝不拖垮榜单
+                logger.info("heroes 组织归属聚合失败（部门榜为空）: %s", e)
+                my_l1 = None
+            my_top = ([t for t in scored if l1_of.get(t[2], (None,))[0] == my_l1][:10]
+                      if my_l1 else [])
+            # 展示名回填覆盖 全公司 TOP ∪ 本部门 TOP（只反馈没贡献的人没有 author_name）
+            _need = {uid for _, _, uid, _ in top} | {uid for _, _, uid, _ in my_top}
+            missing = [uid for uid in sorted(_need) if not names.get(uid)]
             if missing:
                 try:
                     ph = ",".join(["%s"] * len(missing))
@@ -1186,16 +1263,23 @@ def kb_contribution_heroes(request: Request, identity: Optional[Identity] = Depe
                             names[r[0]] = r[1]
                 except Exception as e:   # noqa: BLE001
                     logger.info("heroes 展示名回填失败（回退 uid）: %s", e)
-            for i, (score, a, uid, fb) in enumerate(top):
-                items.append(KbHeroItem(
+
+            def _item(i, t):
+                score, a, uid, fb = t
+                return KbHeroItem(
                     rank=i + 1, author_id=uid, author_name=names.get(uid, ""),
                     count=a, adopted=a, feedback=fb, score=score,
-                    hits=((hits or {}).get(uid, 0) if hits is not None else None)))
+                    hits=((hits or {}).get(uid, 0) if hits is not None else None))
+
+            items = [_item(i, t) for i, t in enumerate(top)]
+            my_dept_items = [_item(i, t) for i, t in enumerate(my_top)]
     except Exception as e:
         logger.info("heroes 查询失败（fail-open 空榜）: %s", e)
+        return KbHeroesResponse(items=items)
     finally:
         conn.close()
-    return KbHeroesResponse(items=items)
+    return KbHeroesResponse(items=items, dept_items=dept_items,
+                            my_dept_items=my_dept_items, my_dept_name=my_dept_name)
 
 
 def _gaps_review_funnel(identity) -> dict:
