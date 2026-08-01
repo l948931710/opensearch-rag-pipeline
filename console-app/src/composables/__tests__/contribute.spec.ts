@@ -241,6 +241,24 @@ describe('被引用数展示（批次ε-2 R2）', () => {
     expect(w.text()).toContain('8')                                     // 排名主数字（入库篇数）仍在
   })
 
+  it('HeroBoard 总积分榜（2026-08-01，预览权重 10/1/3）：主数字=score、副行构成、预览口径标', async () => {
+    withSession()
+    useContribute().heroes.value = [
+      { rank: 1, author_id: 'u2', author_name: '王伟', count: 2, hits: 0, adopted: 2, feedback: 8, score: 44 },
+      { rank: 2, author_id: 'u1', author_name: '李娜', count: 3, hits: null, adopted: 3, feedback: 0, score: 30 },
+    ] as never
+    const HeroBoard = (await import('@/components/contribute/HeroBoard.vue')).default
+    const w = mount(HeroBoard)
+    expect(w.text()).toContain('总积分榜')
+    expect(w.text()).toContain('预览口径')
+    const rows = w.findAll('[data-testid="hero-breakdown"]')
+    expect(rows.map((r) => r.text().replace(/\s+/g, ''))).toEqual(
+      ['采纳×2·引用×0·反馈×8', '采纳×3·引用×—·反馈×0'])   // hits=null → 「—」不用 0 顶替
+    expect(w.text()).toContain('44')
+    // 总分模式下旧「引用 N」chip 不再出现（构成进了副行）
+    expect(w.findAll('[data-testid="hero-hits"]').length).toBe(0)
+  })
+
   it('MyContributions：仅已入库行显「被引用 N 次」；非 searchable / hits 缺失自隐', () => {
     withSession()
     useContribute().myContribs.value = [

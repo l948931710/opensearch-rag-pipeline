@@ -264,14 +264,31 @@ class KbContributionActionResponse(BaseModel):
     requires_kb_admin_approval: bool = False
 
 
+# ── 总积分榜预览权重（Sam 2026-08-01 拍板 10/1/3）──────────────────────────────
+# 口径=docs/ai_reward_metrics_2026-07-27.md：采纳=⑦(searchable) / 被引用=cited 事实表 /
+# 有效反馈=④⑤(downvote+RESOLVED+首报按 message_id 去重)且按①限渠道(console+小程序)。
+# 活跃/提问量**刻意不进**个人分（07-27 结论：量化消耗≠价值）。
+# ⚠️ 这是【预览口径】：正式积分换算以《AI参与奖励管理办法》定稿为准（F1 试行稿在等
+# 综合管理中心二稿）；权重单一来源在此，改动须同步口径文件留修订记录。
+HERO_SCORE_W_ADOPTED = 10
+HERO_SCORE_W_HIT = 1
+HERO_SCORE_W_FEEDBACK = 3
+
+
 class KbHeroItem(BaseModel):
     rank: int = 0
     author_id: str = ""
     author_name: str = ""
-    count: int = 0
+    count: int = 0                       # =adopted（旧字段名保留兼容）
     # 被引用次数（批次ε-2 R2）：cited=True 口径（与 Phase E 价值类看板同源）、全期窗口。
     # None=算不出（事实表路径不可用/查询失败——诚实 NULL 纪律，绝不用 0 顶替）；0=真零引用。
     hits: Optional[int] = None
+    # 总积分（2026-08-01）：10×采纳 + 1×引用 + 3×有效反馈。hits=None 时引用项按 0 计
+    # （分数如实少算，不伪造）；构成三项随行回传供 UI 副行展示（可审计：任何人质疑
+    # 都能指到构成与口径定义）。
+    adopted: int = 0
+    feedback: int = 0
+    score: int = 0
 
 
 class KbHeroesResponse(BaseModel):
@@ -1080,7 +1097,16 @@ def kb_contribution_retry(cid: str, request: Request,
 
 @router.get("/api/kb/contributions/heroes", response_model=KbHeroesResponse)
 def kb_contribution_heroes(request: Request, identity: Optional[Identity] = Depends(current_identity)):
-    """知识贡献英雄榜：按【已入库(searchable)】贡献数排名（真正闭环才计入）。全公司前 10。"""
+    """总积分榜（2026-08-01，Sam 拍板权重 10/1/3，预览口径）：
+    score = 10×采纳入库 + 1×被引用 + 3×有效反馈，全公司前 10。
+
+    三项构成（口径=docs/ai_reward_metrics_2026-07-27.md）：
+      · 采纳=ingestion_status='searchable'（⑦：采纳但入库失败不计分）；
+      · 被引用=cited 事实表全期口径（fact 路径关 → hits=None，分数按 0 如实少算）；
+      · 有效反馈=downvote+RESOLVED+按 message_id 首报去重（④⑤，防乱踩/组团），
+        且限渠道 console+小程序（①：conversation_type IS NULL）。
+    候选池 = 采纳作者 ∪ 有效反馈者（只反馈没贡献也上榜——反馈是办法认可的参与项）。
+    """
     _enforce_rate_limit(request, identity, scope="aux")
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="需要登录")
@@ -1093,19 +1119,39 @@ def kb_contribution_heroes(request: Request, identity: Optional[Identity] = Depe
     try:
         _reconcile_contributions_searchable(conn)
         with conn.cursor() as cur:
+            # ① 采纳数（kb_contribution 表规模小，全量聚合后在 py 内合成排名）
             cur.execute(
                 f"SELECT author_id, MAX(author_name), COUNT(*) c FROM {_op_db()}.kb_contribution"
-                " WHERE ingestion_status='searchable' GROUP BY author_id ORDER BY c DESC LIMIT 10")
-            for i, r in enumerate(cur.fetchall() or []):
-                items.append(KbHeroItem(rank=i + 1, author_id=r[0] or "",
-                                        author_name=r[1] or "", count=int(r[2] or 0)))
-            # 批次ε-2 R2：榜上作者回填被引用数（**排名仍按入库篇数，hits 只是次级信号**——
-            # 改排名=行为变更，本轮不做）。一条聚合查询覆盖 TOP10 全员，author 无引用=真 0。
-            if items:
+                " WHERE ingestion_status='searchable' GROUP BY author_id")
+            adopted: Dict[str, int] = {}
+            names: Dict[str, str] = {}
+            for r in cur.fetchall() or []:
+                if r and r[0]:
+                    adopted[r[0]] = int(r[2] or 0)
+                    names[r[0]] = r[1] or ""
+            # ② 有效反馈数（④⑤⑥①）：每个 downvote 消息只记首报者；处置是按 message_id
+            # 批量置 RESOLVED，故必须按 message_id 去重。GROUP_CONCAT 取 (created_at, id)
+            # 最早行（staffId 无逗号，SUBSTRING_INDEX 安全）。失败 → 该项按空（榜单不倒）。
+            feedback: Dict[str, int] = {}
+            try:
+                cur.execute(
+                    "SELECT t.uid, COUNT(*) FROM ("
+                    " SELECT SUBSTRING_INDEX(GROUP_CONCAT(f.user_id ORDER BY f.created_at ASC, f.id ASC), ',', 1) uid"
+                    f" FROM {_op_db()}.user_feedback f"
+                    f" JOIN {_op_db()}.qa_session_log q"
+                    "   ON q.message_id = f.message_id AND q.conversation_type IS NULL"
+                    " WHERE f.feedback_type='downvote' AND f.handled_status='RESOLVED'"
+                    " GROUP BY f.message_id) t WHERE t.uid IS NOT NULL AND t.uid<>'' GROUP BY t.uid")
+                feedback = {r[0]: int(r[1] or 0) for r in (cur.fetchall() or []) if r and r[0]}
+            except Exception as e:   # noqa: BLE001 — 单项失败绝不拖垮榜单
+                logger.info("heroes 有效反馈聚合失败（该项按 0）: %s", e)
+            # ③ 被引用数：覆盖全部采纳作者（不再只回填 TOP10——引用现在进分）。
+            hits: Optional[Dict[str, int]] = None
+            if adopted:
                 from opensearch_pipeline.qa_facts import FACT_TABLE, fact_join_enabled
                 if fact_join_enabled():
                     try:
-                        ph = ",".join(["%s"] * len(items))
+                        ph = ",".join(["%s"] * len(adopted))
                         cur.execute(
                             f"SELECT c.author_id, COUNT(DISTINCT jt.message_id)"
                             f" FROM {_op_db()}.kb_contribution c"
@@ -1113,12 +1159,38 @@ def kb_contribution_heroes(request: Request, identity: Optional[Identity] = Depe
                             f"   ON jt.doc_id = c.doc_id AND jt.cited=1"
                             f" WHERE c.ingestion_status='searchable' AND c.author_id IN ({ph})"
                             " GROUP BY c.author_id",
-                            tuple(it.author_id for it in items))
-                        by_author = {r[0]: int(r[1] or 0) for r in (cur.fetchall() or [])}
-                        for it in items:
-                            it.hits = by_author.get(it.author_id, 0)
+                            tuple(adopted))
+                        hits = {r[0]: int(r[1] or 0) for r in (cur.fetchall() or [])}
                     except Exception as e:   # noqa: BLE001 — 激励信号绝不拖垮榜单
                         logger.info("heroes 引用数聚合失败（诚实 None）: %s", e)
+            # 合成 + 排名（分同 → 采纳多者前 → uid 字典序，确定性）
+            pool = sorted(set(adopted) | set(feedback))
+            scored = []
+            for uid in pool:
+                a = adopted.get(uid, 0)
+                fb = feedback.get(uid, 0)
+                h = (hits or {}).get(uid, 0) if hits is not None else 0
+                scored.append((HERO_SCORE_W_ADOPTED * a + HERO_SCORE_W_HIT * h
+                               + HERO_SCORE_W_FEEDBACK * fb, a, uid, fb))
+            scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
+            top = scored[:10]
+            # 只反馈没贡献的人没有 author_name → user_role 批量回填展示名（best-effort）
+            missing = [uid for _, _, uid, _ in top if not names.get(uid)]
+            if missing:
+                try:
+                    ph = ",".join(["%s"] * len(missing))
+                    cur.execute(f"SELECT user_id, user_name FROM {_kb_db()}.user_role"
+                                f" WHERE user_id IN ({ph})", tuple(missing))
+                    for r in cur.fetchall() or []:
+                        if r and r[0] and (r[1] or ""):
+                            names[r[0]] = r[1]
+                except Exception as e:   # noqa: BLE001
+                    logger.info("heroes 展示名回填失败（回退 uid）: %s", e)
+            for i, (score, a, uid, fb) in enumerate(top):
+                items.append(KbHeroItem(
+                    rank=i + 1, author_id=uid, author_name=names.get(uid, ""),
+                    count=a, adopted=a, feedback=fb, score=score,
+                    hits=((hits or {}).get(uid, 0) if hits is not None else None)))
     except Exception as e:
         logger.info("heroes 查询失败（fail-open 空榜）: %s", e)
     finally:

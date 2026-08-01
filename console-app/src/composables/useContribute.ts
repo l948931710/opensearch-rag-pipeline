@@ -67,7 +67,12 @@ export interface ContributionItem {
 export interface ContributionRevision { question?: string; content?: string; category_dept?: string }
 export interface HeroItem {
   rank: number; author_id: string; author_name: string; count: number
-  hits?: number | null   // 被引用数（批次ε-2 R2）：null=算不出 → 自隐；排名仍按 count
+  hits?: number | null   // 被引用数：null=算不出 → 构成里显「—」，分数按 0 如实少算
+  // 总积分（2026-08-01，预览口径 10/1/3）：score=10×采纳+1×引用+3×有效反馈；
+  // 构成随行回传供副行展示（可审计）。旧后端无这些键 → 按 0 兜底、副行自隐。
+  adopted?: number
+  feedback?: number
+  score?: number
 }
 
 interface GapsResp { items: GapItem[]; summary: GapsSummary; has_more: boolean; window_days?: number }
@@ -144,9 +149,9 @@ function _previewPending(): ContributionItem[] {
 }
 function _previewHeroes(): HeroItem[] {
   return [
-    { rank: 1, author_id: 'u1', author_name: '李娜', count: 8, hits: 41 },
-    { rank: 2, author_id: 'u2', author_name: '张三', count: 5, hits: 0 },
-    { rank: 3, author_id: 'preview', author_name: '设计预览', count: 3, hits: 12 },
+    { rank: 1, author_id: 'u1', author_name: '李娜', count: 8, hits: 41, adopted: 8, feedback: 2, score: 127 },
+    { rank: 2, author_id: 'u2', author_name: '张三', count: 5, hits: 0, adopted: 5, feedback: 4, score: 62 },
+    { rank: 3, author_id: 'preview', author_name: '设计预览', count: 3, hits: 12, adopted: 3, feedback: 0, score: 42 },
   ]
 }
 

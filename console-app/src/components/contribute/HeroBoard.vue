@@ -4,8 +4,11 @@ import { Trophy } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { useContribute } from '@/composables/useContribute'
 
-// 知识贡献英雄榜：按【已入库(searchable)】贡献数排名（真正闭环才计入）。
+// 总积分榜（2026-08-01，Sam 拍板预览权重 10/1/3）：score=10×采纳+1×引用+3×有效反馈。
+// 构成随行副行展示（可审计——任何人质疑都能指到构成与口径定义）；旧后端无 score 键时
+// 回退按 count 展示（副行自隐）。正式积分换算以《AI参与奖励管理办法》定稿为准。
 const { heroes } = useContribute()
+const hasScore = computed(() => heroes.value.some((h) => typeof h.score === 'number'))
 const me = computed(() => useSession().identity?.userId || '')
 // 名次奖牌调：金（琥珀）/ 银（灰）/ 铜（暖橙，借调 --c-str），4 名以后素灰。
 const RANK_TONE: Record<number, string> = {
@@ -23,7 +26,9 @@ function initial(name: string) { return (name || '?').trim().charAt(0) || '?' }
     <div class="overflow-hidden rounded-[15px] border border-border bg-card">
       <div class="flex items-center gap-2.5 border-b border-border px-[18px] py-3">
         <Trophy :size="16" :stroke-width="1.75" class="text-st-warn" />
-        <span class="text-sm font-semibold text-foreground">英雄榜</span>
+        <span class="text-sm font-semibold text-foreground">{{ hasScore ? '总积分榜' : '英雄榜' }}</span>
+        <span v-if="hasScore" class="rounded bg-panel px-1.5 py-px text-[10.5px] text-faint"
+              title="预览口径：10 分/篇采纳 · 1 分/次引用 · 3 分/条有效反馈；正式积分以《AI参与奖励管理办法》定稿为准">预览口径</span>
       </div>
       <div
         v-for="h in heroes" :key="h.author_id"
@@ -32,14 +37,20 @@ function initial(name: string) { return (name || '?').trim().charAt(0) || '?' }
       >
         <span class="grid size-6 shrink-0 place-items-center rounded-md font-mono text-[12px] font-bold tabular-nums" :class="rankCls(h.rank)">{{ h.rank }}</span>
         <span class="grid size-7 shrink-0 place-items-center rounded-full bg-accent-soft text-[12px] font-semibold text-accent-text">{{ initial(h.author_name) }}</span>
-        <span class="min-w-0 flex-1 truncate text-[13px] font-medium text-foreground">{{ h.author_name || h.author_id }}<span v-if="h.author_id === me" class="ml-1 text-[11px] text-accent-text">（我）</span></span>
-        <!-- 被引用数（批次ε-2 R2）：次级价值信号，排名仍按入库篇数；算不出（null）自隐不用 0 顶替 -->
-        <span
-          v-if="h.hits != null" data-testid="hero-hits"
+        <div class="min-w-0 flex-1">
+          <div class="truncate text-[13px] font-medium text-foreground">{{ h.author_name || h.author_id }}<span v-if="h.author_id === me" class="ml-1 text-[11px] text-accent-text">（我）</span></div>
+          <!-- 构成副行（可审计）：采纳×N · 引用×M · 反馈×K；引用算不出显「—」不用 0 顶替 -->
+          <div v-if="hasScore" class="mt-0.5 truncate text-[10.5px] tabular-nums text-faint" data-testid="hero-breakdown">
+            采纳×{{ h.adopted ?? h.count }} · 引用×{{ h.hits != null ? h.hits : '—' }} · 反馈×{{ h.feedback ?? 0 }}
+          </div>
+        </div>
+        <span v-if="!hasScore && h.hits != null" data-testid="hero-hits"
           class="shrink-0 rounded bg-accent-soft px-1.5 py-px text-[10.5px] font-medium tabular-nums text-accent-text"
           :title="`TA 的贡献被引用进 ${h.hits} 次回答（累计）`"
         >引用 {{ h.hits }}</span>
-        <span class="shrink-0 font-mono text-[13px] font-bold tabular-nums text-foreground" title="已入库篇数（排名依据）">{{ h.count }}</span>
+        <span class="shrink-0 font-mono text-[14px] font-bold tabular-nums text-foreground"
+              :title="hasScore ? '总积分（10×采纳 + 1×引用 + 3×有效反馈）' : '已入库篇数（排名依据）'"
+        >{{ hasScore ? (h.score ?? 0) : h.count }}</span>
       </div>
     </div>
   </section>
