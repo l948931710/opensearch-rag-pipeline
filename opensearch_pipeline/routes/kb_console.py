@@ -1798,6 +1798,12 @@ def kb_ops_metrics(request: Request, identity: Optional[Identity] = Depends(curr
 class KbConfigResponse(BaseModel):
     max_upload_bytes: int = 0
     accepted_exts: List[str] = Field(default_factory=list)
+    # 节点授权是否已对读侧生效（= RAG_NODE_ACL_GRANT）。上传表单据此选授权口径。
+    # ⚠️ 放这里而不是 org-tree：本端点【有意公开】、无身份查库，实测 2ms；而 org-tree 每次
+    # 要过 _require_kb_console（一次 RDS 往返，实测 ~1s）。2026-08-01 一度为拿这个布尔值
+    # 在 loadConfig 里多打一整个 org-tree 请求，等于给控制台首屏白加 ~1-2.6s。
+    # 与 max_upload_bytes 同性质：能力常量，不含部门/文档数据。
+    node_acl_grant: bool = False
 
 
 @router.get("/api/kb/config", response_model=KbConfigResponse)
@@ -1812,6 +1818,7 @@ def kb_config(request: Request, identity: Optional[Identity] = Depends(current_i
     return KbConfigResponse(
         max_upload_bytes=int(MAX_UPLOAD_BYTES),
         accepted_exts=sorted(_PHASE1_EXTS),
+        node_acl_grant=_node_acl_grant_enabled(),
     )
 
 

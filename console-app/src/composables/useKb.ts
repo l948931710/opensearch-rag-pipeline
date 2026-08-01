@@ -93,7 +93,7 @@ export interface KbGovernance {
   feedback_last7: number; feedback_daily: KbFeedbackDay[]; downvote_reasons: KbDownvoteReason[]
   dept_coverage: KbDeptCoverage[]
 }
-export interface KbConfig { max_upload_bytes: number; accepted_exts: string[] }
+export interface KbConfig { max_upload_bytes: number; accepted_exts: string[]; node_acl_grant?: boolean }
 
 // ── 运营数据面（批次γ D1-D3，GET /api/kb/ops-metrics，kb_admin 专属）──
 // 三块各自 available：false=该块查询失败（诚实「未知」）；true+空列表=表可读但确实没数据。
@@ -591,12 +591,10 @@ async function loadStats() {
 async function loadConfig() {
   // 上传上限/类型走后端权威，避免硬编码漂移（失败则用 MAX_UPLOAD_MB 常量兜底）。
   try { kbConfig.value = await apiJson<KbConfig>('/api/kb/config', { auth: true }) } catch { /* 兜底 */ }
-  // 节点授权读侧姿态：决定上传表单给组码 chips 还是组织树（见 nodeAclGrant 注释）。
-  // 与 org-tree 同端点（服务端 TTL 缓存，成本可忽略）；失败保持 false ⇒ 继续走 legacy。
-  try {
-    const t = await apiJson<{ node_acl_grant?: boolean }>('/api/kb/org-tree', { auth: true })
-    nodeAclGrant.value = !!t?.node_acl_grant
-  } catch { /* 兜底 legacy */ }
+  // 节点授权读侧姿态随 kbConfig 一起回（同一个请求，零额外往返）。
+  // ⚠️ 别为这个布尔值单独打 /api/kb/org-tree：那个端点要过 _require_kb_console（一次 RDS
+  // 往返，实测 ~1s），而 kb/config 是公开能力端点、实测 2ms。
+  nodeAclGrant.value = !!kbConfig.value?.node_acl_grant
 }
 
 // ── Phase E：概览看板真实数据（缺数据/端点未上线 → 静默兜底 null，由组件如实显空/加载中）──

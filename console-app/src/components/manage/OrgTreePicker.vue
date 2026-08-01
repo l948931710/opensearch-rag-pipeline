@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ChevronRight, Loader2, Search, TriangleAlert, Users } from '@lucide/vue'
-import { apiJson } from '@/lib/api'
+import { fetchOrgSnapshot, type OrgNode } from '@/composables/useOrgSnapshot'
 
 /**
  * 组织树选择器 —— 归属(单选)与可见范围(多选)共用同一棵树。
@@ -16,16 +16,6 @@ import { apiJson } from '@/lib/api'
  *  · **每个选中项带「含下级」开关**(默认开)。关掉 = 仅直挂本节点的人。现网 26 个节点
  *    有子部门却仍有直挂人员、合计 172 人,纯子树语义表达不了"要部分子部门 + 直挂本级"。
  */
-export interface OrgNode {
-  dept_id: number
-  parent_id: number
-  name: string
-  depth: number
-  /** 子树总人数（本节点直属 + 全部后代）—— 对应「含下级」= d:<id> */
-  staff_count: number
-  /** 仅直挂本节点的人数 —— 对应「仅本级」= dx:<id>。旧后端无此字段，按 0 兜底 */
-  direct_staff_count?: number
-}
 export interface PickedNode { dept_id: number; subtree: boolean }
 
 const props = withDefaults(defineProps<{
@@ -44,13 +34,16 @@ const q = ref('')
 // 默认展开到二级 —— 119 个节点一次全铺会淹没管理员
 const expanded = ref<Set<number>>(new Set())
 
+// 组织快照的缓存/去重在 `@/composables/useOrgSnapshot` —— **不能**写在这里:
+// `<script setup>` 顶层代码全部编译进 setup()，模块级 `let` 会变成每个实例的局部变量
+// （2026-08-01 实测连开三次弹窗打三次请求）。同理这里也不允许 `export` 任何值。
+
 onMounted(async () => {
   try {
-    const r = await apiJson<any>('/api/kb/org-tree')
-    const t = r?.org_tree || {}
-    nodes.value = (t.nodes || []) as OrgNode[]
-    stale.value = !!t.stale
-    syncedAt.value = t.synced_at || ''
+    const snap = await fetchOrgSnapshot()
+    nodes.value = snap.nodes
+    stale.value = snap.stale
+    syncedAt.value = snap.synced_at
     for (const n of nodes.value) if (n.depth <= 1) expanded.value.add(n.dept_id)
   } catch (e: any) {
     err.value = e?.message || '组织数据加载失败'
