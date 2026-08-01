@@ -174,7 +174,14 @@ const bulkMsg = ref('')
 const newTitle = ref('')
 const newOwner = ref('')
 const newPerm = ref('dept_internal')          // dept_internal / shared（=dept_internal+主动授权）/ public / restricted
-const newShareDepts = ref<string[]>([])       // newPerm='shared' 时的共享目标组码
+const newShareDepts = ref<string[]>([])       // newPerm='shared' 时的共享目标组码（legacy 口径）
+// 上传时按组织架构选的节点（node 口径）。⚠️ 与 newShareDepts **二选一**，绝不双写：
+// acl_policy 的模式互斥不变量规定 node ⇒ 只投 d:/dx:、绝不含组码（codex BLOCKER-1）。
+const newShareNodes = ref<{ dept_id: number; subtree: boolean }[]>([])
+// 节点授权是否已对**读侧**生效（后端 /api/kb/org-tree 回的 RAG_NODE_ACL_GRANT）。
+// ⚠️ 关时上传必须继续走 legacy 组码：GRANT 关时 can_read_doc 对 node 文档无条件 DENY，
+// 此刻写 node 授权 = 新文档对所有人不可见（连归属部门自己都看不到）。
+const nodeAclGrant = ref(false)
 // 主动共享弹窗（owner 侧）：把自己部门的 dept_internal 文档直接放行给指定部门（POST /api/kb/access-grants）。
 const shareCtx = ref<DocItem | null>(null)
 const shareBusy = ref(false)
@@ -584,6 +591,12 @@ async function loadStats() {
 async function loadConfig() {
   // 上传上限/类型走后端权威，避免硬编码漂移（失败则用 MAX_UPLOAD_MB 常量兜底）。
   try { kbConfig.value = await apiJson<KbConfig>('/api/kb/config', { auth: true }) } catch { /* 兜底 */ }
+  // 节点授权读侧姿态：决定上传表单给组码 chips 还是组织树（见 nodeAclGrant 注释）。
+  // 与 org-tree 同端点（服务端 TTL 缓存，成本可忽略）；失败保持 false ⇒ 继续走 legacy。
+  try {
+    const t = await apiJson<{ node_acl_grant?: boolean }>('/api/kb/org-tree', { auth: true })
+    nodeAclGrant.value = !!t?.node_acl_grant
+  } catch { /* 兜底 legacy */ }
 }
 
 // ── Phase E：概览看板真实数据（缺数据/端点未上线 → 静默兜底 null，由组件如实显空/加载中）──
@@ -886,10 +899,17 @@ async function uploadSingle(file: File) {
     const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
     uploadOk.value = true
     let shareNote = ''
-    if (shared && newShareDepts.value.length) {
-      // 共享失败不判上传失败：文档已在库，提示可去台账「共享」补做。文案以响应 granted/skipped 为准。
-      try { shareNote = shareResultNote(await createGrants(r.doc_id, [...newShareDepts.value])) }
-      catch { shareNote = '；共享设置失败，可稍后在台账点「共享」重试' }
+    if (shared) {
+      // 共享失败不判上传失败：文档已在库，提示可去台账「共享」补做。
+      // ⚠️ 口径二选一（见 nodeAclGrant 注释）：GRANT 开 ⇒ 节点授权；关 ⇒ legacy 组码。
+      try {
+        if (nodeAclGrant.value && newShareNodes.value.length) {
+          await saveNodeGrants(r.doc_id, [...newShareNodes.value], 0, '上传时设定')
+          shareNote = `；可见范围已按组织架构设定（${newShareNodes.value.length} 个部门）`
+        } else if (newShareDepts.value.length) {
+          shareNote = shareResultNote(await createGrants(r.doc_id, [...newShareDepts.value]))
+        }
+      } catch { shareNote = '；共享设置失败，可稍后在台账点「共享」重试' }
     }
     uploadMsg.value = `已提交：${r.title || file.name} v${r.version_no}（${r.status_badge}${r.requires_kb_admin_approval ? '，待审批' : ''}）${shareNote}`
     contentDupMsg.value = buildDupMsg(r.content_dups, r.content_dups_other)
@@ -1506,7 +1526,7 @@ export function useKb() {
     docsPage, docsTotal, docsPerPage: DOCS_PAGE, docsMaxPage: DOCS_MAX_PAGE, loadDocsPage,
     // 多选 / 批量
     selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
-    newTitle, newOwner, newPerm, newShareDepts, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
+    newTitle, newOwner, newPerm, newShareDepts, newShareNodes, nodeAclGrant, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, isBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
     shareCtx, shareBusy, shareTargets: SHARE_TARGETS,
@@ -1531,7 +1551,7 @@ export function __resetKb() {
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   selectedIds.value = new Set(); bulkBusy.value = false; bulkMsg.value = ''
-  newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; newShareDepts.value = []; verCtx.value = null
+  newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; newShareDepts.value = []; newShareNodes.value = []; verCtx.value = null
   shareCtx.value = null; shareBusy.value = false
   uploadBusy.value = false; uploadMsg.value = ''; uploadErr.value = ''; uploadOk.value = false
   dupWarn.value = ''; contentDupMsg.value = ''; uploadQueue.value = []; selectedNames.value = []

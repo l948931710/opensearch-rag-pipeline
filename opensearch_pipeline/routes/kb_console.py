@@ -99,7 +99,21 @@ def kb_org_tree(request: Request, identity: Optional[Identity] = Depends(current
         my_managed_owner_depts=managed_owner_depts(kb),
         my_grantable_owner_depts=grantable_owner_depts(kb),
         org_tree=_load_org_tree_snapshot(),
+        # 读侧真实姿态（不是"控件做没做"）——上传侧据此决定写 legacy 组码还是 node 节点。
+        # 读不到 config 时按 False 兜底：宁可继续走 legacy（现状可用），也不要写出对所有人
+        # 不可见的 node 文档。
+        node_acl_grant=_node_acl_grant_enabled(),
     )
+
+
+def _node_acl_grant_enabled() -> bool:
+    """`RAG_NODE_ACL_GRANT` 现值。**绝不抛** —— 取不到一律 False（fail-safe 到 legacy）。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        return bool(get_config().rag.node_acl_grant)
+    except Exception as e:   # noqa: BLE001
+        logger.warning("读取 node_acl_grant 失败，按未开启处理: %s", e)
+        return False
 
 
 def _kb_usage_enrich(cur, doc_ids):

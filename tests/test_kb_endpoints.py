@@ -2089,3 +2089,35 @@ def test_my_docs_badge_counts_faceted(monkeypatch):
     assert "owner_dept = %s" in counts_sql and "production" in (counts_params or ())
     # 计数查询不含 badge 自身的筛选（faceted 语义：各状态的数在当前其他筛选下可见）
     assert counts_sql.count("CASE") <= main_sql.count("CASE") and "已上线" not in str(counts_params)
+
+
+def test_org_tree_exposes_node_acl_grant_flag(monkeypatch):
+    """★ org-tree 必须回读侧 `node_acl_grant` —— 上传表单据此决定写 legacy 组码还是 node 节点。
+
+    ⚠️ 这不是"控件做没做"的开关，是**安全开关**：GRANT 关时 `can_read_doc` 对 node 文档
+    无条件 DENY（acl_policy.py:281），此刻若把新上传文档写成 node 授权，它对所有人不可见
+    ——连归属部门自己都看不到（投影轴换哨兵后 legacy owner 分支不再放行）。
+    """
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline import api
+    monkeypatch.setattr(api, "_load_org_tree_snapshot", lambda: {"nodes": [], "stale": True})
+
+    for flag, expect in ((True, True), (False, False)):
+        monkeypatch.setattr("opensearch_pipeline.routes.kb_console._node_acl_grant_enabled",
+                            lambda f=flag: f)
+        resp = api.kb_org_tree(request=None, identity=api.Identity(user_id="dev1"))
+        assert resp.node_acl_grant is expect
+
+
+def test_org_tree_flag_fails_safe_to_legacy(monkeypatch):
+    """读不到 config ⇒ 回 False（继续走 legacy 组码），绝不因异常就把上传切到 node 口径。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline.routes import kb_console
+
+    def _boom():
+        raise RuntimeError("config 不可用")
+
+    monkeypatch.setattr("opensearch_pipeline.config.get_config", _boom)
+    assert kb_console._node_acl_grant_enabled() is False

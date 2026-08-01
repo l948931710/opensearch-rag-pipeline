@@ -4,9 +4,11 @@ import { UploadCloud, FileUp, X } from '@lucide/vue'
 import { UPLOAD_ACCEPT, PERM_LABEL, deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
+import OrgTreePicker from './OrgTreePicker.vue'
 
 const {
-  verCtx, newTitle, newOwner, newPerm, newShareDepts, shareTargets, uploadTargetDepts, selectedNames,
+  verCtx, newTitle, newOwner, newPerm, newShareDepts, newShareNodes, nodeAclGrant,
+  shareTargets, uploadTargetDepts, selectedNames,
   dupWarn, uploadBusy, uploadMsg, uploadErr, uploadOk, contentDupMsg, uploadQueue,
   onFileSelected, doUpload, exitVersionMode, maxUploadMb,
 } = useKb()
@@ -112,8 +114,19 @@ function onDrop(e: DragEvent) {
         </select>
       </label>
 
+      <!-- 指定部门 · 组织架构口径（节点授权已对读侧生效时才出现）——
+           ⚠️ 与下方组码 chips **二选一**：GRANT 关时写 node 授权会让新文档对所有人不可见
+           （can_read_doc 无条件 DENY），故此处严格按后端回的 node_acl_grant 切换。 -->
+      <div v-if="newPerm === 'shared' && nodeAclGrant" class="sm:col-span-3">
+        <div class="mb-1.5 text-xs" :class="newShareNodes.length ? 'text-muted-foreground' : 'text-st-busy'">
+          可见范围（按组织架构{{ newShareNodes.length ? `，已选 ${newShareNodes.length} 个部门` : '，至少选 1 个' }}）
+        </div>
+        <OrgTreePicker v-model="newShareNodes" :disabled="uploadBusy" />
+        <p class="mt-1.5 text-[11.5px] text-faint">与台账「跨部门共享 / 权限」同一口径；登记后可随时在那里调整或清空。</p>
+      </div>
+
       <!-- 指定部门：目标 chips（登记后自动放行所选部门，记录于审批历史、可随时撤销） -->
-      <div v-if="newPerm === 'shared'" class="sm:col-span-3">
+      <div v-if="newPerm === 'shared' && !nodeAclGrant" class="sm:col-span-3">
         <div class="mb-1.5 text-xs" :class="newShareDepts.length ? 'text-muted-foreground' : 'text-st-busy'">
           共享给（多选{{ newShareDepts.length ? `，已选 ${newShareDepts.length} 个` : '，至少选 1 个' }}）
         </div>

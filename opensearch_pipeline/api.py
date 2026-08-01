@@ -2570,6 +2570,12 @@ class KbOrgTreeResponse(BaseModel):
     my_managed_owner_depts: List[str] = Field(default_factory=list)
     my_grantable_owner_depts: List[str] = Field(default_factory=list)
     org_tree: Optional[Dict[str, Any]] = Field(default=None, description="org 快照（缺失则 null）")
+    # 2026-08-01：节点授权是否**已对读侧生效**（= RAG_NODE_ACL_GRANT）。
+    # ⚠️ 上传侧必须据此选授权口径,不能只看"控件写好了"：GRANT 关时 `can_read_doc` 对 node
+    # 文档是**无条件 DENY**(acl_policy.py:281),此刻若把新上传文档写成 node 授权,它对所有人
+    # 不可见——连归属部门自己都看不到(投影轴换哨兵后 legacy owner 分支不再放行)。
+    # 故 GRANT 关 ⇒ 上传仍走 legacy 组码;开 ⇒ 自动切组织树。读写两侧共用同一个开关。
+    node_acl_grant: bool = Field(default=False, description="节点授权是否已对读侧生效")
 
 
 class KbDocItem(BaseModel):
