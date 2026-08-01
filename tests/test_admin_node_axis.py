@@ -155,3 +155,109 @@ def test_grant_endpoint_still_400_when_both_axes_empty(monkeypatch):
         kb_admin_grant(KbAdminGrantRequest(user_id="u2", owner_depts=[]),
                        request=None, identity=api.Identity(user_id="adm1"))
     assert ei.value.status_code == 400
+
+
+# ── 候选裁决：陈旧 rev 拒确认（TOCTOU 关死）────────────────────────────────────
+class _DecideCur:
+    """decide 端点的模式匹配游标：候选行 + 当前快照 rev + staff 挂靠。"""
+
+    def __init__(self, *, cand=("u1", 110, 5, "pending"), cur_rev=5, staff_csv="110"):
+        self.cand, self.cur_rev, self.staff_csv = cand, cur_rev, staff_csv
+        self._rows, self.sql = [], []
+        self.rowcount = 1
+
+    def execute(self, sql, args=()):
+        s = " ".join(sql.split())
+        self.sql.append((s, args))
+        if "dept_admin_node_candidate WHERE id" in s:
+            self._rows = [self.cand]
+        elif "MAX(snapshot_rev)" in s:
+            self._rows = [(self.cur_rev,)]
+        elif "FROM" in s and "staff_dim" in s:
+            self._rows = [(self.staff_csv,)]
+        elif "user_role" in s and s.startswith("SELECT"):
+            self._rows = [("dept_admin",)]
+        elif "source='manual'" in s and s.startswith("SELECT"):
+            self._rows = []                      # 无 manual override
+        elif "dept_dim WHERE dept_id" in s:
+            self._rows = [(1,)]
+        elif "dept_dim WHERE is_active=1" in s:
+            self._rows = [(110, 100), (100, 1)]  # depth 判定用（_candidate_risk）
+        elif "SELECT depth FROM" in s:
+            self._rows = [(2,)]
+        else:
+            self._rows = []
+
+    def fetchall(self):
+        return self._rows
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _DecideConn:
+    def __init__(self, cur):
+        self._c, self.commits = cur, 0
+
+    def cursor(self):
+        return self._c
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _decide(monkeypatch, cur, action="confirm", cid=1):
+    from fastapi.testclient import TestClient
+    from opensearch_pipeline import api, db
+    from opensearch_pipeline.routes import kb_access
+
+    class _Kb:
+        user_id, name, role = "adm", "管理员", "kb_admin"
+
+    monkeypatch.setattr(kb_access, "_require_kb_admin", lambda i: _Kb())
+    monkeypatch.setattr(kb_access, "_enforce_rate_limit", lambda *a, **k: None)
+    import opensearch_pipeline.env_guard as eg
+    monkeypatch.setattr(eg, "assert_metadata_write_allowed", lambda *a, **k: None)
+    import opensearch_pipeline.audit_log as al
+    monkeypatch.setattr(al, "write_audit", lambda **k: None)
+    monkeypatch.setattr(db, "_get_db_conn", lambda: _DecideConn(cur))
+    return TestClient(api.app).post("/api/kb/admin-node-candidates/decide",
+                                    json={"candidate_id": cid, "action": action})
+
+
+def test_candidate_confirm_writes_authority(monkeypatch):
+    cur = _DecideCur()
+    r = _decide(monkeypatch, cur)
+    assert r.status_code == 200 and r.json()["status"] == "confirmed"
+    assert any("INSERT INTO" in s and "dept_admin_node_grant" in s for s, _ in cur.sql)
+    assert any("SET status='confirmed'" in s for s, _ in cur.sql)
+
+
+def test_candidate_stale_rev_409_rederives_not_confirms(monkeypatch):
+    """★ TOCTOU：快照已翻（rev 5→9）⇒ 409 + 按当前快照重派生刷新本行——
+    **绝不确认陈旧候选**、绝不写权威表。"""
+    cur = _DecideCur(cand=("u1", 110, 5, "pending"), cur_rev=9)
+    r = _decide(monkeypatch, cur)
+    assert r.status_code == 409
+    assert any("derived_snapshot_rev=%s" in s for s, _ in cur.sql)     # 重派生刷新
+    assert not any("INSERT INTO" in s and "dept_admin_node_grant" in s for s, _ in cur.sql)
+
+
+def test_candidate_stale_rev_and_moved_dept_superseded(monkeypatch):
+    """快照翻了且挂靠也变了 ⇒ superseded（旧候选不可再确认）。"""
+    cur = _DecideCur(cand=("u1", 110, 5, "pending"), cur_rev=9, staff_csv="120")
+    r = _decide(monkeypatch, cur)
+    assert r.status_code == 409 and "失效" in str(r.json()["detail"])
+    assert any("status='superseded'" in s for s, _ in cur.sql)
