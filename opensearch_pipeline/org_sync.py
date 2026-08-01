@@ -176,9 +176,128 @@ def sync(commit: bool = False) -> dict:
             cur.execute("UPDATE staff_dim SET is_active=0 WHERE snapshot_rev<%s AND is_active=1", (rev,))
             stat["staff_deactivated"] = cur.rowcount
         conn.commit()
+        # 阶段 B T5:管辖根自动派生(快照落定后同连接跑;派生失败绝不让同步整轮报废)
+        try:
+            with conn.cursor() as cur:
+                stat["admin_derive"] = derive_admin_node_roots(cur, rev, depts, staff)
+            conn.commit()
+        except Exception as e:   # noqa: BLE001
+            logger.warning("管辖根自动派生失败(快照本身已落定): %s", e)
+            stat["admin_derive"] = {"error": str(e)[:200]}
         return stat
     finally:
         conn.close()
+
+
+# ── 阶段 B T5:dept_admin 管辖根自动派生(Sam 2026-07-28 裁决,五条规则锁死)──────
+# 候选/权威分表(schema/061 dept_admin_node_candidate vs 060 dept_admin_node_grant):
+# 权威表消费者的语义永远是 is_active=1 即有效——待确认态绝不进权威表(codex:每个授权
+# 查询都得记得追加 confirmed 条件,漏一处即静默提权)。
+def _auto_max_subtree() -> int:
+    try:
+        return int(os.environ.get("RAG_NODE_ADMIN_AUTO_MAX_SUBTREE", "30") or 30)
+    except ValueError:
+        return 30
+
+
+def derive_admin_node_roots(cur, rev: int, depts: Dict[int, dict],
+                            staff: Dict[str, Set[int]]) -> dict:
+    """按五条规则派生 dept_admin 管辖根。规则(设计稿 §3.5):
+      1. 只有 active dept_admin 派生——普通员工绝不因组织归属获得管理权;
+      2. manual 行存在 ⇒ auto 整体失效(本函数直接跳过该用户,还会撤停其存量 auto 行);
+      3. 无部门/多直属部门 ⇒ fail-closed 不派生(既不写权威也不写候选——多部门该谁管
+         是业务判断,转人工在成员面板手动指定);
+      4. 根变化 / 中心级(depth==1) / 子树超阈值(RAG_NODE_ADMIN_AUTO_MAX_SUBTREE,默认 30)
+         ⇒ 撤停旧 auto + 只写候选(dept_admin_node_candidate),待 kb_admin 确认;
+      5. 本函数只在快照同步 commit 后调用 ⇒ 快照天然新鲜(>48h 失效由读侧把关)。
+    幂等:同 (user, root) 的候选走 ON DUPLICATE 复活为 pending 并刷新 derived_snapshot_rev。
+    """
+    out = {"auto_upserted": 0, "auto_revoked": 0, "candidates": 0, "skipped_multi_dept": 0,
+           "skipped_manual": 0}
+    # 子部门索引(内存态,与本轮快照同源)
+    children: Dict[int, List[int]] = {}
+    for did, v in depts.items():
+        children.setdefault(int(v["parent_id"]), []).append(int(did))
+
+    def _subtree_size(root: int) -> int:
+        n, queue, seen = 0, [root], {root}
+        while queue:
+            c = queue.pop()
+            n += 1
+            for ch in children.get(c, ()):  # 快照来自 fetch_org(已判环),此处 seen 仅防御
+                if ch not in seen:
+                    seen.add(ch)
+                    queue.append(ch)
+        return n
+
+    cur.execute("SELECT user_id FROM user_role WHERE is_active=1 AND role='dept_admin'")
+    admins = [r[0] for r in cur.fetchall() if r and r[0]]
+    for uid in admins:
+        cur.execute("SELECT managed_dept_id, source, is_active FROM dept_admin_node_grant "
+                    "WHERE user_id=%s", (uid,))
+        rows = cur.fetchall()
+        has_manual = any((r[1] or "") == "manual" and r[2] for r in rows)
+        auto_active = [int(r[0]) for r in rows if (r[1] or "") == "auto" and r[2]]
+        if has_manual:
+            # 规则 2:manual 替换 auto——存量 auto 行一并撤停,不留双轨
+            if auto_active:
+                cur.execute("UPDATE dept_admin_node_grant SET is_active=0, updated_at=NOW() "
+                            "WHERE user_id=%s AND source='auto' AND is_active=1", (uid,))
+                out["auto_revoked"] += cur.rowcount
+            out["skipped_manual"] += 1
+            continue
+        direct = sorted(staff.get(uid, ()))
+        if len(direct) != 1:
+            # 规则 3:0/多直属 fail-closed——撤停旧 auto(挂靠关系已不成立),转人工;
+            # 其 pending 候选一并 superseded(挂靠变了,旧候选不可再确认)
+            if auto_active:
+                cur.execute("UPDATE dept_admin_node_grant SET is_active=0, updated_at=NOW() "
+                            "WHERE user_id=%s AND source='auto' AND is_active=1", (uid,))
+                out["auto_revoked"] += cur.rowcount
+            cur.execute("UPDATE dept_admin_node_candidate SET status='superseded', updated_at=NOW() "
+                        "WHERE user_id=%s AND status='pending'", (uid,))
+            out["skipped_multi_dept"] += 1
+            continue
+        root = int(direct[0])
+        if auto_active == [root]:
+            # 已生效的 auto 根与派生一致 ⇒ 零变化。⚠️ 这一步必须在 risk 判定**之前**:
+            # 经确认落地的中心级/超规模根若再过 risk 判定,会被每晚撤销+重开候选,
+            # 确认动作等于白做(规则 4 只 gate【变化】,不 gate 既定事实)。
+            continue
+        # 换根/新派生 ⇒ 该用户其它 pending 候选一律 superseded(不留陈旧确认面)
+        cur.execute("UPDATE dept_admin_node_candidate SET status='superseded', updated_at=NOW() "
+                    "WHERE user_id=%s AND proposed_dept_id<>%s AND status='pending'", (uid, root))
+        risk = None
+        if int(depts.get(root, {}).get("depth", 0)) == 1:
+            risk = "center_level"          # 中心级根 = 一次拿整个中心(实测 97 人直挂一级)
+        elif _subtree_size(root) > _auto_max_subtree():
+            risk = "oversized"
+        elif auto_active and root not in auto_active:
+            risk = "root_changed"          # 调岗:旧 auto 撤停后新根须人工确认(防调岗静默提权)
+        if risk is None:
+            # 安全首派:直接进权威表(source='auto')
+            cur.execute("INSERT INTO dept_admin_node_grant "
+                        "(user_id, managed_dept_id, source, granted_by, is_active, note) "
+                        "VALUES (%s,%s,'auto','org_sync',1,%s) "
+                        "ON DUPLICATE KEY UPDATE is_active=1, granted_by='org_sync', "
+                        "note=VALUES(note), updated_at=NOW()",
+                        (uid, root, f"rev={rev}"))
+            out["auto_upserted"] += 1
+            continue
+        # 有风险:撤停旧 auto + 写候选待确认(同根候选 ON DUPLICATE 复活并刷新 rev)
+        if auto_active:
+            cur.execute("UPDATE dept_admin_node_grant SET is_active=0, updated_at=NOW() "
+                        "WHERE user_id=%s AND source='auto' AND is_active=1", (uid,))
+            out["auto_revoked"] += cur.rowcount
+        cur.execute("INSERT INTO dept_admin_node_candidate "
+                    "(user_id, proposed_dept_id, derived_snapshot_rev, risk_reason, status) "
+                    "VALUES (%s,%s,%s,%s,'pending') "
+                    "ON DUPLICATE KEY UPDATE derived_snapshot_rev=VALUES(derived_snapshot_rev), "
+                    "risk_reason=VALUES(risk_reason), status='pending', confirmed_by=NULL, "
+                    "confirmed_at=NULL, updated_at=NOW()",
+                    (uid, root, rev, risk))
+        out["candidates"] += 1
+    return out
 
 
 def main(argv=None) -> int:

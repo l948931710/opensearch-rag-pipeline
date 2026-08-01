@@ -2777,6 +2777,129 @@ def _kb_can_manage(kb, owner_dept: str) -> bool:
     return (owner_dept or "") in set(expand_managed_owner_depts(managed_owner_depts(kb)))
 
 
+# ── 阶段 B：文档域 mode 隔离管理判定（generic _kb_can_manage/_kb_owner_scope_sql
+#    保持组码语义不动——贡献审核仍消费它们，见 kb_authz.can_manage_doc 头注）─────────
+def _kb_node_capability(cursor) -> str:
+    """060 三列探测的**三态**读法：'present' | 'absent' | 'unknown'。
+
+    absent（真实未 apply）→ 调用方生成与现行完全相同的 legacy SQL；
+    unknown（探测本身失败）→ dept_admin 一律 `AND 1=0`（fail-closed，仅 kb_admin）——
+    把探测失败当 absent 会违反「未知 mode 仅 kb_admin」裁决（codex 阶段 B major）。
+    present 有正向缓存（access_grants._NODE_SCHEMA_PRESENT），热路径零开销。
+    """
+    from opensearch_pipeline.access_grants import _node_acl_columns_present
+    try:
+        return "present" if _node_acl_columns_present(cursor, strict=True) else "absent"
+    except Exception:   # noqa: BLE001
+        return "unknown"
+
+
+def _kb_managed_descendants(kb):
+    """dept_admin 的管辖后代集（含根）→ set[int] 或 **None**（不可得 = fail-closed）。
+
+    None 的三种来源：组织快照读失败/表空（OrgSnapshotUnavailable）、快照 >48h
+    （fresh=False——设计裁决：自动根与后代展开同时失效）、展开异常（非法根/超上限）。
+    调用方对 None 一律去掉 node 腿/判 False，**绝不回退 legacy 残值判定**。
+    空 roots 是合法状态 → set()（匹配空 = 无 node 管辖，非 None）。
+    """
+    roots = getattr(kb, "granted_node_roots", ()) or ()
+    if not roots:
+        return set()
+    try:
+        from opensearch_pipeline.dept_ancestry import resolve_descendant_ids
+        from opensearch_pipeline.org_sync import load_children_index
+        _rev, fresh, children = load_children_index()
+        if not fresh:
+            return None
+        got, ok = resolve_descendant_ids(children, roots)
+        return got if ok else None
+    except Exception:   # noqa: BLE001 — OrgSnapshotUnavailable 等
+        return None
+
+
+def _kb_doc_owner_scope_sql(kb, cap: str, alias: str = "m"):
+    """文档域 owner 作用域 SQL（**严格 mode 隔离**）→ (clause, params, degraded)。
+
+    kb_admin 不限；dept_admin：
+      cap='absent'  → 与现行 _kb_owner_scope_sql 逐字节同构（`AND {alias}.owner_dept IN …`）；
+      cap='unknown' → `AND 1=0` + degraded=True；
+      cap='present' → `AND ((acl_mode='legacy' AND owner_dept IN …)
+                            OR (acl_mode='node' AND owner_dept_id IN <后代集>))`。
+        node 腿在后代集不可得时**整腿去掉**（node 文档对该管理员隐身 = fail-closed）
+        并置 degraded=True；⚠️ 无条件 OR 两列 = node 文档的 owner_dept 残值继续命中
+        旧管理员（越权洞，设计稿 §3.5）。
+    degraded=True 时调用方应在响应标注 scope_degraded 并 WARNING（T6 告警面）。
+    """
+    from opensearch_pipeline.kb_authz import (
+        ROLE_KB_ADMIN, expand_managed_owner_depts, managed_owner_depts,
+    )
+    if kb.role == ROLE_KB_ADMIN:
+        return "", [], False
+    owners = expand_managed_owner_depts(managed_owner_depts(kb))
+    if cap == "absent":
+        if not owners:
+            return "AND 1=0", [], False
+        ph = ",".join(["%s"] * len(owners))
+        return f"AND {alias}.owner_dept IN ({ph})", list(owners), False
+    if cap != "present":                       # unknown：探测失败，仅 kb_admin
+        logger.warning("node capability 探测失败——dept_admin 作用域 fail-closed（scope_degraded）")
+        return "AND 1=0", [], True
+    descendants = _kb_managed_descendants(kb)
+    degraded = descendants is None
+    if degraded:
+        logger.warning("管辖后代集不可得（快照过期/读失败）——node 腿失效（scope_degraded）")
+    legs, params = [], []
+    if owners:
+        ph = ",".join(["%s"] * len(owners))
+        legs.append(f"({alias}.acl_mode='legacy' AND {alias}.owner_dept IN ({ph}))")
+        params.extend(owners)
+    if descendants:
+        idph = ",".join(["%s"] * len(descendants))
+        legs.append(f"({alias}.acl_mode='node' AND {alias}.owner_dept_id IN ({idph}))")
+        params.extend(sorted(descendants))
+    if not legs:
+        return "AND 1=0", [], degraded
+    return "AND (" + " OR ".join(legs) + ")", params, degraded
+
+
+def _kb_can_manage_doc(kb, acl_mode, legacy_owner, owner_dept_id) -> bool:
+    """单文档管理判定（写端点在锁内读齐三元组后调用）。node 文档的后代集解析
+    失败 ⇒ False（kb_authz.can_manage_doc 对 descendant_ids=None fail-closed）。"""
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, can_manage_doc
+    if kb.role == ROLE_KB_ADMIN:
+        return True                            # 短路：kb_admin 不需要后代集解析
+    mode = (acl_mode or "legacy").strip().lower()
+    descendants = _kb_managed_descendants(kb) if mode == "node" else set()
+    return can_manage_doc(kb, mode, legacy_owner, owner_dept_id, descendants)
+
+
+def _kb_read_doc_triplet(cursor, doc_id: str):
+    """锁外/锁内通用：读 (owner_dept, acl_mode, owner_dept_id, acl_revision, permission_level,
+    status)。060 未 apply（capability≠present）→ 只读 legacy 列，mode 恒 'legacy'、
+    owner_dept_id/acl_revision 恒 None/0——写端点在旧环境保持现行为。找不到行 → None。"""
+    cap = _kb_node_capability(cursor)
+    if cap == "present":
+        cursor.execute(
+            f"SELECT owner_dept, acl_mode, owner_dept_id, acl_revision, permission_level, status "
+            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s", (doc_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {"owner_dept": row[0] or "", "acl_mode": (row[1] or "legacy").strip().lower(),
+                "owner_dept_id": row[2], "acl_revision": int(row[3] or 0),
+                "permission_level": (row[4] or "").strip().lower(),
+                "status": (row[5] or "active"), "cap": cap}
+    cursor.execute(
+        f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
+        "WHERE doc_id=%s", (doc_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {"owner_dept": row[0] or "", "acl_mode": "legacy", "owner_dept_id": None,
+            "acl_revision": 0, "permission_level": (row[1] or "").strip().lower(),
+            "status": (row[2] or "active"), "cap": cap}
+
+
 def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
     """按 OSS ETag（字节级内容指纹）找其它 active 文档（跨部门内容查重）。
 

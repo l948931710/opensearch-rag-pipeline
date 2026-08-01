@@ -9,6 +9,22 @@ employee/匿名在任何 DB 查询【之前】被 401/403 拒绝。授权走 res
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _default_node_capability_absent(monkeypatch):
+    """阶段 B：本文件全部端点测试默认 capability='absent'。
+
+    两个原因：①本文件的桩游标（_stub_multi/_stub_capture）按 execute 次数弹结果，
+    真探针的额外一次 information_schema 查询会让整个序列错位；②absent 生成与旧
+    _kb_owner_scope_sql 逐字节同构的 SQL（tests/test_kb_doc_scope.py 的回归锚钉死），
+    故本文件既有 legacy 断言语义完全不变。node 路径的测试**显式**改打 'present'
+    并在桩行里自带 acl_mode/owner_dept_id 列。
+    ⚠️ kb_console 是 from-import 绑定——api 与 routes 两个命名空间都要打。"""
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    monkeypatch.setattr(api, "_kb_node_capability", lambda cur: "absent")
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "absent")
+
+
 def _skip_if_not_sim():
     from opensearch_pipeline.config import get_config
     if not get_config().simulate_api:

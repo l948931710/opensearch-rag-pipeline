@@ -1,0 +1,178 @@
+# -*- coding: utf-8 -*-
+"""阶段 B WP1：文档域 mode 隔离管理判定（kb_authz.can_manage_doc + api 三件套）。
+
+要锁死的（codex 2026-08-01 评审共识）：
+  · 严格 mode 隔离——node 文档的 owner_dept 残值绝不命中 legacy 管理员（越权洞）；
+  · capability 三态——absent 生成与现行逐字节同构的 SQL，unknown 一律 1=0（仅 kb_admin）；
+  · 后代集不可得（None）⇒ node 判定/腿 fail-closed，绝不回退 legacy 残值；
+  · 全 legacy 存量语义恒等（回归锚）。
+"""
+from opensearch_pipeline.kb_authz import KbIdentity, can_manage_doc
+
+
+def _kb(role="dept_admin", owners=(), roots=()):
+    return KbIdentity.build(user_id="u1", role=role,
+                            granted_owner_depts=list(owners),
+                            granted_node_roots=list(roots))
+
+
+# ── can_manage_doc 真值表 ─────────────────────────────────────────────────────
+def test_kb_admin_manages_everything():
+    kb = _kb(role="kb_admin")
+    assert can_manage_doc(kb, "legacy", "hr", None, None)
+    assert can_manage_doc(kb, "node", None, 599318766, None)
+    assert can_manage_doc(kb, "weird", None, None, None)
+
+
+def test_employee_never_manages():
+    kb = _kb(role="employee", owners=["hr"], roots=[100])
+    assert not can_manage_doc(kb, "legacy", "hr", None, {100})
+
+
+def test_legacy_hit_and_miss_with_umbrella():
+    kb = _kb(owners=["production"])
+    assert can_manage_doc(kb, "legacy", "production", None, None)
+    # 伞形展开：子线文档归 production 管理员（与既有 _kb_can_manage 同语义）
+    assert can_manage_doc(kb, "legacy", "production_paper_cup", None, None)
+    assert not can_manage_doc(kb, "legacy", "hr", None, None)
+
+
+def test_node_doc_never_matches_legacy_residual_owner():
+    """★ 核心隔离：node 文档 owner_dept 残值 = 该管理员的组码，也**不得**放行。"""
+    kb = _kb(owners=["production"], roots=())
+    assert not can_manage_doc(kb, "node", "production", 599318766, set())
+
+
+def test_node_hit_and_miss_by_descendants():
+    kb = _kb(roots=[100])
+    assert can_manage_doc(kb, "node", None, 110, {100, 110, 111})
+    assert not can_manage_doc(kb, "node", None, 999, {100, 110, 111})
+
+
+def test_node_descendants_unavailable_fails_closed():
+    """后代集 None（快照过期/读失败）⇒ False，绝不回退 legacy 残值判定。"""
+    kb = _kb(owners=["production"], roots=[100])
+    assert not can_manage_doc(kb, "node", "production", 110, None)
+
+
+def test_unknown_mode_and_missing_owner_id_fail_closed():
+    kb = _kb(owners=["hr"], roots=[100])
+    assert not can_manage_doc(kb, "weird", "hr", 100, {100})
+    assert not can_manage_doc(kb, "node", None, None, {100})
+
+
+def test_legacy_doc_ignores_node_axis():
+    """两轴独立：只有 node 管辖根的管理员管不了 legacy 文档。"""
+    kb = _kb(owners=(), roots=[100])
+    assert not can_manage_doc(kb, "legacy", "hr", None, {100})
+
+
+# ── _kb_doc_owner_scope_sql ──────────────────────────────────────────────────
+def _scope(kb, cap, monkeypatch=None, descendants="unset"):
+    from opensearch_pipeline import api
+    if descendants != "unset":
+        monkeypatch.setattr(api, "_kb_managed_descendants", lambda _kb: descendants)
+    return api._kb_doc_owner_scope_sql(kb, cap)
+
+
+def test_scope_kb_admin_unrestricted():
+    assert _scope(_kb(role="kb_admin"), "present") == ("", [], False)
+
+
+def test_scope_absent_bytes_identical_to_legacy_helper():
+    """★ 回归锚：cap=absent 生成的 SQL 与现行 _kb_owner_scope_sql(kb, "m.owner_dept")
+    逐字节同构——060 未 apply 的环境行为零变化。"""
+    from opensearch_pipeline import api
+    kb = _kb(owners=["hr", "production"])
+    clause, params, degraded = api._kb_doc_owner_scope_sql(kb, "absent")
+    old_clause, old_params = api._kb_owner_scope_sql(kb, "m.owner_dept")
+    assert clause == old_clause and params == old_params and degraded is False
+
+
+def test_scope_absent_no_owners_matches_empty():
+    clause, params, degraded = _scope(_kb(owners=()), "absent")
+    assert clause == "AND 1=0" and params == [] and not degraded
+
+
+def test_scope_unknown_fails_closed_and_degraded():
+    """探测失败 ≠ 未 apply：unknown 一律 1=0（把它当 absent 会违反「未知仅 kb_admin」裁决）。"""
+    clause, params, degraded = _scope(_kb(owners=["hr"]), "unknown")
+    assert clause == "AND 1=0" and degraded is True
+
+
+def test_scope_present_mode_isolated_two_legs(monkeypatch):
+    kb = _kb(owners=["hr"], roots=[100])
+    clause, params, degraded = _scope(kb, "present", monkeypatch, {100, 110})
+    assert "m.acl_mode='legacy' AND m.owner_dept IN" in clause
+    assert "m.acl_mode='node' AND m.owner_dept_id IN" in clause
+    assert " OR " in clause and params == ["hr", 100, 110] and not degraded
+
+
+def test_scope_present_node_leg_dropped_when_descendants_unavailable(monkeypatch):
+    """后代集 None ⇒ 去 node 腿 + degraded；legacy 腿保留（legacy 文档不受波及）。"""
+    kb = _kb(owners=["hr"], roots=[100])
+    clause, params, degraded = _scope(kb, "present", monkeypatch, None)
+    assert "acl_mode='node'" not in clause and "m.acl_mode='legacy'" in clause
+    assert params == ["hr"] and degraded is True
+
+
+def test_scope_present_no_axis_matches_empty(monkeypatch):
+    clause, params, degraded = _scope(_kb(), "present", monkeypatch, set())
+    assert clause == "AND 1=0" and params == []
+
+
+# ── _kb_node_capability 三态 ─────────────────────────────────────────────────
+def test_capability_tri_state(monkeypatch):
+    from opensearch_pipeline import access_grants, api
+    calls = {}
+
+    def fake(cursor, strict=False):
+        calls["strict"] = strict
+        r = calls["ret"]
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    monkeypatch.setattr(access_grants, "_node_acl_columns_present", fake)
+    calls["ret"] = True
+    assert api._kb_node_capability(None) == "present" and calls["strict"] is True
+    calls["ret"] = False
+    assert api._kb_node_capability(None) == "absent"
+    calls["ret"] = RuntimeError("probe boom")
+    assert api._kb_node_capability(None) == "unknown"
+
+
+# ── _kb_read_doc_triplet 双路 ────────────────────────────────────────────────
+class _Cur:
+    def __init__(self, row):
+        self._row, self.sqls = row, []
+
+    def execute(self, sql, args=()):
+        self.sqls.append(" ".join(sql.split()))
+
+    def fetchone(self):
+        return self._row
+
+
+def test_read_triplet_present(monkeypatch):
+    from opensearch_pipeline import api
+    monkeypatch.setattr(api, "_kb_node_capability", lambda cur: "present")
+    cur = _Cur(("", "node", 110, 3, "dept_internal", "active"))
+    t = api._kb_read_doc_triplet(cur, "d1")
+    assert t["acl_mode"] == "node" and t["owner_dept_id"] == 110 and t["acl_revision"] == 3
+    assert "acl_mode" in cur.sqls[0]
+
+
+def test_read_triplet_absent_falls_back_legacy_columns(monkeypatch):
+    from opensearch_pipeline import api
+    monkeypatch.setattr(api, "_kb_node_capability", lambda cur: "absent")
+    cur = _Cur(("hr", "dept_internal", "active"))
+    t = api._kb_read_doc_triplet(cur, "d1")
+    assert t["acl_mode"] == "legacy" and t["owner_dept_id"] is None and t["owner_dept"] == "hr"
+    assert "acl_mode" not in cur.sqls[0]
+
+
+def test_read_triplet_missing_doc_none(monkeypatch):
+    from opensearch_pipeline import api
+    monkeypatch.setattr(api, "_kb_node_capability", lambda cur: "present")
+    assert api._kb_read_doc_triplet(_Cur(None), "nope") is None

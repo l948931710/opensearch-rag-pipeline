@@ -871,6 +871,8 @@ def resolve_kb_identity(staff_id: str):
                 role=os.environ.get("RAG_SIM_USER_ROLE", ROLE_EMPLOYEE),
                 acl_groups=ident.get("dept") or [],
                 granted_owner_depts=os.environ.get("RAG_SIM_MANAGED_OWNER_DEPTS", ""),
+                granted_node_roots=[s for s in os.environ.get(
+                    "RAG_SIM_MANAGED_NODE_ROOTS", "").split(",") if s.strip()],
             )
     except Exception:
         pass
@@ -878,6 +880,7 @@ def resolve_kb_identity(staff_id: str):
     role = ROLE_EMPLOYEE
     name = ""
     managed: List[str] = []
+    node_roots: List[int] = []
     try:
         from opensearch_pipeline.db import _get_db_conn
 
@@ -901,6 +904,19 @@ def resolve_kb_identity(staff_id: str):
                     (staff_id,),
                 )
                 managed = [r[0] for r in cur.fetchall() if r and r[0]]
+                # 阶段 B 管理轴：node 管辖根（dept_admin_node_grant，auto+manual 有效行）。
+                # 独立 try：060 未 apply 的环境（1146 表缺失）只让**节点轴**为空，
+                # 绝不把整个身份 fail-closed 成 employee——那会误伤 legacy dept_admin。
+                try:
+                    cur.execute(
+                        f"SELECT managed_dept_id FROM {_kb_db()}.dept_admin_node_grant "
+                        "WHERE user_id=%s AND is_active=1",
+                        (staff_id,),
+                    )
+                    node_roots = [r[0] for r in cur.fetchall() if r and r[0]]
+                except Exception as ne:   # noqa: BLE001 — 表缺失/读失败 ⇒ 节点轴空（收紧方向）
+                    logger.debug("dept_admin_node_grant 读取失败（节点轴按空处理）staff_id=%s: %s",
+                                 staff_id, ne)
         finally:
             conn.close()
     except Exception as e:
@@ -911,6 +927,7 @@ def resolve_kb_identity(staff_id: str):
     return KbIdentity.build(
         user_id=staff_id, name=name, role=role,
         acl_groups=acl_groups, granted_owner_depts=managed,
+        granted_node_roots=node_roots,
     )
 
 

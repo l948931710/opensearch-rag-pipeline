@@ -39,9 +39,11 @@ from opensearch_pipeline.api import (
     _KB_MAX_OFFSET,
     _enforce_rate_limit,
     _kb_can_manage,
+    _kb_can_manage_doc,
     _kb_content_dups,
     _kb_db,
-    _kb_owner_scope_sql,
+    _kb_doc_owner_scope_sql,
+    _kb_node_capability,
     _kb_status_badge,
     _load_org_tree_snapshot,
     _require_kb_admin,
@@ -236,7 +238,6 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     kb = _require_kb_console(identity)
     limit = max(1, min(limit, 50))
     offset = max(0, min(offset, _KB_MAX_OFFSET))   # 上界防深分页扫表（全库 ~1600，1万 offset 绰绰有余，G7）
-    clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
     search_clause, search_params = _kb_like_search_sql(q)
     owner_clause, owner_params = _kb_owner_facet_sql(owner_dept)
     if owner_clause is None:
@@ -247,6 +248,10 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # 阶段 B：mode 隔离作用域（capability 探测要 cursor，故在连接内构造——
+                # absent 环境生成与旧 _kb_owner_scope_sql 逐字节同构的 SQL）
+                cap = _kb_node_capability(cur)
+                clause, params, _deg = _kb_doc_owner_scope_sql(kb, cap)
                 # faceted 计数先行（主查询保持「最后一次 execute」——既有 SQL 捕获类测试的锚点）
                 badge_counts = _kb_badge_counts(
                     cur,
@@ -375,6 +380,11 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
         raise HTTPException(status_code=500, detail=f"全部门浏览查询失败 (trace: {trace_id})")
 
     has_more = len(rows) > limit
+    # 阶段 B：browse 行级 can_manage 改 mode 隔离——node 文档绝不因 owner_dept 残值
+    # 显示为"可管理"。行里没有三元组（browse SELECT 未取 acl_mode），此处按批量补查
+    # 成本不值（每页 ≤50 行且只是 UI 提示位，真边界在写端点的 _kb_can_manage_doc）；
+    # 取保守面：browse 是全部门视图，legacy 判定照旧，acl_mode 列由 WP4 的 owner DTO
+    # 统一时一并进 SELECT 后切 _kb_can_manage_doc。
     items = []
     for r in rows[:limit]:
         (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r
@@ -415,20 +425,20 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
     # perf（2026-07-16）：stats 接入既有看板 TTL 缓存（键按作用域分片，永不跨权限串数据）——
     # 此前 stats 是管理台首屏最慢端点（实测 4.6-5.2s）且每请求现算。
-    cache_key = ("stats", tuple(sorted(str(p) for p in params)) if clause else "GLOBAL")
+    # 阶段 B：键改按身份的两条授权轴（owners + node roots）——capability/后代集要 cursor
+    # 才能算，而缓存命中必须发生在开连接**之前**才有 perf 价值；同轴身份共享条目，组织
+    # 快照变动的陈旧窗口 = 看板 TTL（30s），与既有语义一致。
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN as _RKA
+    from opensearch_pipeline.kb_authz import managed_owner_depts as _managed
+    _scope_key = ("GLOBAL" if kb.role == _RKA else
+                  (tuple(sorted(_managed(kb))),
+                   tuple(sorted(getattr(kb, "granted_node_roots", ()) or ()))))
+    cache_key = ("stats", _scope_key)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
-    # node-ACL（2026-07-31）：分块作用域**必须走 document_meta.owner_dept**，不能用
-    # chunk_meta.owner_dept —— 后者是【检索投影轴】，node 模式文档在那一列上是哨兵
-    # `__acl_node_mode_v1__`（acl_policy.project_doc_acl 的模式互斥不变量），按它过滤会让
-    # 整篇 node 文档的分块从 dept_admin 的部门统计里静默消失（归属轴 document_meta.owner_dept
-    # 仍是真实部门，文档级计数因此不受影响 —— 只有这一处分块计数会分叉）。
-    ck_clause, ck_params = _kb_owner_scope_sql(kb, "m.owner_dept")  # 归属轴（JOIN document_meta）
-    dm_clause, dm_params = _kb_owner_scope_sql(kb, "owner_dept")   # document_meta.owner_dept（本月新增计数）
     from datetime import date
     month_start = date.today().replace(day=1).isoformat()         # 当月首日；以参数传入避免 % 转义坑
     chunks = new_this_month = 0
@@ -438,6 +448,14 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # 阶段 B：mode 隔离作用域（在连接内构造，absent 环境与旧 SQL 逐字节同构）。
+                # node-ACL（2026-07-31）：分块作用域**必须走 document_meta.owner_dept**，不能用
+                # chunk_meta.owner_dept —— 后者是【检索投影轴】，node 模式文档在那一列上是哨兵
+                # `__acl_node_mode_v1__`，按它过滤会让整篇 node 文档的分块从 dept_admin 的部门
+                # 统计里静默消失（归属轴仍是真实部门/owner_dept_id，文档级计数不受影响）。
+                cap = _kb_node_capability(cur)
+                clause, params, _deg = _kb_doc_owner_scope_sql(kb, cap)
+                ck_clause, ck_params = clause, params   # 归属轴（JOIN document_meta，同 alias m）
                 # perf（2026-07-16）：状态分布改【服务端 GROUP BY】——此前整表 1936 行拉回
                 # Python 分桶（实测该查询 1.2s，传输占大头），现只回 status×徽章×归属 的几十行。
                 # 徽章走 _KB_BADGE_CASE_SQL（与 _kb_status_badge 的奇偶校验测试钉死同义）。
@@ -473,9 +491,9 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                 # 本月新增文档数（设计「+N 本月新增」徽标）；月首日以参数传入；取数失败仅置 0。
                 try:
                     cur.execute(
-                        f"SELECT COUNT(*) FROM {_kb_db()}.document_meta "
-                        f"WHERE created_at >= %s AND status='active' {dm_clause}",
-                        tuple([month_start] + dm_params),
+                        f"SELECT COUNT(*) FROM {_kb_db()}.document_meta m "
+                        f"WHERE m.created_at >= %s AND m.status='active' {clause}",
+                        tuple([month_start] + list(params)),
                     )
                     new_this_month = int((cur.fetchone() or (0,))[0] or 0)
                 except Exception as e:
@@ -650,16 +668,17 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
-    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    from opensearch_pipeline.kb_authz import managed_owner_depts as _managed
     win = _KB_INSIGHTS_WINDOW_DAYS
-    # 角色/作用域解析之后才查缓存：键按作用域分片，永不跨权限串数据
-    cache_key = ("insights",
-                 tuple(sorted(str(p) for p in scope_params)) if scope_clause else "GLOBAL", win)
+    # 角色/作用域解析之后才查缓存：键按作用域分片，永不跨权限串数据。
+    # 阶段 B：键按身份两条授权轴（capability/后代集要 cursor，缓存命中须在开连接前）。
+    _scope_key = ("GLOBAL" if kb.role == ROLE_KB_ADMIN else
+                  (tuple(sorted(_managed(kb))),
+                   tuple(sorted(getattr(kb, "granted_node_roots", ()) or ()))))
+    cache_key = ("insights", _scope_key, win)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
-    base = _kb_qa_owner_join() + (" " + scope_clause if scope_clause else "")
-    args = tuple([win] + scope_params)
     out = KbInsightsResponse(scope=("global" if kb.role == ROLE_KB_ADMIN else "dept"), window_days=win)
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -675,6 +694,11 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
         # 共享一个游标跑多条子查询：依赖 pymysql 默认 buffered Cursor（_init_db_pool 未设 SSCursor），
         # 某子查询异常后结果已全量缓冲，下一句 execute 不会 "Commands out of sync (2014)"。
         with conn.cursor() as cur:
+            # 阶段 B：mode 隔离作用域（连接内构造；absent 环境与旧 SQL 逐字节同构）
+            _cap = _kb_node_capability(cur)
+            scope_clause, scope_params, _deg = _kb_doc_owner_scope_sql(kb, _cap)
+            base = _kb_qa_owner_join() + (" " + scope_clause if scope_clause else "")
+            args = tuple([win] + list(scope_params))
             # 1) 使用聚合：提问数 / 提问人 / 成功 / 拒答（DISTINCT message_id 去 JSON 扇出）
             try:
                 cur.execute(
@@ -794,15 +818,17 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
-    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    from opensearch_pipeline.kb_authz import managed_owner_depts as _managed
     win = _KB_INSIGHTS_WINDOW_DAYS
     limit = max(1, min(limit, 50))
     # 处置态过滤：默认只收未处置（handled_status IS NULL / '' / PENDING / AWAITING_COMMENT）。
     handled_clause = "" if include_resolved else (
         " AND (f.handled_status IS NULL OR f.handled_status NOT IN ('RESOLVED','DISMISSED'))")
-    cache_key = ("fb_review",
-                 tuple(sorted(str(p) for p in scope_params)) if scope_clause else "GLOBAL",
-                 win, limit, include_resolved)
+    # 阶段 B：键按身份两条授权轴（同 stats/insights；scope SQL 在连接内构造）
+    _scope_key = ("GLOBAL" if kb.role == ROLE_KB_ADMIN else
+                  (tuple(sorted(_managed(kb))),
+                   tuple(sorted(getattr(kb, "granted_node_roots", ()) or ()))))
+    cache_key = ("fb_review", _scope_key, win, limit, include_resolved)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -814,6 +840,9 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                _cap = _kb_node_capability(cur)
+                scope_clause, scope_params, _deg = _kb_doc_owner_scope_sql(kb, _cap)
+                scope_params = list(scope_params)
                 # 平铺 (message, doc) 行，Python 侧按 message 分组保序（GROUP_CONCAT 拼结构太脆）。
                 # LIMIT 300 行 ≈ 数十条差评 × 引用文档数，上限后截 limit 条消息。
                 cur.execute(
@@ -893,7 +922,6 @@ def kb_feedback_resolve(req: KbFeedbackResolveRequest, request: Request,
         raise HTTPException(status_code=400, detail="非法处置动作")
     assert_metadata_write_allowed("kb_feedback_resolve", get_config().rds.host, kind="rds")
     trace_id = get_request_id()
-    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
     try:
         from opensearch_pipeline.db import _get_db_conn
         from opensearch_pipeline.qa_facts import qa_docs_join_sql
@@ -902,6 +930,9 @@ def kb_feedback_resolve(req: KbFeedbackResolveRequest, request: Request,
             with conn.cursor() as cur:
                 # dept_admin 越权守卫：确认该差评回答引用了调用者作用域内文档（kb_admin scope 为空 → 恒过）。
                 if kb.role != ROLE_KB_ADMIN:
+                    _cap = _kb_node_capability(cur)
+                    scope_clause, scope_params, _deg = _kb_doc_owner_scope_sql(kb, _cap)
+                    scope_params = list(scope_params)
                     cur.execute(
                         "SELECT 1"
                         f" FROM {_op_db()}.user_feedback f"
@@ -1835,13 +1866,17 @@ def kb_version_history(request: Request, doc_id: str,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT owner_dept, status FROM {_kb_db()}.document_meta "
+                # 阶段 B：mode 隔离授权（capability=absent 环境走 legacy 列，行为不变）
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, status{_mc} FROM {_kb_db()}.document_meta "
                             "WHERE doc_id=%s LIMIT 1", (doc_id,))
                 meta = cur.fetchone()
                 if not meta:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, _doc_status = meta[0] or "", meta[1]
-                if not _kb_can_manage(kb, owner_dept):
+                _mode, _oid = ((meta[2] or "legacy"), meta[3]) if _cap == "present" else ("legacy", None)
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权查看该文档")
                 cur.execute(
                     f"""
@@ -1887,13 +1922,16 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, status, current_version_no "
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, status, current_version_no{_mc} "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (doc_id,))
                 meta = cur.fetchone()
                 if not meta:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, doc_status, cur_ver = meta[0] or "", meta[1], int(meta[2] or 1)
-                if not _kb_can_manage(kb, owner_dept):
+                _mode, _oid = ((meta[3] or "legacy"), meta[4]) if _cap == "present" else ("legacy", None)
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权查看该文档")
                 vno = int(version) if version else cur_ver
                 cur.execute(
@@ -1964,9 +2002,11 @@ def kb_doc_preview(request: Request, doc_id: str, version: int = 0,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                _cap = _kb_node_capability(cur)
+                _mc = ", m.acl_mode, m.owner_dept_id" if _cap == "present" else ""
                 # 一次 JOIN 取 归属 + 原文件名 + 该版本 raw_key（version=0 → 落到 current_version_no）。
                 cur.execute(
-                    "SELECT m.owner_dept, m.original_filename, v.raw_key, v.version_no"
+                    f"SELECT m.owner_dept, m.original_filename, v.raw_key, v.version_no{_mc}"
                     f" FROM {_kb_db()}.document_meta m"
                     f" JOIN {_kb_db()}.document_version v"
                     "   ON v.doc_id = m.doc_id AND v.version_no = IF(%s > 0, %s, m.current_version_no)"
@@ -1986,8 +2026,9 @@ def kb_doc_preview(request: Request, doc_id: str, version: int = 0,
     if not row:
         raise HTTPException(status_code=404, detail="文档或版本不存在")
     owner_dept, filename, raw_key, vno = (row[0] or ""), (row[1] or ""), (row[2] or ""), int(row[3] or 0)
+    _mode, _oid = ((row[4] or "legacy"), row[5]) if len(row) > 4 else ("legacy", None)
     # 授权先于任何 URL 生成：受限/他部门原件绝不外露（dept_admin 越权直接 403）。
-    if not _kb_can_manage(kb, owner_dept):
+    if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
         raise HTTPException(status_code=403, detail="无权预览该文档")
     if not raw_key:
         return KbDocPreviewResponse(doc_id=doc_id, version_no=vno, filename=filename, available=False)
@@ -2127,8 +2168,10 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
             conn = _get_db_conn()
             try:
                 with conn.cursor() as cur:
-                    cur.execute(f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
-                                "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
+                    _cap = _kb_node_capability(cur)
+                    _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                    cur.execute(f"SELECT owner_dept, permission_level, status{_mc} "
+                                f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (req.doc_id,))
                     row = cur.fetchone()
             finally:
                 conn.close()
@@ -2140,6 +2183,12 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
             raise HTTPException(status_code=500, detail=f"查询文档失败 (trace: {trace_id})")
         if not row:
             raise HTTPException(status_code=404, detail="升版目标文档不存在")
+        _mode, _oid = ((row[3] or "legacy"), row[4]) if len(row) > 3 else ("legacy", None)
+        if (_mode or "legacy") != "legacy":
+            # node 文档升版由 WP2 的 node 上传契约承接（raw/node-<id>/ 命名空间 + token 带
+            # owner_dept_id）；legacy 通道的 owner 一致性检查对 node 文档无意义（owner_dept=NULL），
+            # 且 legacy raw-key 会让 stage-1 按路径重派归属。在 WP2 落地前显式拒绝。
+            raise HTTPException(status_code=409, detail="该文档为组织树授权模式，暂不支持经此通道升版")
         if (row[0] or "") != owner or not _kb_can_manage(kb, owner):
             raise HTTPException(status_code=403, detail="无权升版该文档（owner_dept 不在管理范围）")
         # F-37 早失败：退役文档禁止升版——否则新版本会被 stage-1 认领复活（认领只看 dv.status）。
@@ -2577,16 +2626,19 @@ def kb_retire(req: KbRetireRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                # 行锁文档元数据，串行化并发退役 / 退役-vs-升版
-                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                # 行锁文档元数据，串行化并发退役 / 退役-vs-升版；锁内读齐 mode 三元组（阶段 B）
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status, current_version_no{_mc} "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm = (row[0] or ""), (row[1] or "")
                 status, cur_ver = (row[2] or "active"), int(row[3] or 1)
+                _mode, _oid = ((row[4] or "legacy"), row[5]) if _cap == "present" else ("legacy", None)
                 # 授权：先作用域，再"公开需 kb_admin"（与上传同款不对称——公开影响全公司）
-                if not _kb_can_manage(kb, owner_dept):
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权退役该文档（owner_dept 不在管理范围）")
                 if perm == "public" and kb.role != ROLE_KB_ADMIN:
                     raise HTTPException(status_code=403, detail="公开文档需知识库管理员退役")
@@ -2674,15 +2726,18 @@ def kb_restore(req: KbRetireRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status, current_version_no{_mc} "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm = (row[0] or ""), (row[1] or "")
                 status, cur_ver = (row[2] or "active"), int(row[3] or 1)
+                _mode, _oid = ((row[4] or "legacy"), row[5]) if _cap == "present" else ("legacy", None)
                 # 授权：与退役同款不对称——作用域 + 公开文档需 kb_admin
-                if not _kb_can_manage(kb, owner_dept):
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权恢复该文档（owner_dept 不在管理范围）")
                 if perm == "public" and kb.role != ROLE_KB_ADMIN:
                     raise HTTPException(status_code=403, detail="公开文档需知识库管理员恢复")
@@ -2768,14 +2823,17 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status, current_version_no{_mc} "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, cur_perm = (row[0] or ""), (row[1] or "")
                 status, cur_ver = (row[2] or "active"), int(row[3] or 1)
-                if not _kb_can_manage(kb, owner_dept):
+                _mode, _oid = ((row[4] or "legacy"), row[5]) if _cap == "present" else ("legacy", None)
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权修改该文档（owner_dept 不在管理范围）")
                 # public 涉及全公司可见 → 收窄/放宽均需 kb_admin（与 retire/restore/上传同款不对称）
                 if (target == "public" or cur_perm == "public") and kb.role != ROLE_KB_ADMIN:
