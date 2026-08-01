@@ -208,6 +208,25 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(autouse=True)
+def _reset_node_acl_capability_cache():
+    """node-ACL capability 探测的 positive-only 进程内缓存（access_grants，2026-07-31）。
+
+    该缓存建模的是「这个物理库的 acl_mode 列已存在」这一**单调事实**，键 = (host, database)。
+    生产里它永不失效；但测试用**同一套 config** 伪造「已 apply / 未 apply」两种 schema 形态，
+    先跑的 True 会把后跑的「未 apply」用例污染成 node（实测：test_node_acl_write_paths.py::
+    test_modes_default_legacy_when_migration_absent 单跑绿、全量红）。故每测清空。
+    仅在模块已导入时处理（sys.modules 探测，零 import 成本）。"""
+    import sys as _sys
+    _mod = _sys.modules.get("opensearch_pipeline.access_grants")
+    if _mod is not None and hasattr(_mod, "_NODE_SCHEMA_PRESENT"):
+        _mod._NODE_SCHEMA_PRESENT.clear()
+    yield
+    _mod = _sys.modules.get("opensearch_pipeline.access_grants")
+    if _mod is not None and hasattr(_mod, "_NODE_SCHEMA_PRESENT"):
+        _mod._NODE_SCHEMA_PRESENT.clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_ready_probe_cache():
     """批次7（ultra api:593）：/api/ready 探针结果进程级 TTL 缓存——非 sim 的 readiness
     测试各自 monkeypatch 探针并断言当次结果，缓存跨测试残留会串台。仅在 api 已导入时

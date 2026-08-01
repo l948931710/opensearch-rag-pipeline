@@ -408,6 +408,28 @@ def _expand_groups_to_owners(groups: List[str]) -> List[str]:
     return sorted(owners)
 
 
+def groups_that_can_read_owner(owner_dept: str) -> List[str]:
+    """`_expand_groups_to_owners` 的**反向**：owner_dept → 能检索到它的【用户组码】集合。
+
+    为什么必须有这个函数（2026-07-31，codex 实测）：**owner 值域 ≠ 组码值域**。
+    `production_mold` 是合法 owner，但不是用户组码 —— 把它当组码送进过滤器只会得到
+    public-only（组码白名单会丢掉它），能读该 owner 的组码其实是 `production`/`marketing`。
+    任何"按文档 owner 反推应当能看到它的人"的场景（如 `ha3_verify` 的自查身份）都必须走
+    这里，**绝不在调用方复制一份 production/marketing taxonomy**。
+
+    返回排序去重列表；owner 为空或无人可读 ⇒ 空列表（调用方按 fail-closed 处置）。
+    """
+    owner_dept = (owner_dept or "").strip()      # 自行规范化，不指望调用方记得
+    if not owner_dept:
+        return []
+    out = {g for g, owners in _DEPT_OWNER_EXPANSION.items() if owner_dept in owners}
+    if owner_dept in _VALID_ACL_GROUPS:
+        # 未进展开表的部门：组码就是 owner 自身（精确匹配）。**必须过白名单** ——
+        # 否则 production_mold 这类"只是 owner"的值会被当成组码传出去，等于查了个寂寞。
+        out.add(owner_dept)
+    return sorted(out)
+
+
 def audit_production_owner_taxonomy(active_owner_depts) -> List[str]:
     """Surface production-like owner_dept values present in data but NOT in the umbrella
     taxonomy. Such owners are invisible to 'production' users (fail-closed) until added
@@ -474,8 +496,16 @@ def _build_permission_filter(user_dept: Union[str, List[str], None], *, acl_ctx=
     'production' 伞组经 _expand_groups_to_owners 展开为各 production* 子线 owner（其余组精确匹配）。
     """
     groups = _normalize_acl_groups(user_dept)
+    # node-ACL 分支【必须先于空-groups 早退算出来】（2026-07-31，codex 共识）：
+    # 组码通道与节点通道是**两条独立通道** —— `acl_policy.can_read_doc` 的 node 分支
+    # 压根不读 `ctx.groups`（只看 node_channel_ok / org_wide_reader / 祖先链∩授权节点）。
+    # 原实现在 groups 为空时直接返回 public-only，导致**过滤器比权威判定更严**：
+    # 无组码映射的员工（现网部门映射缺口 26/131）即便被节点授权也只看得到 public。
+    # 修正后语义只在 (groups 空) ∧ (acl_ctx 非空) ∧ (GRANT=on) ∧ (节点项非空) 时变化，
+    # 且该集合正是 can_read_doc 已经放行的集合 ⇒ 是**对齐**，不是放宽。
+    node_extra = _node_filter_suffix(acl_ctx)
     if not groups:
-        return '(permission_level="public")'
+        return '(permission_level="public")' + node_extra
     # groups 已净化+白名单；owners 为 taxonomy 常量（伞组展开），字符串拼接无注入风险
     owners = _expand_groups_to_owners(groups)
     dept_clause = " OR ".join('owner_dept="' + o + '"' for o in owners)
@@ -492,25 +522,39 @@ def _build_permission_filter(user_dept: Union[str, List[str], None], *, acl_ctx=
     if get_config().rag.allowed_depts_acl:
         allowed_clause = " OR ".join('allowed_depts="' + g + '"' for g in groups)
         base = base + ' OR (permission_level="dept_internal" AND (' + allowed_clause + '))'
-    # node-ACL（RAG_NODE_ACL_GRANT，默认关）：追加祖先链/直属部门的节点 OR 分支。
-    # acl_ctx=None（当前全部调用点）⇒ 整段不执行，返回串与历史逐字节一致。
-    # ⚠️ 节点值由 acl_policy 自行严格拼接，**绝不流经 _sanitize_ha3_filter_value**
-    #   （该净化器会删掉冒号，d:123 会被打成 d123）。值域只含 d:/dx: + 正整数，无注入面。
-    # org_wide_reader（总经办 `*`）：单靠事后 can_read_doc 放行不够——HA3 主过滤器压根
-    #   不会把 node 文档召回来（其 owner 是哨兵、祖先链也不含被勾节点），事后判定轮不到
-    #   执行。故给该角色一条候选分支：直接放行全部 dept_internal，召回后统一走权威复核。
-    if acl_ctx is not None:
-        grant, _enforce = _node_acl_flags()
-        if grant:
-            if getattr(acl_ctx, "org_wide_reader", False):
-                base = base + ' OR (permission_level="dept_internal")'
-            else:
-                from opensearch_pipeline.acl_policy import node_filter_terms
-                terms = node_filter_terms(acl_ctx)
-                if terms:
-                    node_clause = " OR ".join('allowed_depts="' + t + '"' for t in terms)
-                    base = base + ' OR (permission_level="dept_internal" AND (' + node_clause + '))'
-    return base
+    return base + node_extra
+
+
+def _node_filter_suffix(acl_ctx) -> str:
+    """node-ACL 追加分支（RAG_NODE_ACL_GRANT，默认关）→ 待拼在过滤表达式末尾的后缀。
+
+    `acl_ctx=None` ⇒ 恒返回 `""` ⇒ `_build_permission_filter` 的两条返回路径都与历史
+    **逐字节一致**（全部 legacy 调用点、flag 关时的全部调用点都落在这里）。
+
+    ⚠️ 节点值由 acl_policy 自行严格拼接，**绝不流经 _sanitize_ha3_filter_value**
+      （该净化器会删掉冒号，d:123 会被打成 d123）。值域只含 d:/dx: + 正整数，无注入面。
+    org_wide_reader（总经办 `*`）：单靠事后 can_read_doc 放行不够——HA3 主过滤器压根
+      不会把 node 文档召回来（其 owner 是哨兵、祖先链也不含被勾节点），事后判定轮不到
+      执行。故给该角色一条候选分支：直接放行全部 dept_internal，召回后统一走权威复核。
+      ⚠️ 该分支**必须与 can_read_doc 同样先过 node_channel_ok**（acl_policy.py:283 在
+      org_wide_reader 之前判它）：组织快照不可信时连节点语义都不成立，此时放出「全部
+      dept_internal」候选只会把判定压力全推给事后复核（2026-07-31 codex 评审）。
+    """
+    if acl_ctx is None:
+        return ""
+    grant, _enforce = _node_acl_flags()
+    if not grant:
+        return ""
+    if not getattr(acl_ctx, "node_channel_ok", False):
+        return ""                       # 祖先链不可信 ⇒ 无节点通道（与 can_read_doc 同序）
+    if getattr(acl_ctx, "org_wide_reader", False):
+        return ' OR (permission_level="dept_internal")'
+    from opensearch_pipeline.acl_policy import node_filter_terms
+    terms = node_filter_terms(acl_ctx)
+    if not terms:
+        return ""
+    node_clause = " OR ".join('allowed_depts="' + t + '"' for t in terms)
+    return ' OR (permission_level="dept_internal" AND (' + node_clause + '))'
 
 
 # ── E#39：查询侧授权复核的 (doc_id → approved 组码集) 进程内 TTL 缓存 ──────────
@@ -539,41 +583,64 @@ def invalidate_deny_cache(doc_id: Optional[str] = None) -> None:
             _deny_cache.pop(doc_id, None)
 
 
-def _deny_revoked_node_hits(results, acl_ctx, cross_idx):
-    """node-ACL 的查询侧复核:对【全部非 public 跨部门命中】按当前权威 + 真值表判定。
+def _deny_revoked_node_hits(results, acl_ctx, cand_idx, owner_set):
+    """node-ACL 的查询侧复核：对【全部非 public 命中】按当前权威 + 真值表判定（mode-dispatch）。
 
-    ⚠️ 为什么必须有这条:`RAG_ALLOWED_DEPTS_ACL` 现网已开 ⇒ 下方 legacy 复核是**活代码**,
-    它做的是**纯组码相交**;node 授权命中的 doc 没有任何组码 ⇒ 会被它整批**误丢**,
-    node 文档在生产上根本查不出来。这不是设计缺陷而是阻断项(codex 增量评审)。
+    ⚠️ 为什么候选是「全部非 public」而不是「跨部门」（2026-07-31 codex 共识，实测复现）：
+    一篇 RDS 权威已切 node 的文档，在投影未收敛期 HA3 里可能**还是旧的真实 owner**。
+    若该 owner 恰好等于调用者的组码，旧口径（owner ∉ 自有集才算候选）就**不会复核它**，
+    于是 `can_read_doc` 根本没机会执行 —— 设计稿 §8 承诺的「关 GRANT ⇒ node 文档非 public
+    命中全部被拒 = 真 public-only」当场落空。实测：
+        GRANT=false + 陈旧 owner 'hr' + 调用者组码 'hr' ⇒ 文档仍被投放。
 
-    ⚠️ 过渡期**不能靠哨兵识别 node 命中**:`acl_mode` 不进 HA3,而未收敛的投影里旧 owner
-    可能还在、哨兵尚未写下 ⇒ 必须对全部候选**批量查当前 acl_mode**(这里与权威解析一次
-    往返合并完成,不额外加 DB 往返)。
+    ⚠️ 过渡期**不能靠哨兵识别 node 命中**：`acl_mode` 不进 HA3，未收敛投影里哨兵尚未写下
+    ⇒ 必须对全部候选**批量查当前 acl_mode**（与权威解析一次往返合并，不额外加 DB 往返）。
 
-    返回需要丢弃的下标集合。权威不可达 ⇒ 丢弃全部候选(fail-closed,机密性优先)。
+    **mode-dispatch（刻意不对全部候选无差别调 can_read_doc）**：
+      · mode 不可判（缺行 / 未知 mode / 权威不可达）⇒ 丢弃
+      · node    ⇒ 恒走 `can_read_doc`（这正是本函数存在的理由）
+      · legacy 且 owner ∈ 调用者自有集 ⇒ **保留**，维持旧 same-owner 语义
+      · legacy 且跨部门          ⇒ 走 `can_read_doc`（等价于既有 legacy 授权复核）
+    为什么 legacy same-owner 不一并复核：那会新增「owner 漂移即拒 / permission 暂时不一致
+    即拒」等本批次不需要的 legacy 行为扩面，而 same-owner 本就不是可撤销的组码 grant。
+
+    返回需要丢弃的下标集合。权威不可达 ⇒ 丢弃**全部**候选（fail-closed，机密性优先）。
     """
-    from opensearch_pipeline.acl_policy import can_read_doc
+    from opensearch_pipeline.acl_policy import ACL_MODE_NODE, can_read_doc
     grant, enforce = _node_acl_flags()
-    doc_ids = {results[i].get("doc_id") for i in cross_idx if results[i].get("doc_id")}
+    doc_ids = {results[i].get("doc_id") for i in cand_idx if results[i].get("doc_id")}
     if not doc_ids:
-        return set()
+        # 候选都没有 doc_id ⇒ 无从按权威判定 ⇒ fail-closed 全丢（不是「没候选」）
+        return set(cand_idx)
     try:
         from opensearch_pipeline.access_grants import resolve_doc_acl
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                acls = resolve_doc_acl(doc_ids, cur)
+                # strict=True：capability/节点权威读失败一律上抛，缺行/未知 mode 不返回该 doc。
+                # 绝不能让「读不到」退化成「按 legacy 放行」——那正是 stale-owner 窗口。
+                acls = resolve_doc_acl(doc_ids, cur, strict=True)
         finally:
             conn.close()
-    except Exception as e:   # noqa: BLE001 — 权威不可达 ⇒ fail-closed 丢弃全部跨部门命中
-        logger.warning("node-ACL 查询侧复核失败,fail-closed 丢弃 %d 条跨部门命中: %s",
-                       len(cross_idx), e)
-        return set(cross_idx)
+    except Exception as e:   # noqa: BLE001 — 权威不可达 ⇒ fail-closed 丢弃全部非 public 候选
+        logger.warning("node-ACL 查询侧复核失败,fail-closed 丢弃 %d 条非 public 命中: %s",
+                       len(cand_idx), e)
+        return set(cand_idx)
     drop = set()
-    for i in cross_idx:
+    for i in cand_idx:
         acl = acls.get(results[i].get("doc_id"))
-        if acl is None or not can_read_doc(acl_ctx, acl, grant_enabled=grant, enforce_enabled=enforce):
+        if acl is None:                       # 缺行 / 未知 mode（strict 下不返回）
+            drop.add(i)
+            continue
+        if (getattr(acl, "mode", "") or "").strip().lower() == ACL_MODE_NODE:
+            if not can_read_doc(acl_ctx, acl, grant_enabled=grant, enforce_enabled=enforce):
+                drop.add(i)
+            continue
+        # ── 确认 legacy ──
+        if (results[i].get("owner_dept") or "") in owner_set:
+            continue                          # same-owner:保持旧语义，不新增拒绝面
+        if not can_read_doc(acl_ctx, acl, grant_enabled=grant, enforce_enabled=enforce):
             drop.add(i)
     if drop:
         logger.info("node-ACL 查询侧拒绝:丢弃 %d 条无在册授权的命中", len(drop))
@@ -594,22 +661,25 @@ def _deny_revoked_cross_dept(results, user_dept, *, acl_ctx=None):
     E#39：RAG_ACL_DENY_CACHE_TTL_S>0 时启用 (doc_id → approved 组码集) 进程内 TTL 缓存
     （默认 0=关闭），decide 端点提交后主动失效（invalidate_deny_cache）。
     """
-    if not get_config().rag.allowed_depts_acl or not results:
+    if not results:
         return results
     norm = _normalize_acl_groups(user_dept)
+    # ⚠️ node-ACL 分支【必须先于 legacy flag 判定】(2026-07-31 codex 共识)：
+    # 原实现把整段复核挂在 `RAG_ALLOWED_DEPTS_ACL` 之下（代码默认 false），于是
+    # node ENFORCE 这条**设计上常开**的闸门会随一个 legacy 开关一起被关掉 ——
+    # 设计稿 §8 明确要求 ENFORCE 不得随正向开关关闭。
     if acl_ctx is not None:
-        # node-ACL 接线后:候选口径与 legacy 一致(非 public 且 owner 不在自有集——node 文档
-        # 的哨兵 owner 天然落在这里),但判定改走统一真值表,不再做纯组码相交。
+        # 候选 = **全部非 public 命中**（不要求 owner 非空、不排除 owner 属自有集）。
+        # 理由见 `_deny_revoked_node_hits` 的 docstring：陈旧真实 owner 恰等于调用者组码时，
+        # 旧的「跨部门」口径会整条漏判。判定本身仍按 mode 分派，legacy same-owner 语义不变。
         _owners = set(_expand_groups_to_owners(norm))
-        _cross = [
-            i for i, r in enumerate(results)
-            if r.get("permission_level") != "public"
-            and r.get("owner_dept") and r.get("owner_dept") not in _owners
-        ]
-        if not _cross:
+        _cand = [i for i, r in enumerate(results) if r.get("permission_level") != "public"]
+        if not _cand:
             return results
-        _drop = _deny_revoked_node_hits(results, acl_ctx, _cross)
+        _drop = _deny_revoked_node_hits(results, acl_ctx, _cand, _owners)
         return [r for i, r in enumerate(results) if i not in _drop]
+    if not get_config().rag.allowed_depts_acl:
+        return results
     groups = set(norm)
     owner_set = set(_expand_groups_to_owners(norm))
     # P2-02：从「仅 dept_internal」放宽到「任何非 public」——这样字段漂移→restricted 兜底的

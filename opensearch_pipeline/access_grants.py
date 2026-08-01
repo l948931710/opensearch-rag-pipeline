@@ -14,11 +14,45 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterable, List
+import threading
+from typing import Dict, Iterable, List, Set, Tuple
 
 from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus
 
 logger = logging.getLogger(__name__)
+
+
+class NodeAclAuthorityUnavailable(RuntimeError):
+    """node-ACL 权威**不可达**（≠「查得到、结果是零授权」）。
+
+    只在 `strict=True`（serving ENFORCE 路径）抛出。宽松路径（写路径）保持原有
+    「读不到 ⇒ 按空集/legacy」的兼容行为不变。
+
+    ⚠️ 存在的理由:把故障伪装成「正常的零授权」会让 serving 无法区分两件事 ——
+    「这篇没人被授权」和「我读不到授权表」。前者应拒该篇,后者应拒**全部非 public**。
+    调用方（`retriever._deny_revoked_cross_dept`）据此整体 fail-closed。
+    """
+
+
+# ── capability 探测的 positive-only 进程内缓存 ────────────────────────────────
+# **只缓存 True**,按 (host, database) 分键。
+#   · schema/060 是 additive migration ⇒ 「列已存在」是**单调事实**,缓存不会过期变假;
+#   · 缓存 False 则会制造真实窗口:apply 之后、缓存失效之前,serving 仍把 node 文档
+#     解析成 legacy —— 那正是本批要消灭的 stale-owner 模式混淆(codex 共识 2026-07-31)。
+#     故 False 不缓存,apply 后**下一次请求即生效**(原 docstring 承诺的语义得以保留)。
+#   · 异常同样不缓存;strict 下向上抛,宽松下退回 False。
+# ⚠️ 已知后果:若有人**回滚** 060(删列),缓存仍报 True ⇒ acl_mode 查询 1054 ⇒ strict 下
+#   异常上抛 ⇒ 全部非 public 命中被丢弃,直到进程重启。方向是 fail-closed 且报错响亮,
+#   刻意不做自愈重试(回滚 additive 列不是计划内操作,静默自愈只会掩盖它)。
+_NODE_SCHEMA_PRESENT: Set[Tuple[str, str]] = set()
+_NODE_SCHEMA_LOCK = threading.Lock()
+
+
+def _schema_cache_key() -> Tuple[str, str]:
+    """(物理 host, 库名) —— 测试/staging/未来多目标进程之间绝不串值。"""
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    return (str(getattr(cfg.rds, "host", "") or ""), str(getattr(cfg.rds, "database", "") or ""))
 
 
 def _kb_db() -> str:
@@ -71,23 +105,38 @@ def resolve_allowed_depts(doc_ids: Iterable[str], cursor) -> Dict[str, List[str]
 
 
 # ── node-ACL：结构化权威解析（两个权威源【分别】解析，只在投影边界编码）──────────
-def _node_acl_columns_present(cursor) -> bool:
+def _node_acl_columns_present(cursor, *, strict: bool = False) -> bool:
     """schema/060 是否已 apply（`document_meta.acl_mode` 存在）。
 
     未 apply → 全库恒 legacy，node 分支彻底惰化（与 049 的 1054 回退同型：代码可先部署，
-    apply 是 user-gated）。**结果不缓存**——apply 是一次性事件，多查一次 information_schema
-    的代价远小于"部署后 apply 却要重启才生效"。
+    apply 是 user-gated）。
+
+    缓存语义（2026-07-31，B-2 把本探测搬上了 serving 热路径）：
+    **True 按 (host, database) 进程内缓存；False 与异常都不缓存** ——
+    见 `_NODE_SCHEMA_PRESENT` 的说明。apply 后下一次请求即生效，与原「不缓存」承诺等价。
+
+    strict=True（仅 serving ENFORCE 路径）：探测异常**向上抛**，不再伪装成「未 apply」。
     """
+    key = _schema_cache_key()
+    if key in _NODE_SCHEMA_PRESENT:
+        return True
     try:
         cursor.execute(
             "SELECT COUNT(*) FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='document_meta' AND COLUMN_NAME='acl_mode'",
             (_kb_db(),))
         row = cursor.fetchone()
-        return bool(row and row[0])
-    except Exception as e:   # noqa: BLE001 — 查不出 ⇒ 保守当作未 apply（fail-safe 退回现状）
+        present = bool(row and row[0])
+    except Exception as e:   # noqa: BLE001
+        if strict:
+            # serving:探不出 capability ⇒ 无法安全区分 node/legacy ⇒ 交给调用方整体 fail-closed
+            raise NodeAclAuthorityUnavailable("node-ACL 列探测失败，无法判定 acl_mode 归属") from e
         logger.warning("node-ACL 列探测失败，按未 apply 处理（全库 legacy）: %s", e)
         return False
+    if present:
+        with _NODE_SCHEMA_LOCK:
+            _NODE_SCHEMA_PRESENT.add(key)   # 并发首请求可能重复探测一次，无害
+    return present
 
 
 def resolve_acl_modes(doc_ids: Iterable[str], cursor) -> Dict[str, str]:
@@ -117,8 +166,25 @@ def resolve_acl_modes(doc_ids: Iterable[str], cursor) -> Dict[str, str]:
     return out
 
 
-def resolve_doc_acl(doc_ids: Iterable[str], cursor) -> Dict[str, "object"]:
+def resolve_doc_acl(doc_ids: Iterable[str], cursor, *, strict: bool = False) -> Dict[str, "object"]:
     """聚合给定 doc 的【结构化 ACL 权威】→ {doc_id: acl_policy.DocAcl}。
+
+    **strict=True 仅供 serving ENFORCE 路径**（`retriever._deny_revoked_cross_dept`）。
+    写路径（ingestion / 升版 / re-chunk / materialize）一律用默认宽松语义 —— 那里的
+    「部署先于 schema apply」兼容行为是刻意的，不能被本参数全局改掉。
+
+    | 情形 | 宽松（默认，写路径） | strict（serving） |
+    |---|---|---|
+    | capability 探测异常 | 吞 ⇒ 全 legacy | **抛** `NodeAclAuthorityUnavailable` |
+    | 探测成功、060 确未 apply | 全 legacy | 全 legacy（**相同** —— 合法部署态，不是故障） |
+    | `document_meta` 缺行 | 合成默认 legacy DocAcl | **不返回该 doc**（调用方 `.get()` → None ⇒ 拒） |
+    | 未知 `acl_mode` | 改写为 legacy | **不返回该 doc** ⇒ 拒 |
+    | `kb_doc_node_grant` 读失败 | 按空集 | **抛** `NodeAclAuthorityUnavailable` |
+    | 节点授权正常返回空集 | 零授权 DocAcl | 零授权 DocAcl（**相同** —— 查得到就不是故障） |
+
+    为什么 strict 下「缺行/未知 mode」不能退回 legacy:退回 legacy 会让 `_legacy_readable`
+    按 owner 放行 —— 而一篇 node 文档在投影未收敛期，HA3 里的 owner 可能正是调用者的组码。
+    那恰好是本轮要堵的 stale-owner 窗口（codex 共识 2026-07-31）。
 
     ⚠️ **两个权威源分别解析、各自校验**，只在 RDS/HA3 投影边界才由
     `acl_policy.project_doc_acl` 编码成混合集合 —— 绝不能先把组码与 `d:`/`dx:` 混进一个
@@ -142,7 +208,7 @@ def resolve_doc_acl(doc_ids: Iterable[str], cursor) -> Dict[str, "object"]:
     if not ids:
         return {}
     ph = ",".join(["%s"] * len(ids))
-    has_node = _node_acl_columns_present(cursor)
+    has_node = _node_acl_columns_present(cursor, strict=strict)
 
     # 1. 文档自身（模式 / 敏感级 / 真实 owner）
     cols = "doc_id, permission_level, owner_dept" + (", acl_mode" if has_node else "")
@@ -166,14 +232,26 @@ def resolve_doc_acl(doc_ids: Iterable[str], cursor) -> Dict[str, "object"]:
             for doc_id, dept_id, scope in cursor.fetchall():
                 bucket = exacts if str(scope or "").strip().lower() == "exact" else nodes
                 bucket.setdefault(doc_id, []).append(dept_id)
-        except Exception as e:   # noqa: BLE001 — 节点权威读失败 ⇒ fail-closed（空集，不放行）
+        except Exception as e:   # noqa: BLE001
+            if strict:
+                # 「读不到授权表」≠「这篇零授权」。serving 必须能区分,故整体 fail-closed。
+                raise NodeAclAuthorityUnavailable("kb_doc_node_grant 读取失败") from e
             logger.warning("kb_doc_node_grant 读取失败，节点授权按空集处理（fail-closed）: %s", e)
             nodes, exacts = {}, {}
 
     out: Dict[str, object] = {}
     for doc_id in ids:
+        if strict and doc_id not in meta:
+            # 缺 document_meta 行 ⇒ mode 不可判 ⇒ 不返回(调用方按拒处置)。
+            # 绝不合成 legacy DocAcl:那会让 _legacy_readable 按 owner 放行陈旧 node 命中。
+            logger.warning("doc=%s 无 document_meta 行,strict 下不返回 ACL（调用方 fail-closed）", doc_id)
+            continue
         perm, owner, mode = meta.get(doc_id, ("", "", ACL_MODE_LEGACY))
         if mode not in (ACL_MODE_LEGACY, ACL_MODE_NODE):
+            if strict:
+                logger.error("doc=%s 未知 acl_mode=%r,strict 下不返回 ACL（调用方 fail-closed）",
+                             doc_id, mode)
+                continue
             logger.warning("doc=%s 未知 acl_mode=%r ⇒ 按 legacy 解析", doc_id, mode)
             mode = ACL_MODE_LEGACY
         n_ids, n_ov = normalize_node_ids(nodes.get(doc_id, ()))
