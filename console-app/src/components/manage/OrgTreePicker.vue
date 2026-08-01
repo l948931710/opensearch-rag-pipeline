@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { ChevronRight, Loader2, Search, TriangleAlert, Users } from '@lucide/vue'
+import { computed, onMounted, provide, ref } from 'vue'
+import { Loader2, Search, TriangleAlert } from '@lucide/vue'
+import OrgTreeRow from './OrgTreeRow.vue'
 import { fetchOrgSnapshot, type OrgNode } from '@/composables/useOrgSnapshot'
 
 /**
@@ -172,6 +173,25 @@ const uncoveredDirect = computed(() => {
   }
   return out
 })
+
+// 递归行组件的操作面（OrgTreeRow 注入；函数闭包引用响应式状态，天然保持响应性）。
+// 深树修复（codex 阶段 B）：此前模板硬编码三层，生产树深 5——归属要选到车间/班组根本够不到。
+provide('orgPickerApi', {
+  get multiple() { return props.multiple },
+  get disabled() { return props.disabled },
+  children: (id: number) => childrenOf.value.get(id) || [],
+  picked: (id: number) => pickedMap.value.get(id),
+  isPicked,
+  shown,
+  isOpen,
+  hasKids,
+  toggle,
+  toggleSubtree,
+  toggleExpand,
+  nodeLabel,
+  caretLabel,
+  subtreeLabel,
+})
 </script>
 
 <template>
@@ -189,82 +209,7 @@ const uncoveredDirect = computed(() => {
       </label>
 
       <ul class="op-tree">
-        <template v-for="r in roots" :key="r.dept_id">
-          <li v-if="shown(r.dept_id)">
-            <div class="op-row" :class="{ picked: isPicked(r.dept_id) }">
-              <button class="op-caret" :class="{ open: isOpen(r.dept_id) }" type="button"
-                      :disabled="!hasKids(r.dept_id)" :aria-label="caretLabel(r)"
-                      :aria-expanded="isOpen(r.dept_id)" @click="toggleExpand(r.dept_id)">
-                <ChevronRight v-if="hasKids(r.dept_id)" :size="13" />
-              </button>
-              <label class="op-label">
-                <input :type="multiple ? 'checkbox' : 'radio'" :checked="isPicked(r.dept_id)"
-                       :aria-label="nodeLabel(r)"
-                       :disabled="disabled" @change="toggle(r)" />
-                <span class="op-name">{{ r.name }}</span>
-                <span class="op-count" :class="{ zero: r.staff_count === 0 }">
-                  <Users :size="11" />{{ r.staff_count }}
-                </span>
-              </label>
-              <button v-if="multiple && isPicked(r.dept_id)" type="button" class="op-sub"
-                      :class="{ on: pickedMap.get(r.dept_id)?.subtree }" :disabled="disabled"
-                      :aria-label="subtreeLabel(r)"
-                      @click="toggleSubtree(r.dept_id)">
-                {{ pickedMap.get(r.dept_id)?.subtree ? '含下级' : '仅本级' }}
-              </button>
-            </div>
-            <ul v-if="isOpen(r.dept_id)" class="op-children">
-              <template v-for="c in (childrenOf.get(r.dept_id) || [])" :key="c.dept_id">
-                <li v-if="shown(c.dept_id)">
-                  <div class="op-row" :class="{ picked: isPicked(c.dept_id) }">
-                    <button class="op-caret" :class="{ open: isOpen(c.dept_id) }" type="button"
-                            :disabled="!hasKids(c.dept_id)" :aria-label="caretLabel(c)"
-                      :aria-expanded="isOpen(c.dept_id)" @click="toggleExpand(c.dept_id)">
-                      <ChevronRight v-if="hasKids(c.dept_id)" :size="13" />
-                    </button>
-                    <label class="op-label">
-                      <input :type="multiple ? 'checkbox' : 'radio'" :checked="isPicked(c.dept_id)"
-                       :aria-label="nodeLabel(c)"
-                             :disabled="disabled" @change="toggle(c)" />
-                      <span class="op-name">{{ c.name }}</span>
-                      <span class="op-count" :class="{ zero: c.staff_count === 0 }">
-                        <Users :size="11" />{{ c.staff_count }}
-                      </span>
-                    </label>
-                    <button v-if="multiple && isPicked(c.dept_id)" type="button" class="op-sub"
-                            :class="{ on: pickedMap.get(c.dept_id)?.subtree }" :disabled="disabled"
-                      :aria-label="subtreeLabel(c)"
-                            @click="toggleSubtree(c.dept_id)">
-                      {{ pickedMap.get(c.dept_id)?.subtree ? '含下级' : '仅本级' }}
-                    </button>
-                  </div>
-                  <ul v-if="isOpen(c.dept_id)" class="op-children">
-                    <template v-for="g in (childrenOf.get(c.dept_id) || [])" :key="g.dept_id">
-                      <li v-if="shown(g.dept_id)" class="op-row" :class="{ picked: isPicked(g.dept_id) }">
-                        <span class="op-caret" />
-                        <label class="op-label">
-                          <input :type="multiple ? 'checkbox' : 'radio'" :checked="isPicked(g.dept_id)"
-                       :aria-label="nodeLabel(g)"
-                                 :disabled="disabled" @change="toggle(g)" />
-                          <span class="op-name">{{ g.name }}</span>
-                          <span class="op-count" :class="{ zero: g.staff_count === 0 }">
-                            <Users :size="11" />{{ g.staff_count }}
-                          </span>
-                        </label>
-                        <button v-if="multiple && isPicked(g.dept_id)" type="button" class="op-sub"
-                                :class="{ on: pickedMap.get(g.dept_id)?.subtree }" :disabled="disabled"
-                      :aria-label="subtreeLabel(g)"
-                                @click="toggleSubtree(g.dept_id)">
-                          {{ pickedMap.get(g.dept_id)?.subtree ? '含下级' : '仅本级' }}
-                        </button>
-                      </li>
-                    </template>
-                  </ul>
-                </li>
-              </template>
-            </ul>
-          </li>
-        </template>
+        <OrgTreeRow v-for="r in roots" :key="r.dept_id" :node="r" />
       </ul>
 
       <div v-if="coverHint" class="op-cover" :class="{ warn: coverHint.startsWith('⚠️') }">
@@ -293,30 +238,9 @@ const uncoveredDirect = computed(() => {
   border: 1px solid var(--border, #e5e7eb); border-radius: 6px; color: var(--muted, #6b7280);
 }
 .op-search input { flex: 1; border: 0; outline: 0; background: transparent; font-size: 12px; }
-.op-tree, .op-children { list-style: none; margin: 0; padding: 0; }
-.op-children { padding-left: 16px; }
-.op-row { display: flex; align-items: center; gap: 4px; padding: 2px 4px; border-radius: 5px; }
-.op-row.picked { background: #eef2ff; }
-.op-caret {
-  width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center;
-  border: 0; background: transparent; cursor: pointer; color: var(--muted, #9ca3af);
-  transition: transform .15s;
-}
-.op-caret.open { transform: rotate(90deg); }
-.op-caret:disabled { cursor: default; opacity: 0; }
-.op-label { display: flex; align-items: center; gap: 6px; flex: 1; cursor: pointer; min-width: 0; }
-.op-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.op-count {
-  display: inline-flex; align-items: center; gap: 2px; padding: 0 5px; border-radius: 9px;
-  background: var(--chip, #f3f4f6); color: var(--muted, #6b7280); font-size: 11px; flex: none;
-}
-/* 0 人节点 = 授权给它没人能看到 —— 必须显眼 */
-.op-count.zero { background: #fef2f2; color: #b91c1c; font-weight: 600; }
-.op-sub {
-  flex: none; padding: 1px 7px; border-radius: 9px; font-size: 11px; cursor: pointer;
-  border: 1px solid var(--border, #e5e7eb); background: #fff; color: var(--muted, #6b7280);
-}
-.op-sub.on { border-color: #6366f1; background: #eef2ff; color: #4338ca; }
+/* 行级样式（op-row/op-caret/op-label/op-count/op-sub/op-children）住在 OrgTreeRow.vue ——
+   scoped 样式不会穿透到子组件 DOM，随行组件走 */
+.op-tree { list-style: none; margin: 0; padding: 0; }
 .op-cover { margin-top: 8px; color: var(--muted, #6b7280); }
 .op-cover.warn { color: #b91c1c; }
 </style>

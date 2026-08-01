@@ -2,6 +2,7 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { X, Loader2, Lock } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
+import { apiJson } from '@/lib/api'
 import { useKb, type AccessGrantItem, type DocItem } from '@/composables/useKb'
 import { useDialog } from '@/composables/useDialog'
 import OrgTreePicker, { type PickedNode } from './OrgTreePicker.vue'
@@ -24,19 +25,39 @@ const err = ref('')
 // node-ACL：按组织树勾选的可见范围（整体替换语义 —— 取消勾选即撤销）
 const nodePicked = ref<PickedNode[]>([])
 const nodeErr = ref('')
+// 阶段 B：开弹窗先拉 GET /api/kb/doc-meta 预填——此前每次打开都清空 nodePicked 再整体
+// 替换保存 = **静默抹掉存量授权**（codex 评审点名的隐患）。预填失败禁保存（宁可存不了，
+// 不可空集覆盖）；CAS revision 也从这里来（后端已必填）。
+const docMeta = ref<null | {
+  acl_mode: string; acl_revision: number; owner_label: string
+  node_grants: { dept_id: number; scope: string; name: string; active: boolean }[]
+}>(null)
+const metaLoading = ref(false)
+const metaErr = ref('')
 async function saveNodes() {
   const d = shareCtx.value
-  if (!d) return
+  if (!d || !docMeta.value) return
   nodeErr.value = ''
-  const e = await saveNodeGrants(d.doc_id, nodePicked.value, (d as any).acl_revision ?? null,
+  const e = await saveNodeGrants(d.doc_id, nodePicked.value, docMeta.value.acl_revision,
                                  reason.value.trim())
   if (e) nodeErr.value = e
 }
 const visBusy = ref('')           // 正在切换的目标级别（禁用按钮 + 转圈）
 
-watch(shareCtx, () => {
+watch(shareCtx, async (d) => {
   picked.value = []; reason.value = ''; err.value = ''; visBusy.value = ''
-  nodePicked.value = []; nodeErr.value = ''
+  nodePicked.value = []; nodeErr.value = ''; docMeta.value = null; metaErr.value = ''
+  if (!d) return
+  metaLoading.value = true
+  try {
+    const m = await apiJson<any>(
+      `/api/kb/doc-meta?doc_id=${encodeURIComponent(d.doc_id)}`, { auth: true })
+    docMeta.value = m
+    nodePicked.value = ((m?.node_grants || []) as any[]).map(
+      (g) => ({ dept_id: g.dept_id, subtree: (g.scope || 'subtree') === 'subtree' }))
+  } catch (e: any) {
+    metaErr.value = e?.detail || '加载当前可见范围失败——为防误覆盖，已禁用保存'
+  } finally { metaLoading.value = false }
 })
 
 const curLevel = computed(() => shareCtx.value?.permission_level || '')
@@ -170,8 +191,16 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         <p v-if="!isKbAdmin" class="mb-4 text-[11px] text-faint">「全公司」涉及全员可见，需知识库管理员操作。</p>
         <p v-else class="mb-4 text-[11px] text-faint">改「受限」= 下线归档、离开检索（可再改回恢复）。</p>
 
-        <!-- node-ACL：按组织架构设可见范围（整体替换；取消勾选即撤销） -->
-        <template v-if="isDeptInternal">
+        <!-- node-ACL：按组织架构设可见范围（整体替换；取消勾选即撤销）——仅已迁移 node 文档 -->
+        <template v-if="isDeptInternal && metaLoading">
+          <p class="mb-4 flex items-center gap-1.5 text-[11px] text-faint">
+            <Loader2 :size="12" class="animate-spin" /> 加载当前可见范围…
+          </p>
+        </template>
+        <template v-else-if="isDeptInternal && metaErr">
+          <p class="mb-4 text-[11px] text-danger">{{ metaErr }}</p>
+        </template>
+        <template v-else-if="isDeptInternal && docMeta?.acl_mode === 'node'">
           <p class="mb-2 text-[11px] font-bold uppercase tracking-[0.04em] text-faint">
             按组织架构设置可见范围
           </p>
@@ -185,10 +214,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           <button
             type="button"
             class="mb-5 inline-flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-[13px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
-            :disabled="shareBusy"
+            :disabled="shareBusy || !docMeta"
             @click="saveNodes"
           ><Loader2 v-if="shareBusy" :size="13" :stroke-width="2" class="animate-spin" />{{
-            shareBusy ? '保存中…' : (nodePicked.length ? `保存可见范围（${nodePicked.length} 个部门）` : '保存可见范围（清空）')
+            shareBusy ? '保存中…' : (nodePicked.length ? `保存可见范围（${nodePicked.length} 个节点）` : '保存可见范围（清空）')
           }}</button>
         </template>
 

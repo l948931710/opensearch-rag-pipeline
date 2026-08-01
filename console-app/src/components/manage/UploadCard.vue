@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { UploadCloud, FileUp, X } from '@lucide/vue'
 import { UPLOAD_ACCEPT, PERM_LABEL, deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
@@ -7,11 +7,31 @@ import StatusPill from './StatusPill.vue'
 import OrgTreePicker from './OrgTreePicker.vue'
 
 const {
-  verCtx, newTitle, newOwner, newPerm, newShareDepts, newShareNodes, nodeAclGrant,
+  verCtx, newTitle, newOwner, newOwnerNode, newPerm, newShareDepts, newShareNodes, nodeAclGrant,
   shareTargets, uploadTargetDepts, selectedNames,
   dupWarn, uploadBusy, uploadMsg, uploadErr, uploadOk, contentDupMsg, uploadQueue,
   onFileSelected, doUpload, exitVersionMode, maxUploadMb,
 } = useKb()
+
+// 阶段 B：归属节点默认预勾进可见集（Sam 裁决：**只是 UI 的显式默认值**——可取消，取消时
+// 警示"属主部门将看不到"；后端绝不偷偷补回）。换归属时把旧归属的预勾替换为新归属；
+// 用户手动移除后（同一归属内）不再回填。
+let seededOwner = 0
+watch(() => newOwnerNode.value[0]?.dept_id, (oid) => {
+  if (!oid) return
+  const cur = newShareNodes.value
+  const withoutOld = seededOwner ? cur.filter((p) => p.dept_id !== seededOwner) : cur
+  if (!withoutOld.some((p) => p.dept_id === oid)) {
+    newShareNodes.value = [{ dept_id: oid, subtree: true }, ...withoutOld]
+  } else {
+    newShareNodes.value = withoutOld
+  }
+  seededOwner = oid
+})
+const ownerNotVisible = computed(() =>
+  !!newOwnerNode.value.length
+  && (newPerm.value === 'dept_internal' || newPerm.value === 'shared')
+  && !newShareNodes.value.some((p) => p.dept_id === newOwnerNode.value[0].dept_id))
 
 // 「指定部门」模式的目标选项 = 10 组码 − 归属部门自身（本部门本就可读）。
 const shareOpts = computed(() => shareTargets.filter((t) => t !== newOwner.value))
@@ -97,13 +117,20 @@ function onDrop(e: DragEvent) {
           class="rounded-md border border-input bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring/15" />
       </label>
       <p v-else class="text-xs text-faint sm:col-span-3">已选 {{ selectedNames.length }} 个文件，将批量上传，标题各取文件名（如需自定义标题请逐个上传）。</p>
-      <label class="flex flex-col gap-1 text-xs text-muted-foreground">
+      <label v-if="!nodeAclGrant || verCtx" class="flex flex-col gap-1 text-xs text-muted-foreground">
         归属部门
         <select v-model="newOwner" class="ui-select rounded-md border border-input bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-ring focus:outline-none">
           <option value="" disabled>选择部门</option>
           <option v-for="o in uploadTargetDepts" :key="o" :value="o">{{ deptLabel(o) }}</option>
         </select>
       </label>
+      <!-- 阶段 B：归属 = 组织节点（级联单选，中心→部门→车间/班组；树深 5 递归可达） -->
+      <div v-else class="flex flex-col gap-1 text-xs text-muted-foreground">
+        <span :class="newOwnerNode.length ? '' : 'text-st-busy'">归属部门（组织架构，单选）</span>
+        <div class="max-h-56 overflow-y-auto rounded-md border border-input bg-card px-2 py-1.5">
+          <OrgTreePicker v-model="newOwnerNode" :multiple="false" :disabled="uploadBusy" />
+        </div>
+      </div>
       <label class="flex flex-col gap-1 text-xs text-muted-foreground sm:col-span-2">
         可见范围
         <select v-model="newPerm" class="ui-select rounded-md border border-input bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-ring focus:outline-none">
@@ -117,11 +144,15 @@ function onDrop(e: DragEvent) {
       <!-- 指定部门 · 组织架构口径（节点授权已对读侧生效时才出现）——
            ⚠️ 与下方组码 chips **二选一**：GRANT 关时写 node 授权会让新文档对所有人不可见
            （can_read_doc 无条件 DENY），故此处严格按后端回的 node_acl_grant 切换。 -->
-      <div v-if="newPerm === 'shared' && nodeAclGrant" class="sm:col-span-3">
+      <div v-if="nodeAclGrant && !verCtx && (newPerm === 'shared' || newPerm === 'dept_internal')" class="sm:col-span-3">
         <div class="mb-1.5 text-xs" :class="newShareNodes.length ? 'text-muted-foreground' : 'text-st-busy'">
-          可见范围（按组织架构{{ newShareNodes.length ? `，已选 ${newShareNodes.length} 个部门` : '，至少选 1 个' }}）
+          可见范围（按组织架构{{ newShareNodes.length ? `，已选 ${newShareNodes.length} 个节点` : '，至少选 1 个' }}）
+          <span class="text-faint">· 归属部门已默认加入，可取消</span>
         </div>
         <OrgTreePicker v-model="newShareNodes" :disabled="uploadBusy" />
+        <p v-if="ownerNotVisible" class="mt-1.5 text-[11.5px] text-st-busy">
+          ⚠️ 归属部门不在可见范围内 —— 属主部门自己将看不到这篇文档
+        </p>
         <p class="mt-1.5 text-[11.5px] text-faint">与台账「跨部门共享 / 权限」同一口径；登记后可随时在那里调整或清空。</p>
       </div>
 
@@ -148,7 +179,9 @@ function onDrop(e: DragEvent) {
       <button
         type="button"
         class="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-        :disabled="uploadBusy || !selectedNames.length || (!verCtx && !newOwner) || (!verCtx && newPerm === 'shared' && !newShareDepts.length)"
+        :disabled="uploadBusy || !selectedNames.length
+          || (!verCtx && (nodeAclGrant ? !newOwnerNode.length : !newOwner))
+          || (!verCtx && newPerm === 'shared' && (nodeAclGrant ? !newShareNodes.length : !newShareDepts.length))"
         @click="doUpload()"
       >
         {{ uploadBusy ? '上传中…' : (verCtx ? '上传新版本' : '上传') }}
