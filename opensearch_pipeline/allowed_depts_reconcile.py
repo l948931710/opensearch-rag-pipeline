@@ -122,10 +122,24 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
             cur.execute(f"SELECT DISTINCT doc_id FROM {_kb_db()}.chunk_meta "
                         f"WHERE is_active=1 AND allowed_depts IS NOT NULL")
             have_ad = {r[0] for r in cur.fetchall() if r and r[0]}
+            # 2b. node-ACL 权威（2026-07-31，设计稿 §4「候选集纳入 kb_doc_node_grant」）：
+            #     approved ∪ have_ad **兜不住"从未投影过的 node 文档"** —— 它既没有
+            #     kb_access_request 行（那是 legacy 权威），chunk_meta.allowed_depts 也还是
+            #     NULL（decide 端点漏入队 / outbox 没 drain / 直接改库授权），于是全扫这条
+            #     最后防线正好跳过它 ⇒ 管理员在管理台勾了组织节点，文档却永远搜不到。
+            #     已投影过的 node 文档本来就会经 have_ad 进来，这里补的是"零投影"那一类。
+            #     ⚠️ 060 未 apply 时表不存在 —— 与 org_sync 同款处置：跳过，不阻断整轮对账。
+            try:
+                cur.execute(f"SELECT DISTINCT doc_id FROM {_kb_db()}.kb_doc_node_grant "
+                            "WHERE revoked_at IS NULL")
+                node_granted = {r[0] for r in cur.fetchall() if r and r[0]}
+            except Exception as e:   # noqa: BLE001 — schema/060 未 apply
+                logger.debug("kb_doc_node_grant 候选跳过（表不存在?）: %s", e)
+                node_granted = set()
             # 全量扫描候选，但按【实际漂移写】数封顶（_LIMIT）——unchanged 文档只读不占写预算，故高位
             # 漂移文档绝不会被一致文档挤出（旧实现 sorted(...)[:_LIMIT] 固定切片会饿死高位漂移；Step 5
             # 审计）。漂移文档本轮处理后下轮即变 unchanged，预算自然腾给后续漂移 → 自清、最终全覆盖。
-            targets = sorted(set(approved) | have_ad)
+            targets = sorted(set(approved) | have_ad | node_granted)
 
             # perf E#36：批量预筛（2 条聚合查询）先在内存 diff 出确定无漂移的 doc，跳过其
             # 逐 doc 4×SQL 复核；漂移/存疑子集仍走单一注入点 materialize 复核+写（锁/gate/

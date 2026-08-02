@@ -39,9 +39,13 @@ from opensearch_pipeline.api import (
     _KB_MAX_OFFSET,
     _enforce_rate_limit,
     _kb_can_manage,
+    _kb_can_manage_doc,
     _kb_content_dups,
     _kb_db,
-    _kb_owner_scope_sql,
+    _kb_doc_owner_scope_sql,
+    _kb_managed_descendants,
+    _kb_node_capability,
+    _kb_read_doc_triplet,
     _kb_status_badge,
     _load_org_tree_snapshot,
     _require_kb_admin,
@@ -99,7 +103,21 @@ def kb_org_tree(request: Request, identity: Optional[Identity] = Depends(current
         my_managed_owner_depts=managed_owner_depts(kb),
         my_grantable_owner_depts=grantable_owner_depts(kb),
         org_tree=_load_org_tree_snapshot(),
+        # 读侧真实姿态（不是"控件做没做"）——上传侧据此决定写 legacy 组码还是 node 节点。
+        # 读不到 config 时按 False 兜底：宁可继续走 legacy（现状可用），也不要写出对所有人
+        # 不可见的 node 文档。
+        node_acl_grant=_node_acl_grant_enabled(),
     )
+
+
+def _node_acl_grant_enabled() -> bool:
+    """`RAG_NODE_ACL_GRANT` 现值。**绝不抛** —— 取不到一律 False（fail-safe 到 legacy）。"""
+    try:
+        from opensearch_pipeline.config import get_config
+        return bool(get_config().rag.node_acl_grant)
+    except Exception as e:   # noqa: BLE001
+        logger.warning("读取 node_acl_grant 失败，按未开启处理: %s", e)
+        return False
 
 
 def _kb_usage_enrich(cur, doc_ids):
@@ -176,15 +194,47 @@ def _kb_ledger_filter_sql(perm: str = "", badge: str = "", cited: str = ""):
 
 
 def _kb_owner_facet_sql(owner_dept: str):
-    """按归属部门精确筛选（含生产子线，如 production_mold）→ (SQL 片段, 参数)。
+    """按归属精确筛选 → (SQL 片段, 参数)。阶段 B：额外接受稳定键形态 `node:<id>`
+    （owner DTO 单一键语义——中文名不当键）；legacy 传组码不变（含生产子线）。
     参数化本身防注入，这里再剥离注入字符 + 限长做纵深防御。返回 (None, None) = 非法 facet（fail-closed）。"""
+    raw = (owner_dept or "").strip()
+    if raw.startswith("node:"):
+        tail = raw[5:]
+        if not (tail.isdigit() and tail[0] != "0"):
+            return None, None
+        return "AND m.acl_mode = 'node' AND m.owner_dept_id = %s", [int(tail)]
     from opensearch_pipeline.kb_authz import _SANITIZE_RE
-    facet = _SANITIZE_RE.sub("", (owner_dept or "").strip())[:64]
+    facet = _SANITIZE_RE.sub("", raw)[:64]
     if owner_dept and not facet:
         return None, None   # 传了但清洗后为空 = 非法 → 调用方 fail-closed 空
     if facet:
         return "AND m.owner_dept = %s", [facet]
     return "", []
+
+
+def _kb_node_names(cur, dept_ids) -> Dict[int, str]:
+    """批量 dept_id → 现名（LEFT 语义：失活/缺行回 id 串）。列表页每页 ≤50 行一次往返。"""
+    ids = sorted({int(i) for i in dept_ids if i})
+    if not ids:
+        return {}
+    out = {i: str(i) for i in ids}
+    try:
+        ph = ",".join(["%s"] * len(ids))
+        cur.execute(f"SELECT dept_id, name FROM {_kb_db()}.dept_dim WHERE dept_id IN ({ph})",
+                    tuple(ids))
+        for r in cur.fetchall():
+            if r and r[0]:
+                out[int(r[0])] = r[1] or str(r[0])
+    except Exception as e:   # noqa: BLE001 — 展示 enrichment，失败回 id 串
+        logger.debug("节点名批量解析失败（回 id 串）: %s", e)
+    return out
+
+
+def _kb_owner_dto(mode: str, owner: str, oid, node_names: Dict[int, str]):
+    """(acl_mode, owner_dept, owner_dept_id) → (owner_key, owner_label)。"""
+    if (mode or "legacy") == "node" and oid:
+        return f"node:{int(oid)}", node_names.get(int(oid), str(oid))
+    return (f"legacy:{owner}" if owner else ""), (owner or "")
 
 
 def _kb_badge_counts(cur, base_from_where: str, base_params: tuple,
@@ -222,7 +272,6 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     kb = _require_kb_console(identity)
     limit = max(1, min(limit, 50))
     offset = max(0, min(offset, _KB_MAX_OFFSET))   # 上界防深分页扫表（全库 ~1600，1万 offset 绰绰有余，G7）
-    clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
     search_clause, search_params = _kb_like_search_sql(q)
     owner_clause, owner_params = _kb_owner_facet_sql(owner_dept)
     if owner_clause is None:
@@ -233,6 +282,10 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # 阶段 B：mode 隔离作用域（capability 探测要 cursor，故在连接内构造——
+                # absent 环境生成与旧 _kb_owner_scope_sql 逐字节同构的 SQL）
+                cap = _kb_node_capability(cur)
+                clause, params, _deg = _kb_doc_owner_scope_sql(kb, cap)
                 # faceted 计数先行（主查询保持「最后一次 execute」——既有 SQL 捕获类测试的锚点）
                 badge_counts = _kb_badge_counts(
                     cur,
@@ -241,12 +294,13 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     "ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no "
                     f"WHERE 1=1 {clause} {search_clause} {owner_clause}",
                     (*params, *search_params, *owner_params), perm, cited)
+                _mc = ", m.acl_mode, m.owner_dept_id" if cap == "present" else ""
                 cur.execute(
                     f"""
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status,
-                           v.chunk_status, v.content_process_error
+                           v.chunk_status, v.content_process_error{_mc}
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -258,6 +312,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                 )
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
+                node_names = _kb_node_names(
+                    cur, [r[14] for r in rows[:limit] if len(r) > 14 and r[14]])
         finally:
             conn.close()
     except HTTPException:
@@ -270,11 +326,14 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     has_more = len(rows) > limit
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks, cpe) = r
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks, cpe) = r[:13]
+        _mode, _oid = ((r[13] or "legacy"), r[14]) if len(r) > 13 else ("legacy", None)
+        _okey, _olabel = _kb_owner_dto(_mode, owner or "", _oid, node_names)
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
-            owner_dept=owner or "", permission_level=perm or "public",
+            owner_dept=owner or "", acl_mode=_mode, owner_key=_okey, owner_label=_olabel,
+            permission_level=perm or "public",
             current_version_no=int(cur_ver or 1), status=status or "active",
             status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
             updated_at=str(updated) if updated else "",
@@ -283,7 +342,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
             # 驳回原因只在被驳回态外露（其他失败态的 content_process_error 是内部诊断文案，不外发）
             reject_reason=(str(cpe)[:200] if (cps == "REJECTED" and cpe) else ""),
         ))
-    return KbMyDocsResponse(items=items, has_more=has_more, badge_counts=badge_counts)
+    return KbMyDocsResponse(items=items, has_more=has_more, badge_counts=badge_counts,
+                            scope_degraded=_deg)
 
 
 @router.get("/api/kb/browse", response_model=KbMyDocsResponse)
@@ -322,6 +382,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                _bcap = _kb_node_capability(cur)
+                _mc = ", m.acl_mode, m.owner_dept_id" if _bcap == "present" else ""
                 # faceted 计数先行（主查询保持「最后一次 execute」——既有 SQL 捕获类测试的锚点）
                 badge_counts = _kb_badge_counts(
                     cur,
@@ -337,7 +399,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status,
-                           v.chunk_status
+                           v.chunk_status{_mc}
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -351,6 +413,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                 )
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
+                node_names = _kb_node_names(
+                    cur, [r[13] for r in rows[:limit] if len(r) > 13 and r[13]])
         finally:
             conn.close()
     except HTTPException:
@@ -361,21 +425,34 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
         raise HTTPException(status_code=500, detail=f"全部门浏览查询失败 (trace: {trace_id})")
 
     has_more = len(rows) > limit
+    # 阶段 B：browse 行级 can_manage 走 mode 隔离判定——node 文档绝不因 owner_dept 残值
+    # 显示为"可管理"。后代集整页解析一次（不逐行）；真边界仍在写端点。
+    from opensearch_pipeline.kb_authz import can_manage_doc as _cmd
+    _descendants = _kb_managed_descendants(kb)
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r[:12]
+        _mode, _oid = ((r[12] or "legacy"), r[13]) if len(r) > 12 else ("legacy", None)
+        _okey, _olabel = _kb_owner_dto(_mode, owner or "", _oid, node_names)
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
-            owner_dept=owner or "", permission_level=perm or "dept_internal",
+            owner_dept=owner or "", acl_mode=_mode, owner_key=_okey, owner_label=_olabel,
+            permission_level=perm or "dept_internal",
             current_version_no=int(cur_ver or 1), status=status or "active",
             status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
             updated_at=str(updated) if updated else "",
-            can_manage=_kb_can_manage(kb, owner or ""),
+            can_manage=_cmd(kb, _mode, owner or "", _oid, _descendants),
             cited_count=(None if usage is None else (_u[0] if _u else 0)),
             last_cited_at=(_u[1] if _u else ""),
         ))
     return KbMyDocsResponse(items=items, has_more=has_more, badge_counts=badge_counts)
+
+
+class KbOwnerFacet(BaseModel):
+    """阶段 B owner DTO：稳定键（legacy:<code> | node:<id>）+ 展示名。"""
+    key: str = ""
+    label: str = ""
 
 
 class KbStatsResponse(BaseModel):
@@ -388,6 +465,10 @@ class KbStatsResponse(BaseModel):
     # 归属部门 facet（全作用域去重，含生产子线）：台账「按归属筛选」下拉的全库口径来源，
     # 不再只从已加载页派生（否则 >50 篇时下拉漏掉未翻到的部门）。#7
     owner_depts: List[str] = Field(default_factory=list)
+    # 阶段 B：双轴 facet（legacy 组码 + node 节点，稳定键防重名/改名）；owner_depts 保留
+    # 兼容（仅 legacy）。scope_degraded 同 my-docs 语义（进缓存值，TTL 内陈旧可接受）。
+    owner_facets: List[KbOwnerFacet] = Field(default_factory=list)
+    scope_degraded: bool = False
 
 
 @router.get("/api/kb/stats", response_model=KbStatsResponse)
@@ -401,15 +482,20 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    clause, params = _kb_owner_scope_sql(kb, "m.owner_dept")
     # perf（2026-07-16）：stats 接入既有看板 TTL 缓存（键按作用域分片，永不跨权限串数据）——
     # 此前 stats 是管理台首屏最慢端点（实测 4.6-5.2s）且每请求现算。
-    cache_key = ("stats", tuple(sorted(str(p) for p in params)) if clause else "GLOBAL")
+    # 阶段 B：键改按身份的两条授权轴（owners + node roots）——capability/后代集要 cursor
+    # 才能算，而缓存命中必须发生在开连接**之前**才有 perf 价值；同轴身份共享条目，组织
+    # 快照变动的陈旧窗口 = 看板 TTL（30s），与既有语义一致。
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN as _RKA
+    from opensearch_pipeline.kb_authz import managed_owner_depts as _managed
+    _scope_key = ("GLOBAL" if kb.role == _RKA else
+                  (tuple(sorted(_managed(kb))),
+                   tuple(sorted(getattr(kb, "granted_node_roots", ()) or ()))))
+    cache_key = ("stats", _scope_key)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
-    ck_clause, ck_params = _kb_owner_scope_sql(kb, "owner_dept")   # chunk_meta.owner_dept 同口径作用域
-    dm_clause, dm_params = _kb_owner_scope_sql(kb, "owner_dept")   # document_meta.owner_dept（本月新增计数）
     from datetime import date
     month_start = date.today().replace(day=1).isoformat()         # 当月首日；以参数传入避免 % 转义坑
     chunks = new_this_month = 0
@@ -419,28 +505,47 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # 阶段 B：mode 隔离作用域（在连接内构造，absent 环境与旧 SQL 逐字节同构）。
+                # node-ACL（2026-07-31）：分块作用域**必须走 document_meta.owner_dept**，不能用
+                # chunk_meta.owner_dept —— 后者是【检索投影轴】，node 模式文档在那一列上是哨兵
+                # `__acl_node_mode_v1__`，按它过滤会让整篇 node 文档的分块从 dept_admin 的部门
+                # 统计里静默消失（归属轴仍是真实部门/owner_dept_id，文档级计数不受影响）。
+                cap = _kb_node_capability(cur)
+                clause, params, _deg = _kb_doc_owner_scope_sql(kb, cap)
+                ck_clause, ck_params = clause, params   # 归属轴（JOIN document_meta，同 alias m）
+                _mgc = ", m.acl_mode, m.owner_dept_id" if cap == "present" else ""
                 # perf（2026-07-16）：状态分布改【服务端 GROUP BY】——此前整表 1936 行拉回
                 # Python 分桶（实测该查询 1.2s，传输占大头），现只回 status×徽章×归属 的几十行。
                 # 徽章走 _KB_BADGE_CASE_SQL（与 _kb_status_badge 的奇偶校验测试钉死同义）。
+                # 阶段 B：GROUP BY 追加 mode/owner_dept_id——node 文档（owner_dept=NULL）按
+                # 节点分桶进 owner_facets，绝不用中文名当键（重名/改名破分桶）。
                 cur.execute(
                     f"""
-                    SELECT m.status, ({_KB_BADGE_CASE_SQL}) AS b, m.owner_dept, COUNT(*)
+                    SELECT m.status, ({_KB_BADGE_CASE_SQL}) AS b, m.owner_dept, COUNT(*){_mgc}
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
                     WHERE 1=1 {clause}
-                    GROUP BY m.status, b, m.owner_dept
+                    GROUP BY m.status, b, m.owner_dept{_mgc}
                     """,
                     tuple(params),
                 )
                 rows = cur.fetchall()
+                _stats_node_names = _kb_node_names(
+                    cur, [r[5] for r in rows if len(r) > 5 and r[5]])
                 # 当前已索引分块总数（设计「全库已索引 chunk」口径）；取数失败仅置 0，不拖垮主统计。
+                # kb_admin（无作用域 clause）走无 JOIN 的原查询：JOIN 会把没有 document_meta 行的
+                # 孤儿分块从全库口径里悄悄减掉，那是治理端的信号、不该由统计端替它抹平。
+                ck_sql = (
+                    f"SELECT COUNT(*) FROM {_kb_db()}.chunk_meta c "
+                    f"JOIN {_kb_db()}.document_meta m ON m.doc_id = c.doc_id "
+                    f"WHERE c.is_active=1 AND c.index_status='{ChunkIndexStatus.INDEXED}' {ck_clause}"
+                ) if ck_clause else (
+                    f"SELECT COUNT(*) FROM {_kb_db()}.chunk_meta "
+                    f"WHERE is_active=1 AND index_status='{ChunkIndexStatus.INDEXED}'"
+                )
                 try:
-                    cur.execute(
-                        f"SELECT COUNT(*) FROM {_kb_db()}.chunk_meta "
-                        f"WHERE is_active=1 AND index_status='{ChunkIndexStatus.INDEXED}' {ck_clause}",
-                        tuple(ck_params),
-                    )
+                    cur.execute(ck_sql, tuple(ck_params))
                     chunks = int((cur.fetchone() or (0,))[0] or 0)
                 except Exception as e:
                     aux_fails += 1
@@ -448,9 +553,9 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                 # 本月新增文档数（设计「+N 本月新增」徽标）；月首日以参数传入；取数失败仅置 0。
                 try:
                     cur.execute(
-                        f"SELECT COUNT(*) FROM {_kb_db()}.document_meta "
-                        f"WHERE created_at >= %s AND status='active' {dm_clause}",
-                        tuple([month_start] + dm_params),
+                        f"SELECT COUNT(*) FROM {_kb_db()}.document_meta m "
+                        f"WHERE m.created_at >= %s AND m.status='active' {clause}",
+                        tuple([month_start] + list(params)),
                     )
                     new_this_month = int((cur.fetchone() or (0,))[0] or 0)
                 except Exception as e:
@@ -467,7 +572,10 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     total = active = retired = 0
     by_badge: Dict[str, int] = {}
     owner_set = set()
-    for status, badge, owner, n in rows:
+    node_facets: Dict[str, str] = {}     # key(node:<id>) → label
+    for r in rows:
+        status, badge, owner, n = r[0], r[1], r[2], r[3]
+        _mode, _oid = ((r[4] or "legacy"), r[5]) if len(r) > 4 else ("legacy", None)
         n = int(n or 0)
         total += n
         # 语义与旧 Python 逐行分桶逐字节一致：active 判定 (status or 'active')=='active'；
@@ -477,11 +585,16 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
         else:
             retired += n
         by_badge[str(badge or "")] = by_badge.get(str(badge or ""), 0) + n
-        if owner:
+        if _mode == "node" and _oid:
+            node_facets[f"node:{int(_oid)}"] = _stats_node_names.get(int(_oid), str(_oid))
+        elif owner:
             owner_set.add(owner)
+    facets = ([KbOwnerFacet(key=f"legacy:{o}", label=o) for o in sorted(owner_set)]
+              + [KbOwnerFacet(key=k, label=v) for k, v in sorted(node_facets.items())])
     out = KbStatsResponse(total=total, active=active, retired=retired, chunks=chunks,
                           new_this_month=new_this_month, by_badge=by_badge,
-                          owner_depts=sorted(owner_set))
+                          owner_depts=sorted(owner_set), owner_facets=facets,
+                          scope_degraded=_deg)
     if aux_fails == 0:   # 与 insights 同纪律：降级响应（辅计数失败置 0）不缓存，下一请求重试全量
         _dashboard_cache_put(cache_key, out)
     return out
@@ -603,6 +716,7 @@ class KbGapQueryItem(BaseModel):
 
 class KbInsightsResponse(BaseModel):
     scope: str = "dept"                  # 'global'（kb_admin 全库）| 'dept'（dept_admin 本部门）
+    scope_degraded: bool = False         # 阶段 B：node 管辖腿失效（快照过期/读失败）——前端挂 banner
     window_days: int = _KB_INSIGHTS_WINDOW_DAYS
     questions: int = 0                   # 命中所辖文档的提问数（DISTINCT message_id，去 JSON 扇出重复）
     askers: int = 0
@@ -625,16 +739,17 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
-    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    from opensearch_pipeline.kb_authz import managed_owner_depts as _managed
     win = _KB_INSIGHTS_WINDOW_DAYS
-    # 角色/作用域解析之后才查缓存：键按作用域分片，永不跨权限串数据
-    cache_key = ("insights",
-                 tuple(sorted(str(p) for p in scope_params)) if scope_clause else "GLOBAL", win)
+    # 角色/作用域解析之后才查缓存：键按作用域分片，永不跨权限串数据。
+    # 阶段 B：键按身份两条授权轴（capability/后代集要 cursor，缓存命中须在开连接前）。
+    _scope_key = ("GLOBAL" if kb.role == ROLE_KB_ADMIN else
+                  (tuple(sorted(_managed(kb))),
+                   tuple(sorted(getattr(kb, "granted_node_roots", ()) or ()))))
+    cache_key = ("insights", _scope_key, win)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
-    base = _kb_qa_owner_join() + (" " + scope_clause if scope_clause else "")
-    args = tuple([win] + scope_params)
     out = KbInsightsResponse(scope=("global" if kb.role == ROLE_KB_ADMIN else "dept"), window_days=win)
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -650,6 +765,12 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
         # 共享一个游标跑多条子查询：依赖 pymysql 默认 buffered Cursor（_init_db_pool 未设 SSCursor），
         # 某子查询异常后结果已全量缓冲，下一句 execute 不会 "Commands out of sync (2014)"。
         with conn.cursor() as cur:
+            # 阶段 B：mode 隔离作用域（连接内构造；absent 环境与旧 SQL 逐字节同构）
+            _cap = _kb_node_capability(cur)
+            scope_clause, scope_params, _deg = _kb_doc_owner_scope_sql(kb, _cap)
+            out.scope_degraded = _deg
+            base = _kb_qa_owner_join() + (" " + scope_clause if scope_clause else "")
+            args = tuple([win] + list(scope_params))
             # 1) 使用聚合：提问数 / 提问人 / 成功 / 拒答（DISTINCT message_id 去 JSON 扇出）
             try:
                 cur.execute(
@@ -769,15 +890,17 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
-    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
+    from opensearch_pipeline.kb_authz import managed_owner_depts as _managed
     win = _KB_INSIGHTS_WINDOW_DAYS
     limit = max(1, min(limit, 50))
     # 处置态过滤：默认只收未处置（handled_status IS NULL / '' / PENDING / AWAITING_COMMENT）。
     handled_clause = "" if include_resolved else (
         " AND (f.handled_status IS NULL OR f.handled_status NOT IN ('RESOLVED','DISMISSED'))")
-    cache_key = ("fb_review",
-                 tuple(sorted(str(p) for p in scope_params)) if scope_clause else "GLOBAL",
-                 win, limit, include_resolved)
+    # 阶段 B：键按身份两条授权轴（同 stats/insights；scope SQL 在连接内构造）
+    _scope_key = ("GLOBAL" if kb.role == ROLE_KB_ADMIN else
+                  (tuple(sorted(_managed(kb))),
+                   tuple(sorted(getattr(kb, "granted_node_roots", ()) or ()))))
+    cache_key = ("fb_review", _scope_key, win, limit, include_resolved)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -789,6 +912,9 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                _cap = _kb_node_capability(cur)
+                scope_clause, scope_params, _deg = _kb_doc_owner_scope_sql(kb, _cap)
+                scope_params = list(scope_params)
                 # 平铺 (message, doc) 行，Python 侧按 message 分组保序（GROUP_CONCAT 拼结构太脆）。
                 # LIMIT 300 行 ≈ 数十条差评 × 引用文档数，上限后截 limit 条消息。
                 cur.execute(
@@ -868,7 +994,6 @@ def kb_feedback_resolve(req: KbFeedbackResolveRequest, request: Request,
         raise HTTPException(status_code=400, detail="非法处置动作")
     assert_metadata_write_allowed("kb_feedback_resolve", get_config().rds.host, kind="rds")
     trace_id = get_request_id()
-    scope_clause, scope_params = _kb_owner_scope_sql(kb, "m.owner_dept")
     try:
         from opensearch_pipeline.db import _get_db_conn
         from opensearch_pipeline.qa_facts import qa_docs_join_sql
@@ -877,6 +1002,9 @@ def kb_feedback_resolve(req: KbFeedbackResolveRequest, request: Request,
             with conn.cursor() as cur:
                 # dept_admin 越权守卫：确认该差评回答引用了调用者作用域内文档（kb_admin scope 为空 → 恒过）。
                 if kb.role != ROLE_KB_ADMIN:
+                    _cap = _kb_node_capability(cur)
+                    scope_clause, scope_params, _deg = _kb_doc_owner_scope_sql(kb, _cap)
+                    scope_params = list(scope_params)
                     cur.execute(
                         "SELECT 1"
                         f" FROM {_op_db()}.user_feedback f"
@@ -1078,7 +1206,8 @@ class KbEmbedRunItem(BaseModel):
 
 
 class KbDeptCoverageItem(BaseModel):
-    owner_dept: str = ""
+    owner_dept: str = ""                 # 分桶键：组码 | node:<id>（阶段 B，稳定键不用中文名）
+    owner_label: str = ""                # 展示名（legacy 组码原样由前端 deptLabel 转；node 给节点名）
     docs: int = 0                        # 已上线（active）文档数
     new_month: int = 0                   # 本月新增
     qa_hits: int = 0                     # 使用量（命中本部门文档的提问数）
@@ -1387,17 +1516,25 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
             try:
                 from datetime import date as _date
                 ms = _date.today().replace(day=1).isoformat()
+                # 阶段 B：稳定分桶键——node 文档（owner_dept=NULL）按 node:<id> 分桶
+                # （不用中文名当键，M2）；legacy 键 = 组码，行为逐字节不变。半迁移态
+                # （两列皆 NULL）落 "unknown" 桶（_cell 的既有兜底）。
+                _gcap = _kb_node_capability(cur)
+                _own_m = ("COALESCE(m.owner_dept, CONCAT('node:', m.owner_dept_id))"
+                          if _gcap == "present" else "m.owner_dept")
+                _own_b = ("COALESCE(owner_dept, CONCAT('node:', owner_dept_id))"
+                          if _gcap == "present" else "owner_dept")
                 cov: Dict[str, Dict[str, int]] = {}
 
                 def _cell(d):
                     return cov.setdefault(d or "unknown", {"docs": 0, "new_month": 0, "qa_hits": 0, "refusal": 0, "pii": 0, "new7": 0, "ret7": 0, "qa7": 0, "qa_prev7": 0})
 
-                cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
-                            " WHERE status='active' GROUP BY owner_dept")
+                cur.execute(f"SELECT {_own_b}, COUNT(*) FROM {_kb_db()}.document_meta"
+                            " WHERE status='active' GROUP BY 1")
                 for dept, docs in cur.fetchall():
                     _cell(dept)["docs"] = int(docs or 0)
-                cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
-                            " WHERE status='active' AND created_at >= %s GROUP BY owner_dept", (ms,))
+                cur.execute(f"SELECT {_own_b}, COUNT(*) FROM {_kb_db()}.document_meta"
+                            " WHERE status='active' AND created_at >= %s GROUP BY 1", (ms,))
                 for dept, n in cur.fetchall():
                     _cell(dept)["new_month"] = int(n or 0)
                 # 文档总量周环比：本周 active 新增；本周退役只计【上周末前已存在】者（created_at < 7d），
@@ -1405,47 +1542,47 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                 # updated_at 近似退役时点（无独立 retired_at）。
                 wow_ok = True
                 try:
-                    cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
-                                " WHERE status='active' AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY owner_dept")
+                    cur.execute(f"SELECT {_own_b}, COUNT(*) FROM {_kb_db()}.document_meta"
+                                " WHERE status='active' AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY 1")
                     for dept, n in cur.fetchall():
                         _cell(dept)["new7"] = int(n or 0)
-                    cur.execute(f"SELECT owner_dept, COUNT(*) FROM {_kb_db()}.document_meta"
+                    cur.execute(f"SELECT {_own_b}, COUNT(*) FROM {_kb_db()}.document_meta"
                                 " WHERE status='retired' AND updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)"
-                                " AND created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY owner_dept")
+                                " AND created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY 1")
                     for dept, n in cur.fetchall():
                         _cell(dept)["ret7"] = int(n or 0)
                 except Exception as e:
                     wow_ok = False; logger.warning("kb_governance dept wow 失败: %s", e)
                 from opensearch_pipeline.qa_facts import qa_docs_join_sql
                 cur.execute(
-                    "SELECT m.owner_dept, COUNT(DISTINCT q.message_id),"
+                    f"SELECT {_own_m}, COUNT(DISTINCT q.message_id),"
                     " COUNT(DISTINCT CASE WHEN q.answer_status='REFUSAL' THEN q.message_id END)"
                     f" FROM {_op_db()}.qa_session_log q"
                     + qa_docs_join_sql()
-                    + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY m.owner_dept", (win,))
+                    + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) GROUP BY 1", (win,))
                 for dept, hits, refu in cur.fetchall():
                     cell = _cell(dept); cell["qa_hits"] = int(hits or 0); cell["refusal"] = int(refu or 0)
                 # 各部门使用量周环比：近7天 vs 前7天 命中提问数（与 qa_hits 同 DISTINCT message_id 去 chunk 扇出口径）。
                 qa_wow_ok = True
                 try:
                     cur.execute(
-                        "SELECT m.owner_dept,"
+                        f"SELECT {_own_m},"
                         " COUNT(DISTINCT CASE WHEN q.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN q.message_id END),"
                         " COUNT(DISTINCT CASE WHEN q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)"
                         "   AND q.created_at < DATE_SUB(NOW(), INTERVAL 7 DAY) THEN q.message_id END)"
                         f" FROM {_op_db()}.qa_session_log q"
                         + qa_docs_join_sql()
-                        + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) GROUP BY m.owner_dept")
+                        + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) GROUP BY 1")
                     for dept, q7, qp7 in cur.fetchall():
                         cell = _cell(dept); cell["qa7"] = int(q7 or 0); cell["qa_prev7"] = int(qp7 or 0)
                 except Exception as e:
                     qa_wow_ok = False; logger.warning("kb_governance dept usage wow 失败: %s", e)
                 cur.execute(
-                    "SELECT m.owner_dept, COUNT(DISTINCT f.doc_id)"
+                    f"SELECT {_own_m}, COUNT(DISTINCT f.doc_id)"
                     f" FROM {_kb_db()}.document_sensitive_finding f"
                     f" JOIN {_kb_db()}.document_meta m"
                     "   ON m.doc_id = CONVERT(f.doc_id USING utf8mb4) COLLATE utf8mb4_unicode_ci"
-                    " WHERE f.action IN ('QUARANTINED','REDACTED') GROUP BY m.owner_dept")
+                    " WHERE f.action IN ('QUARANTINED','REDACTED') GROUP BY 1")
                 for dept, n in cur.fetchall():
                     _cell(dept)["pii"] = int(n or 0)
                 def _wow_net(v):                          # 本周净变化「篇数」
@@ -1462,9 +1599,16 @@ def kb_governance(request: Request, identity: Optional[Identity] = Depends(curre
                     if not qa_wow_ok:
                         return None
                     return round((v["qa7"] - v["qa_prev7"]) / v["qa_prev7"], 4) if v["qa_prev7"] > 0 else None
+                _cov_names = _kb_node_names(
+                    cur, [int(k[5:]) for k in cov if k.startswith("node:") and k[5:].isdigit()])
+                def _cov_label(k):
+                    if k.startswith("node:") and k[5:].isdigit():
+                        return _cov_names.get(int(k[5:]), k)
+                    return k
                 out.dept_coverage = sorted(
                     [KbDeptCoverageItem(
-                        owner_dept=k, docs=v["docs"], new_month=v["new_month"], qa_hits=v["qa_hits"],
+                        owner_dept=k, owner_label=_cov_label(k),
+                        docs=v["docs"], new_month=v["new_month"], qa_hits=v["qa_hits"],
                         no_answer_rate=round(v["refusal"] / v["qa_hits"], 4) if v["qa_hits"] else 0.0,
                         pii_docs=v["pii"], wow_net=_wow_net(v), wow_total=_wow_pct(v),
                         qa_wow_net=_qa_wow_net(v), qa_wow=_qa_wow(v),
@@ -1773,6 +1917,12 @@ def kb_ops_metrics(request: Request, identity: Optional[Identity] = Depends(curr
 class KbConfigResponse(BaseModel):
     max_upload_bytes: int = 0
     accepted_exts: List[str] = Field(default_factory=list)
+    # 节点授权是否已对读侧生效（= RAG_NODE_ACL_GRANT）。上传表单据此选授权口径。
+    # ⚠️ 放这里而不是 org-tree：本端点【有意公开】、无身份查库，实测 2ms；而 org-tree 每次
+    # 要过 _require_kb_console（一次 RDS 往返，实测 ~1s）。2026-08-01 一度为拿这个布尔值
+    # 在 loadConfig 里多打一整个 org-tree 请求，等于给控制台首屏白加 ~1-2.6s。
+    # 与 max_upload_bytes 同性质：能力常量，不含部门/文档数据。
+    node_acl_grant: bool = False
 
 
 @router.get("/api/kb/config", response_model=KbConfigResponse)
@@ -1787,6 +1937,7 @@ def kb_config(request: Request, identity: Optional[Identity] = Depends(current_i
     return KbConfigResponse(
         max_upload_bytes=int(MAX_UPLOAD_BYTES),
         accepted_exts=sorted(_PHASE1_EXTS),
+        node_acl_grant=_node_acl_grant_enabled(),
     )
 
 
@@ -1803,13 +1954,17 @@ def kb_version_history(request: Request, doc_id: str,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT owner_dept, status FROM {_kb_db()}.document_meta "
+                # 阶段 B：mode 隔离授权（capability=absent 环境走 legacy 列，行为不变）
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, status{_mc} FROM {_kb_db()}.document_meta "
                             "WHERE doc_id=%s LIMIT 1", (doc_id,))
                 meta = cur.fetchone()
                 if not meta:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, _doc_status = meta[0] or "", meta[1]
-                if not _kb_can_manage(kb, owner_dept):
+                _mode, _oid = ((meta[2] or "legacy"), meta[3]) if _cap == "present" else ("legacy", None)
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权查看该文档")
                 cur.execute(
                     f"""
@@ -1855,13 +2010,16 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, status, current_version_no "
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, status, current_version_no{_mc} "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (doc_id,))
                 meta = cur.fetchone()
                 if not meta:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, doc_status, cur_ver = meta[0] or "", meta[1], int(meta[2] or 1)
-                if not _kb_can_manage(kb, owner_dept):
+                _mode, _oid = ((meta[3] or "legacy"), meta[4]) if _cap == "present" else ("legacy", None)
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权查看该文档")
                 vno = int(version) if version else cur_ver
                 cur.execute(
@@ -1932,9 +2090,11 @@ def kb_doc_preview(request: Request, doc_id: str, version: int = 0,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                _cap = _kb_node_capability(cur)
+                _mc = ", m.acl_mode, m.owner_dept_id" if _cap == "present" else ""
                 # 一次 JOIN 取 归属 + 原文件名 + 该版本 raw_key（version=0 → 落到 current_version_no）。
                 cur.execute(
-                    "SELECT m.owner_dept, m.original_filename, v.raw_key, v.version_no"
+                    f"SELECT m.owner_dept, m.original_filename, v.raw_key, v.version_no{_mc}"
                     f" FROM {_kb_db()}.document_meta m"
                     f" JOIN {_kb_db()}.document_version v"
                     "   ON v.doc_id = m.doc_id AND v.version_no = IF(%s > 0, %s, m.current_version_no)"
@@ -1954,8 +2114,9 @@ def kb_doc_preview(request: Request, doc_id: str, version: int = 0,
     if not row:
         raise HTTPException(status_code=404, detail="文档或版本不存在")
     owner_dept, filename, raw_key, vno = (row[0] or ""), (row[1] or ""), (row[2] or ""), int(row[3] or 0)
+    _mode, _oid = ((row[4] or "legacy"), row[5]) if len(row) > 4 else ("legacy", None)
     # 授权先于任何 URL 生成：受限/他部门原件绝不外露（dept_admin 越权直接 403）。
-    if not _kb_can_manage(kb, owner_dept):
+    if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
         raise HTTPException(status_code=403, detail="无权预览该文档")
     if not raw_key:
         return KbDocPreviewResponse(doc_id=doc_id, version_no=vno, filename=filename, available=False)
@@ -1976,16 +2137,25 @@ def kb_doc_preview(request: Request, doc_id: str, version: int = 0,
 # 写守卫用【轻量】assert_metadata_write_allowed（≠ HA3 删除级开关）。
 # ═══════════════════════════════════════════════════════════════
 
+class KbUploadNodePick(BaseModel):
+    dept_id: int = 0
+    subtree: bool = True
+
+
 class KbUploadUrlRequest(BaseModel):
     action: Literal["new", "version"] = "new"
     filename: str
-    owner_dept: str
+    owner_dept: str = ""                               # legacy 组码；node 上传可空
     permission_level: str = "dept_internal"
     title: Optional[str] = None
     category_l1: Optional[str] = None
     category_l2: Optional[str] = None
     doc_id: Optional[str] = None                       # action=version 必填
     share_owner_depts: Optional[List[str]] = None      # 多部门共享意图（Phase 2 才在检索侧生效）
+    # 阶段 B node 上传（仅 RAG_NODE_ACL_GRANT 开时受理）：归属节点 + 可见节点集。
+    # 可见集是**显式全集**——UI 默认预勾归属节点、可取消（后端绝不偷偷补回，Sam 裁决）。
+    owner_dept_id: Optional[int] = None
+    visible_nodes: Optional[List[KbUploadNodePick]] = None
 
 
 class KbUploadUrlResponse(BaseModel):
@@ -2087,6 +2257,81 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
     owner = kb_authz.sanitize_owner_dept(req.owner_dept)
     perm = req.permission_level
 
+    # ── 阶段 B：node 归属上传（owner_dept_id 给出即走 node 契约）────────────────
+    node_owner_id = int(req.owner_dept_id or 0) or None
+    node_visible: Optional[List[tuple]] = None
+    if node_owner_id is not None and req.action == "new":
+        if not _node_acl_grant_enabled():
+            raise HTTPException(status_code=400, detail="组织树授权通道未开启（RAG_NODE_ACL_GRANT）")
+        from opensearch_pipeline.acl_policy import MAX_DOC_NODES, normalize_node_ids
+        picks = req.visible_nodes or []
+        ids, overflow = normalize_node_ids([p.dept_id for p in picks], limit=MAX_DOC_NODES)
+        if overflow:
+            raise HTTPException(status_code=422, detail=f"可见节点数超上限 {MAX_DOC_NODES}")
+        if len(ids) != len({p.dept_id for p in picks}):
+            raise HTTPException(status_code=400, detail="可见节点含非法 dept_id")
+        node_visible = [(int(p.dept_id), bool(p.subtree)) for p in picks]
+        # 归属节点 + 可见节点须在册 active（dept_dim 现查）；归属节点须在调用者管辖后代集内
+        try:
+            from opensearch_pipeline.db import _get_db_conn
+            conn = _get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    if _kb_node_capability(cur) != "present":
+                        raise HTTPException(status_code=400,
+                                            detail="node-ACL schema 未就绪（060 未 apply）")
+                    check_ids = sorted({node_owner_id, *ids})
+                    ph = ",".join(["%s"] * len(check_ids))
+                    cur.execute(f"SELECT dept_id FROM {_kb_db()}.dept_dim "
+                                f"WHERE is_active=1 AND dept_id IN ({ph})", tuple(check_ids))
+                    live = {int(r[0]) for r in cur.fetchall()}
+                    dead = [i for i in check_ids if i not in live]
+                    if dead:
+                        raise HTTPException(status_code=400,
+                                            detail=f"节点不存在或已停用: {dead}")
+            finally:
+                conn.close()
+        except HTTPException:
+            raise
+        except Exception as e:
+            trace_id = get_request_id()
+            logger.error("upload-url node 校验失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"组织节点校验失败 (trace: {trace_id})")
+        if not _kb_can_manage_doc(kb, "node", None, node_owner_id):
+            raise HTTPException(status_code=403, detail="归属节点不在你的管辖范围内")
+        if perm not in ("dept_internal", "public", "restricted", "internal", "private"):
+            raise HTTPException(status_code=400, detail="非法可见级别")
+        perm = {"internal": "dept_internal", "private": "dept_internal"}.get(perm, perm)
+        # 公开影响全公司 → 与 legacy 同款不对称：非 kb_admin 进审批
+        from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN as _RKA2
+        _node_requires_approval = (perm == "public" and kb.role != _RKA2)
+        doc_id = kb_upload.new_doc_id()
+        upload_id = kb_upload.new_ulid()
+        seg = kb_upload.node_storage_segment(node_owner_id)
+        raw_key = kb_upload.build_raw_key(seg, doc_id, upload_id, req.filename,
+                                          permission_level=perm)
+        token = kb_upload.sign_upload_token({
+            "uid": kb.user_id, "action": "new", "doc_id": doc_id, "owner_dept": "",
+            "owner_dept_id": node_owner_id,
+            "visible_nodes": [[d, s] for d, s in node_visible],
+            "raw_key": raw_key, "filename": kb_upload.safe_filename(req.filename), "ext": ext,
+            "title": req.title or kb_upload.safe_filename(req.filename),
+            "category_l1": req.category_l1 or "", "category_l2": req.category_l2 or "",
+            "permission_level": perm,
+            "max_size": kb_upload.MAX_UPLOAD_BYTES,
+            "requires_approval": _node_requires_approval,
+            "owner_name": kb.name,
+        })
+        from opensearch_pipeline.oss_url import generate_signed_url as _gsu, mime_for_ext as _mfe
+        _ct = _mfe(ext)
+        _put = _gsu(raw_key, expires=kb_upload.UPLOAD_TOKEN_TTL, method="PUT", content_type=_ct)
+        logger.info("kb upload-url[node]: uid=%s doc_id=%s owner_node=%s nodes=%d",
+                    kb.user_id, doc_id, node_owner_id, len(node_visible))
+        return KbUploadUrlResponse(
+            upload_token=token, put_url=_put, raw_key=raw_key, doc_id=doc_id,
+            expires_in=kb_upload.UPLOAD_TOKEN_TTL,
+            requires_kb_admin_approval=_node_requires_approval, content_type=_ct)
+
     if req.action == "version":
         if not req.doc_id:
             raise HTTPException(status_code=400, detail="升版需提供 doc_id")
@@ -2095,8 +2340,10 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
             conn = _get_db_conn()
             try:
                 with conn.cursor() as cur:
-                    cur.execute(f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
-                                "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
+                    _cap = _kb_node_capability(cur)
+                    _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                    cur.execute(f"SELECT owner_dept, permission_level, status{_mc} "
+                                f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (req.doc_id,))
                     row = cur.fetchone()
             finally:
                 conn.close()
@@ -2108,7 +2355,17 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
             raise HTTPException(status_code=500, detail=f"查询文档失败 (trace: {trace_id})")
         if not row:
             raise HTTPException(status_code=404, detail="升版目标文档不存在")
-        if (row[0] or "") != owner or not _kb_can_manage(kb, owner):
+        _mode, _oid = ((row[3] or "legacy"), row[4]) if len(row) > 3 else ("legacy", None)
+        _is_node_upgrade = (_mode or "legacy") == "node"
+        if _is_node_upgrade:
+            # 阶段 B：node 文档升版——raw-key 走 node 命名空间（legacy raw-key 会让 stage-1
+            # 按路径段重派归属），授权走 mode 隔离判定；owner 一致性检查是 legacy 语义、跳过。
+            if not _oid:
+                raise HTTPException(status_code=409,
+                                    detail="该文档缺归属节点（半迁移态），请先在「编辑信息」中补齐归属")
+            if not _kb_can_manage_doc(kb, "node", row[0] or "", _oid):
+                raise HTTPException(status_code=403, detail="无权升版该文档（归属节点不在管辖范围）")
+        elif (row[0] or "") != owner or not _kb_can_manage(kb, owner):
             raise HTTPException(status_code=403, detail="无权升版该文档（owner_dept 不在管理范围）")
         # F-37 早失败：退役文档禁止升版——否则新版本会被 stage-1 认领复活（认领只看 dv.status）。
         # 连 PUT URL 都不颁发，客户端根本传不了文件。恢复上线走 /api/kb/restore。
@@ -2118,18 +2375,29 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
         perm = row[1] or perm
         doc_id = req.doc_id
     else:
+        _is_node_upgrade, _oid = False, None
         doc_id = kb_upload.new_doc_id()
 
-    # 授权裁决用最终生效的 perm（新建=客户端选；升版=原文档继承）。
-    decision = kb_authz.authorize_upload(kb, owner, perm, req.share_owner_depts)
-    if not decision.allowed:
-        raise HTTPException(status_code=403, detail=f"无权上传：{decision.reason}")
+    if _is_node_upgrade:
+        # node 升版无 legacy 白名单可裁——授权已在上方 mode 隔离判定完成；公开继承原级别
+        # 不产生新审批（升版不得改可见范围）。
+        class _D:  # noqa: N801 — 与 AuthzDecision 同形的最小占位
+            allowed, requires_kb_admin_approval = True, False
+        decision = _D()
+    else:
+        # 授权裁决用最终生效的 perm（新建=客户端选；升版=原文档继承）。
+        decision = kb_authz.authorize_upload(kb, owner, perm, req.share_owner_depts)
+        if not decision.allowed:
+            raise HTTPException(status_code=403, detail=f"无权上传：{decision.reason}")
 
     upload_id = kb_upload.new_ulid()
     # 可见范围编码进路径段，防管线 stage-2 把 dept_internal/restricted 升成 public（自助上传/贡献同款）。
-    raw_key = kb_upload.build_raw_key(owner, doc_id, upload_id, req.filename, permission_level=perm)
+    _seg = kb_upload.node_storage_segment(_oid) if _is_node_upgrade else owner
+    raw_key = kb_upload.build_raw_key(_seg, doc_id, upload_id, req.filename, permission_level=perm)
     token = kb_upload.sign_upload_token({
-        "uid": kb.user_id, "action": req.action, "doc_id": doc_id, "owner_dept": owner,
+        "uid": kb.user_id, "action": req.action, "doc_id": doc_id,
+        "owner_dept": ("" if _is_node_upgrade else owner),
+        **({"owner_dept_id": _oid} if _is_node_upgrade else {}),
         "raw_key": raw_key, "filename": kb_upload.safe_filename(req.filename), "ext": ext,
         "title": req.title or kb_upload.safe_filename(req.filename),
         "category_l1": req.category_l1 or "", "category_l2": req.category_l2 or "",
@@ -2221,11 +2489,21 @@ def kb_register(req: KbRegisterRequest, request: Request,
     owner = payload["owner_dept"]
     raw_key = payload["raw_key"]
     perm = payload["permission_level"]
-    # 现查授权（撤销/收回授权后即时生效，绝不信旧 token 的判断）
-    decision = kb_authz.authorize_upload(kb, owner, perm, payload.get("share_owner_depts"))
-    if not decision.allowed:
-        raise HTTPException(status_code=403, detail=f"无权登记：{decision.reason}")
-    requires_approval = bool(decision.requires_kb_admin_approval)
+    node_owner_id = int(payload.get("owner_dept_id") or 0) or None
+    if node_owner_id is not None:
+        # 阶段 B node 契约：现查 mode 隔离授权（撤管辖即时生效）；flag 关闭 = 通道关死
+        # （token TTL 窗口内翻 flag 也不放行）。
+        if not _node_acl_grant_enabled():
+            raise HTTPException(status_code=400, detail="组织树授权通道未开启（RAG_NODE_ACL_GRANT）")
+        if not _kb_can_manage_doc(kb, "node", None, node_owner_id):
+            raise HTTPException(status_code=403, detail="无权登记：归属节点不在管辖范围")
+        requires_approval = bool(payload.get("requires_approval"))
+    else:
+        # 现查授权（撤销/收回授权后即时生效，绝不信旧 token 的判断）
+        decision = kb_authz.authorize_upload(kb, owner, perm, payload.get("share_owner_depts"))
+        if not decision.allowed:
+            raise HTTPException(status_code=403, detail=f"无权登记：{decision.reason}")
+        requires_approval = bool(decision.requires_kb_admin_approval)
 
     # OSS-HEAD 实物校验：存在 + 大小
     meta = head_object(raw_key)
@@ -2328,6 +2606,39 @@ def kb_register(req: KbRegisterRequest, request: Request,
                     cur.execute(f"UPDATE {_kb_db()}.document_meta "
                                 "SET current_version_no=%s, updated_at=NOW() WHERE doc_id=%s",
                                 (version_no, doc_id))
+                elif node_owner_id is not None:
+                    # 阶段 B node 注册：同事务原子落 归属(owner_dept_id) + acl_mode +
+                    # 可见节点集(kb_doc_node_grant) + 投影 outbox —— 上传与授权不再是两个
+                    # 请求两个事务（codex B4：失败留半截 node 文档的根因）。owner_dept=NULL。
+                    version_no = 1
+                    if _kb_node_capability(cur) != "present":
+                        raise HTTPException(status_code=400,
+                                            detail="node-ACL schema 未就绪（060 未 apply）")
+                    cur.execute(
+                        f"""
+                        INSERT INTO {_kb_db()}.document_meta
+                          (doc_id, title, original_filename, owner_dept, owner_user_id, owner_name,
+                           category_l1, category_l2, permission_level, kb_type, status,
+                           current_version_no, acl_mode, owner_dept_id)
+                        VALUES (%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,'active',1,'node',%s)
+                        ON DUPLICATE KEY UPDATE current_version_no=GREATEST(current_version_no,1),
+                                                updated_at=NOW()
+                        """,
+                        (doc_id, payload.get("title"), payload.get("filename"),
+                         kb.user_id, payload.get("owner_name") or kb.name,
+                         payload.get("category_l1") or None, payload.get("category_l2") or None,
+                         perm, ("public" if perm == "public" else "private"), node_owner_id),
+                    )
+                    _vn = payload.get("visible_nodes") or []
+                    for _d, _s in _vn:
+                        cur.execute(
+                            f"INSERT INTO {_kb_db()}.kb_doc_node_grant "
+                            "(doc_id, dept_id, scope, granted_by, note) VALUES (%s,%s,%s,%s,%s) "
+                            "ON DUPLICATE KEY UPDATE revoked_at=NULL, revoked_by=NULL, "
+                            "granted_by=VALUES(granted_by), granted_at=NOW(), note=VALUES(note)",
+                            (doc_id, int(_d), "subtree" if _s else "exact", kb.user_id, "register"))
+                    from opensearch_pipeline.access_grants import enqueue_acl_projection
+                    enqueue_acl_projection(cur, doc_id, reason="node_register")
                 else:
                     version_no = 1
                     cur.execute(
@@ -2545,16 +2856,19 @@ def kb_retire(req: KbRetireRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                # 行锁文档元数据，串行化并发退役 / 退役-vs-升版
-                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                # 行锁文档元数据，串行化并发退役 / 退役-vs-升版；锁内读齐 mode 三元组（阶段 B）
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status, current_version_no{_mc} "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm = (row[0] or ""), (row[1] or "")
                 status, cur_ver = (row[2] or "active"), int(row[3] or 1)
+                _mode, _oid = ((row[4] or "legacy"), row[5]) if _cap == "present" else ("legacy", None)
                 # 授权：先作用域，再"公开需 kb_admin"（与上传同款不对称——公开影响全公司）
-                if not _kb_can_manage(kb, owner_dept):
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权退役该文档（owner_dept 不在管理范围）")
                 if perm == "public" and kb.role != ROLE_KB_ADMIN:
                     raise HTTPException(status_code=403, detail="公开文档需知识库管理员退役")
@@ -2642,15 +2956,18 @@ def kb_restore(req: KbRetireRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status, current_version_no{_mc} "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm = (row[0] or ""), (row[1] or "")
                 status, cur_ver = (row[2] or "active"), int(row[3] or 1)
+                _mode, _oid = ((row[4] or "legacy"), row[5]) if _cap == "present" else ("legacy", None)
                 # 授权：与退役同款不对称——作用域 + 公开文档需 kb_admin
-                if not _kb_can_manage(kb, owner_dept):
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权恢复该文档（owner_dept 不在管理范围）")
                 if perm == "public" and kb.role != ROLE_KB_ADMIN:
                     raise HTTPException(status_code=403, detail="公开文档需知识库管理员恢复")
@@ -2736,14 +3053,17 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status, current_version_no{_mc} "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, cur_perm = (row[0] or ""), (row[1] or "")
                 status, cur_ver = (row[2] or "active"), int(row[3] or 1)
-                if not _kb_can_manage(kb, owner_dept):
+                _mode, _oid = ((row[4] or "legacy"), row[5]) if _cap == "present" else ("legacy", None)
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权修改该文档（owner_dept 不在管理范围）")
                 # public 涉及全公司可见 → 收窄/放宽均需 kb_admin（与 retire/restore/上传同款不对称）
                 if (target == "public" or cur_perm == "public") and kb.role != ROLE_KB_ADMIN:
@@ -2887,3 +3207,331 @@ def kb_pending_approvals(request: Request,
         for r in rows
     ]
     return KbPendingResponse(items=items)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 阶段 B — 文档元数据读模型 + 编辑端点（doc-meta）
+#   「一个端点四件事」（Sam 2026-07-28 裁决 §5.2a）：改标题 + 改分类 + 改归属节点 +
+#   改可见节点集，同事务 + 审计 + 投影意图。也是 legacy→node 迁移与 node→legacy 回滚
+#   （kb_admin-only）的唯一入口。
+#   D5（Sam 2026-08-01 拍板）：改标题/分类 = HA3 字段级刷新（meta 投影 outbox +
+#   stage-3 pre-drain 重推；title 走 loader 的 document_meta JOIN 现读、category 由
+#   pre-drain 同步进 chunk_meta）——chunk_text 内嵌的旧标题前缀**不动**，文本级改名
+#   另走维护 re-chunk。
+# ═══════════════════════════════════════════════════════════════
+class KbDocMetaNodeGrant(BaseModel):
+    dept_id: int = 0
+    scope: str = "subtree"            # subtree | exact
+    name: str = ""                    # dept_dim 现名（LEFT JOIN 含失活，不悄悄隐藏授权意图）
+    active: bool = True               # 节点是否仍在册
+
+
+class KbDocMetaResponse(BaseModel):
+    doc_id: str = ""
+    title: str = ""
+    category_l1: str = ""
+    category_l2: str = ""
+    permission_level: str = ""
+    status: str = "active"
+    acl_mode: str = "legacy"
+    owner_dept: str = ""
+    owner_dept_id: Optional[int] = None
+    owner_key: str = ""               # 稳定分桶键：legacy:<code> | node:<id>（WP4 统一口径）
+    owner_label: str = ""
+    acl_revision: int = 0
+    node_grants: List[KbDocMetaNodeGrant] = Field(default_factory=list)
+    legacy_grants: List[str] = Field(default_factory=list)   # approved 组码（审计/展示）
+
+
+class KbDocMetaSaveRequest(BaseModel):
+    doc_id: str = ""
+    expected_acl_revision: Optional[int] = None   # CAS 必填（缺省 400）
+    title: Optional[str] = None
+    category_l1: Optional[str] = None
+    category_l2: Optional[str] = None
+    owner_dept_id: Optional[int] = None           # 设/改归属节点（legacy→node 迁移须同时给 visible_nodes）
+    visible_nodes: Optional[List[KbUploadNodePick]] = None   # None=不动；[]=清空；[…]=权威全集
+    # node→legacy 回滚（kb_admin-only）：target_acl_mode='legacy' + 必填 legacy_owner_dept
+    target_acl_mode: Optional[str] = None
+    legacy_owner_dept: Optional[str] = None
+    reason: str = ""
+
+
+class KbDocMetaSaveResponse(BaseModel):
+    doc_id: str = ""
+    acl_mode: str = ""
+    acl_revision: int = 0
+    changed: List[str] = Field(default_factory=list)   # title/category/owner/visible_nodes/mode
+    ok: bool = True
+
+
+@router.get("/api/kb/doc-meta", response_model=KbDocMetaResponse)
+def kb_doc_meta(doc_id: str, request: Request,
+                identity: Optional[Identity] = Depends(current_identity)):
+    """文档管理面读模型：三元组 + revision + 授权全集。**过 can_manage_doc**（非「可读」——
+    授权全集是管理面数据，只读可见不等于可看授权面，codex minor）。ShareDocModal/DocMetaModal
+    的预填来源（修「开弹窗清空+整体替换=静默抹授权」的隐患）。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                t = _kb_read_doc_triplet(cur, doc_id)
+                if t is None:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                if not _kb_can_manage_doc(kb, t["acl_mode"], t["owner_dept"], t["owner_dept_id"]):
+                    raise HTTPException(status_code=403, detail="无权查看该文档的授权信息")
+                cur.execute(f"SELECT title, category_l1, category_l2 FROM {_kb_db()}.document_meta "
+                            "WHERE doc_id=%s", (doc_id,))
+                trow = cur.fetchone() or ("", "", "")
+                node_grants: List[KbDocMetaNodeGrant] = []
+                owner_label = t["owner_dept"] or ""
+                if t["cap"] == "present":
+                    try:
+                        cur.execute(
+                            f"SELECT g.dept_id, g.scope, d.name, d.is_active "
+                            f"FROM {_kb_db()}.kb_doc_node_grant g "
+                            f"LEFT JOIN {_kb_db()}.dept_dim d ON d.dept_id = g.dept_id "
+                            "WHERE g.doc_id=%s AND g.revoked_at IS NULL ORDER BY g.dept_id",
+                            (doc_id,))
+                        node_grants = [KbDocMetaNodeGrant(
+                            dept_id=int(r[0]), scope=r[1] or "subtree",
+                            name=r[2] or str(r[0]),
+                            active=bool(r[3]) if r[3] is not None else False)
+                            for r in cur.fetchall()]
+                    except Exception as ne:   # noqa: BLE001
+                        logger.debug("doc-meta node grants 读取失败: %s", ne)
+                    if t["acl_mode"] == "node" and t["owner_dept_id"]:
+                        cur.execute(f"SELECT name FROM {_kb_db()}.dept_dim WHERE dept_id=%s",
+                                    (t["owner_dept_id"],))
+                        nrow = cur.fetchone()
+                        owner_label = (nrow[0] if nrow else "") or str(t["owner_dept_id"])
+                cur.execute(f"SELECT DISTINCT requester_depts FROM {_kb_db()}.kb_access_request "
+                            "WHERE doc_id=%s AND status='approved'", (doc_id,))
+                legacy_grants = sorted({(r[0] or "").strip() for r in cur.fetchall()
+                                        if r and (r[0] or "").strip()})
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = get_request_id()
+        logger.error("kb_doc_meta 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"文档信息查询失败 (trace: {trace_id})")
+    owner_key = (f"node:{t['owner_dept_id']}" if t["acl_mode"] == "node" and t["owner_dept_id"]
+                 else f"legacy:{t['owner_dept']}" if t["owner_dept"] else "")
+    return KbDocMetaResponse(
+        doc_id=doc_id, title=trow[0] or "", category_l1=trow[1] or "", category_l2=trow[2] or "",
+        permission_level=t["permission_level"], status=t["status"], acl_mode=t["acl_mode"],
+        owner_dept=t["owner_dept"], owner_dept_id=t["owner_dept_id"], owner_key=owner_key,
+        owner_label=owner_label, acl_revision=t["acl_revision"],
+        node_grants=node_grants, legacy_grants=legacy_grants)
+
+
+@router.post("/api/kb/doc-meta", response_model=KbDocMetaSaveResponse)
+def kb_doc_meta_save(req: KbDocMetaSaveRequest, request: Request,
+                     identity: Optional[Identity] = Depends(current_identity)):
+    """编辑文档元数据（四件事同事务）。语义要点（codex 4 轮共识）：
+
+    - CAS 必填：每次**实际变更**（含 title/category-only）都把 acl_revision +1——否则两个持同
+      revision 的并发元数据编辑第二个仍会通过；
+    - legacy→node 迁移：必须同时给 owner_dept_id + visible_nodes（原子，不产生半迁移态）；
+      改归属须**同时管源与目标**（kb_admin 除外，D6——防「把文档挪进别人子树」）；迁移事务内
+      清理存量 legacy 申请行（approved 软撤销、pending 自动 reject，M6——防隐形组码回滚复活）；
+    - node→legacy 回滚：kb_admin-only + 必填 legacy_owner_dept（白名单）——node grants 全撤、
+      owner_dept 写回、owner_dept_id=NULL；投影经 mode 对称 materializer 把哨兵洗回真实组码；
+    - title/category 变更：enqueue_meta_projection（061 未 apply 抛 1146 → 整笔回滚，诚实失败）。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.access_grants import (
+        enqueue_acl_projection, enqueue_meta_projection, materialize_doc_allowed_depts,
+    )
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, sanitize_owner_dept
+
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    if req.expected_acl_revision is None:
+        raise HTTPException(status_code=400, detail="缺少 expected_acl_revision（请从文档信息读取后提交）")
+    target_mode = (req.target_acl_mode or "").strip().lower() or None
+    if target_mode not in (None, "legacy"):
+        raise HTTPException(status_code=400, detail="target_acl_mode 仅支持 'legacy'（node 迁移经 owner_dept_id）")
+    assert_metadata_write_allowed("kb_doc_meta_save", get_config().rds.host, kind="rds")
+    trace_id = get_request_id()
+    changed: List[str] = []
+    new_rev = 0
+    final_mode = ""
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status, acl_revision, title, "
+                            f"category_l1, category_l2{_mc} "
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE",
+                            (req.doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept = row[0] or ""
+                cur_rev, cur_title = int(row[3] or 0), row[4] or ""
+                cur_c1, cur_c2 = row[5] or "", row[6] or ""
+                cur_mode, cur_oid = ((row[7] or "legacy"), row[8]) if cap == "present" else ("legacy", None)
+                final_mode = cur_mode
+                if int(req.expected_acl_revision) != cur_rev:
+                    raise HTTPException(status_code=409,
+                                        detail=f"文档信息已被他人修改（当前版本 {cur_rev}），请刷新后重试")
+                if not _kb_can_manage_doc(kb, cur_mode, owner_dept, cur_oid):
+                    raise HTTPException(status_code=403, detail="无权编辑该文档")
+
+                # ── mode/归属/可见集 ────────────────────────────────────────
+                if target_mode == "legacy":
+                    if cur_mode != "node":
+                        raise HTTPException(status_code=400, detail="该文档已是组码授权模式")
+                    if kb.role != ROLE_KB_ADMIN:
+                        raise HTTPException(status_code=403, detail="迁回组码模式仅限知识库管理员")
+                    legacy_owner = sanitize_owner_dept(req.legacy_owner_dept or "")
+                    if not legacy_owner:
+                        raise HTTPException(status_code=400,
+                                            detail="迁回组码模式必须提供合法的 legacy_owner_dept")
+                    cur.execute(f"UPDATE {_kb_db()}.kb_doc_node_grant SET revoked_at=NOW(), "
+                                "revoked_by=%s WHERE doc_id=%s AND revoked_at IS NULL",
+                                (kb.user_id, req.doc_id))
+                    cur.execute(f"UPDATE {_kb_db()}.document_meta SET acl_mode='legacy', "
+                                "owner_dept=%s, owner_dept_id=NULL, updated_at=NOW() "
+                                "WHERE doc_id=%s", (legacy_owner, req.doc_id))
+                    enqueue_acl_projection(cur, req.doc_id, reason="node_to_legacy")
+                    changed.append("mode")
+                    final_mode = "legacy"
+                elif req.owner_dept_id is not None or req.visible_nodes is not None:
+                    if not _node_acl_grant_enabled():
+                        raise HTTPException(status_code=400,
+                                            detail="组织树授权通道未开启（RAG_NODE_ACL_GRANT）")
+                    if cap != "present":
+                        raise HTTPException(status_code=400, detail="node-ACL schema 未就绪（060 未 apply）")
+                    new_oid = int(req.owner_dept_id or 0) or cur_oid
+                    if cur_mode != "node":
+                        # legacy→node 迁移：owner + 可见集必须一起给（原子，不产生半迁移态）
+                        if not (req.owner_dept_id and req.visible_nodes is not None):
+                            raise HTTPException(status_code=400,
+                                                detail="迁移到组织树模式须同时提供归属节点与可见范围")
+                    if not new_oid:
+                        raise HTTPException(status_code=400, detail="缺少归属节点")
+                    # 校验节点在册 + D6 双端管辖（kb_admin 除外）
+                    picks = req.visible_nodes if req.visible_nodes is not None else []
+                    from opensearch_pipeline.acl_policy import MAX_DOC_NODES, normalize_node_ids
+                    ids, overflow = normalize_node_ids([p.dept_id for p in picks], limit=MAX_DOC_NODES)
+                    if overflow:
+                        raise HTTPException(status_code=422, detail=f"可见节点数超上限 {MAX_DOC_NODES}")
+                    check_ids = sorted({new_oid, *ids})
+                    ph = ",".join(["%s"] * len(check_ids))
+                    cur.execute(f"SELECT dept_id FROM {_kb_db()}.dept_dim "
+                                f"WHERE is_active=1 AND dept_id IN ({ph})", tuple(check_ids))
+                    live = {int(r[0]) for r in cur.fetchall()}
+                    dead = [i for i in check_ids if i not in live]
+                    if dead:
+                        raise HTTPException(status_code=400, detail=f"节点不存在或已停用: {dead}")
+                    if new_oid != cur_oid and not _kb_can_manage_doc(kb, "node", None, new_oid):
+                        raise HTTPException(status_code=403, detail="目标归属节点不在你的管辖范围内")
+                    if req.owner_dept_id and new_oid != cur_oid:
+                        changed.append("owner")
+                    if cur_mode != "node":
+                        changed.append("mode")
+                        # M6：迁移事务内清理存量 legacy 申请行（防 node 期间的隐形组码在回滚时复活）
+                        cur.execute(f"UPDATE {_kb_db()}.kb_access_request SET status='revoked', "
+                                    "decided_by=%s, decided_at=NOW(), decision_note='归属已迁组织树' "
+                                    "WHERE doc_id=%s AND status='approved'", (kb.user_id, req.doc_id))
+                        cur.execute(f"UPDATE {_kb_db()}.kb_access_request SET status='rejected', "
+                                    "decided_by=%s, decided_at=NOW(), decision_note='归属已迁组织树' "
+                                    "WHERE doc_id=%s AND status='pending'", (kb.user_id, req.doc_id))
+                    cur.execute(f"UPDATE {_kb_db()}.document_meta SET acl_mode='node', "
+                                "owner_dept=NULL, owner_dept_id=%s, updated_at=NOW() "
+                                "WHERE doc_id=%s", (new_oid, req.doc_id))
+                    final_mode = "node"
+                    if req.visible_nodes is not None:
+                        scope_by_id = {int(p.dept_id): ("subtree" if p.subtree else "exact")
+                                       for p in picks}
+                        cur.execute(f"SELECT dept_id, scope FROM {_kb_db()}.kb_doc_node_grant "
+                                    "WHERE doc_id=%s AND revoked_at IS NULL", (req.doc_id,))
+                        before = {(int(r[0]), r[1] or "subtree") for r in cur.fetchall()}
+                        after = {(i, scope_by_id[i]) for i in ids}
+                        for dept_id, scope in sorted(before - after):
+                            cur.execute(f"UPDATE {_kb_db()}.kb_doc_node_grant SET revoked_at=NOW(), "
+                                        "revoked_by=%s WHERE doc_id=%s AND dept_id=%s AND scope=%s "
+                                        "AND revoked_at IS NULL",
+                                        (kb.user_id, req.doc_id, dept_id, scope))
+                        for dept_id, scope in sorted(after - before):
+                            cur.execute(f"INSERT INTO {_kb_db()}.kb_doc_node_grant "
+                                        "(doc_id, dept_id, scope, granted_by, note) VALUES (%s,%s,%s,%s,%s) "
+                                        "ON DUPLICATE KEY UPDATE revoked_at=NULL, revoked_by=NULL, "
+                                        "granted_by=VALUES(granted_by), granted_at=NOW(), note=VALUES(note)",
+                                        (req.doc_id, dept_id, scope, kb.user_id,
+                                         (req.reason or "")[:255]))
+                        if before != after:
+                            changed.append("visible_nodes")
+                    enqueue_acl_projection(cur, req.doc_id, reason="doc_meta_save")
+
+                # ── title / category（D5：字段级刷新）─────────────────────────
+                new_title = req.title.strip() if isinstance(req.title, str) else None
+                if new_title and new_title != cur_title:
+                    cur.execute(f"UPDATE {_kb_db()}.document_meta SET title=%s, updated_at=NOW() "
+                                "WHERE doc_id=%s", (new_title[:255], req.doc_id))
+                    changed.append("title")
+                _nc1 = req.category_l1.strip() if isinstance(req.category_l1, str) else None
+                _nc2 = req.category_l2.strip() if isinstance(req.category_l2, str) else None
+                if (_nc1 is not None and _nc1 != cur_c1) or (_nc2 is not None and _nc2 != cur_c2):
+                    cur.execute(f"UPDATE {_kb_db()}.document_meta SET "
+                                "category_l1=COALESCE(%s, category_l1), "
+                                "category_l2=COALESCE(%s, category_l2), updated_at=NOW() "
+                                "WHERE doc_id=%s", (_nc1, _nc2, req.doc_id))
+                    changed.append("category")
+                if "title" in changed or "category" in changed:
+                    # 持久投影意图（061）：stage-3 pre-drain 同步 chunk category + 标脏重推。
+                    # 061 未 apply → 1146 上抛 → 整笔回滚（诚实失败，不留半提交）。
+                    enqueue_meta_projection(cur, req.doc_id,
+                                            reason=("title_changed" if "title" in changed
+                                                    else "category_changed"))
+
+                if not changed:
+                    conn.rollback()
+                    return KbDocMetaSaveResponse(doc_id=req.doc_id, acl_mode=final_mode,
+                                                 acl_revision=cur_rev, changed=[], ok=True)
+                # 每次实际变更 revision+1（M3：CAS 对元数据并发同样有效）
+                new_rev = cur_rev + 1
+                cur.execute(f"UPDATE {_kb_db()}.document_meta SET acl_revision=%s, updated_at=NOW() "
+                            "WHERE doc_id=%s", (new_rev, req.doc_id))
+                # ACL 相关变更内联 best-effort 物化（outbox 兜底）
+                if {"mode", "owner", "visible_nodes"} & set(changed):
+                    try:
+                        materialize_doc_allowed_depts(cur, req.doc_id)
+                    except Exception as _pe:   # noqa: BLE001
+                        logger.warning("doc-meta 内联标脏失败（outbox 兜底）doc=%s: %s",
+                                       req.doc_id, _pe)
+                write_audit(doc_id=req.doc_id, version_no=None, action_type="DOC_META_SAVE",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"changed={','.join(changed)} rev={cur_rev}->{new_rev} "
+                                    f"reason={(req.reason or '')[:120]}", cursor=cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_doc_meta_save 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"保存文档信息失败 (trace: {trace_id})")
+    if {"mode", "owner", "visible_nodes"} & set(changed):
+        try:
+            from opensearch_pipeline.retriever import invalidate_deny_cache
+            invalidate_deny_cache(req.doc_id)
+        except Exception as _ce:   # noqa: BLE001
+            logger.warning("失效 deny 缓存失败（TTL 兜底）doc=%s: %s", req.doc_id, _ce)
+    return KbDocMetaSaveResponse(doc_id=req.doc_id, acl_mode=final_mode,
+                                 acl_revision=new_rev, changed=changed, ok=True)

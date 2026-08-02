@@ -6,8 +6,10 @@ name: Frontend
 
 on:
   push:
-    # 批次8（ultra ci.yml:12 同族）：前端门同样覆盖实际出包的工作分支
-    branches: [main, "claude/**"]
+    # ⚠️ 2026-08-01：去掉 `branches: [main, "claude/**"]` 过滤，改为**全部分支**。
+    # 理由同 ci.yml：实测 fix/+feat/ 合计 23 个分支比 claude/ 的 21 个还多，多数工作
+    # 分支从来没跑过前端门；本次 feat/node-acl-phase-a 全程未触发，一个 vue-tsc TS2322
+    # 就这么上了线（「保存可见范围」按钮永久禁用）。paths 过滤仍在 ⇒ 纯后端推送不白跑。
     paths:
       - "console-app/**"
       - "fuling-rag-miniapp/**"
@@ -45,7 +47,20 @@ jobs:
         run: npm ci
       - name: Test (vitest)
         run: npm run test
-      - name: Build (vue-tsc 类型检查 + vite build)
+      # 独立一步跑 typecheck。⚠️ **它不是这次事故的修复**——事故的唯一原因是分支 filter
+      # 让本分支从没跑过 CI（见上方 on: 注释）。2026-08-01 净室实测（git worktree 检出
+      # 修复前的 813bda3 复跑）已**推翻**"增量缓存会掩盖类型错误"这个猜测：
+      #     无 .tsbuildinfo      vue-tsc -b   exit=2 报错 ✅
+      #     有 .tsbuildinfo(增量) vue-tsc -b   exit=2 报错 ✅
+      #     npm run build        exit=2 报错 ✅ 且不产出产物
+      # 也就是说 build 那步本来就拦得住。加这一步只为两点边际收益：
+      #   ① 失败信息直指类型问题，不混 vite/压缩噪声；
+      #   ② 与 console-app/CLAUDE.md 的 done bar（npm run typecheck）字面一致。
+      # ⚠️ 顺带记一条真正的坑：当时报"vue-tsc exit=0"最可能是 `| tail` 吞掉了退出码
+      #    （见 ~/.claude 记忆 feedback-verify-exit-codes）。验证要显式回显 ${PIPESTATUS}。
+      - name: Typecheck (vue-tsc --noEmit)
+        run: npm run typecheck
+      - name: Build (vite build + 压缩产物)
         run: npm run build
 
   # δ4a（M14，Majors 批次 δ，codex 共识 2026-07-21）：Playwright UX 硬门进 CI——

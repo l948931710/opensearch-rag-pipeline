@@ -2,12 +2,20 @@
 """
 test_ha3_verify_repush.py — DAG-3 节点 04b（node_verify_and_repush）单测。
 
-无需阿里云实例：通过 mock HA3 client（query/push_documents）+ mock RDS conn 验证：
-推送后 HA3 物理存在性校验（权威 point-read，PK 相符）→ 有界补推 → 三终态
+无需阿里云实例：通过 mock HA3 client（fetch/push_documents）+ mock RDS conn 验证：
+推送后 HA3 物理存在性校验（**官方 /vector-service/fetch**，PK 相符）→ 有界补推 → 三终态
 （all-present / DROP / UNKNOWN）→ 失败写回 FAILED（分类、rowcount 闭环、阻断 node 05）。
+
+⚠️ 2026-07-22 C2：权威判据由零向量 point-read 换成官方 fetch。零向量 query 与任何向量
+内积恒为 0 ⇒ 全部得分并列 ⇒ 返回哪个子集由引擎召回逻辑决定，会把**在场行判 missing**
+（实测某在场行零向量返 0 命中而 fetch 正常取回）⇒ 无谓补推 + 04b raise 阻断节点 05
+⇒ 旧版本永不停用、双版本长存。故本文件的存在性用例一律走 fetch，并断言存在性路径
+**零 client.query 调用**。
+
+fetch 的失败粒度是**批**（≤100/批）：批异常、返回请求集外 PK、同批重复 PK 一律使
+**整批 UNKNOWN**（绝不误判 missing）——与旧的"逐 PK 隔离"不同，相关用例已按批语义重写。
 """
 
-import re
 import sys
 import types
 
@@ -40,6 +48,42 @@ def _ensure_ha3_mock():
                 self.output_fields = output_fields
                 self.filter = filter
         models.QueryRequest = QueryRequest
+    if not hasattr(models, "FetchRequest"):    # C2：权威存在性走官方 fetch
+        class FetchRequest:
+            def __init__(self, table_name=None, ids=None, include_vector=None,
+                         output_fields=None):
+                self.table_name = table_name
+                self.ids = ids
+                self.include_vector = include_vector
+                self.output_fields = output_fields
+        models.FetchRequest = FetchRequest
+    # ⚠️ 本函数把假 models 模块塞进 sys.modules，会**遮蔽真 SDK**（`if name not in sys.modules`
+    # 先到先得）。倒排枚举 helper（clients.ha3_enumerate_bucket）运行时 import 这两个类，
+    # 缺了就会被判 unhealthy → 同批运行的 reconcile/L6/enumerator 用例集体假红（实测踩过）。
+    # 按仓库既有惯例就地补属性，保证谁先注入都不缺件。
+    if not hasattr(models, "SearchRequest"):
+        class SearchRequest:
+            def __init__(self, table_name=None, size=None, from_=None, order=None,
+                         output_fields=None, knn=None, text=None, rank=None):
+                self.table_name = table_name
+                self.size = size
+                self.from_ = from_
+                self.order = order
+                self.output_fields = output_fields
+                self.knn = knn
+                self.text = text
+                self.rank = rank
+        models.SearchRequest = SearchRequest
+    if not hasattr(models, "TextQuery"):
+        class TextQuery:
+            def __init__(self, query_string=None, query_params=None, filter=None,
+                         weight=None, terminate_after=None):
+                self.query_string = query_string
+                self.query_params = query_params
+                self.filter = filter
+                self.weight = weight
+                self.terminate_after = terminate_after
+        models.TextQuery = TextQuery
 
 
 _ensure_ha3_mock()
@@ -51,25 +95,32 @@ def _resp(items):
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
 class FakeHA3:
-    """可配置的 HA3 client。point-read(filter id=<pk>) + range-enum(id>=lo AND id<hi) + push。"""
+    """可配置的 HA3 client：官方 fetch(批 ≤100) + push。
 
-    def __init__(self, present=(), never_heal=(), point_raise=(), wrong_id=(),
-                 lag_first=(), enumerate_raise=False, stale=(), stale_heals=True, texts=None):
+    ⚠️ 不实现 `query`——存在性路径若还调零向量 query 会立刻 AttributeError，
+    这本身就是"不得回退零向量判存在性"的回归断言。"""
+
+    def __init__(self, present=(), never_heal=(), fetch_raise=(), wrong_id=(),
+                 lag_first=(), stale=(), stale_heals=True, texts=None):
         self.present = set(present)            # 当前"真在" HA3 的 pk
         self.never_heal = set(never_heal)      # 补推也不会进 HA3（持久 DROP）
-        self.point_raise = set(point_raise)    # 这些 pk 的 point-read 抛异常（UNKNOWN）
-        self.wrong_id = set(wrong_id)          # 返回行 id 与目标不符（PK 不匹配 → MISSING）
-        self.lag_first = set(lag_first)        # 在 present 但首次 point-read 返回空（最终一致性滞后）
-        self.enumerate_raise = enumerate_raise
+        # ⚠️ 批语义：只要批内**任一** pk 命中 fetch_raise，整批抛异常 → 整批 UNKNOWN
+        self.fetch_raise = set(fetch_raise)
+        # 返回请求集外的 PK（畸形响应）→ 整批 UNKNOWN（**不是** MISSING/DROP）
+        self.wrong_id = set(wrong_id)
+        self.lag_first = set(lag_first)        # 在 present 但首次 fetch 不返回（最终一致性滞后）
         self.stale = set(stale)               # present 但 chunk_text_store 陈旧（≠ 内存 t{pk}）→ drift
         self.stale_heals = stale_heals        # 补推后陈旧内容是否变一致
         self.texts = dict(texts or {})        # 显式覆盖某 pk 返回的 chunk_text_store
         self.push_calls = []                   # list[list[int]]
-        self.point_reads = []                  # list[int]
-        self.range_reads = []                  # list[(lo, hi)]
-        self.query_vector_lens = []
+        self.fetch_calls = []                  # list[list[int]]：每批请求的 id 列表
         self._reads = {}
         self._repushed = set()
+
+    @property
+    def fetched_pks(self):
+        """所有被 fetch 过的 pk（扁平化，供等价于旧 point_reads 的断言）。"""
+        return [pk for batch in self.fetch_calls for pk in batch]
 
     def _text_for(self, pk):
         if pk in self.texts:
@@ -78,28 +129,21 @@ class FakeHA3:
             return "STALE_CONTENT"
         return f"t{pk}"                        # matches _mk_chunk's chunk_text → no drift
 
-    def query(self, req):
-        self.query_vector_lens.append(len(req.vector))
-        m = re.fullmatch(r"\s*\w+=(\d+)\s*", req.filter)
-        if m:
-            pk = int(m.group(1))
-            self.point_reads.append(pk)
-            if pk in self.point_raise:
-                raise RuntimeError("simulated point-read failure")
+    def fetch(self, req):
+        pks = [int(x) for x in req.ids]
+        self.fetch_calls.append(pks)
+        assert len(pks) <= 100, "fetch 单批上限 100"
+        if self.fetch_raise & set(pks):
+            raise RuntimeError("simulated fetch batch failure")
+        items = []
+        for pk in pks:
             self._reads[pk] = self._reads.get(pk, 0) + 1
             lagging = pk in self.lag_first and self._reads[pk] == 1
-            if pk in self.present and not lagging:
-                rid = (pk + 100000) if pk in self.wrong_id else pk
-                return _resp([{"id": rid, "fields": {"chunk_id": f"c{pk}", "doc_id": "doc1",
-                                                     "chunk_text_store": self._text_for(pk)}}])
-            return _resp([])
-        mr = re.search(r"id>=(\d+) AND id<(\d+)", req.filter)
-        if self.enumerate_raise:
-            raise RuntimeError("simulated enumerate failure")
-        lo, hi = (int(mr.group(1)), int(mr.group(2))) if mr else (0, 10 ** 18)
-        self.range_reads.append((lo, hi))
-        items = [{"id": pk, "fields": {"chunk_id": f"c{pk}", "doc_id": "doc1"}}
-                 for pk in self.present if lo <= pk < hi]
+            if pk not in self.present or lagging:
+                continue                        # 不返回 = 该 pk MISSING
+            rid = (pk + 100000) if pk in self.wrong_id else pk   # 越集 → 整批 UNKNOWN
+            items.append({"id": rid, "fields": {"chunk_id": f"c{pk}", "doc_id": "doc1",
+                                                "chunk_text_store": self._text_for(pk)}})
         return _resp(items)
 
     def push_documents(self, table, pk_field, request):
@@ -208,7 +252,7 @@ def test_flag_explicit_off_returns_even_in_real_mode(monkeypatch):
     monkeypatch.setattr(pn, "_get_opensearch_client", lambda ctx=None: client)
     ctx = {"bulk_batches": [{"chunks": [_mk_chunk(1)]}], "simulate_opensearch": False}
     pn.node_verify_and_repush(ctx)
-    assert client.point_reads == [] and client.push_calls == []
+    assert client.fetch_calls == [] and client.push_calls == []
 
 
 def test_flag_default_on_runs_verify_in_real_mode(monkeypatch):
@@ -220,7 +264,7 @@ def test_flag_default_on_runs_verify_in_real_mode(monkeypatch):
     monkeypatch.setattr(pn, "_get_opensearch_client", lambda ctx=None: client)
     ctx = {"bulk_batches": [{"chunks": [_mk_chunk(1)]}], "simulate_opensearch": False}
     pn.node_verify_and_repush(ctx)
-    assert client.point_reads != []  # 默认常开 → 真的读了 HA3
+    assert client.fetch_calls != []  # 默认常开 → 真的读了 HA3(官方 fetch)
 
 
 # ── 3. all present ───────────────────────────────────────────────────────────
@@ -229,7 +273,7 @@ def test_all_present_no_repush_no_raise(monkeypatch):
     client = FakeHA3(present={10, 11, 12})
     ctx = _setup(monkeypatch, client, chunks)
     pn.node_verify_and_repush(ctx)
-    assert sorted(client.point_reads) == [10, 11, 12]
+    assert sorted(client.fetched_pks) == [10, 11, 12]
     assert client.push_calls == []
 
 
@@ -263,42 +307,40 @@ def test_persistent_drop_raises_and_persists(monkeypatch):
     assert ("doc1", 2) in ctx["failed_doc_versions"]
 
 
-# ── 6. UNKNOWN (point-read raises) → raise, distinct code, NO re-push ─────────
+# ── 6. UNKNOWN（fetch 批异常）→ raise, distinct code, NO re-push ───────────────
 def test_unknown_blocks_without_repush(monkeypatch):
+    """fetch 的失败粒度是**批**：批内任一 PK 读失败 ⇒ 整批 UNKNOWN。
+    这是有意的保守方向——读不到就绝不敢断言"缺失"，宁可整批阻断节点 05。"""
     chunks = [_mk_chunk(10), _mk_chunk(11)]
-    client = FakeHA3(present={10, 11}, point_raise={11})
+    client = FakeHA3(present={10, 11}, fetch_raise={11})
     conn = FakeConn()
     ctx = _setup(monkeypatch, client, chunks, conn=conn, RAG_STAGE3_PARITY_MAX_RETRIES=2)
     with pytest.raises(RuntimeError, match="parity"):
         pn.node_verify_and_repush(ctx)
     assert client.push_calls == []              # UNKNOWN 不补推
-    assert chunks[1].index_status == "FAILED"
-    assert chunks[1].index_error_code == "PARITY_UNKNOWN"
+    for c in chunks:                            # 同批两条都进 UNKNOWN 桶
+        assert c.index_status == "FAILED"
+        assert c.index_error_code == "PARITY_UNKNOWN"
     assert conn.committed
     assert ("doc1", 2) in ctx["failed_doc_versions"]
 
 
-# ── 7. enumerate raises → degrade to full point-read (NOT fail-open) ──────────
-def test_enumerate_failure_degrades_to_pointread(monkeypatch):
-    chunks = [_mk_chunk(10), _mk_chunk(11), _mk_chunk(12)]
-    client = FakeHA3(present={10, 11, 12}, enumerate_raise=True)
-    # POINTREAD_ALL_MAX=0 → 走大批 enum 路径；enum 抛 → 降级全量 point-read
-    ctx = _setup(monkeypatch, client, chunks, RAG_STAGE3_PARITY_POINTREAD_ALL_MAX=0)
-    pn.node_verify_and_repush(ctx)              # 全 present → 不抛异常
-    assert sorted(client.point_reads) == [10, 11, 12]   # 确实降级为逐个 point-read
-
-
-# ── 8. point-read PK-mismatch → treated as MISSING ───────────────────────────
-def test_pk_mismatch_treated_as_missing(monkeypatch):
+# ── 7. fetch 返回请求集外 PK（畸形）→ 整批 UNKNOWN，**不是** DROP ───────────────
+def test_pk_mismatch_is_batch_unknown_not_drop(monkeypatch):
+    """畸形响应不能被读成"这些行不存在"。旧零向量 point-read 把 PK 不符判 MISSING→DROP；
+    fetch 口径下它是"这批响应不可信"⇒ 整批 UNKNOWN + 零补推 + 不计重试预算。"""
     chunks = [_mk_chunk(10), _mk_chunk(11)]
-    # 11 "在" HA3 但返回行 id 不符 → 必须判为 MISSING；max_retries=0 直接 DROP
     client = FakeHA3(present={10, 11}, wrong_id={11})
     conn = FakeConn()
-    ctx = _setup(monkeypatch, client, chunks, conn=conn, RAG_STAGE3_PARITY_MAX_RETRIES=0)
+    ctx = _setup(monkeypatch, client, chunks, conn=conn, RAG_STAGE3_PARITY_MAX_RETRIES=2)
     with pytest.raises(RuntimeError, match="parity"):
         pn.node_verify_and_repush(ctx)
-    assert client.push_calls == []              # max_retries=0
-    assert chunks[1].index_error_code == "PARITY_DROP"
+    assert client.push_calls == []
+    for c in chunks:
+        assert c.index_error_code == "PARITY_UNKNOWN"
+    upd = [e for e in conn.cur.executed if "UPDATE chunk_meta" in e[0]]
+    assert all("index_retry_count" not in sql for sql, _ in upd), \
+        "畸形响应属「无法确认」，绝不消耗重试预算"
 
 
 # ── 9. eventual-consistency: lag on first read, present on re-confirm ─────────
@@ -312,36 +354,43 @@ def test_eventual_consistency_heals_without_persistent(monkeypatch):
     assert client.push_calls == [[11]]          # 只补推 1 次即愈合
 
 
-# ── 10. small batch → no id-range enumerate ──────────────────────────────────
-def test_small_batch_skips_enumerate(monkeypatch):
+# ── 10. 全部已知 PK 直接 fetch：不再有 id-range enum-hint 分支 ────────────────
+#    （原「小批跳过 enum」「enum 失败降级 point-read」两用例随该分支删除而移除——
+#      被测代码已不存在，留着只会空转假绿。enum 本身的健康/失败语义由
+#      tests/test_ha3_reconcile.py 与 tests/test_ha3_verify.py 覆盖。）
+def test_no_enumerate_hint_all_pks_go_through_fetch(monkeypatch):
     chunks = [_mk_chunk(10), _mk_chunk(11)]
     client = FakeHA3(present={10, 11})
     called = {"enum": 0}
     import opensearch_pipeline.ha3_reconcile as rc
     monkeypatch.setattr(rc, "_enumerate_ha3_pks",
                         lambda *a, **k: called.__setitem__("enum", called["enum"] + 1) or {})
-    ctx = _setup(monkeypatch, client, chunks)   # default POINTREAD_ALL_MAX=200 ≥ 2
-    pn.node_verify_and_repush(ctx)
-    assert called["enum"] == 0
-    assert client.range_reads == []             # 没有任何区间扫描，只有 point-read
-
-
-# ── 11. vector dimension read from config (not hardcoded 1024) ───────────────
-def test_pointread_vector_dim_from_config(monkeypatch):
-    from opensearch_pipeline.config import get_config
-    cfg = get_config()
-    monkeypatch.setattr(cfg.embedding, "dimension", 8)   # 自动还原
-    chunks = [_mk_chunk(10)]
-    client = FakeHA3(present={10})
     ctx = _setup(monkeypatch, client, chunks)
     pn.node_verify_and_repush(ctx)
-    assert client.query_vector_lens and all(n == 8 for n in client.query_vector_lens)
+    assert called["enum"] == 0, "stage-3 不再走 enum-hint"
+    assert sorted(client.fetched_pks) == [10, 11], "全部 expected 都过 fetch"
+
+
+# ── 11. 批次切分：>100 PK 分多批，且排序后分批（归因确定）──────────────────────
+def test_fetch_batches_at_100_sorted(monkeypatch):
+    pks = list(range(10, 215))                   # 205 个 → 3 批（100/100/5）
+    chunks = [_mk_chunk(pk) for pk in pks]
+    client = FakeHA3(present=set(pks))
+    ctx = _setup(monkeypatch, client, chunks)
+    pn.node_verify_and_repush(ctx)
+    assert [len(b) for b in client.fetch_calls] == [100, 100, 5]
+    assert client.fetched_pks == pks             # 排序分批，顺序确定
+    assert client.push_calls == []
 
 
 # ── 12. DROP + UNKNOWN coexist → two separate UPDATEs, distinct codes ─────────
 def test_drop_and_unknown_coexist_two_updates(monkeypatch):
-    chunks = [_mk_chunk(10), _mk_chunk(11), _mk_chunk(12), _mk_chunk(13)]
-    client = FakeHA3(present={10, 12}, never_heal={11}, point_raise={13})
+    # 批语义下二者共存需跨批：批0 = 10..109（含 never_heal=11 → DROP），
+    # 批1 = 110..111（fetch_raise 命中 → 整批 UNKNOWN）。
+    pks = list(range(10, 112))                   # 102 个 → 2 批
+    chunks = [_mk_chunk(pk) for pk in pks]
+    present = set(pks) - {11}
+    client = FakeHA3(present=present, never_heal={11}, fetch_raise={110})
     conn = FakeConn()
     ctx = _setup(monkeypatch, client, chunks, conn=conn, RAG_STAGE3_PARITY_MAX_RETRIES=1)
     with pytest.raises(RuntimeError, match="parity"):
@@ -360,8 +409,12 @@ def test_drop_and_unknown_coexist_two_updates(monkeypatch):
     assert "index_retry_count" not in unk_sql, "读故障不得把健康 chunk 推向 DEAD"
     assert unk_params[0] == "PARITY_UNKNOWN"
     assert conn.committed
-    assert chunks[1].index_error_code == "PARITY_DROP"     # rds_id 11
-    assert chunks[3].index_error_code == "PARITY_UNKNOWN"  # rds_id 13
+    by_pk = {c.rds_id: c for c in chunks}
+    assert by_pk[11].index_error_code == "PARITY_DROP"          # 批0 内的真丢失
+    for pk in (110, 111):                                       # 批1 整批 UNKNOWN
+        assert by_pk[pk].index_error_code == "PARITY_UNKNOWN"
+    # 同批健康行不受牵连（健康路径根本不设该属性）
+    assert getattr(by_pk[10], "index_error_code", None) is None
 
 
 # ── 13. rowcount mismatch → rollback + raise, no commit ──────────────────────
@@ -380,7 +433,7 @@ def test_empty_batch_returns(monkeypatch):
     client = FakeHA3()
     ctx = _setup(monkeypatch, client, [])       # 空批
     pn.node_verify_and_repush(ctx)
-    assert client.point_reads == [] and client.push_calls == []
+    assert client.fetch_calls == [] and client.push_calls == []
 
 
 def test_all_non_indexed_returns(monkeypatch):
@@ -388,7 +441,7 @@ def test_all_non_indexed_returns(monkeypatch):
     client = FakeHA3()
     ctx = _setup(monkeypatch, client, chunks)   # 无 INDEXED → expected 空
     pn.node_verify_and_repush(ctx)
-    assert client.point_reads == [] and client.push_calls == []
+    assert client.fetch_calls == [] and client.push_calls == []
 
 
 # ── 15. DAG wiring guard ─────────────────────────────────────────────────────
@@ -449,3 +502,73 @@ def test_drift_failopen_on_unreadable_text(monkeypatch):
     ctx = _setup(monkeypatch, client, chunks, RAG_STAGE3_PARITY_DRIFT="true")
     pn.node_verify_and_repush(ctx)
     assert client.push_calls == []
+
+
+# ── C2 回归（2026-07-22）：零向量伪影不再能把在场行判缺 + 固定等待 ───────────────
+
+def test_fetch_present_but_zero_vector_invisible_is_present(monkeypatch):
+    """**本次改造的核心回归**：行在 HA3(fetch 可取回)但零向量 query 看不见(枚举盲区)。
+
+    旧实现走零向量 point-read ⇒ 判 missing ⇒ 无谓补推 ⇒ 未愈合则 04b raise ⇒ 节点 05
+    永不执行 ⇒ 旧版本永不停用、双版本长存。新实现走官方 fetch ⇒ PRESENT ⇒ 零补推、不抛。
+    FakeHA3 刻意不实现 `query`：一旦回退零向量会立刻 AttributeError。"""
+    chunks = [_mk_chunk(10), _mk_chunk(11)]
+    client = FakeHA3(present={10, 11})
+    assert not hasattr(client, "query"), "桩不得提供 query——存在性路径回退即失败"
+    ctx = _setup(monkeypatch, client, chunks)
+    pn.node_verify_and_repush(ctx)
+    assert sorted(client.fetched_pks) == [10, 11]
+    assert client.push_calls == []
+    for c in chunks:
+        assert c.index_status == "INDEXED"
+
+
+def test_settle_early_exits_when_fetch_sees_probe(monkeypatch):
+    """F#56 早退已解禁（2026-07-30 生产实测：push 返回时 fetch/query/倒排三平面均已可见，
+    平面间差值 1-2ms ≪ 分辨率下界 0.58s ⇒ 无可测跨平面窗口）。探针与权威判据同用 fetch。
+    断言=探针可见即刻返回，一次 sleep 都不发生。"""
+    chunks = [_mk_chunk(10), _mk_chunk(11)]
+    client = FakeHA3(present={10, 11})          # 探针 pk=max=11 立即可见
+    ctx = _setup(monkeypatch, client, chunks, RAG_STAGE3_PARITY_SETTLE_SEC=7)
+    slept = []                                  # 必须在 _setup 之后：它自带 sleep no-op 桩
+    monkeypatch.setattr(pn.time, "sleep", lambda s: slept.append(s))
+    pn.node_verify_and_repush(ctx)
+    assert slept == [], "探针已可见就不该睡"
+    assert 11 in client.fetched_pks, "settle 探针必须走 fetch（与权威同平面）"
+
+
+def test_settle_falls_back_to_full_wait_when_never_visible(monkeypatch):
+    """探针始终不可见 → 轮询至 settle 上限才放行（上限是最终兜底，不能被早退绕过）。
+
+    用**假时钟**（sleep 推进 time.time）：否则 sleep 被桩掉而真实时钟照走，循环会空转
+    整整 settle 秒；假时钟既快又能精确断言轮询节奏。"""
+    chunks = [_mk_chunk(10)]
+    client = FakeHA3(present=set(), never_heal={10})   # 永不可见
+    conn = FakeConn()
+    ctx = _setup(monkeypatch, client, chunks, conn=conn,
+                 RAG_STAGE3_PARITY_SETTLE_SEC=7, RAG_STAGE3_PARITY_SETTLE_POLL_SEC=3,
+                 RAG_STAGE3_PARITY_MAX_RETRIES=1)
+    clock = {"t": 1000.0}
+    slept = []
+
+    def _sleep(s):
+        slept.append(s)
+        clock["t"] += s
+
+    monkeypatch.setattr(pn.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(pn.time, "sleep", _sleep)
+    with pytest.raises(RuntimeError, match="parity"):
+        pn.node_verify_and_repush(ctx)
+    # 每次 settle：poll=3 → 3+3+1 恰好用满 7s 上限，末次被 remaining 截断
+    assert slept[:3] == [3, 3, 1]
+    assert sum(slept[:3]) == 7, "轮询总时长不得超过 settle 上限"
+
+
+def test_settle_zero_skips_wait(monkeypatch):
+    chunks = [_mk_chunk(10)]
+    client = FakeHA3(present={10})
+    ctx = _setup(monkeypatch, client, chunks, RAG_STAGE3_PARITY_SETTLE_SEC=0)
+    slept = []                                  # 同上：须在 _setup 之后打桩
+    monkeypatch.setattr(pn.time, "sleep", lambda s: slept.append(s))
+    pn.node_verify_and_repush(ctx)
+    assert slept == []

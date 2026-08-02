@@ -16,6 +16,7 @@ import DocTable from '@/components/manage/DocTable.vue'
 import VersionHistoryModal from '@/components/manage/VersionHistoryModal.vue'
 import AccessRequestModal from '@/components/manage/AccessRequestModal.vue'
 import ShareDocModal from '@/components/manage/ShareDocModal.vue'
+import DocMetaModal from '@/components/manage/DocMetaModal.vue'
 import VisibilityModal from '@/components/manage/VisibilityModal.vue'
 import KbAdminDashboard from '@/components/manage/KbAdminDashboard.vue'
 import DeptDashboard from '@/components/manage/DeptDashboard.vue'
@@ -318,6 +319,7 @@ onMounted(async () => {
     <VersionHistoryModal />
     <AccessRequestModal />
     <ShareDocModal />
+    <DocMetaModal />
     <VisibilityModal />
     <!-- 确认/输入/告知 框已上移 AppShell 全局挂载（贡献页审核失败等 notice 也要能渲染） -->
   </div>

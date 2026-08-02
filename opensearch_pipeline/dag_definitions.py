@@ -142,9 +142,13 @@ def build_dag2_canonical_to_chunk() -> DAG:
 
 def build_dag3_chunk_to_opensearch() -> DAG:
     """
-    DAG 3: chunks -> embedding -> OpenSearch -> deactivate old
+    DAG 3: chunks -> embedding -> OpenSearch -> verify -> deactivate old
 
-    embedding -> bulk payload -> push -> status update -> deactivate old version chunks
+    embedding -> bulk payload -> push -> status update(04) -> **parity verify(04b)**
+    -> deactivate old version chunks(05)
+
+    04b（verify_and_repush）是停用旧版本前的最后一道闸：用官方 /vector-service/fetch 对本批
+    全部已推 PK 做权威存在性确认，未愈合的 DROP/UNKNOWN/DRIFT 会 raise 从而阻断 05。
     """
     dag = DAG(
         dag_id="dag3_chunk_to_opensearch",

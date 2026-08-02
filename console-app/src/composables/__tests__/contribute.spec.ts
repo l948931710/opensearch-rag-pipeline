@@ -241,6 +241,67 @@ describe('被引用数展示（批次ε-2 R2）', () => {
     expect(w.text()).toContain('8')                                     // 排名主数字（入库篇数）仍在
   })
 
+  it('HeroBoard 总积分榜（2026-08-01，预览权重 10/1/3）：主数字=score、副行构成、预览口径标', async () => {
+    withSession()
+    useContribute().heroes.value = [
+      { rank: 1, author_id: 'u2', author_name: '王伟', count: 2, hits: 0, adopted: 2, feedback: 8, score: 44 },
+      { rank: 2, author_id: 'u1', author_name: '李娜', count: 3, hits: null, adopted: 3, feedback: 0, score: 30 },
+    ] as never
+    const HeroBoard = (await import('@/components/contribute/HeroBoard.vue')).default
+    const w = mount(HeroBoard)
+    expect(w.text()).toContain('总积分榜')
+    expect(w.text()).toContain('预览口径')
+    const rows = w.findAll('[data-testid="hero-breakdown"]')
+    expect(rows.map((r) => r.text().replace(/\s+/g, ''))).toEqual(
+      ['采纳×2·引用×0·反馈×8', '采纳×3·引用×—·反馈×0'])   // hits=null → 「—」不用 0 顶替
+    expect(w.text()).toContain('44')
+    // 总分模式下旧「引用 N」chip 不再出现（构成进了副行）
+    expect(w.findAll('[data-testid="hero-hits"]').length).toBe(0)
+  })
+
+  it('HeroBoard 三榜切换：tab 栏随组织数据出现；部门榜行/本部门空态/全公司默认', async () => {
+    withSession()
+    const c = useContribute()
+    c.heroes.value = [
+      { rank: 1, author_id: 'u1', author_name: '李娜', count: 3, hits: 0, adopted: 3, feedback: 0, score: 30 },
+    ] as never
+    c.deptHeroes.value = [
+      { rank: 1, dept_id: 100, dept_name: '生产中心', members: 2, score: 50 },
+      { rank: 2, dept_id: 200, dept_name: '综合管理中心', members: 1, score: 10 },
+    ] as never
+    c.myDeptHeroes.value = [] as never
+    c.myDeptName.value = '生产中心'
+    const HeroBoard = (await import('@/components/contribute/HeroBoard.vue')).default
+    const w = mount(HeroBoard)
+    // 默认全公司
+    expect(w.find('[data-testid="hero-breakdown"]').exists()).toBe(true)
+    // 切部门榜
+    await w.find('[data-testid="hero-tab-dept"]').trigger('click')
+    const rows = w.findAll('[data-testid="hero-dept-row"]')
+    expect(rows.length).toBe(2)
+    expect(rows[0].text()).toContain('生产中心')
+    expect(rows[0].text()).toContain('2 人参与')
+    expect(rows[0].text()).toContain('50')
+    // 切本部门（空态诚实提示）
+    await w.find('[data-testid="hero-tab-mydept"]').trigger('click')
+    expect(w.text()).toContain('你所在部门暂无上榜数据')
+    expect(w.text()).toContain('本部门 · 生产中心')
+  })
+
+  it('HeroBoard 组织数据缺失：tab 栏自隐，观感与单榜一致', async () => {
+    withSession()
+    const c = useContribute()
+    c.heroes.value = [
+      { rank: 1, author_id: 'u1', author_name: '李娜', count: 3, adopted: 3, feedback: 0, score: 30 },
+    ] as never
+    c.deptHeroes.value = [] as never
+    c.myDeptHeroes.value = [] as never
+    const HeroBoard = (await import('@/components/contribute/HeroBoard.vue')).default
+    const w = mount(HeroBoard)
+    expect(w.find('[data-testid="hero-tab-dept"]').exists()).toBe(false)
+    expect(w.find('[data-testid="hero-breakdown"]').exists()).toBe(true)
+  })
+
   it('MyContributions：仅已入库行显「被引用 N 次」；非 searchable / hits 缺失自隐', () => {
     withSession()
     useContribute().myContribs.value = [

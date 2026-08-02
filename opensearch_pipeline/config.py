@@ -367,6 +367,14 @@ class RAGConfig:
     # allowed_depts、入库按 approved 授权聚合写 chunk_meta.allowed_depts。默认关；需先 HA3 加
     # allowed_depts 字段(Step 2) + 回填(Step 3) 再开。flag 关时全链路与现状逐字节一致。
     allowed_depts_acl: bool = False         # RAG_ALLOWED_DEPTS_ACL
+    # node-ACL（组织树节点授权，设计稿 docs/permission_node_acl_design_2026-07-27_DRAFT.md）。
+    # **双开关且不可合并**：投影未收敛时 HA3 里可能仍是旧真实 owner、legacy approved 组码
+    # 也可能还在，只关正向分支反而让旧通道复活 ⇒ ENFORCE 必须常开。
+    #   GRANT   = 正向放行（过滤器发节点 OR 分支）。关 = 不再产生新的节点命中。
+    #   ENFORCE = node 模式非 public 命中一律按当前权威复核；GRANT=false 时**无条件拒绝**。
+    # ⚠️ GRANT=true && ENFORCE=false 是非法姿态，acl_policy.assert_flag_posture 启动即失败。
+    node_acl_grant: bool = False            # RAG_NODE_ACL_GRANT
+    node_acl_enforce: bool = True           # RAG_NODE_ACL_ENFORCE（默认开，回滚时也不关）
     # 主命中 RDS 复核（盲区审计 P3-1）：邻居/扩展路径一直有 is_active=1 + 同权限复核，
     # 而主 HA3 命中此前直接投放——ACL 收紧/下线与 HA3 投影之间的延迟窗内，旧值按旧口径
     # 被逐字投放。开启后主命中按权威表复核 is_active + permission_level/owner_dept 一致性，
@@ -1016,6 +1024,8 @@ def load_config() -> PipelineConfig:
             # 相关度标签阈值（高/中/低）；可经 RAG_SCORE_THRESHOLD_HIGH / _MEDIUM 覆盖。
             conversation_history=_env_bool("CONVERSATION_HISTORY", False),
             allowed_depts_acl=_env_bool("ALLOWED_DEPTS_ACL", False),            # RAG_ALLOWED_DEPTS_ACL
+            node_acl_grant=_env_bool("NODE_ACL_GRANT", False),                  # RAG_NODE_ACL_GRANT
+            node_acl_enforce=_env_bool("NODE_ACL_ENFORCE", True),               # RAG_NODE_ACL_ENFORCE
             main_hit_revalidate=_env_bool("MAIN_HIT_REVALIDATE", True),         # RAG_MAIN_HIT_REVALIDATE
             stream_reasoning=_env_bool("STREAM_REASONING", False),              # RAG_STREAM_REASONING
             qa_log_pii_redact=_env_bool("QA_LOG_PII_REDACT", True),             # RAG_QA_LOG_PII_REDACT

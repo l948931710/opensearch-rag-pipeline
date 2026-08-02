@@ -14,11 +14,45 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterable, List
+import threading
+from typing import Dict, Iterable, List, Set, Tuple
 
 from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus
 
 logger = logging.getLogger(__name__)
+
+
+class NodeAclAuthorityUnavailable(RuntimeError):
+    """node-ACL 权威**不可达**（≠「查得到、结果是零授权」）。
+
+    只在 `strict=True`（serving ENFORCE 路径）抛出。宽松路径（写路径）保持原有
+    「读不到 ⇒ 按空集/legacy」的兼容行为不变。
+
+    ⚠️ 存在的理由:把故障伪装成「正常的零授权」会让 serving 无法区分两件事 ——
+    「这篇没人被授权」和「我读不到授权表」。前者应拒该篇,后者应拒**全部非 public**。
+    调用方（`retriever._deny_revoked_cross_dept`）据此整体 fail-closed。
+    """
+
+
+# ── capability 探测的 positive-only 进程内缓存 ────────────────────────────────
+# **只缓存 True**,按 (host, database) 分键。
+#   · schema/060 是 additive migration ⇒ 「列已存在」是**单调事实**,缓存不会过期变假;
+#   · 缓存 False 则会制造真实窗口:apply 之后、缓存失效之前,serving 仍把 node 文档
+#     解析成 legacy —— 那正是本批要消灭的 stale-owner 模式混淆(codex 共识 2026-07-31)。
+#     故 False 不缓存,apply 后**下一次请求即生效**(原 docstring 承诺的语义得以保留)。
+#   · 异常同样不缓存;strict 下向上抛,宽松下退回 False。
+# ⚠️ 已知后果:若有人**回滚** 060(删列),缓存仍报 True ⇒ acl_mode 查询 1054 ⇒ strict 下
+#   异常上抛 ⇒ 全部非 public 命中被丢弃,直到进程重启。方向是 fail-closed 且报错响亮,
+#   刻意不做自愈重试(回滚 additive 列不是计划内操作,静默自愈只会掩盖它)。
+_NODE_SCHEMA_PRESENT: Set[Tuple[str, str]] = set()
+_NODE_SCHEMA_LOCK = threading.Lock()
+
+
+def _schema_cache_key() -> Tuple[str, str]:
+    """(物理 host, 库名) —— 测试/staging/未来多目标进程之间绝不串值。"""
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    return (str(getattr(cfg.rds, "host", "") or ""), str(getattr(cfg.rds, "database", "") or ""))
 
 
 def _kb_db() -> str:
@@ -67,6 +101,170 @@ def resolve_allowed_depts(doc_ids: Iterable[str], cursor) -> Dict[str, List[str]
             )
         if clean:
             out[doc_id] = clean
+    return out
+
+
+# ── node-ACL：结构化权威解析（两个权威源【分别】解析，只在投影边界编码）──────────
+def _node_acl_columns_present(cursor, *, strict: bool = False) -> bool:
+    """schema/060 是否已 apply（`document_meta.acl_mode` 存在）。
+
+    未 apply → 全库恒 legacy，node 分支彻底惰化（与 049 的 1054 回退同型：代码可先部署，
+    apply 是 user-gated）。
+
+    缓存语义（2026-07-31，B-2 把本探测搬上了 serving 热路径）：
+    **True 按 (host, database) 进程内缓存；False 与异常都不缓存** ——
+    见 `_NODE_SCHEMA_PRESENT` 的说明。apply 后下一次请求即生效，与原「不缓存」承诺等价。
+
+    strict=True（仅 serving ENFORCE 路径）：探测异常**向上抛**，不再伪装成「未 apply」。
+    """
+    key = _schema_cache_key()
+    if key in _NODE_SCHEMA_PRESENT:
+        return True
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='document_meta' AND COLUMN_NAME='acl_mode'",
+            (_kb_db(),))
+        row = cursor.fetchone()
+        present = bool(row and row[0])
+    except Exception as e:   # noqa: BLE001
+        if strict:
+            # serving:探不出 capability ⇒ 无法安全区分 node/legacy ⇒ 交给调用方整体 fail-closed
+            raise NodeAclAuthorityUnavailable("node-ACL 列探测失败，无法判定 acl_mode 归属") from e
+        logger.warning("node-ACL 列探测失败，按未 apply 处理（全库 legacy）: %s", e)
+        return False
+    if present:
+        with _NODE_SCHEMA_LOCK:
+            _NODE_SCHEMA_PRESENT.add(key)   # 并发首请求可能重复探测一次，无害
+    return present
+
+
+def resolve_acl_modes(doc_ids: Iterable[str], cursor) -> Dict[str, str]:
+    """轻量批查 {doc_id: acl_mode}（写路径热路径用；060 未 apply / 查不到 → 全 legacy）。
+
+    为什么单列一个函数:写路径(ingestion / 升版 / re-chunk / stage-3 reload)**每批都要**
+    知道模式才能决定投影形态,但绝大多数批次 100% 是 legacy —— 只做一次 document_meta
+    单列 SELECT 即可判定,避免为此把 `resolve_doc_acl` 的三次查询摊到每批。
+    """
+    from opensearch_pipeline.acl_policy import ACL_MODE_LEGACY, ACL_MODE_NODE
+    ids = [d for d in dict.fromkeys(doc_ids) if d]
+    if not ids:
+        return {}
+    out = {d: ACL_MODE_LEGACY for d in ids}
+    if not _node_acl_columns_present(cursor):
+        return out
+    try:
+        ph = ",".join(["%s"] * len(ids))
+        cursor.execute(
+            f"SELECT doc_id, acl_mode FROM {_kb_db()}.document_meta WHERE doc_id IN ({ph})",
+            tuple(ids))
+        for doc_id, mode in cursor.fetchall():
+            m = str(mode or "").strip().lower()
+            out[doc_id] = m if m in (ACL_MODE_LEGACY, ACL_MODE_NODE) else ACL_MODE_LEGACY
+    except Exception as e:   # noqa: BLE001 — 读不到 ⇒ 按 legacy(退回现状语义,绝不误升 node)
+        logger.warning("resolve_acl_modes 失败，按 legacy 处理: %s", e)
+    return out
+
+
+def resolve_doc_acl(doc_ids: Iterable[str], cursor, *, strict: bool = False) -> Dict[str, "object"]:
+    """聚合给定 doc 的【结构化 ACL 权威】→ {doc_id: acl_policy.DocAcl}。
+
+    **strict=True 仅供 serving ENFORCE 路径**（`retriever._deny_revoked_cross_dept`）。
+    写路径（ingestion / 升版 / re-chunk / materialize）一律用默认宽松语义 —— 那里的
+    「部署先于 schema apply」兼容行为是刻意的，不能被本参数全局改掉。
+
+    | 情形 | 宽松（默认，写路径） | strict（serving） |
+    |---|---|---|
+    | capability 探测异常 | 吞 ⇒ 全 legacy | **抛** `NodeAclAuthorityUnavailable` |
+    | 探测成功、060 确未 apply | 全 legacy | 全 legacy（**相同** —— 合法部署态，不是故障） |
+    | `document_meta` 缺行 | 合成默认 legacy DocAcl | **不返回该 doc**（调用方 `.get()` → None ⇒ 拒） |
+    | 未知 `acl_mode` | 改写为 legacy | **不返回该 doc** ⇒ 拒 |
+    | `kb_doc_node_grant` 读失败 | 按空集 | **抛** `NodeAclAuthorityUnavailable` |
+    | 节点授权正常返回空集 | 零授权 DocAcl | 零授权 DocAcl（**相同** —— 查得到就不是故障） |
+
+    为什么 strict 下「缺行/未知 mode」不能退回 legacy:退回 legacy 会让 `_legacy_readable`
+    按 owner 放行 —— 而一篇 node 文档在投影未收敛期，HA3 里的 owner 可能正是调用者的组码。
+    那恰好是本轮要堵的 stale-owner 窗口（codex 共识 2026-07-31）。
+
+    ⚠️ **两个权威源分别解析、各自校验**，只在 RDS/HA3 投影边界才由
+    `acl_policy.project_doc_acl` 编码成混合集合 —— 绝不能先把组码与 `d:`/`dx:` 混进一个
+    列表再送 `sanitize_owner_depts`（组码白名单会把节点值静默丢光）。
+
+      · kb_access_request(status='approved') → groups（过组码白名单，legacy 语义）
+      · kb_doc_node_grant(revoked_at IS NULL) → node_ids / exact_node_ids（node 语义）
+      · document_meta → acl_mode / permission_level / owner_dept（模式与敏感级权威）
+
+    schema/060 未 apply ⇒ 恒返回 legacy 形态（node 字段为空），行为与现状逐字节一致。
+
+    ⚠️ cursor 契约 = **tuple 游标**（与本模块其余函数一致；serving 路径 `db._get_db_conn()`
+    实测返回 tuple）。**别传 `prod_access.get_prod_readonly_conn()` 的游标** —— 它默认
+    `DictCursor`，行按列名取值，这里的 `row[1]` 会 KeyError（2026-07-29 核查脚本踩过）。
+    需用 prod_access 核查时传 `dict_cursor=False`。
+    """
+    from opensearch_pipeline.acl_policy import (
+        ACL_MODE_LEGACY, ACL_MODE_NODE, DocAcl, normalize_node_ids,
+    )
+    ids = [d for d in dict.fromkeys(doc_ids) if d]
+    if not ids:
+        return {}
+    ph = ",".join(["%s"] * len(ids))
+    has_node = _node_acl_columns_present(cursor, strict=strict)
+
+    # 1. 文档自身（模式 / 敏感级 / 真实 owner）
+    cols = "doc_id, permission_level, owner_dept" + (", acl_mode" if has_node else "")
+    cursor.execute(f"SELECT {cols} FROM {_kb_db()}.document_meta WHERE doc_id IN ({ph})", tuple(ids))
+    meta: Dict[str, tuple] = {}
+    for row in cursor.fetchall():
+        mode = (row[3] if has_node and len(row) > 3 else None) or ACL_MODE_LEGACY
+        meta[row[0]] = ((row[1] or ""), (row[2] or ""), str(mode).strip().lower())
+
+    # 2. legacy 权威：approved 跨部门组码（复用既有单一注入点，白名单/去重/告警口径不变）
+    groups_by_doc = resolve_allowed_depts(ids, cursor)
+
+    # 3. node 权威：active 节点授权，按 scope 分流
+    nodes: Dict[str, List[int]] = {}
+    exacts: Dict[str, List[int]] = {}
+    if has_node:
+        try:
+            cursor.execute(
+                f"SELECT doc_id, dept_id, scope FROM {_kb_db()}.kb_doc_node_grant "
+                f"WHERE revoked_at IS NULL AND doc_id IN ({ph})", tuple(ids))
+            for doc_id, dept_id, scope in cursor.fetchall():
+                bucket = exacts if str(scope or "").strip().lower() == "exact" else nodes
+                bucket.setdefault(doc_id, []).append(dept_id)
+        except Exception as e:   # noqa: BLE001
+            if strict:
+                # 「读不到授权表」≠「这篇零授权」。serving 必须能区分,故整体 fail-closed。
+                raise NodeAclAuthorityUnavailable("kb_doc_node_grant 读取失败") from e
+            logger.warning("kb_doc_node_grant 读取失败，节点授权按空集处理（fail-closed）: %s", e)
+            nodes, exacts = {}, {}
+
+    out: Dict[str, object] = {}
+    for doc_id in ids:
+        if strict and doc_id not in meta:
+            # 缺 document_meta 行 ⇒ mode 不可判 ⇒ 不返回(调用方按拒处置)。
+            # 绝不合成 legacy DocAcl:那会让 _legacy_readable 按 owner 放行陈旧 node 命中。
+            logger.warning("doc=%s 无 document_meta 行,strict 下不返回 ACL（调用方 fail-closed）", doc_id)
+            continue
+        perm, owner, mode = meta.get(doc_id, ("", "", ACL_MODE_LEGACY))
+        if mode not in (ACL_MODE_LEGACY, ACL_MODE_NODE):
+            if strict:
+                logger.error("doc=%s 未知 acl_mode=%r,strict 下不返回 ACL（调用方 fail-closed）",
+                             doc_id, mode)
+                continue
+            logger.warning("doc=%s 未知 acl_mode=%r ⇒ 按 legacy 解析", doc_id, mode)
+            mode = ACL_MODE_LEGACY
+        n_ids, n_ov = normalize_node_ids(nodes.get(doc_id, ()))
+        e_ids, e_ov = normalize_node_ids(exacts.get(doc_id, ()))
+        if n_ov or e_ov:
+            # 权威表里的既存超限脏数据：取确定性安全子集（normalize 已按首次出现截序）
+            # 并高优告警——不静默放行全部，也不整篇拒绝。
+            logger.error("doc=%s 节点授权超上限（脏数据）⇒ 取安全子集并告警", doc_id)
+        out[doc_id] = DocAcl(
+            mode=mode, permission_level=perm, owner_dept=owner,
+            groups=tuple(groups_by_doc.get(doc_id, ())),
+            node_ids=tuple(n_ids), exact_node_ids=tuple(e_ids),
+        )
     return out
 
 
@@ -137,6 +335,21 @@ def gate_by_permission(
     return out
 
 
+def _current_owner_for_doc(cursor, doc_id: str, version_no: int) -> str:
+    """该 doc 指定版本 active chunk 的**检索投影轴** owner_dept(不一致时返回首个,供 diff)。
+
+    ⚠️ 读的是 `chunk_meta.owner_dept`(检索投影轴),**不是** `document_meta.owner_dept`
+    (归属/管理轴,node 模式下保持真实属主不变)。
+    """
+    cursor.execute(
+        f"SELECT DISTINCT owner_dept FROM {_kb_db()}.chunk_meta "
+        "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+        (doc_id, version_no),
+    )
+    vals = sorted({(r[0] or "") for r in cursor.fetchall()})
+    return vals[0] if vals else ""
+
+
 def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) -> Dict[str, object]:
     """把单篇文档的 approved 授权【物化】到 chunk_meta.allowed_depts 投影——decide 端点与
     allowed_depts_reconcile 对账共用的【唯一写实现】（与上面 resolve/gate/current 读原语配套）。
@@ -174,7 +387,35 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
     if not row:
         return {"status": "skipped_locked", "reset_chunks": 0, "version_no": None}
     ver = int(row[0] or 1)
-    # 2. authority → 该版本 permission_level 版本限定 gate 到 dept_internal
+
+    # 2a. node-ACL:模式决定投影形态(唯一注入点 acl_policy.project_doc_acl)。
+    #     ⚠️ 本函数是 ACL 变更的【唯一写实现】(decide 端点 + reconcile 共用),node 文档
+    #     必须在这里把检索投影轴的 owner 一并改成哨兵 —— 只改 allowed_depts 而留着真实
+    #     owner,legacy owner 分支照样放行,等于没收权(codex 评审 BLOCKER-1 的同一根因)。
+    from opensearch_pipeline.acl_policy import ACL_MODE_NODE, project_doc_acl
+    if resolve_acl_modes([doc_id], cursor).get(doc_id) == ACL_MODE_NODE:
+        _acl = resolve_doc_acl([doc_id], cursor).get(doc_id)
+        _owner, want = project_doc_acl(
+            ACL_MODE_NODE, "", (),
+            getattr(_acl, "node_ids", ()) if _acl else (),
+            getattr(_acl, "exact_node_ids", ()) if _acl else ())
+        have = current_allowed_for_doc(cursor, doc_id, ver)
+        _cur_owner = _current_owner_for_doc(cursor, doc_id, ver)
+        if sorted(want) == have and _cur_owner == _owner:
+            return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
+        status = "materialized" if want else "retracted"
+        if not apply:
+            return {"status": status, "reset_chunks": 0, "version_no": ver}
+        aj = _json.dumps(want, ensure_ascii=False) if want else None
+        cursor.execute(
+            f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, owner_dept=%s, "
+            f"index_status='{ChunkIndexStatus.NOT_INDEXED}' "
+            "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+            (aj, _owner, doc_id, ver),
+        )
+        return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver}
+
+    # 2. legacy:authority → 该版本 permission_level 版本限定 gate 到 dept_internal
     raw_want = resolve_allowed_depts_one(doc_id, cursor)
     cursor.execute(
         f"SELECT GROUP_CONCAT(DISTINCT permission_level) FROM {_kb_db()}.chunk_meta "
@@ -182,21 +423,33 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         (doc_id, ver),
     )
     prow = cursor.fetchone()
-    want = gate_by_permission(
+    gated = gate_by_permission(
         {doc_id: raw_want}, {doc_id: (prow[0] if prow else None)},
     ).get(doc_id, [])
-    # 3. diff vs 现存投影
+    # 阶段 B（codex 评审 BLOCKER，2026-08-01）：legacy 分支同样走 project_doc_acl 投影
+    # **owner 一并比较与写回**——此前只写 allowed_depts，node→legacy 迁移后 chunk 的
+    # owner 永远留着哨兵，legacy owner 过滤召不回文档（access_grants.py 旧 :437-442）。
+    # 对纯 legacy 存量这是无操作：chunk owner 本就是真实值 → owner 比较恒等，
+    # unchanged 路径与改动前逐字节一致。
+    cursor.execute(
+        f"SELECT owner_dept FROM {_kb_db()}.document_meta WHERE doc_id=%s", (doc_id,))
+    orow = cursor.fetchone()
+    from opensearch_pipeline.acl_policy import ACL_MODE_LEGACY
+    _owner, want = project_doc_acl(ACL_MODE_LEGACY, (orow[0] if orow else "") or "", gated)
+    # 3. diff vs 现存投影（owner 与集合都比：owner 漂移也必须触发重投影）
     have = current_allowed_for_doc(cursor, doc_id, ver)
-    if sorted(want) == have:
+    _cur_owner = _current_owner_for_doc(cursor, doc_id, ver)
+    if sorted(want) == have and _cur_owner == _owner:
         return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
     status = "materialized" if want else "retracted"
     if not apply:
         return {"status": status, "reset_chunks": 0, "version_no": ver}
     aj = _json.dumps(want, ensure_ascii=False) if want else None
     cursor.execute(
-        f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
+        f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, owner_dept=%s, "
+        f"index_status='{ChunkIndexStatus.NOT_INDEXED}' "
         "WHERE doc_id=%s AND version_no=%s AND is_active=1",
-        (aj, doc_id, ver),
+        (aj, _owner, doc_id, ver),
     )
     return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver}
 
@@ -335,3 +588,113 @@ def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
     finally:
         conn.close()
     return result
+
+
+# ── 阶段 B：doc-meta 投影 outbox（schema/061 kb_doc_meta_projection_outbox）─────
+# 为什么必须持久意图（codex 阶段 B blocker）：stage-3 的 loader 在 dag.run()（锁获取）
+# **之前**把 title/category/chunk_text 读进内存（dataworks_orchestrator.py:454-605→:610），
+# 推完又按 chunk_id 无条件回写 INDEXED（pipeline_nodes.py:8271-8288）——窗口内直接落的
+# NOT_INDEXED 标记会被本轮吞掉。outbox 行 + generation CAS 让被吞的编辑下轮重投影。
+def enqueue_meta_projection(cursor, doc_id: str, reason: str = "") -> None:
+    """doc-meta 端点【同事务】入队（仅 title/category 变更需要；owner/可见集走 ACL outbox）。
+    刻意不吞异常：061 未 apply 时抛 1146 → 端点整笔回滚——改标题/分类的能力以 061 为前置，
+    半提交（元数据改了、投影意图丢了）比诚实失败更糟。**不提交事务**。"""
+    if not doc_id:
+        return
+    cursor.execute(
+        f"INSERT INTO {_kb_db()}.kb_doc_meta_projection_outbox (doc_id, reason) VALUES (%s, %s) "
+        "ON DUPLICATE KEY UPDATE processed_at=NULL, attempts=0, last_error=NULL, "
+        "generation=generation+1, reason=VALUES(reason), updated_at=NOW()",
+        (doc_id, (reason or "")[:64]),
+    )
+
+
+def pre_drain_meta_projection(limit: int = 200) -> dict:
+    """stage-3 在 loader **之前**调用：对每条未处理行同步 chunk_meta 的 category 列
+    （stage-3 载荷的 category 取自 chunk_meta 而非 JOIN document_meta —— 只改 document_meta
+    分类永远推不进 HA3）+ 把 active chunk 标 NOT_INDEXED（title 由 loader 的 JOIN 现读）。
+    返回 {"claims": [(id, doc_id, generation)], ...}——调用方在本轮 DAG **成功推送后**
+    把 claims 交给 complete_meta_projection 按 CAS 收尾；失败/中断则不收尾，下轮重投影
+    （幂等：category 同步与标脏都可重放）。表不存在（061 未 apply）→ skipped。"""
+    out = {"claims": [], "marked": 0, "skipped": False, "errors": []}
+    from opensearch_pipeline.db import _get_db_conn
+    try:
+        conn = _get_db_conn()
+    except Exception as e:   # noqa: BLE001
+        out["errors"].append(f"DB connect failed: {e}")
+        return out
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    f"SELECT id, doc_id, generation FROM {_kb_db()}.kb_doc_meta_projection_outbox "
+                    "WHERE processed_at IS NULL ORDER BY enqueued_at ASC LIMIT %s", (limit,))
+                rows = cur.fetchall() or []
+            except Exception:   # noqa: BLE001 — 1146 表不存在 = 061 未 apply
+                out["skipped"] = True
+                return out
+            for rid, doc_id, gen in rows:
+                try:
+                    cur.execute(
+                        f"UPDATE {_kb_db()}.chunk_meta cm "
+                        f"JOIN {_kb_db()}.document_meta dm ON dm.doc_id = cm.doc_id "
+                        "SET cm.category_l1 = dm.category_l1, cm.category_l2 = dm.category_l2, "
+                        f"    cm.index_status = '{ChunkIndexStatus.NOT_INDEXED}' "
+                        "WHERE cm.doc_id = %s AND cm.is_active = 1",
+                        (doc_id,))
+                    out["marked"] += cur.rowcount
+                    cur.execute(
+                        f"UPDATE {_kb_db()}.kb_doc_meta_projection_outbox "
+                        "SET attempts = attempts + 1, updated_at = NOW() WHERE id = %s", (rid,))
+                    out["claims"].append((int(rid), doc_id, int(gen or 0)))
+                except Exception as e:   # noqa: BLE001 — 单行失败不拖垮整轮
+                    out["errors"].append(f"{doc_id}: {e}")
+                    try:
+                        cur.execute(
+                            f"UPDATE {_kb_db()}.kb_doc_meta_projection_outbox "
+                            "SET attempts = attempts + 1, last_error = %s, updated_at = NOW() "
+                            "WHERE id = %s", (str(e)[:512], rid))
+                    except Exception:   # noqa: BLE001
+                        pass
+        conn.commit()
+    except Exception as e:   # noqa: BLE001
+        out["errors"].append(str(e))
+    finally:
+        conn.close()
+    return out
+
+
+def complete_meta_projection(claims) -> dict:
+    """本轮 DAG 成功推送后按 (id, generation) CAS 标 processed。CAS 落空 = 窗口中途该行被
+    doc-meta 再次入队（generation 已 +1）——行保持待处理，下轮按新代次重投影（丢更新关死）。
+    ⚠️ 只允许在**成功**路径调用（DAG 失败/中断不收尾，049 同款前提条款）。"""
+    out = {"completed": 0, "superseded": 0, "errors": []}
+    if not claims:
+        return out
+    from opensearch_pipeline.db import _get_db_conn
+    try:
+        conn = _get_db_conn()
+    except Exception as e:   # noqa: BLE001
+        out["errors"].append(f"DB connect failed: {e}")
+        return out
+    try:
+        with conn.cursor() as cur:
+            for rid, _doc_id, gen in claims:
+                try:
+                    cur.execute(
+                        f"UPDATE {_kb_db()}.kb_doc_meta_projection_outbox "
+                        "SET processed_at = NOW(), last_error = NULL, updated_at = NOW() "
+                        "WHERE id = %s AND generation = %s AND processed_at IS NULL",
+                        (rid, gen))
+                    if cur.rowcount:
+                        out["completed"] += 1
+                    else:
+                        out["superseded"] += 1
+                except Exception as e:   # noqa: BLE001
+                    out["errors"].append(f"#{rid}: {e}")
+        conn.commit()
+    except Exception as e:   # noqa: BLE001
+        out["errors"].append(str(e))
+    finally:
+        conn.close()
+    return out

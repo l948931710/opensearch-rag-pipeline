@@ -99,6 +99,7 @@ def _refuse_prod_targets():
                       ("opensearch_pipeline.dingtalk_identity", "_bot_dept_cache_clear"),
                       ("opensearch_pipeline.routes.kb_console", "_dashboard_cache_clear"),
                       ("opensearch_pipeline.routes.contribution", "_gaps_cache_clear"),
+                      ("opensearch_pipeline.org_sync", "_children_cache_clear"),
                       ("opensearch_pipeline.qa_facts", "_fact_state_clear")):
         try:
             m = _sys.modules.get(_mod)
@@ -205,6 +206,25 @@ def pytest_collection_modifyitems(config, items):
         base = _os.path.basename(mod)
         group = "local-db-stack" if base in _LOCAL_STACK_SERIAL_MODULES else mod
         item.add_marker(pytest.mark.xdist_group(group))
+
+
+@pytest.fixture(autouse=True)
+def _reset_node_acl_capability_cache():
+    """node-ACL capability 探测的 positive-only 进程内缓存（access_grants，2026-07-31）。
+
+    该缓存建模的是「这个物理库的 acl_mode 列已存在」这一**单调事实**，键 = (host, database)。
+    生产里它永不失效；但测试用**同一套 config** 伪造「已 apply / 未 apply」两种 schema 形态，
+    先跑的 True 会把后跑的「未 apply」用例污染成 node（实测：test_node_acl_write_paths.py::
+    test_modes_default_legacy_when_migration_absent 单跑绿、全量红）。故每测清空。
+    仅在模块已导入时处理（sys.modules 探测，零 import 成本）。"""
+    import sys as _sys
+    _mod = _sys.modules.get("opensearch_pipeline.access_grants")
+    if _mod is not None and hasattr(_mod, "_NODE_SCHEMA_PRESENT"):
+        _mod._NODE_SCHEMA_PRESENT.clear()
+    yield
+    _mod = _sys.modules.get("opensearch_pipeline.access_grants")
+    if _mod is not None and hasattr(_mod, "_NODE_SCHEMA_PRESENT"):
+        _mod._NODE_SCHEMA_PRESENT.clear()
 
 
 @pytest.fixture(autouse=True)

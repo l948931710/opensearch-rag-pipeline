@@ -46,8 +46,14 @@ export interface ApprovalHistoryItem {
   decided_by: string; decided_by_name: string; decided_at: string
 }
 // Phase F 成员/角色管理（kb_admin 专属）：现行管理员 + 各自可管理 owner_dept（后端 /api/kb/admin-grants）。
+export interface AdminNodeRoot { dept_id: number; name: string; source: string; active: boolean }
+export interface NodeCandidate {
+  id: number; user_id: string; user_name: string; dept_id: number; dept_name: string
+  risk_reason: string; derived_snapshot_rev: number; created_at: string
+}
 export interface AdminItem {
   user_id: string; user_name: string; role: string; managed_owner_depts: string[]
+  managed_node_roots?: AdminNodeRoot[]
 }
 // 申请人侧：我的申请 + 派生同步态（已批准·待同步 vs 已放行；后端 /api/kb/my-access-requests）。
 export interface MyAccessRequestItem {
@@ -93,7 +99,7 @@ export interface KbGovernance {
   feedback_last7: number; feedback_daily: KbFeedbackDay[]; downvote_reasons: KbDownvoteReason[]
   dept_coverage: KbDeptCoverage[]
 }
-export interface KbConfig { max_upload_bytes: number; accepted_exts: string[] }
+export interface KbConfig { max_upload_bytes: number; accepted_exts: string[]; node_acl_grant?: boolean }
 
 // ── 运营数据面（批次γ D1-D3，GET /api/kb/ops-metrics，kb_admin 专属）──
 // 三块各自 available：false=该块查询失败（诚实「未知」）；true+空列表=表可读但确实没数据。
@@ -147,6 +153,7 @@ const queuesSettled = ref(false)                      // 队列完成过至少�
 const accessGrants = ref<AccessGrantItem[]>([])       // 已授权清单（审批人侧 · approved 存量，供撤销）
 const approvalHistory = ref<ApprovalHistoryItem[]>([]) // 审批历史（只读聚合，四流合并时间线）
 const adminGrants = ref<AdminItem[]>([])              // Phase F 现行管理员名单（kb_admin 专属）
+const nodeCandidates = ref<NodeCandidate[]>([])       // 阶段 B：管辖根候选确认队列（kb_admin）
 const grantableDepts = ref<string[]>([])             // 授予表单可选 owner_dept（写白名单）
 const loadingDocs = ref(false)
 const loadingMoreDocs = ref(false)                   // 「加载更多」翻页中（与首屏 loadingDocs 区分）
@@ -174,9 +181,19 @@ const bulkMsg = ref('')
 const newTitle = ref('')
 const newOwner = ref('')
 const newPerm = ref('dept_internal')          // dept_internal / shared（=dept_internal+主动授权）/ public / restricted
-const newShareDepts = ref<string[]>([])       // newPerm='shared' 时的共享目标组码
+const newShareDepts = ref<string[]>([])       // newPerm='shared' 时的共享目标组码（legacy 口径）
+// 上传时按组织架构选的节点（node 口径）。⚠️ 与 newShareDepts **二选一**，绝不双写：
+// acl_policy 的模式互斥不变量规定 node ⇒ 只投 d:/dx:、绝不含组码（codex BLOCKER-1）。
+const newShareNodes = ref<{ dept_id: number; subtree: boolean }[]>([])
+// 阶段 B：node 模式的归属节点（单选；数组形状与 OrgTreePicker v-model 一致，恒 ≤1 项）
+const newOwnerNode = ref<{ dept_id: number; subtree: boolean }[]>([])
+// 节点授权是否已对**读侧**生效（后端 /api/kb/org-tree 回的 RAG_NODE_ACL_GRANT）。
+// ⚠️ 关时上传必须继续走 legacy 组码：GRANT 关时 can_read_doc 对 node 文档无条件 DENY，
+// 此刻写 node 授权 = 新文档对所有人不可见（连归属部门自己都看不到）。
+const nodeAclGrant = ref(false)
 // 主动共享弹窗（owner 侧）：把自己部门的 dept_internal 文档直接放行给指定部门（POST /api/kb/access-grants）。
 const shareCtx = ref<DocItem | null>(null)
+const docMetaCtx = ref<DocItem | null>(null)   // 阶段 B「编辑信息」弹窗（doc-meta 端点 UI 面）
 const shareBusy = ref(false)
 // 「谁能看到这篇文档」解释器弹窗（只读）：GET /api/kb/visibility-explain。
 const visCtx = ref<DocItem | null>(null)
@@ -584,6 +601,10 @@ async function loadStats() {
 async function loadConfig() {
   // 上传上限/类型走后端权威，避免硬编码漂移（失败则用 MAX_UPLOAD_MB 常量兜底）。
   try { kbConfig.value = await apiJson<KbConfig>('/api/kb/config', { auth: true }) } catch { /* 兜底 */ }
+  // 节点授权读侧姿态随 kbConfig 一起回（同一个请求，零额外往返）。
+  // ⚠️ 别为这个布尔值单独打 /api/kb/org-tree：那个端点要过 _require_kb_console（一次 RDS
+  // 往返，实测 ~1s），而 kb/config 是公开能力端点、实测 2ms。
+  nodeAclGrant.value = !!kbConfig.value?.node_acl_grant
 }
 
 // ── Phase E：概览看板真实数据（缺数据/端点未上线 → 静默兜底 null，由组件如实显空/加载中）──
@@ -875,9 +896,15 @@ async function uploadSingle(file: File) {
     const isVer = !!verCtx.value
     // 「指定部门」模式：登记仍是 dept_internal（可见度基线），随后经主动共享端点放行所选部门。
     const shared = !isVer && newPerm.value === 'shared'
+    // 阶段 B node 模式：归属=组织节点，可见集随 upload-url 走、register 原子落授权
+    // （不再是「先登记、再补授权」两请求两事务——失败会留半截 node 文档）。
+    const nodeMode = !isVer && nodeAclGrant.value && newOwnerNode.value.length > 0
     const body = isVer
       ? { action: 'version', doc_id: verCtx.value!.doc_id, owner_dept: verCtx.value!.owner_dept, permission_level: verCtx.value!.permission_level, filename: file.name, title: newTitle.value || undefined }
-      : { action: 'new', filename: file.name, owner_dept: newOwner.value, permission_level: shared ? 'dept_internal' : newPerm.value, title: newTitle.value || undefined }
+      : nodeMode
+        ? { action: 'new', filename: file.name, owner_dept: '', permission_level: shared ? 'dept_internal' : newPerm.value, title: newTitle.value || undefined,
+            owner_dept_id: newOwnerNode.value[0].dept_id, visible_nodes: [...newShareNodes.value] }
+        : { action: 'new', filename: file.name, owner_dept: newOwner.value, permission_level: shared ? 'dept_internal' : newPerm.value, title: newTitle.value || undefined }
     uploadMsg.value = '申请上传地址…'
     const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify(body) })
     uploadMsg.value = '上传文件到 OSS… 0%'
@@ -886,10 +913,16 @@ async function uploadSingle(file: File) {
     const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
     uploadOk.value = true
     let shareNote = ''
-    if (shared && newShareDepts.value.length) {
-      // 共享失败不判上传失败：文档已在库，提示可去台账「共享」补做。文案以响应 granted/skipped 为准。
-      try { shareNote = shareResultNote(await createGrants(r.doc_id, [...newShareDepts.value])) }
-      catch { shareNote = '；共享设置失败，可稍后在台账点「共享」重试' }
+    if (nodeMode && newShareNodes.value.length) {
+      // node 模式授权已随 register 原子落库，这里只是提示语
+      shareNote = `；可见范围已按组织架构设定（${newShareNodes.value.length} 个节点）`
+    } else if (shared && !nodeMode) {
+      // legacy 共享失败不判上传失败：文档已在库，提示可去台账「共享」补做。
+      try {
+        if (newShareDepts.value.length) {
+          shareNote = shareResultNote(await createGrants(r.doc_id, [...newShareDepts.value]))
+        }
+      } catch { shareNote = '；共享设置失败，可稍后在台账点「共享」重试' }
     }
     uploadMsg.value = `已提交：${r.title || file.name} v${r.version_no}（${r.status_badge}${r.requires_kb_admin_approval ? '，待审批' : ''}）${shareNote}`
     contentDupMsg.value = buildDupMsg(r.content_dups, r.content_dups_other)
@@ -920,7 +953,10 @@ async function uploadBatch(files: File[]) {
     if (f.size <= 0 || f.size > maxUploadBytes.value) { row.status = '跳过'; row.msg = f.size <= 0 ? '空文件' : `超过 ${maxUploadMb.value}MB`; badN++; return }
     try {
       row.status = '上传中'
-      const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify({ action: 'new', filename: f.name, owner_dept: newOwner.value, permission_level: shared ? 'dept_internal' : newPerm.value }) })
+      const bNodeMode = nodeAclGrant.value && newOwnerNode.value.length > 0
+      const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify(bNodeMode
+        ? { action: 'new', filename: f.name, owner_dept: '', permission_level: shared ? 'dept_internal' : newPerm.value, owner_dept_id: newOwnerNode.value[0].dept_id, visible_nodes: [...newShareNodes.value] }
+        : { action: 'new', filename: f.name, owner_dept: newOwner.value, permission_level: shared ? 'dept_internal' : newPerm.value }) })
       await putWithProgress(u.put_url, f, (pct) => { row.pct = pct; row.msg = `${pct}%` }, u.content_type)
       row.status = '登记中'; row.msg = ''
       const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
@@ -1273,6 +1309,8 @@ function docGrantRows(docId: string): AccessGrantItem[] {
 }
 
 function openShare(d: DocItem) { shareCtx.value = d }
+function openDocMeta(d: DocItem) { docMetaCtx.value = d }
+function closeDocMeta() { docMetaCtx.value = null }
 function closeShare() { if (!shareBusy.value) shareCtx.value = null }
 
 /** 直接放行：POST /api/kb/access-grants；成功后刷新已授权清单（弹窗/台账随之更新）。
@@ -1314,6 +1352,29 @@ async function submitShare(depts: string[], reason: string): Promise<string | nu
     return null
   } catch (e: any) {
     return e && e.status === 403 ? (e.detail || '无权共享该文档') : uploadErrText(e)
+  } finally { shareBusy.value = false }
+}
+
+/** node-ACL：保存文档的组织树节点可见范围 —— **整体替换**（POST /api/kb/doc-node-grants）。
+ * 未勾选的节点会被撤销；acl_revision 做 CAS，并发保存时后到者收 409（绝不静默丢勾选）。
+ * 返回 null=成功；string=错误文案。 */
+async function saveNodeGrants(
+  docId: string, nodes: { dept_id: number; subtree: boolean }[],
+  aclRevision: number | null, reason = ''): Promise<string | null> {
+  if (!docId) return '缺少文档'
+  shareBusy.value = true
+  try {
+    await apiJson('/api/kb/doc-node-grants', {
+      method: 'POST', auth: true,
+      body: JSON.stringify({ doc_id: docId, nodes, acl_revision: aclRevision, reason }),
+    })
+    shareCtx.value = null
+    await loadDocs()
+    return null
+  } catch (e: any) {
+    if (e?.status === 409) return e.detail || '可见范围已被他人修改，请刷新后重试'
+    if (e?.status === 422) return e.detail || '所选节点过多，请改选更上层节点'
+    return e?.status === 403 ? (e.detail || '无权管理该文档') : uploadErrText(e)
   } finally { shareBusy.value = false }
 }
 
@@ -1392,8 +1453,33 @@ async function loadAdminGrants() {
   } catch (e) { adminGrants.value = []; grantableDepts.value = []; noteLoadError('adminGrants', e) }   // 404 静默；5xx 显错
 }
 
+// 阶段 B：管辖根候选队列（org_sync 派生的中心级/超规模/换根待 kb_admin 确认）
+async function loadNodeCandidates() {
+  const s = useSession()
+  if (s.role !== 'kb_admin') { nodeCandidates.value = []; return }
+  try {
+    const r = await apiJson<{ items: NodeCandidate[] }>('/api/kb/admin-node-candidates', { auth: true })
+    nodeCandidates.value = r.items || []
+  } catch { nodeCandidates.value = [] }
+}
+
+/** 确认/驳回候选。409 = 快照已翻或候选失效——刷新队列并把后端文案回给调用方。 */
+async function decideNodeCandidate(id: number, action: 'confirm' | 'reject'): Promise<string | null> {
+  try {
+    await apiJson('/api/kb/admin-node-candidates/decide', {
+      method: 'POST', auth: true, body: JSON.stringify({ candidate_id: id, action }) })
+    await Promise.all([loadNodeCandidates(), loadAdminGrants()])
+    return null
+  } catch (e: any) {
+    await loadNodeCandidates()
+    return e?.detail?.message || e?.detail || '操作失败，请刷新后重试'
+  }
+}
+
 // 授予/更新一名部门管理员（owner_depts = 权威全集,提交即覆盖）。成功返回 true。
-async function grantDeptAdmin(userId: string, userName: string, ownerDepts: string[], note: string): Promise<boolean> {
+// 阶段 B：nodeRoots —— undefined=不动节点轴；[]=清空；[ids]=该轴权威全集（覆盖按轴隔离）。
+async function grantDeptAdmin(userId: string, userName: string, ownerDepts: string[], note: string,
+                              nodeRoots?: number[]): Promise<boolean> {
   return (await withInflight(`member:${userId}`, async () => {
     try {
       const s = useSession()
@@ -1403,15 +1489,16 @@ async function grantDeptAdmin(userId: string, userName: string, ownerDepts: stri
         adminGrants.value = i >= 0 ? adminGrants.value.map((a, k) => (k === i ? row : a)) : [...adminGrants.value, row]
         return true
       }
-      await apiJson('/api/kb/admin-grants', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, user_name: userName, owner_depts: ownerDepts, note }) })
+      await apiJson('/api/kb/admin-grants', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, user_name: userName, owner_depts: ownerDepts, note, ...(nodeRoots !== undefined ? { node_roots: nodeRoots } : {}) }) })
       await loadAdminGrants()
       return true
     } catch (e: any) { void notice({ title: '授予失败', message: uploadErrText(e), danger: true }); return false }
   })) ?? false   // 在途（重复点击）→ 视为未提交
 }
 
-// 撤销：ownerDept 指定→撤该一项；为空→撤全部并降级 employee。
-async function revokeAdminGrant(userId: string, ownerDept = ''): Promise<void> {
+// 撤销：ownerDept 指定→撤该一项；nodeRoot 指定→撤该管辖根；两者皆空→撤两轴全部
+// （降级判定后端看两表——node-only 管理员不误降）。
+async function revokeAdminGrant(userId: string, ownerDept = '', nodeRoot = 0): Promise<void> {
   await withInflight(`member:${userId}`, async () => {
     try {
       const s = useSession()
@@ -1421,7 +1508,7 @@ async function revokeAdminGrant(userId: string, ownerDept = ''): Promise<void> {
           .filter((a) => a.role === 'kb_admin' || a.managed_owner_depts.length > 0)   // 无授权剩余 → 视为降级移出
         return
       }
-      await apiJson('/api/kb/admin-grants/revoke', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, owner_dept: ownerDept }) })
+      await apiJson('/api/kb/admin-grants/revoke', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, owner_dept: ownerDept, node_root: nodeRoot }) })
       await loadAdminGrants()
     } catch (e: any) { void notice({ title: '撤销失败', message: uploadErrText(e), danger: true }) }
   })
@@ -1483,7 +1570,7 @@ export function useKb() {
     docsPage, docsTotal, docsPerPage: DOCS_PAGE, docsMaxPage: DOCS_MAX_PAGE, loadDocsPage,
     // 多选 / 批量
     selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
-    newTitle, newOwner, newPerm, newShareDepts, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
+    newTitle, newOwner, newOwnerNode, newPerm, newShareDepts, newShareNodes, nodeAclGrant, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, isBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
     shareCtx, shareBusy, shareTargets: SHARE_TARGETS,
@@ -1491,7 +1578,9 @@ export function useKb() {
     // 方法
     loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, openHistory, closeHistory, openDocPreview, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,
-    openShare, closeShare, submitShare, grantedDeptsOf, grantedLabelsByDoc, docGrantRows, setVisibility,
+    openShare, closeShare, submitShare, saveNodeGrants, grantedDeptsOf, grantedLabelsByDoc, docGrantRows, setVisibility,
+    docMetaCtx, openDocMeta, closeDocMeta,
+    nodeCandidates, loadNodeCandidates, decideNodeCandidate,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     feedbackReview, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
     reviewTasks, loadReviewTasks, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
@@ -1508,7 +1597,7 @@ export function __resetKb() {
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   selectedIds.value = new Set(); bulkBusy.value = false; bulkMsg.value = ''
-  newTitle.value = ''; newOwner.value = ''; newPerm.value = 'dept_internal'; newShareDepts.value = []; verCtx.value = null
+  newTitle.value = ''; newOwner.value = ''; newOwnerNode.value = []; newPerm.value = 'dept_internal'; newShareDepts.value = []; newShareNodes.value = []; verCtx.value = null
   shareCtx.value = null; shareBusy.value = false
   uploadBusy.value = false; uploadMsg.value = ''; uploadErr.value = ''; uploadOk.value = false
   dupWarn.value = ''; contentDupMsg.value = ''; uploadQueue.value = []; selectedNames.value = []

@@ -408,6 +408,28 @@ def _expand_groups_to_owners(groups: List[str]) -> List[str]:
     return sorted(owners)
 
 
+def groups_that_can_read_owner(owner_dept: str) -> List[str]:
+    """`_expand_groups_to_owners` 的**反向**：owner_dept → 能检索到它的【用户组码】集合。
+
+    为什么必须有这个函数（2026-07-31，codex 实测）：**owner 值域 ≠ 组码值域**。
+    `production_mold` 是合法 owner，但不是用户组码 —— 把它当组码送进过滤器只会得到
+    public-only（组码白名单会丢掉它），能读该 owner 的组码其实是 `production`/`marketing`。
+    任何"按文档 owner 反推应当能看到它的人"的场景（如 `ha3_verify` 的自查身份）都必须走
+    这里，**绝不在调用方复制一份 production/marketing taxonomy**。
+
+    返回排序去重列表；owner 为空或无人可读 ⇒ 空列表（调用方按 fail-closed 处置）。
+    """
+    owner_dept = (owner_dept or "").strip()      # 自行规范化，不指望调用方记得
+    if not owner_dept:
+        return []
+    out = {g for g, owners in _DEPT_OWNER_EXPANSION.items() if owner_dept in owners}
+    if owner_dept in _VALID_ACL_GROUPS:
+        # 未进展开表的部门：组码就是 owner 自身（精确匹配）。**必须过白名单** ——
+        # 否则 production_mold 这类"只是 owner"的值会被当成组码传出去，等于查了个寂寞。
+        out.add(owner_dept)
+    return sorted(out)
+
+
 def audit_production_owner_taxonomy(active_owner_depts) -> List[str]:
     """Surface production-like owner_dept values present in data but NOT in the umbrella
     taxonomy. Such owners are invisible to 'production' users (fail-closed) until added
@@ -455,7 +477,16 @@ def _normalize_acl_groups(user_dept: Union[str, List[str], None]) -> List[str]:
     return out
 
 
-def _build_permission_filter(user_dept: Union[str, List[str], None]) -> str:
+def _node_acl_flags() -> Tuple[bool, bool]:
+    """(grant, enforce)。启动/首用即校验姿态:GRANT=true && ENFORCE=false 非法。"""
+    from opensearch_pipeline.acl_policy import assert_flag_posture
+    cfg = get_config().rag
+    grant, enforce = bool(cfg.node_acl_grant), bool(cfg.node_acl_enforce)
+    assert_flag_posture(grant_enabled=grant, enforce_enabled=enforce)
+    return grant, enforce
+
+
+def _build_permission_filter(user_dept: Union[str, List[str], None], *, acl_ctx=None) -> str:
     """构建 HA3 权限过滤表达式（安全边界，单一实现）。
 
     放行 public；对用户所属的每个 ACL 组额外放行该组的 dept_internal。入参经
@@ -465,8 +496,16 @@ def _build_permission_filter(user_dept: Union[str, List[str], None]) -> str:
     'production' 伞组经 _expand_groups_to_owners 展开为各 production* 子线 owner（其余组精确匹配）。
     """
     groups = _normalize_acl_groups(user_dept)
+    # node-ACL 分支【必须先于空-groups 早退算出来】（2026-07-31，codex 共识）：
+    # 组码通道与节点通道是**两条独立通道** —— `acl_policy.can_read_doc` 的 node 分支
+    # 压根不读 `ctx.groups`（只看 node_channel_ok / org_wide_reader / 祖先链∩授权节点）。
+    # 原实现在 groups 为空时直接返回 public-only，导致**过滤器比权威判定更严**：
+    # 无组码映射的员工（现网部门映射缺口 26/131）即便被节点授权也只看得到 public。
+    # 修正后语义只在 (groups 空) ∧ (acl_ctx 非空) ∧ (GRANT=on) ∧ (节点项非空) 时变化，
+    # 且该集合正是 can_read_doc 已经放行的集合 ⇒ 是**对齐**，不是放宽。
+    node_extra = _node_filter_suffix(acl_ctx)
     if not groups:
-        return '(permission_level="public")'
+        return '(permission_level="public")' + node_extra
     # groups 已净化+白名单；owners 为 taxonomy 常量（伞组展开），字符串拼接无注入风险
     owners = _expand_groups_to_owners(groups)
     dept_clause = " OR ".join('owner_dept="' + o + '"' for o in owners)
@@ -483,7 +522,39 @@ def _build_permission_filter(user_dept: Union[str, List[str], None]) -> str:
     if get_config().rag.allowed_depts_acl:
         allowed_clause = " OR ".join('allowed_depts="' + g + '"' for g in groups)
         base = base + ' OR (permission_level="dept_internal" AND (' + allowed_clause + '))'
-    return base
+    return base + node_extra
+
+
+def _node_filter_suffix(acl_ctx) -> str:
+    """node-ACL 追加分支（RAG_NODE_ACL_GRANT，默认关）→ 待拼在过滤表达式末尾的后缀。
+
+    `acl_ctx=None` ⇒ 恒返回 `""` ⇒ `_build_permission_filter` 的两条返回路径都与历史
+    **逐字节一致**（全部 legacy 调用点、flag 关时的全部调用点都落在这里）。
+
+    ⚠️ 节点值由 acl_policy 自行严格拼接，**绝不流经 _sanitize_ha3_filter_value**
+      （该净化器会删掉冒号，d:123 会被打成 d123）。值域只含 d:/dx: + 正整数，无注入面。
+    org_wide_reader（总经办 `*`）：单靠事后 can_read_doc 放行不够——HA3 主过滤器压根
+      不会把 node 文档召回来（其 owner 是哨兵、祖先链也不含被勾节点），事后判定轮不到
+      执行。故给该角色一条候选分支：直接放行全部 dept_internal，召回后统一走权威复核。
+      ⚠️ 该分支**必须与 can_read_doc 同样先过 node_channel_ok**（acl_policy.py:283 在
+      org_wide_reader 之前判它）：组织快照不可信时连节点语义都不成立，此时放出「全部
+      dept_internal」候选只会把判定压力全推给事后复核（2026-07-31 codex 评审）。
+    """
+    if acl_ctx is None:
+        return ""
+    grant, _enforce = _node_acl_flags()
+    if not grant:
+        return ""
+    if not getattr(acl_ctx, "node_channel_ok", False):
+        return ""                       # 祖先链不可信 ⇒ 无节点通道（与 can_read_doc 同序）
+    if getattr(acl_ctx, "org_wide_reader", False):
+        return ' OR (permission_level="dept_internal")'
+    from opensearch_pipeline.acl_policy import node_filter_terms
+    terms = node_filter_terms(acl_ctx)
+    if not terms:
+        return ""
+    node_clause = " OR ".join('allowed_depts="' + t + '"' for t in terms)
+    return ' OR (permission_level="dept_internal" AND (' + node_clause + '))'
 
 
 # ── E#39：查询侧授权复核的 (doc_id → approved 组码集) 进程内 TTL 缓存 ──────────
@@ -512,7 +583,71 @@ def invalidate_deny_cache(doc_id: Optional[str] = None) -> None:
             _deny_cache.pop(doc_id, None)
 
 
-def _deny_revoked_cross_dept(results, user_dept):
+def _deny_revoked_node_hits(results, acl_ctx, cand_idx, owner_set):
+    """node-ACL 的查询侧复核：对【全部非 public 命中】按当前权威 + 真值表判定（mode-dispatch）。
+
+    ⚠️ 为什么候选是「全部非 public」而不是「跨部门」（2026-07-31 codex 共识，实测复现）：
+    一篇 RDS 权威已切 node 的文档，在投影未收敛期 HA3 里可能**还是旧的真实 owner**。
+    若该 owner 恰好等于调用者的组码，旧口径（owner ∉ 自有集才算候选）就**不会复核它**，
+    于是 `can_read_doc` 根本没机会执行 —— 设计稿 §8 承诺的「关 GRANT ⇒ node 文档非 public
+    命中全部被拒 = 真 public-only」当场落空。实测：
+        GRANT=false + 陈旧 owner 'hr' + 调用者组码 'hr' ⇒ 文档仍被投放。
+
+    ⚠️ 过渡期**不能靠哨兵识别 node 命中**：`acl_mode` 不进 HA3，未收敛投影里哨兵尚未写下
+    ⇒ 必须对全部候选**批量查当前 acl_mode**（与权威解析一次往返合并，不额外加 DB 往返）。
+
+    **mode-dispatch（刻意不对全部候选无差别调 can_read_doc）**：
+      · mode 不可判（缺行 / 未知 mode / 权威不可达）⇒ 丢弃
+      · node    ⇒ 恒走 `can_read_doc`（这正是本函数存在的理由）
+      · legacy 且 owner ∈ 调用者自有集 ⇒ **保留**，维持旧 same-owner 语义
+      · legacy 且跨部门          ⇒ 走 `can_read_doc`（等价于既有 legacy 授权复核）
+    为什么 legacy same-owner 不一并复核：那会新增「owner 漂移即拒 / permission 暂时不一致
+    即拒」等本批次不需要的 legacy 行为扩面，而 same-owner 本就不是可撤销的组码 grant。
+
+    返回需要丢弃的下标集合。权威不可达 ⇒ 丢弃**全部**候选（fail-closed，机密性优先）。
+    """
+    from opensearch_pipeline.acl_policy import ACL_MODE_NODE, can_read_doc
+    grant, enforce = _node_acl_flags()
+    doc_ids = {results[i].get("doc_id") for i in cand_idx if results[i].get("doc_id")}
+    if not doc_ids:
+        # 候选都没有 doc_id ⇒ 无从按权威判定 ⇒ fail-closed 全丢（不是「没候选」）
+        return set(cand_idx)
+    try:
+        from opensearch_pipeline.access_grants import resolve_doc_acl
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # strict=True：capability/节点权威读失败一律上抛，缺行/未知 mode 不返回该 doc。
+                # 绝不能让「读不到」退化成「按 legacy 放行」——那正是 stale-owner 窗口。
+                acls = resolve_doc_acl(doc_ids, cur, strict=True)
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 — 权威不可达 ⇒ fail-closed 丢弃全部非 public 候选
+        logger.warning("node-ACL 查询侧复核失败,fail-closed 丢弃 %d 条非 public 命中: %s",
+                       len(cand_idx), e)
+        return set(cand_idx)
+    drop = set()
+    for i in cand_idx:
+        acl = acls.get(results[i].get("doc_id"))
+        if acl is None:                       # 缺行 / 未知 mode（strict 下不返回）
+            drop.add(i)
+            continue
+        if (getattr(acl, "mode", "") or "").strip().lower() == ACL_MODE_NODE:
+            if not can_read_doc(acl_ctx, acl, grant_enabled=grant, enforce_enabled=enforce):
+                drop.add(i)
+            continue
+        # ── 确认 legacy ──
+        if (results[i].get("owner_dept") or "") in owner_set:
+            continue                          # same-owner:保持旧语义，不新增拒绝面
+        if not can_read_doc(acl_ctx, acl, grant_enabled=grant, enforce_enabled=enforce):
+            drop.add(i)
+    if drop:
+        logger.info("node-ACL 查询侧拒绝:丢弃 %d 条无在册授权的命中", len(drop))
+    return drop
+
+
+def _deny_revoked_cross_dept(results, user_dept, *, acl_ctx=None):
     """查询侧拒绝（Phase D 读侧 fail-closed 复核）——撤销即时生效，不等 HA3 投影收回。
 
     HA3 的 allowed_depts 过滤依赖【投影】（chunk_meta→HA3，由 stage-3 drain 物化）。撤销跨部门授权后
@@ -526,9 +661,25 @@ def _deny_revoked_cross_dept(results, user_dept):
     E#39：RAG_ACL_DENY_CACHE_TTL_S>0 时启用 (doc_id → approved 组码集) 进程内 TTL 缓存
     （默认 0=关闭），decide 端点提交后主动失效（invalidate_deny_cache）。
     """
-    if not get_config().rag.allowed_depts_acl or not results:
+    if not results:
         return results
     norm = _normalize_acl_groups(user_dept)
+    # ⚠️ node-ACL 分支【必须先于 legacy flag 判定】(2026-07-31 codex 共识)：
+    # 原实现把整段复核挂在 `RAG_ALLOWED_DEPTS_ACL` 之下（代码默认 false），于是
+    # node ENFORCE 这条**设计上常开**的闸门会随一个 legacy 开关一起被关掉 ——
+    # 设计稿 §8 明确要求 ENFORCE 不得随正向开关关闭。
+    if acl_ctx is not None:
+        # 候选 = **全部非 public 命中**（不要求 owner 非空、不排除 owner 属自有集）。
+        # 理由见 `_deny_revoked_node_hits` 的 docstring：陈旧真实 owner 恰等于调用者组码时，
+        # 旧的「跨部门」口径会整条漏判。判定本身仍按 mode 分派，legacy same-owner 语义不变。
+        _owners = set(_expand_groups_to_owners(norm))
+        _cand = [i for i, r in enumerate(results) if r.get("permission_level") != "public"]
+        if not _cand:
+            return results
+        _drop = _deny_revoked_node_hits(results, acl_ctx, _cand, _owners)
+        return [r for i, r in enumerate(results) if i not in _drop]
+    if not get_config().rag.allowed_depts_acl:
+        return results
     groups = set(norm)
     owner_set = set(_expand_groups_to_owners(norm))
     # P2-02：从「仅 dept_internal」放宽到「任何非 public」——这样字段漂移→restricted 兜底的
@@ -713,6 +864,7 @@ def _search_chunks_opensearch(
     top_k: int,
     user_dept: Union[str, List[str], None] = None,
     degraded: bool = False,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """本地开发回退检索：标准 OpenSearch dense kNN(0.7) + BM25(0.3)。
 
@@ -750,6 +902,22 @@ def _search_chunks_opensearch(
                 {"term": {"permission_level": "dept_internal"}},
                 {"terms": {"allowed_depts": groups}},
             ]}})
+    # node-ACL（2026-07-31）：节点分支与组码**互相独立** —— 与 HA3 侧 `_node_filter_suffix`
+    # 同构地放在 `if groups:` **之外**。无组码映射的员工（现网部门映射缺口 26/131）拿到节点
+    # 授权后，在本地回退链上同样必须可见；写侧 `to_opensearch_doc` 已输出 allowed_depts。
+    if acl_ctx is not None:
+        _grant, _enforce = _node_acl_flags()
+        if _grant and getattr(acl_ctx, "node_channel_ok", False):
+            if getattr(acl_ctx, "org_wide_reader", False):
+                perm_should.append({"term": {"permission_level": "dept_internal"}})
+            else:
+                from opensearch_pipeline.acl_policy import node_filter_terms
+                _terms = node_filter_terms(acl_ctx)
+                if _terms:
+                    perm_should.append({"bool": {"must": [
+                        {"term": {"permission_level": "dept_internal"}},
+                        {"terms": {"allowed_depts": _terms}},
+                    ]}})
 
     fetch_k = max(top_k * 2, top_k + 5)
     # P2-4 降级：零向量不进 kNN（部分引擎对零范数向量报错），纯 BM25 match 排序
@@ -976,6 +1144,7 @@ def search_chunks(
     output_fields: Optional[List[str]] = None,
     user_dept: Union[str, List[str], None] = None,
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """
     端到端检索：query → embedding → HA3 search → 标准化结果。
@@ -1032,7 +1201,7 @@ def search_chunks(
     _output_fields = output_fields or list(_DEFAULT_OUTPUT_FIELDS)
 
     # ── 权限过滤（安全边界，统一实现）──
-    filter_expr = _build_permission_filter(user_dept)
+    filter_expr = _build_permission_filter(user_dept, acl_ctx=acl_ctx)
 
     logger.info("Permission filter: user_dept=%s, filter=%s", user_dept, filter_expr)
 
@@ -1043,8 +1212,9 @@ def search_chunks(
     _full_cfg = get_config()
     if not _full_cfg.alibaba_vector.endpoint and getattr(_full_cfg.opensearch, "host", ""):
         return _revalidate_main_hits(_deny_revoked_cross_dept(
-            _search_chunks_opensearch(query, dense, top_k, user_dept, degraded=degraded),
-            user_dept))
+            _search_chunks_opensearch(query, dense, top_k, user_dept, degraded=degraded,
+                                      acl_ctx=acl_ctx),
+            user_dept, acl_ctx=acl_ctx))
 
     client = _get_ha3_client()
 
@@ -1140,7 +1310,7 @@ def search_chunks(
         _mark_degraded_results(results)   # P2-4：打标 + 分级失效处理（见 helper 注释）
 
     # 4b. 查询侧拒绝（Phase D 读侧 fail-closed 复核）：撤销跨部门授权后即时生效，不等 HA3 投影收回。
-    results = _deny_revoked_cross_dept(results, user_dept)
+    results = _deny_revoked_cross_dept(results, user_dept, acl_ctx=acl_ctx)
 
     # 4c. 主命中 RDS 复核（P3-1）：is_active/权限轴与权威表不一致的陈旧投影不投放。
     results = _revalidate_main_hits(results)
@@ -1901,6 +2071,7 @@ def _fetch_cosurface_images(
     user_dept: Union[str, List[str], None],
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
     max_images: int = 3,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """cosurface 的 HA3 补图查询（F#53 拆出：可在 stitch/expand 期间由 future 并发预取）。
 
@@ -1921,7 +2092,11 @@ def _fetch_cosurface_images(
         f'doc_id="{_sanitize_ha3_filter_value(d)}"' for d in doc_ids
     )
     # 权限子句与 search_chunks 共用同一实现（安全边界单一来源）
-    perm = _build_permission_filter(user_dept)
+    # ⚠️ 必须同样透传 acl_ctx（2026-07-31）：漏传时节点分支不会出现在这条过滤器里，
+    # 于是 node 文档【正文可见但补图召不回】——用户看到答案却永远没有配图，而
+    # step-card 的价值高度依赖配图。方向是 fail-closed（少召回、不越权），故此前
+    # 定性为可用性缺陷；但 node-ACL 一旦放量它就是"图全没了"。
+    perm = _build_permission_filter(user_dept, acl_ctx=acl_ctx)
     filter_expr = f'chunk_type="image" AND ({doc_clause}) AND ({perm})'
 
     req = QueryRequest(
@@ -1946,6 +2121,7 @@ def cosurface_doc_images(
     max_images: int = 3,
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
     prefetched: Optional[Tuple[List[str], Any]] = None,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """图片召回增强：为已检索高分文档补充其最相关的 image chunk。
 
@@ -1996,7 +2172,8 @@ def cosurface_doc_images(
                 img_results = fut.result()
         if img_results is None:
             img_results = _fetch_cosurface_images(
-                query, doc_ids, user_dept, query_embedding, max_images=max_images)
+                query, doc_ids, user_dept, query_embedding, max_images=max_images,
+                acl_ctx=acl_ctx)
     except Exception as e:
         logger.warning("图片召回补充失败 (non-fatal): %s", e)
         return chunks
@@ -2173,6 +2350,7 @@ def _multi_query_search(
     multimodal: bool,
     query_embedding: Optional[Tuple[List[float], List[int], List[float]]] = None,
     primary_supplier: Optional[Any] = None,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """多意图 fan-out：原查询 + 子查询并行检索（各自重排），轮转交错合并去重。
 
@@ -2202,6 +2380,7 @@ def _multi_query_search(
                 chs = search_chunks(
                     q, top_k=fetch_k, user_dept=user_dept,
                     query_embedding=query_embedding if idx == 0 else None,
+                    acl_ctx=acl_ctx,
                 )
             if rerank_enable and chs:
                 if get_config().rag.rerank_img_probe:
@@ -2226,7 +2405,7 @@ def _multi_query_search(
         logger.warning("multi-query 全部 %d 路无结果（%d 路异常），回退原查询单路检索",
                        len(queries), n_errored)
         chs = search_chunks(query, top_k=fetch_k, user_dept=user_dept,
-                            query_embedding=query_embedding)
+                            query_embedding=query_embedding, acl_ctx=acl_ctx)
         if rerank_enable and chs:
             if get_config().rag.rerank_img_probe:
                 chs = _probe_pool_image_refs(chs)   # 回退单路同样探测（#F-mm10a）
@@ -2267,6 +2446,7 @@ def retrieve_and_enrich(
     user_dept: Union[str, List[str], None] = None,
     stitch_window: int = 1,
     cosurface_images: bool = False,
+    acl_ctx=None,
 ) -> List[Dict[str, Any]]:
     """统一检索 + 后处理入口，供 API 和 DingTalk 共用。
 
@@ -2332,13 +2512,14 @@ def retrieve_and_enrich(
             # lambda 体内按模块全局名解析 search_chunks（monkeypatch 兼容，不做 import 期快照）
             _primary_future = _px.submit(
                 lambda: search_chunks(query, top_k=_fetch_k, user_dept=user_dept,
-                                      query_embedding=_emb))
+                                      query_embedding=_emb, acl_ctx=acl_ctx))
         finally:
             _px.shutdown(wait=False)   # 不阻塞：future 照常完成，线程随后回收
         _sub_queries = maybe_decompose(query)
     if _sub_queries:
         chunks = _multi_query_search(
             query, _sub_queries, fetch_k=_fetch_k, top_k=top_k, user_dept=user_dept,
+            acl_ctx=acl_ctx,
             rerank_enable=_av.rerank_enable, multimodal=bool(cosurface_images),
             query_embedding=_emb,
             primary_supplier=(_primary_future.result if _primary_future is not None else None),
@@ -2348,7 +2529,7 @@ def retrieve_and_enrich(
         # 与历史同步调用的传播语义一致）；mode=off 走原同步路径。
         chunks = (_primary_future.result() if _primary_future is not None
                   else search_chunks(query, top_k=_fetch_k, user_dept=user_dept,
-                                     query_embedding=_emb))
+                                     query_embedding=_emb, acl_ctx=acl_ctx))
         _cap = get_config().rag.doc_diversity_cap
         if _av.rerank_enable and chunks:
             # #F-mm10a：探测让 VL 重排看见 step_card 的绑定图（_img_key 取
@@ -2389,8 +2570,12 @@ def retrieve_and_enrich(
 
                 _cx = ThreadPoolExecutor(max_workers=1)
                 try:
+                    # ⚠️ acl_ctx 必须与串行路径同参（2026-07-31）：预取命中时其结果被**直接采用**
+                    # （下方仅比对 doc_ids 是否一致，不重算），漏传就变成"预取时没图、串行时有图"
+                    # 这种随并发时序漂移的 node 文档配图缺失。
                     _cos_pref = (_pre_ids, _cx.submit(
-                        _fetch_cosurface_images, query, _pre_ids, user_dept, _emb))
+                        _fetch_cosurface_images, query, _pre_ids, user_dept, _emb,
+                        acl_ctx=acl_ctx))
                 finally:
                     _cx.shutdown(wait=False)
             except Exception as e:   # noqa: BLE001 — 预取起不来 → 回退串行（fail-open）
@@ -2424,7 +2609,7 @@ def retrieve_and_enrich(
     # P2-4 嵌入降级时跳过，理由见上方 _cos_pref 注释）
     if chunks and cosurface_images and get_config().rag.image_cosurface and not _emb_degraded:
         chunks = cosurface_doc_images(query, chunks, user_dept=user_dept, query_embedding=_emb,
-                                      prefetched=_cos_pref)
+                                      prefetched=_cos_pref, acl_ctx=acl_ctx)
     # P2-31（盲区审计）：附文档日期（版本落库日，RDS 现查、fail-open）——此前索引→上下文→
     # 来源整条链无任何时间信号，模型与用户都无法区分 2023 版与 2025 版 SOP。
     _attach_doc_dates(chunks)

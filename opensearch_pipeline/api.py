@@ -521,6 +521,22 @@ class Identity:
     role: str = "employee"  # 知识库写授权角色【UI 提示】——非边界；写接口须 DB 现查 resolve_kb_identity
 
 
+def _build_acl_ctx(identity: Optional["Identity"], user_id: Optional[str] = None):
+    """Identity → acl_policy.AclContext(node-ACL 读身份)。**绝不抛**。
+
+    节点通道所需的祖先链来自 RDS 组织快照(dept_dim/staff_dim);快照缺失/过期/解析失败
+    一律降级为 node_channel_ok=False —— 只关掉增量的节点通道,legacy 组码语义分毫不动。
+    """
+    try:
+        from opensearch_pipeline.dingtalk_identity import resolve_acl_context
+        sid = (identity.user_id if identity else None) or user_id or ""
+        groups = list(identity.acl_groups) if identity else []
+        return resolve_acl_context(sid, groups)
+    except Exception as e:   # noqa: BLE001 — 增量能力,绝不把现状检索打挂
+        logger.warning("构造 AclContext 失败(节点通道关闭): %s", e)
+        return None
+
+
 def current_identity(authorization: Optional[str] = Header(None)) -> Optional[Identity]:
     """从 Authorization: Bearer <token> 解析已验证身份；无/无效令牌返回 None。
 
@@ -966,10 +982,13 @@ def _prepare_ask(req: AskRequest, identity: Optional["Identity"], *,
     effective_query = rewritten_query or req.question
 
     # 2. 检索
+    # node-ACL：读身份含祖先链/直属部门（组织快照缺失或过期 ⇒ 节点通道自动关闭，
+    # legacy 组码通道不受影响）。GRANT 默认关时全链路仍与历史逐字节一致。
+    _acl_ctx = _build_acl_ctx(identity, uid)
     try:
         chunks = retrieve_and_enrich(
             effective_query, top_k=req.top_k, user_dept=user_dept,
-            cosurface_images=cosurface_images,
+            cosurface_images=cosurface_images, acl_ctx=_acl_ctx,
         )
     except Exception as e:
         trace_id = get_request_id()
@@ -1959,6 +1978,32 @@ def _resign_visible_doc_ids(doc_ids: set, identity: Optional[Identity]) -> set:
                 f"SELECT doc_id, permission_level, owner_dept FROM {_kb_db()}.document_meta "
                 f"WHERE doc_id IN ({ph})", tuple(ids))
             meta = {r[0]: ((r[1] or "").strip().lower(), (r[2] or "")) for r in cur.fetchall()}
+            # 阶段 B（codex 缺口/阶段 A 残差）：node 文档改走 can_read_doc + 调用者 AclContext。
+            # 此前手写 legacy 判定对 node 文档恒拒（owner=NULL 不在组展开）——不越权但功能断：
+            # node 文档的图片在卡片/console 全部加载失败。批量 resolve（一次往返）、
+            # AclContext 只构造一次；resolve 失败按该批 node 文档全拒（fail-closed，产出可读
+            # 图字节的接口绝不 fail-open）。
+            _modes = {}
+            try:
+                from opensearch_pipeline.access_grants import resolve_acl_modes
+                _modes = resolve_acl_modes(ids, cur)
+            except Exception as _me:   # noqa: BLE001 — 模式判不出 ⇒ 全按 legacy（现状语义）
+                logger.warning("resign-images acl_mode 批查失败（按 legacy 处理）: %s", _me)
+            _node_ids = [d for d in ids if _modes.get(d) == "node"]
+            _node_ok: set = set()
+            if _node_ids:
+                try:
+                    from opensearch_pipeline.access_grants import resolve_doc_acl
+                    from opensearch_pipeline.acl_policy import can_read_doc
+                    _acls = resolve_doc_acl(_node_ids, cur, strict=True)
+                    _ctx = _build_acl_ctx(identity)
+                    if _ctx is not None:
+                        for d in _node_ids:
+                            _acl = _acls.get(d)
+                            if _acl is not None and can_read_doc(_ctx, _acl):
+                                _node_ok.add(d)
+                except Exception as _ne:   # noqa: BLE001 — 权威不可达 ⇒ 该批 node 全拒
+                    logger.warning("resign-images node 判定失败（node 文档全拒）: %s", _ne)
             for d in ids:
                 pl, owner = meta.get(d, (None, None))
                 if pl is None:
@@ -1967,6 +2012,10 @@ def _resign_visible_doc_ids(doc_ids: set, identity: Optional[Identity]) -> set:
                     visible.add(d); continue
                 if pl == "restricted":
                     continue                       # 永不服务
+                if _modes.get(d) == "node":        # node：统一判定点已裁决
+                    if d in _node_ok:
+                        visible.add(d)
+                    continue
                 if owner in owners:                # dept_internal 等：owner 展开命中
                     visible.add(d); continue
                 if phase_d and groups:             # Phase D 跨部门授权
@@ -2551,6 +2600,12 @@ class KbOrgTreeResponse(BaseModel):
     my_managed_owner_depts: List[str] = Field(default_factory=list)
     my_grantable_owner_depts: List[str] = Field(default_factory=list)
     org_tree: Optional[Dict[str, Any]] = Field(default=None, description="org 快照（缺失则 null）")
+    # 2026-08-01：节点授权是否**已对读侧生效**（= RAG_NODE_ACL_GRANT）。
+    # ⚠️ 上传侧必须据此选授权口径,不能只看"控件写好了"：GRANT 关时 `can_read_doc` 对 node
+    # 文档是**无条件 DENY**(acl_policy.py:281),此刻若把新上传文档写成 node 授权,它对所有人
+    # 不可见——连归属部门自己都看不到(投影轴换哨兵后 legacy owner 分支不再放行)。
+    # 故 GRANT 关 ⇒ 上传仍走 legacy 组码;开 ⇒ 自动切组织树。读写两侧共用同一个开关。
+    node_acl_grant: bool = Field(default=False, description="节点授权是否已对读侧生效")
 
 
 class KbDocItem(BaseModel):
@@ -2558,6 +2613,13 @@ class KbDocItem(BaseModel):
     title: str = ""
     original_filename: str = ""
     owner_dept: str = ""
+    # 阶段 B owner DTO（codex M1/M2）：稳定分桶键 + 展示名。key=legacy:<code> | node:<id>
+    # ——**不用中文名当键**（重名/改名即破「改名免疫」目标）；label 供直出（legacy 组码由
+    # 前端 deptLabel 转中文，node 节点名后端 JOIN dept_dim 直给）。旧字段 owner_dept 保留
+    # （legacy 兼容），node 文档该字段为空串。
+    acl_mode: str = "legacy"
+    owner_key: str = ""
+    owner_label: str = ""
     permission_level: str = "public"
     current_version_no: int = 1
     status: str = "active"
@@ -2582,6 +2644,9 @@ class KbMyDocsResponse(BaseModel):
     # faceted 状态计数（2026-07-16）：与本次查询同筛选（除 badge 自身）的按徽章计数——
     # 前端 chips/标题总数跟随下拉筛选。None=计数失败/旧后端（前端回退全库口径）。additive。
     badge_counts: Optional[Dict[str, int]] = None
+    # 阶段 B（codex M7/T6）：管辖后代集不可得（组织快照过期/读失败）⇒ node 腿失效、
+    # node 文档对该管理员隐身——fail-closed 是对的，但**不能无声**：前端据此挂 banner。
+    scope_degraded: bool = False
 
 
 class KbVersionItem(BaseModel):
@@ -2752,6 +2817,129 @@ def _kb_can_manage(kb, owner_dept: str) -> bool:
     return (owner_dept or "") in set(expand_managed_owner_depts(managed_owner_depts(kb)))
 
 
+# ── 阶段 B：文档域 mode 隔离管理判定（generic _kb_can_manage/_kb_owner_scope_sql
+#    保持组码语义不动——贡献审核仍消费它们，见 kb_authz.can_manage_doc 头注）─────────
+def _kb_node_capability(cursor) -> str:
+    """060 三列探测的**三态**读法：'present' | 'absent' | 'unknown'。
+
+    absent（真实未 apply）→ 调用方生成与现行完全相同的 legacy SQL；
+    unknown（探测本身失败）→ dept_admin 一律 `AND 1=0`（fail-closed，仅 kb_admin）——
+    把探测失败当 absent 会违反「未知 mode 仅 kb_admin」裁决（codex 阶段 B major）。
+    present 有正向缓存（access_grants._NODE_SCHEMA_PRESENT），热路径零开销。
+    """
+    from opensearch_pipeline.access_grants import _node_acl_columns_present
+    try:
+        return "present" if _node_acl_columns_present(cursor, strict=True) else "absent"
+    except Exception:   # noqa: BLE001
+        return "unknown"
+
+
+def _kb_managed_descendants(kb):
+    """dept_admin 的管辖后代集（含根）→ set[int] 或 **None**（不可得 = fail-closed）。
+
+    None 的三种来源：组织快照读失败/表空（OrgSnapshotUnavailable）、快照 >48h
+    （fresh=False——设计裁决：自动根与后代展开同时失效）、展开异常（非法根/超上限）。
+    调用方对 None 一律去掉 node 腿/判 False，**绝不回退 legacy 残值判定**。
+    空 roots 是合法状态 → set()（匹配空 = 无 node 管辖，非 None）。
+    """
+    roots = getattr(kb, "granted_node_roots", ()) or ()
+    if not roots:
+        return set()
+    try:
+        from opensearch_pipeline.dept_ancestry import resolve_descendant_ids
+        from opensearch_pipeline.org_sync import load_children_index
+        _rev, fresh, children = load_children_index()
+        if not fresh:
+            return None
+        got, ok = resolve_descendant_ids(children, roots)
+        return got if ok else None
+    except Exception:   # noqa: BLE001 — OrgSnapshotUnavailable 等
+        return None
+
+
+def _kb_doc_owner_scope_sql(kb, cap: str, alias: str = "m"):
+    """文档域 owner 作用域 SQL（**严格 mode 隔离**）→ (clause, params, degraded)。
+
+    kb_admin 不限；dept_admin：
+      cap='absent'  → 与现行 _kb_owner_scope_sql 逐字节同构（`AND {alias}.owner_dept IN …`）；
+      cap='unknown' → `AND 1=0` + degraded=True；
+      cap='present' → `AND ((acl_mode='legacy' AND owner_dept IN …)
+                            OR (acl_mode='node' AND owner_dept_id IN <后代集>))`。
+        node 腿在后代集不可得时**整腿去掉**（node 文档对该管理员隐身 = fail-closed）
+        并置 degraded=True；⚠️ 无条件 OR 两列 = node 文档的 owner_dept 残值继续命中
+        旧管理员（越权洞，设计稿 §3.5）。
+    degraded=True 时调用方应在响应标注 scope_degraded 并 WARNING（T6 告警面）。
+    """
+    from opensearch_pipeline.kb_authz import (
+        ROLE_KB_ADMIN, expand_managed_owner_depts, managed_owner_depts,
+    )
+    if kb.role == ROLE_KB_ADMIN:
+        return "", [], False
+    owners = expand_managed_owner_depts(managed_owner_depts(kb))
+    if cap == "absent":
+        if not owners:
+            return "AND 1=0", [], False
+        ph = ",".join(["%s"] * len(owners))
+        return f"AND {alias}.owner_dept IN ({ph})", list(owners), False
+    if cap != "present":                       # unknown：探测失败，仅 kb_admin
+        logger.warning("node capability 探测失败——dept_admin 作用域 fail-closed（scope_degraded）")
+        return "AND 1=0", [], True
+    descendants = _kb_managed_descendants(kb)
+    degraded = descendants is None
+    if degraded:
+        logger.warning("管辖后代集不可得（快照过期/读失败）——node 腿失效（scope_degraded）")
+    legs, params = [], []
+    if owners:
+        ph = ",".join(["%s"] * len(owners))
+        legs.append(f"({alias}.acl_mode='legacy' AND {alias}.owner_dept IN ({ph}))")
+        params.extend(owners)
+    if descendants:
+        idph = ",".join(["%s"] * len(descendants))
+        legs.append(f"({alias}.acl_mode='node' AND {alias}.owner_dept_id IN ({idph}))")
+        params.extend(sorted(descendants))
+    if not legs:
+        return "AND 1=0", [], degraded
+    return "AND (" + " OR ".join(legs) + ")", params, degraded
+
+
+def _kb_can_manage_doc(kb, acl_mode, legacy_owner, owner_dept_id) -> bool:
+    """单文档管理判定（写端点在锁内读齐三元组后调用）。node 文档的后代集解析
+    失败 ⇒ False（kb_authz.can_manage_doc 对 descendant_ids=None fail-closed）。"""
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, can_manage_doc
+    if kb.role == ROLE_KB_ADMIN:
+        return True                            # 短路：kb_admin 不需要后代集解析
+    mode = (acl_mode or "legacy").strip().lower()
+    descendants = _kb_managed_descendants(kb) if mode == "node" else set()
+    return can_manage_doc(kb, mode, legacy_owner, owner_dept_id, descendants)
+
+
+def _kb_read_doc_triplet(cursor, doc_id: str):
+    """锁外/锁内通用：读 (owner_dept, acl_mode, owner_dept_id, acl_revision, permission_level,
+    status)。060 未 apply（capability≠present）→ 只读 legacy 列，mode 恒 'legacy'、
+    owner_dept_id/acl_revision 恒 None/0——写端点在旧环境保持现行为。找不到行 → None。"""
+    cap = _kb_node_capability(cursor)
+    if cap == "present":
+        cursor.execute(
+            f"SELECT owner_dept, acl_mode, owner_dept_id, acl_revision, permission_level, status "
+            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s", (doc_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {"owner_dept": row[0] or "", "acl_mode": (row[1] or "legacy").strip().lower(),
+                "owner_dept_id": row[2], "acl_revision": int(row[3] or 0),
+                "permission_level": (row[4] or "").strip().lower(),
+                "status": (row[5] or "active"), "cap": cap}
+    cursor.execute(
+        f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
+        "WHERE doc_id=%s", (doc_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {"owner_dept": row[0] or "", "acl_mode": "legacy", "owner_dept_id": None,
+            "acl_revision": 0, "permission_level": (row[1] or "").strip().lower(),
+            "status": (row[2] or "active"), "cap": cap}
+
+
 def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
     """按 OSS ETag（字节级内容指纹）找其它 active 文档（跨部门内容查重）。
 
@@ -2766,9 +2954,11 @@ def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                _cap = _kb_node_capability(cur)
+                _mc = ", m.acl_mode, m.owner_dept_id" if _cap == "present" else ""
                 cur.execute(
                     f"""
-                    SELECT m.doc_id, m.title, m.owner_dept
+                    SELECT m.doc_id, m.title, m.owner_dept{_mc}
                     FROM {_kb_db()}.document_meta m
                     JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -2783,10 +2973,17 @@ def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
     except Exception as e:
         logger.info("content-dup 查询失败（fail-open，不报警）: %s", e)
         return [], 0
+    # 阶段 B：详情 vs 只计数的隐私分级改 mode 隔离——node 文档绝不因 owner_dept 残值
+    # 把详情泄给 legacy 管理员（后代集整批解析一次）
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN as _RKA
+    from opensearch_pipeline.kb_authz import can_manage_doc as _cmd
+    _descendants = None if kb.role == _RKA else _kb_managed_descendants(kb)
     visible, other = [], 0
     for r in rows:
         doc_id, title, owner = (r[0] or ""), (r[1] or ""), (r[2] or "")
-        if _kb_can_manage(kb, owner):
+        _mode, _oid = ((r[3] or "legacy"), r[4]) if len(r) > 3 else ("legacy", None)
+        _ok = (kb.role == _RKA) or _cmd(kb, _mode, owner, _oid, _descendants)
+        if _ok:
             visible.append(KbDupDoc(doc_id=doc_id, title=title, owner_dept=owner))
         else:
             other += 1
@@ -2794,7 +2991,23 @@ def _kb_content_dups(etag: str, exclude_doc_id: str, kb):
 
 
 def _load_org_tree_snapshot() -> Optional[Dict[str, Any]]:
-    """读取 org 树快照（scratch/dingtalk_org_tree.json）；缺失/异常 → None（fail open）。"""
+    """org 树快照 —— **2026-07-31 起改读 RDS `dept_dim`**(node-ACL 组织同步 job 产出)。
+
+    ⚠️ 为什么必须改:原实现读 `scratch/dingtalk_org_tree.json`,而 scratch/ 同时被
+    `.gitignore` 与 `.dockerignore` 排除、Dockerfile 只 COPY `opensearch_pipeline/`
+    ⇒ **2026-07-23 起的镜像应用里该文件根本不存在,生产恒返回 null**(管理台的组织
+    选择器因此一直是空的)。RDS 快照对镜像可见,且与祖先链解析用的是同一份数据。
+    """
+    try:
+        from opensearch_pipeline.org_sync import load_org_tree
+        return load_org_tree()
+    except Exception as e:   # noqa: BLE001 — 组织数据不可用不得打挂管理台
+        logger.warning("org 树读取失败（返回 None）: %s", e)
+        return None
+
+
+def _load_org_tree_snapshot_legacy_file() -> Optional[Dict[str, Any]]:
+    """旧实现(读 scratch 文件)——保留供本地无 DB 时调试;生产路径已不再使用。"""
     try:
         from pathlib import Path
         p = Path(__file__).resolve().parent.parent / "scratch" / "dingtalk_org_tree.json"

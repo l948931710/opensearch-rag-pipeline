@@ -25,7 +25,9 @@ from opensearch_pipeline.api import (
     Identity,
     _enforce_rate_limit,
     _kb_can_manage,
+    _kb_can_manage_doc,
     _kb_db,
+    _kb_node_capability,
     _require_kb_admin,
     _require_kb_console,
     current_identity,
@@ -113,12 +115,218 @@ class KbAccessGrantCreateResponse(BaseModel):
     ok: bool = True
 
 
+# ── node-ACL：组织树节点授权（可见范围「整体替换」）─────────────────────────
+class KbNodeGrantItem(BaseModel):
+    dept_id: int
+    subtree: bool = True          # True=含整棵子树(投影 d:) | False=仅直挂本节点(投影 dx:)
+
+
+class KbNodeGrantsSave(BaseModel):
+    """管理员在组织树上勾选后的【整体替换】保存。"""
+    doc_id: str
+    nodes: List[KbNodeGrantItem] = Field(default_factory=list)
+    # 并发整体替换的 CAS:传入端上读到的 acl_revision;与库中不一致 ⇒ 409(有人先改了)
+    acl_revision: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class KbNodeGrantsSaveResponse(BaseModel):
+    doc_id: str = ""
+    acl_mode: str = ""
+    acl_revision: int = 0
+    granted: List[str] = Field(default_factory=list)   # "d:<id>" / "dx:<id>"
+    revoked: List[str] = Field(default_factory=list)
+    ok: bool = True
+
+
+@router.post("/api/kb/doc-node-grants", response_model=KbNodeGrantsSaveResponse)
+def kb_doc_node_grants_save(req: KbNodeGrantsSave, request: Request,
+                            identity: Optional[Identity] = Depends(current_identity)):
+    """保存文档的组织树节点可见范围 —— **整体替换,不是追加**。
+
+    语义(设计稿 §5「保存=替换」):未勾选的节点 soft-revoke、已勾选的 upsert/复活,
+    文档同时切到 `acl_mode='node'`。切换后该文档的 **legacy 组码授权对检索失效**
+    (`project_doc_acl` 模式互斥:node 投影只出 `d:`/`dx:`,绝不含组码) —— 既有
+    `kb_access_request` 行**保留作审计**,不删。
+
+    同事务完成(缺一不可):
+      ①`document_meta ... FOR UPDATE` 行锁 + `acl_revision` CAS —— 并发两个"整体替换"
+        必须串行化,否则后提交者会把先提交者的勾选静默丢掉;
+      ②切 `acl_mode` + `acl_revision+1`;③节点集整体替换;④审计;
+      ⑤`enqueue_acl_projection` 持久入队(权威变更与投影意图原子提交);
+      ⑥内联 `materialize_doc_allowed_depts` best-effort(失败有 outbox + reconcile 兜底)。
+    提交后失效 deny 缓存(撤销即时生效)。
+
+    硬规则(fail-closed):
+      - 只 `dept_internal` 可设节点可见范围(public 本就全司可读→400;restricted 绝不外露→403);
+      - 非在线文档不可改(400);
+      - 必须 `_kb_can_manage(document_meta.owner_dept)` —— **管理轴仍是真实 owner**
+        (node 模式只改检索投影轴,归属/管理轴不动),故此处授权判定无需等 T5;
+      - 节点数超上限 → **422 拒绝**,绝不静默截断后让 UI 以为已完整保存;
+      - dept_id 必须是**在册**组织节点(`dept_dim.is_active=1`)—— 授权给已消失/不存在的
+        节点等于该文档对所有人不可见,且事后无从解释。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.access_grants import (
+        enqueue_acl_projection, materialize_doc_allowed_depts,
+    )
+    from opensearch_pipeline.acl_policy import (
+        ACL_MODE_NODE, MAX_DOC_NODES, format_node_value, normalize_node_ids,
+    )
+    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="缺少 doc_id")
+    ids, overflow = normalize_node_ids([n.dept_id for n in req.nodes], limit=MAX_DOC_NODES)
+    if overflow:
+        raise HTTPException(status_code=422,
+                            detail=f"授权节点数超上限 {MAX_DOC_NODES}（请改选更上层节点）")
+    if len(ids) != len({n.dept_id for n in req.nodes}):
+        raise HTTPException(status_code=400, detail="含非法 dept_id（须为正整数）")
+    scope_by_id = {int(n.dept_id): ("subtree" if n.subtree else "exact") for n in req.nodes}
+
+    assert_metadata_write_allowed("kb_doc_node_grants_save", get_config().rds.host, kind="rds")
+    trace_id = get_request_id()
+    granted: List[str] = []
+    revoked: List[str] = []
+    new_rev = 0
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # ① 行锁 + 前置校验(与并发退役/升版串行化)
+                cur.execute(
+                    f"SELECT owner_dept, permission_level, status, acl_mode, acl_revision, "
+                    f"owner_dept_id FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE",
+                    (req.doc_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="文档不存在")
+                owner_dept, perm, status, cur_mode, cur_rev = (
+                    row[0] or "", (row[1] or "").lower(), (row[2] or "active").lower(),
+                    row[3] or "legacy", int(row[4] or 0))
+                owner_dept_id = row[5]
+                if status != "active":
+                    raise HTTPException(status_code=400, detail="文档不在线,无法设置可见范围")
+                if perm == "restricted":
+                    raise HTTPException(status_code=403, detail="restricted 文档不可对外放行")
+                if perm != "dept_internal":
+                    raise HTTPException(status_code=400,
+                                        detail="仅 dept_internal 文档可设节点可见范围")
+                # 阶段 B 契约收紧（codex 共识）：本端点只做【已是 node 且归属完整】文档的
+                # 可见集整体替换。legacy→node 迁移唯一入口 = doc-meta 端点（须同时给
+                # owner_dept_id + visible_nodes）——阶段 A 的「保存即切 mode」产生过
+                # 缺 owner 的半迁移态（acl_mode=node + owner_dept_id NULL ⇒ 仅 kb_admin
+                # 可管），现网无 node 文档、无兼容负担，直接废除。
+                if (cur_mode or "legacy") != ACL_MODE_NODE:
+                    raise HTTPException(status_code=409,
+                                        detail="该文档仍是组码授权模式，请先在「编辑信息」中迁移归属到组织树")
+                if not owner_dept_id:
+                    raise HTTPException(status_code=409,
+                                        detail="该文档缺归属节点（半迁移态），请先在「编辑信息」中补齐归属")
+                if not _kb_can_manage_doc(kb, cur_mode, owner_dept, owner_dept_id):
+                    raise HTTPException(status_code=403, detail="无权管理该文档（非属主部门管理员）")
+                # CAS 必填（codex major M5）：node 文档必经 register/doc-meta 创建，revision
+                # 永远可读——继续允许缺省 = 并发整体替换互相丢勾选的保护形同虚设。
+                if req.acl_revision is None:
+                    raise HTTPException(status_code=400,
+                                        detail="缺少 acl_revision（请从文档详情读取当前版本后提交）")
+                if int(req.acl_revision) != cur_rev:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"可见范围已被他人修改（当前版本 {cur_rev}），请刷新后重试")
+
+                # dept_id 必须在册 —— 授权给不存在/已消失的节点 = 该文档对所有人不可见
+                if ids:
+                    ph = ",".join(["%s"] * len(ids))
+                    cur.execute(
+                        f"SELECT dept_id FROM {_kb_db()}.dept_dim "
+                        f"WHERE is_active=1 AND dept_id IN ({ph})", tuple(ids))
+                    live = {int(r[0]) for r in cur.fetchall()}
+                    missing = [i for i in ids if i not in live]
+                    if missing:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"节点不存在或已停用: {missing}（组织快照可能过期，请稍后重试）")
+
+                # ③ 整体替换:未勾选的 soft-revoke、勾选的 upsert/复活
+                cur.execute(
+                    f"SELECT dept_id, scope FROM {_kb_db()}.kb_doc_node_grant "
+                    "WHERE doc_id=%s AND revoked_at IS NULL", (req.doc_id,))
+                before = {(int(r[0]), str(r[1] or "subtree")) for r in cur.fetchall()}
+                after = {(i, scope_by_id[i]) for i in ids}
+                for dept_id, scope in sorted(before - after):
+                    cur.execute(
+                        f"UPDATE {_kb_db()}.kb_doc_node_grant SET revoked_at=NOW(), revoked_by=%s "
+                        "WHERE doc_id=%s AND dept_id=%s AND scope=%s AND revoked_at IS NULL",
+                        (kb.user_id, req.doc_id, dept_id, scope))
+                    revoked.append(format_node_value(dept_id, exact=(scope == "exact")))
+                for dept_id, scope in sorted(after - before):
+                    cur.execute(
+                        f"INSERT INTO {_kb_db()}.kb_doc_node_grant "
+                        "(doc_id, dept_id, scope, granted_by, note) VALUES (%s,%s,%s,%s,%s) "
+                        "ON DUPLICATE KEY UPDATE revoked_at=NULL, revoked_by=NULL, "
+                        "granted_by=VALUES(granted_by), granted_at=NOW(), note=VALUES(note)",
+                        (req.doc_id, dept_id, scope, kb.user_id, (req.reason or "")[:255]))
+                    granted.append(format_node_value(dept_id, exact=(scope == "exact")))
+
+                # ② 切模式 + CAS 版本 +1(即便节点集未变也推进,便于端上察觉并发)
+                new_rev = cur_rev + 1
+                cur.execute(
+                    f"UPDATE {_kb_db()}.document_meta SET acl_mode=%s, acl_revision=%s, "
+                    "updated_at=NOW() WHERE doc_id=%s",
+                    (ACL_MODE_NODE, new_rev, req.doc_id))
+
+                # ⑤⑥ 投影:持久入队(不吞异常)+ 内联标脏 best-effort
+                enqueue_acl_projection(cur, req.doc_id, reason="node_grants_save")
+                try:
+                    materialize_doc_allowed_depts(cur, req.doc_id)
+                except Exception as _pe:   # noqa: BLE001 — outbox + reconcile 兜底
+                    logger.warning("node 授权内联标脏失败（outbox 兜底）doc=%s: %s", req.doc_id, _pe)
+
+                write_audit(doc_id=req.doc_id, version_no=None, action_type="ACL_NODE_GRANTS_SAVE",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=(f"mode {cur_mode}→node rev {cur_rev}→{new_rev} "
+                                     f"+{granted} -{revoked}"), cursor=cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_doc_node_grants_save 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"保存失败 (trace: {trace_id})")
+
+    # 撤销即时生效:提交后失效查询侧授权复核缓存
+    try:
+        from opensearch_pipeline.retriever import invalidate_deny_cache
+        invalidate_deny_cache(req.doc_id)
+    except Exception as _ce:   # noqa: BLE001
+        logger.warning("失效 deny 缓存失败（TTL 兜底）doc=%s: %s", req.doc_id, _ce)
+
+    return KbNodeGrantsSaveResponse(
+        doc_id=req.doc_id, acl_mode=ACL_MODE_NODE, acl_revision=new_rev,
+        granted=granted, revoked=revoked, ok=True)
+
+
 # ── Phase F：成员/角色管理（kb_admin 维护 dept_admin 写授权；三分授权 读≠管理≠授权）──
+class KbAdminNodeRoot(BaseModel):
+    """阶段 B 管理轴：一条管辖根（覆盖该节点及全部后代）。"""
+    dept_id: int = 0
+    name: str = ""                                            # dept_dim 现名（失活节点回 id 串）
+    source: str = "manual"                                    # auto | manual
+    active: bool = True
+
+
 class KbAdminItem(BaseModel):
     user_id: str = ""
     user_name: str = ""
     role: str = ""                                            # dept_admin / kb_admin
     managed_owner_depts: List[str] = Field(default_factory=list)  # dept_admin 显式授权；kb_admin=全部(空数组表示全量)
+    managed_node_roots: List[KbAdminNodeRoot] = Field(default_factory=list)  # 阶段 B：node 管辖根（两轴独立）
 
 
 class KbAdminListResponse(BaseModel):
@@ -130,18 +338,24 @@ class KbAdminGrantRequest(BaseModel):
     user_id: str = ""                                         # 钉钉 staffId
     user_name: str = ""
     owner_depts: List[str] = Field(default_factory=list)      # 授予可管理的 owner_dept（权威全集，提交即覆盖）
+    # 阶段 B：node 管辖根（manual）。None=**不动**节点轴；[]=清空该轴；[ids]=该轴权威全集
+    # （覆盖语义按轴隔离——覆盖 legacy 不动 node，反之亦然，codex major M3）。
+    node_roots: Optional[List[int]] = None
     note: str = ""
 
 
 class KbAdminRevokeRequest(BaseModel):
     user_id: str = ""
-    owner_dept: str = ""                                      # 空 = 撤销该用户全部授权并降级 employee
+    owner_dept: str = ""                                      # 撤单条 legacy 授权
+    node_root: int = 0                                        # 阶段 B：撤单条 node 管辖根
+    # 两者都空 = 撤两轴全部授权；降级 employee 的判定看**两表**剩余（node-only 管理员不误降）
 
 
 class KbAdminGrantResponse(BaseModel):
     user_id: str = ""
     role: str = ""
     managed_owner_depts: List[str] = Field(default_factory=list)
+    managed_node_roots: List[int] = Field(default_factory=list)
     ok: bool = True
 
 
@@ -195,12 +409,20 @@ def kb_access_request_submit(req: KbAccessRequestSubmit, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
-                            "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
+                # 阶段 B（M6）：node 文档禁止**新增** legacy 组码授权——申请/共享/审批的组码
+                # 通道对 node 文档全部关死（隐形组码会在 node→legacy 回滚时突然复活）；
+                # 收权动作（reject/revoke）仍允许（decide 端点放行）。
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status{_mc} "
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm, status = (row[0] or ""), (row[1] or ""), (row[2] or "active")
+                if len(row) > 3 and (row[3] or "legacy") == "node":
+                    raise HTTPException(status_code=400,
+                                        detail="该文档为组织树授权模式，请联系属主管理员在可见范围中添加你的部门")
                 if str(status).lower() != "active":
                     raise HTTPException(status_code=400, detail="该文档非在线状态，无法申请")
                 if perm == "public":
@@ -393,13 +615,21 @@ def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT owner_dept, permission_level, status FROM {_kb_db()}.document_meta "
-                            "WHERE doc_id=%s LIMIT 1", (req.doc_id,))
+                # 阶段 B：锁内读齐三元组、mode 隔离授权；node 文档禁止新增 legacy 共享
+                # （组码通道对 node 文档关死，可见范围走节点授权——M6/设计稿 :326）。
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status{_mc} "
+                            f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm, status = (row[0] or ""), (row[1] or ""), (row[2] or "active")
-                if not _kb_can_manage(kb, owner_dept):
+                _mode, _oid = ((row[3] or "legacy"), row[4]) if _cap == "present" else ("legacy", None)
+                if _mode == "node":
+                    raise HTTPException(status_code=400,
+                                        detail="该文档为组织树授权模式，请在「可见范围」中按组织节点共享")
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权共享该文档（非文档所属部门管理员）")
                 if str(status).lower() != "active":
                     raise HTTPException(status_code=400, detail="该文档非在线状态，无法共享")
@@ -462,15 +692,18 @@ def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
 
 
 class KbVisibilityReader(BaseModel):
-    """有效可见范围里的一个读者组：dept=组码（前端 deptLabel 转中文），via=来源。"""
+    """有效可见范围里的一个读者组：dept=组码/节点名（前端 deptLabel 对组码转中文，
+    节点名直出），via=来源。"""
     dept: str = ""
-    via: str = "owner"        # owner=归属部门 / umbrella=生产伞组 / shared_policy=营销共享面 / grant=跨部门授权
+    via: str = "owner"        # owner=归属部门 / umbrella=生产伞组 / shared_policy=营销共享面 /
+    #                           grant=跨部门授权 / node_subtree=节点(含下级) / node_exact=节点(仅本级)
 
 
 class KbVisibilityExplainResponse(BaseModel):
     doc_id: str = ""
     owner_dept: str = ""
     permission_level: str = "dept_internal"
+    acl_mode: str = "legacy"  # 阶段 B：node 文档的可见范围来自组织树授权，不再有组码语义
     everyone: bool = False    # public：全公司可检索
     nobody: bool = False      # restricted / 非在线 / 隔离：不进检索
     quarantined: bool = False # 安全隔离（chunk 停用；唯一出路=脱敏重灌）
@@ -495,26 +728,30 @@ def kb_visibility_explain(request: Request, doc_id: str = "",
         raise HTTPException(status_code=400, detail="缺少 doc_id")
     trace_id = get_request_id()
     grant_depts: List[str] = []
+    node_readers: List[KbVisibilityReader] = []
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT owner_dept, permission_level, status, current_version_no "
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, permission_level, status, current_version_no{_mc} "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s LIMIT 1", (doc_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="文档不存在")
                 owner_dept, perm = (row[0] or ""), (row[1] or "dept_internal")
                 status, cur_ver = (row[2] or "active"), int(row[3] or 1)
-                if not _kb_can_manage(kb, owner_dept):
+                _mode, _oid = ((row[4] or "legacy"), row[5]) if _cap == "present" else ("legacy", None)
+                if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权查看该文档的可见范围明细")
                 cur.execute(f"SELECT publish_status, gate_status FROM {_kb_db()}.document_version "
                             "WHERE doc_id=%s AND version_no=%s", (doc_id, cur_ver))
                 vrow = cur.fetchone()
                 quarantined = bool(vrow and (str(vrow[0] or "").upper() == "QUARANTINED"
                                              or str(vrow[1] or "").lower() == "quarantined"))
-                if perm == "dept_internal":
+                if perm == "dept_internal" and _mode != "node":
                     cur.execute(f"SELECT requester_depts FROM {_kb_db()}.kb_access_request "
                                 "WHERE doc_id=%s AND status='approved'", (doc_id,))
                     _seen_g = set()
@@ -524,6 +761,22 @@ def kb_visibility_explain(request: Request, doc_id: str = "",
                             if p and p not in _seen_g:
                                 _seen_g.add(p)
                                 grant_depts.append(p)
+                elif perm == "dept_internal" and _mode == "node":
+                    # 阶段 B（codex 缺口②）：node 文档解释节点授权——LEFT JOIN dept_dim 取现名，
+                    # **含失活节点并明确标注**（active INNER JOIN 会把授权意图悄悄隐藏——
+                    # 授权还在、节点没了，正是「文档不可见且无从解释」要解释的那种情况）。
+                    cur.execute(
+                        f"SELECT g.dept_id, g.scope, d.name, d.is_active "
+                        f"FROM {_kb_db()}.kb_doc_node_grant g "
+                        f"LEFT JOIN {_kb_db()}.dept_dim d ON d.dept_id = g.dept_id "
+                        "WHERE g.doc_id=%s AND g.revoked_at IS NULL ORDER BY g.dept_id", (doc_id,))
+                    for r in cur.fetchall():
+                        _name = r[2] or str(r[0])
+                        if r[3] is None or not r[3]:
+                            _name += "（节点已失效，无人经此可见）"
+                        node_readers.append(KbVisibilityReader(
+                            dept=_name,
+                            via=("node_subtree" if (r[1] or "subtree") == "subtree" else "node_exact")))
         finally:
             conn.close()
     except HTTPException:
@@ -535,12 +788,17 @@ def kb_visibility_explain(request: Request, doc_id: str = "",
     active = str(status).lower() == "active"
     resp = KbVisibilityExplainResponse(doc_id=doc_id, owner_dept=owner_dept,
                                        permission_level=perm, active=active,
-                                       quarantined=quarantined)
+                                       acl_mode=_mode, quarantined=quarantined)
     if quarantined or not active or perm == "restricted":
         resp.nobody = True        # 隔离/退役/受限：不在检索中（优先级最高，覆盖一切授权）
         return resp
     if perm == "public":
         resp.everyone = True
+        return resp
+    if _mode == "node":
+        # node 文档：可见范围 = 节点授权全集（组码语义不存在；授权空集 = 无人可见，如实）
+        resp.readers = node_readers
+        resp.nobody = not node_readers
         return resp
     # dept_internal：与检索同源反查——owner 组自身 / production 伞 / marketing 共享面
     from opensearch_pipeline.retriever import _VALID_ACL_GROUPS, _expand_groups_to_owners
@@ -944,8 +1202,24 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
                 if not row:
                     raise HTTPException(status_code=404, detail="申请不存在")
                 owner_dept, status, doc_id = (row[0] or ""), (row[1] or ""), (row[2] or "")
-                # 审批权：文档所属部门管理员（owner_dept ∈ managed）或 kb_admin
-                if not _kb_can_manage(kb, owner_dept):
+                # 阶段 B（codex 缺口③）：审批权按**当前文档三元组**现裁，不再只信申请行的
+                # owner_dept 快照——归属迁移后旧属主管理员经快照仍能操作正是要堵的洞。
+                # 快照列降级为纯展示/审计。文档行被删（极端）→ 回退快照判定（收权动作仍可执行）。
+                _cap = _kb_node_capability(cur)
+                _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
+                cur.execute(f"SELECT owner_dept, status{_mc} FROM {_kb_db()}.document_meta "
+                            "WHERE doc_id=%s FOR UPDATE", (doc_id,))
+                drow = cur.fetchone()
+                if drow:
+                    _d_owner = drow[0] or ""
+                    _mode, _oid = ((drow[2] or "legacy"), drow[3]) if _cap == "present" else ("legacy", None)
+                    if not _kb_can_manage_doc(kb, _mode, _d_owner, _oid):
+                        raise HTTPException(status_code=403, detail="无权操作该申请（非文档所属部门管理员）")
+                    # M6：node 文档禁止**新增/扩大** legacy 授权（approve）；收权（reject/revoke）放行
+                    if _mode == "node" and decision == "approved":
+                        raise HTTPException(status_code=400,
+                                            detail="该文档已迁组织树授权模式，组码申请不可批准（请驳回并改用可见范围）")
+                elif not _kb_can_manage(kb, owner_dept):
                     raise HTTPException(status_code=403, detail="无权操作该申请（非文档所属部门管理员）")
                 if status != from_status:
                     conn.commit()       # 幂等：非目标前态（已决 / 非 approved）→ 返回既有态
@@ -1054,11 +1328,30 @@ def kb_admin_grants_list(request: Request,
                 for r in cur.fetchall():
                     if r and r[0]:
                         grants.setdefault(r[0], []).append(r[1])
+                # 阶段 B：node 管辖根（LEFT JOIN dept_dim 取现名，含失活节点——不悄悄隐藏授权意图）。
+                # 独立 try：060 未 apply 时只让节点轴为空，legacy 名单照常。
+                node_roots: Dict[str, List[KbAdminNodeRoot]] = {}
+                try:
+                    cur.execute(
+                        f"SELECT g.user_id, g.managed_dept_id, g.source, d.name, d.is_active "
+                        f"FROM {_kb_db()}.dept_admin_node_grant g "
+                        f"LEFT JOIN {_kb_db()}.dept_dim d ON d.dept_id = g.managed_dept_id "
+                        "WHERE g.is_active=1")
+                    for r in cur.fetchall():
+                        if r and r[0]:
+                            node_roots.setdefault(r[0], []).append(KbAdminNodeRoot(
+                                dept_id=int(r[1] or 0), source=r[2] or "manual",
+                                name=(r[3] or str(r[1] or "")) + ("" if (r[4] is None or r[4]) else "（已失效节点）"),
+                                active=bool(r[4]) if r[4] is not None else False))
+                except Exception as ne:   # noqa: BLE001
+                    logger.debug("dept_admin_node_grant 名单读取失败（节点轴按空展示）: %s", ne)
                 for r in roles:
                     uid = r[0] or ""
                     items.append(KbAdminItem(
                         user_id=uid, user_name=r[1] or "", role=r[3] or "",
-                        managed_owner_depts=sorted(grants.get(uid, []))))
+                        managed_owner_depts=sorted(grants.get(uid, [])),
+                        managed_node_roots=sorted(node_roots.get(uid, []),
+                                                  key=lambda n: n.dept_id)))
         finally:
             conn.close()
     except Exception as e:
@@ -1083,8 +1376,24 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
     if uid == kb.user_id:
         raise HTTPException(status_code=400, detail="不能修改自己的角色/授权")
     depts = sanitize_owner_depts(req.owner_depts)   # 净化 + 写白名单（fail-closed 丢非法）
-    if not depts:
+    # 阶段 B：node_roots=None 不动节点轴 / []=清空 / [ids]=该轴权威全集（覆盖按轴隔离）
+    roots: Optional[List[int]] = None
+    if req.node_roots is not None:
+        roots = []
+        for v in req.node_roots:
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"非法管辖节点 id：{v!r}")
+            if iv <= 1:
+                raise HTTPException(status_code=400, detail="管辖根不得是钉钉根节点（全库语义归 kb_admin）")
+            if iv not in roots:
+                roots.append(iv)
+    if not depts and not roots and roots is None:
+        # 两轴都没给任何授权（node_roots=None 且 depts 空）——与既有 400 语义一致
         raise HTTPException(status_code=400, detail="可管理部门为空或全不在白名单（无法授予）")
+    if not depts and roots == []:
+        raise HTTPException(status_code=400, detail="两条授权轴均为空（如需撤权请走撤销接口）")
     assert_metadata_write_allowed("kb_admin_grant", get_config().rds.host, kind="rds")
     trace_id = get_request_id()
     note = (req.note or "")[:255] or None
@@ -1100,27 +1409,67 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
                 if row and (row[0] or "") == ROLE_KB_ADMIN:
                     raise HTTPException(status_code=400,
                                         detail="该用户已是知识库管理员（kb_admin），请用运维脚本调整以免误降级")
-                # 角色 → dept_admin（dept_code 同步为可管理组 CSV，与 seed 口径一致）
-                cur.execute(f"INSERT INTO {_kb_db()}.user_role (user_id, user_name, dept_code, role, is_active) "
-                            "VALUES (%s,%s,%s,%s,1) ON DUPLICATE KEY UPDATE "
-                            "user_name=COALESCE(VALUES(user_name), user_name), dept_code=VALUES(dept_code), "
-                            "role=VALUES(role), is_active=1, updated_at=NOW()",
-                            (uid, (req.user_name or None), ",".join(depts), ROLE_DEPT_ADMIN))
-                # 权威全集语义：先软撤销本次【未包含】的旧授权,再 upsert 本次
-                ph = ",".join(["%s"] * len(depts))
-                cur.execute(f"UPDATE {_kb_db()}.dept_admin_grant SET is_active=0, updated_at=NOW() "
-                            f"WHERE user_id=%s AND is_active=1 AND managed_owner_dept NOT IN ({ph})",
-                            (uid, *depts))
-                for owner in depts:
-                    cur.execute(f"INSERT INTO {_kb_db()}.dept_admin_grant "
-                                "(user_id, managed_owner_dept, granted_by, note, is_active) VALUES (%s,%s,%s,%s,1) "
-                                "ON DUPLICATE KEY UPDATE is_active=1, granted_by=VALUES(granted_by), "
-                                "note=VALUES(note), updated_at=NOW()",
-                                (uid, owner, kb.user_id, note))
+                # 管辖根必须在册且 active（授权给已消失节点 = 管辖面为空且无从解释）
+                if roots:
+                    ph = ",".join(["%s"] * len(roots))
+                    cur.execute(f"SELECT dept_id FROM {_kb_db()}.dept_dim "
+                                f"WHERE dept_id IN ({ph}) AND is_active=1", tuple(roots))
+                    alive = {int(r[0]) for r in cur.fetchall()}
+                    dead = [r for r in roots if r not in alive]
+                    if dead:
+                        raise HTTPException(status_code=400,
+                                            detail=f"管辖节点不在组织快照中或已失效：{dead}")
+                # 角色 → dept_admin。dept_code（兼作读组）仅在 legacy 轴非空时同步为组 CSV——
+                # node-only 授权绝不覆写 dept_code：写空串会把该用户的**读组**清成仅 public。
+                if depts:
+                    cur.execute(f"INSERT INTO {_kb_db()}.user_role (user_id, user_name, dept_code, role, is_active) "
+                                "VALUES (%s,%s,%s,%s,1) ON DUPLICATE KEY UPDATE "
+                                "user_name=COALESCE(VALUES(user_name), user_name), dept_code=VALUES(dept_code), "
+                                "role=VALUES(role), is_active=1, updated_at=NOW()",
+                                (uid, (req.user_name or None), ",".join(depts), ROLE_DEPT_ADMIN))
+                else:
+                    cur.execute(f"INSERT INTO {_kb_db()}.user_role (user_id, user_name, dept_code, role, is_active) "
+                                "VALUES (%s,%s,'',%s,1) ON DUPLICATE KEY UPDATE "
+                                "user_name=COALESCE(VALUES(user_name), user_name), "
+                                "role=VALUES(role), is_active=1, updated_at=NOW()",
+                                (uid, (req.user_name or None), ROLE_DEPT_ADMIN))
+                # legacy 轴：权威全集语义（先软撤销未包含的旧授权,再 upsert）。
+                # ⚠️ 仅在 owner_depts 明确非空时覆盖——纯 node 授权请求不得清空既有 legacy 轴。
+                if depts:
+                    ph = ",".join(["%s"] * len(depts))
+                    cur.execute(f"UPDATE {_kb_db()}.dept_admin_grant SET is_active=0, updated_at=NOW() "
+                                f"WHERE user_id=%s AND is_active=1 AND managed_owner_dept NOT IN ({ph})",
+                                (uid, *depts))
+                    for owner in depts:
+                        cur.execute(f"INSERT INTO {_kb_db()}.dept_admin_grant "
+                                    "(user_id, managed_owner_dept, granted_by, note, is_active) VALUES (%s,%s,%s,%s,1) "
+                                    "ON DUPLICATE KEY UPDATE is_active=1, granted_by=VALUES(granted_by), "
+                                    "note=VALUES(note), updated_at=NOW()",
+                                    (uid, owner, kb.user_id, note))
+                # node 轴：manual 权威全集（manual 存在 ⇒ auto 失效，设计规则 2——
+                # 撤停范围含 auto 行；[] = 清空整轴）
+                if roots is not None:
+                    if roots:
+                        ph = ",".join(["%s"] * len(roots))
+                        cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_grant SET is_active=0, updated_at=NOW() "
+                                    f"WHERE user_id=%s AND is_active=1 AND managed_dept_id NOT IN ({ph})",
+                                    (uid, *roots))
+                        for root in roots:
+                            cur.execute(f"INSERT INTO {_kb_db()}.dept_admin_node_grant "
+                                        "(user_id, managed_dept_id, source, granted_by, note, is_active) "
+                                        "VALUES (%s,%s,'manual',%s,%s,1) "
+                                        "ON DUPLICATE KEY UPDATE is_active=1, granted_by=VALUES(granted_by), "
+                                        "note=VALUES(note), updated_at=NOW()",
+                                        (uid, root, kb.user_id, note))
+                    else:
+                        cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_grant SET is_active=0, updated_at=NOW() "
+                                    "WHERE user_id=%s AND is_active=1", (uid,))
                 # 同事务审计（B1）：与角色/授权变更原子提交。
                 write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_GRANT",
                             operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                            message=f"grant dept_admin {uid} → {','.join(depts)}", cursor=cur)
+                            message=f"grant dept_admin {uid} → depts={','.join(depts) or '-'} "
+                                    f"nodes={','.join(str(r) for r in (roots or [])) if roots is not None else 'unchanged'}",
+                            cursor=cur)
             conn.commit()
         finally:
             conn.close()
@@ -1129,7 +1478,8 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
     except Exception as e:
         logger.error("kb_admin_grant 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"授予部门管理员失败 (trace: {trace_id})")
-    return KbAdminGrantResponse(user_id=uid, role=ROLE_DEPT_ADMIN, managed_owner_depts=depts, ok=True)
+    return KbAdminGrantResponse(user_id=uid, role=ROLE_DEPT_ADMIN, managed_owner_depts=depts,
+                                managed_node_roots=list(roots or []), ok=True)
 
 
 @router.post("/api/kb/admin-grants/revoke", response_model=KbAdminGrantResponse)
@@ -1161,15 +1511,33 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
                 row = cur.fetchone()
                 if row and (row[0] or "") == ROLE_KB_ADMIN:
                     raise HTTPException(status_code=400, detail="不能经本 UI 撤销知识库管理员（kb_admin）")
+                node_root = int(getattr(req, "node_root", 0) or 0)
                 if owner:
                     cur.execute(f"UPDATE {_kb_db()}.dept_admin_grant SET is_active=0, updated_at=NOW() "
                                 "WHERE user_id=%s AND managed_owner_dept=%s AND is_active=1", (uid, owner))
+                elif node_root:
+                    cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_grant SET is_active=0, updated_at=NOW() "
+                                "WHERE user_id=%s AND managed_dept_id=%s AND is_active=1", (uid, node_root))
                 else:
+                    # 全撤 = 两轴一起（node 轴独立 try：060 未 apply 环境 legacy 撤销照常）
                     cur.execute(f"UPDATE {_kb_db()}.dept_admin_grant SET is_active=0, updated_at=NOW() "
                                 "WHERE user_id=%s AND is_active=1", (uid,))
+                    try:
+                        cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_grant SET is_active=0, updated_at=NOW() "
+                                    "WHERE user_id=%s AND is_active=1", (uid,))
+                    except Exception as ne:   # noqa: BLE001
+                        logger.debug("dept_admin_node_grant 全撤跳过（表缺失?）: %s", ne)
                 cur.execute(f"SELECT COUNT(*) FROM {_kb_db()}.dept_admin_grant "
                             "WHERE user_id=%s AND is_active=1", (uid,))
                 remaining = int(cur.fetchone()[0] or 0)
+                # 阶段 B：降级判定看**两表**——node-only 管理员在 legacy 表恒 0 行，
+                # 只数一张表会把还持有节点管辖的管理员误降 employee（codex major M3）。
+                try:
+                    cur.execute(f"SELECT COUNT(*) FROM {_kb_db()}.dept_admin_node_grant "
+                                "WHERE user_id=%s AND is_active=1", (uid,))
+                    remaining += int(cur.fetchone()[0] or 0)
+                except Exception as ne:   # noqa: BLE001 — 060 未 apply：节点轴按 0 计
+                    logger.debug("dept_admin_node_grant 剩余计数跳过（表缺失?）: %s", ne)
                 if remaining == 0:
                     cur.execute(f"UPDATE {_kb_db()}.user_role SET role=%s, updated_at=NOW() "
                                 "WHERE user_id=%s", (ROLE_EMPLOYEE, uid))
@@ -1177,7 +1545,8 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
                 # 同事务审计（B1）：与撤销/降级变更原子提交。
                 write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_REVOKE",
                             operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                            message=f"revoke {uid} owner={owner or 'ALL'} demoted={demoted}", cursor=cur)
+                            message=f"revoke {uid} owner={owner or '-'} node={node_root or '-'} "
+                                    f"demoted={demoted}", cursor=cur)
             conn.commit()
         finally:
             conn.close()
@@ -1187,3 +1556,215 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
         logger.error("kb_admin_grant_revoke 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"撤销部门管理员授权失败 (trace: {trace_id})")
     return KbAdminGrantResponse(user_id=uid, role=(ROLE_EMPLOYEE if demoted else "dept_admin"), ok=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 阶段 B T5 — 管辖根候选确认（kb_admin 专属）
+#   org_sync 每日派生把「中心级/超规模/换根」的 auto 根写进 dept_admin_node_candidate
+#   （权威表绝不进待确认态）；本组端点 = 确认队列的读与裁决。
+#   TOCTOU 关死：确认动作事务内比对 derived_snapshot_rev 与当前快照 rev——不符 ⇒ 409 +
+#   按当前快照重派生返回最新候选（codex 阶段 B 评审共识），绝不确认陈旧候选。
+# ═══════════════════════════════════════════════════════════════
+class KbNodeCandidateItem(BaseModel):
+    id: int = 0
+    user_id: str = ""
+    user_name: str = ""
+    dept_id: int = 0
+    dept_name: str = ""
+    risk_reason: str = ""
+    derived_snapshot_rev: int = 0
+    created_at: str = ""
+
+
+class KbNodeCandidateListResponse(BaseModel):
+    items: List[KbNodeCandidateItem] = Field(default_factory=list)
+
+
+class KbNodeCandidateDecideRequest(BaseModel):
+    candidate_id: int = 0
+    action: str = ""                       # confirm | reject
+
+
+class KbNodeCandidateDecideResponse(BaseModel):
+    ok: bool = True
+    status: str = ""                       # confirmed | rejected | superseded
+    latest: Optional[KbNodeCandidateItem] = None   # 409 时携带按当前快照重派生的候选
+
+
+@router.get("/api/kb/admin-node-candidates", response_model=KbNodeCandidateListResponse)
+def kb_node_candidates_list(request: Request,
+                            identity: Optional[Identity] = Depends(current_identity)):
+    """kb_admin 查看待确认的管辖根候选。只读。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    _require_kb_admin(identity)
+    items: List[KbNodeCandidateItem] = []
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT c.id, c.user_id, COALESCE(u.user_name,''), c.proposed_dept_id, "
+                    f"COALESCE(d.name,''), c.risk_reason, c.derived_snapshot_rev, c.created_at "
+                    f"FROM {_kb_db()}.dept_admin_node_candidate c "
+                    f"LEFT JOIN {_kb_db()}.dept_dim d ON d.dept_id = c.proposed_dept_id "
+                    f"LEFT JOIN {_kb_db()}.user_role u ON u.user_id = c.user_id AND u.is_active=1 "
+                    "WHERE c.status='pending' ORDER BY c.created_at ASC LIMIT 200")
+                for r in cur.fetchall():
+                    items.append(KbNodeCandidateItem(
+                        id=int(r[0]), user_id=r[1] or "", user_name=r[2] or "",
+                        dept_id=int(r[3] or 0), dept_name=r[4] or str(r[3] or ""),
+                        risk_reason=r[5] or "", derived_snapshot_rev=int(r[6] or 0),
+                        created_at=str(r[7]) if r[7] else ""))
+        finally:
+            conn.close()
+    except Exception as e:
+        trace_id = get_request_id()
+        logger.error("kb_node_candidates_list 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"候选队列查询失败 (trace: {trace_id})")
+    return KbNodeCandidateListResponse(items=items)
+
+
+def _candidate_risk(cur, dept_id: int) -> Optional[str]:
+    """事务内按当前快照评估候选风险（与 org_sync.derive_admin_node_roots 同口径）。
+    返回 None=无风险；节点失活/缺行按 'root_gone' 处理（不可确认）。"""
+    cur.execute(f"SELECT depth FROM {_kb_db()}.dept_dim WHERE dept_id=%s AND is_active=1",
+                (dept_id,))
+    row = cur.fetchone()
+    if not row:
+        return "root_gone"
+    if int(row[0] or 0) == 1:
+        return "center_level"
+    cur.execute(f"SELECT dept_id, parent_id FROM {_kb_db()}.dept_dim WHERE is_active=1")
+    children: Dict[int, List[int]] = {}
+    for r in cur.fetchall():
+        children.setdefault(int(r[1]), []).append(int(r[0]))
+    from opensearch_pipeline.dept_ancestry import resolve_descendant_ids
+    from opensearch_pipeline.org_sync import _auto_max_subtree
+    got, ok = resolve_descendant_ids(children, [dept_id])
+    if not ok:
+        return "root_gone"
+    return "oversized" if len(got) > _auto_max_subtree() else None
+
+
+@router.post("/api/kb/admin-node-candidates/decide", response_model=KbNodeCandidateDecideResponse)
+def kb_node_candidate_decide(req: KbNodeCandidateDecideRequest, request: Request,
+                             identity: Optional[Identity] = Depends(current_identity)):
+    """kb_admin 确认/驳回一条管辖根候选。
+
+    confirm 事务内五重校验（缺一不可，全部对当前状态现查）：
+      ①候选仍 pending（FOR UPDATE 串行化并发裁决）；②derived_snapshot_rev == 当前快照 rev
+      （不符 ⇒ 409 + 按当前快照重派生返回最新候选——同 (user,root) 直接刷新本行，挂靠已变
+      则标 superseded）；③目标用户仍是 active dept_admin；④无 manual override（manual 存在
+      ⇒ auto 失效，规则 2——候选直接 superseded）；⑤根节点仍在册 active。
+    确认落地 = 撤停该用户其它 auto 行 + upsert 权威表 source='auto' + 候选 confirmed。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_admin(identity)
+    from opensearch_pipeline.env_guard import assert_metadata_write_allowed
+    from opensearch_pipeline.audit_log import write_audit
+    cid = int(req.candidate_id or 0)
+    action = (req.action or "").strip().lower()
+    if not cid or action not in ("confirm", "reject"):
+        raise HTTPException(status_code=400, detail="缺少 candidate_id 或非法 action")
+    assert_metadata_write_allowed("kb_node_candidate_decide", get_config().rds.host, kind="rds")
+    trace_id = get_request_id()
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT user_id, proposed_dept_id, derived_snapshot_rev, status "
+                            f"FROM {_kb_db()}.dept_admin_node_candidate WHERE id=%s FOR UPDATE", (cid,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="候选不存在")
+                uid, root, c_rev, status = row[0] or "", int(row[1] or 0), int(row[2] or 0), row[3] or ""
+                if status != "pending":
+                    raise HTTPException(status_code=409, detail=f"候选已处于 {status} 状态")
+                if action == "reject":
+                    cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_candidate "
+                                "SET status='rejected', confirmed_by=%s, confirmed_at=NOW() "
+                                "WHERE id=%s", (kb.user_id, cid))
+                    write_audit(doc_id=None, version_no=None, action_type="KB_NODE_ROOT_REJECT",
+                                operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                                message=f"reject candidate#{cid} {uid} → node {root}", cursor=cur)
+                    conn.commit()
+                    return KbNodeCandidateDecideResponse(ok=True, status="rejected")
+                # ── confirm ──
+                cur.execute(f"SELECT COALESCE(MAX(snapshot_rev),0) FROM {_kb_db()}.dept_dim "
+                            "WHERE is_active=1")
+                cur_rev = int((cur.fetchone() or (0,))[0] or 0)
+                if cur_rev != c_rev:
+                    # TOCTOU：快照已翻——按当前快照重派生。挂靠仍指向同一根 ⇒ 刷新本行
+                    # （rev+risk）回 409 让 kb_admin 基于最新事实再按一次；挂靠已变 ⇒ superseded。
+                    cur.execute(f"SELECT dept_ids FROM {_kb_db()}.staff_dim "
+                                "WHERE staff_id=%s AND is_active=1", (uid,))
+                    srow = cur.fetchone()
+                    direct = [int(x) for x in str((srow or ("",))[0] or "").split(",") if x.strip().isdigit()]
+                    if len(direct) == 1 and direct[0] == root:
+                        risk = _candidate_risk(cur, root) or "root_changed"
+                        cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_candidate "
+                                    "SET derived_snapshot_rev=%s, risk_reason=%s, updated_at=NOW() "
+                                    "WHERE id=%s", (cur_rev, risk, cid))
+                        conn.commit()
+                        return_latest = KbNodeCandidateItem(
+                            id=cid, user_id=uid, dept_id=root, risk_reason=risk,
+                            derived_snapshot_rev=cur_rev)
+                        raise HTTPException(status_code=409, detail={
+                            "message": "组织快照已更新，候选已按当前快照重派生，请确认最新候选",
+                            "latest": return_latest.model_dump()})
+                    cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_candidate "
+                                "SET status='superseded', updated_at=NOW() WHERE id=%s", (cid,))
+                    conn.commit()
+                    raise HTTPException(status_code=409,
+                                        detail="该用户挂靠已变化，候选失效（等下次同步或在成员面板手动指定）")
+                # ③ 用户仍是 active dept_admin
+                cur.execute(f"SELECT role FROM {_kb_db()}.user_role WHERE user_id=%s AND is_active=1 "
+                            "ORDER BY updated_at DESC, id DESC LIMIT 1", (uid,))
+                rrow = cur.fetchone()
+                if not rrow or (rrow[0] or "") != "dept_admin":
+                    cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_candidate "
+                                "SET status='superseded', updated_at=NOW() WHERE id=%s", (cid,))
+                    conn.commit()
+                    raise HTTPException(status_code=409, detail="该用户已不是部门管理员，候选失效")
+                # ④ manual override ⇒ auto 失效（规则 2）
+                cur.execute(f"SELECT 1 FROM {_kb_db()}.dept_admin_node_grant "
+                            "WHERE user_id=%s AND source='manual' AND is_active=1 LIMIT 1", (uid,))
+                if cur.fetchone():
+                    cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_candidate "
+                                "SET status='superseded', updated_at=NOW() WHERE id=%s", (cid,))
+                    conn.commit()
+                    raise HTTPException(status_code=409, detail="该用户已有手动管辖授权（manual 覆盖 auto），候选失效")
+                # ⑤ 根仍在册 active
+                cur.execute(f"SELECT 1 FROM {_kb_db()}.dept_dim WHERE dept_id=%s AND is_active=1", (root,))
+                if not cur.fetchone():
+                    cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_candidate "
+                                "SET status='superseded', updated_at=NOW() WHERE id=%s", (cid,))
+                    conn.commit()
+                    raise HTTPException(status_code=409, detail="目标节点已从组织架构消失，候选失效")
+                # 落地：撤其它 auto 行 + upsert 权威 + 候选 confirmed（同事务）
+                cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_grant SET is_active=0, updated_at=NOW() "
+                            "WHERE user_id=%s AND source='auto' AND is_active=1 AND managed_dept_id<>%s",
+                            (uid, root))
+                cur.execute(f"INSERT INTO {_kb_db()}.dept_admin_node_grant "
+                            "(user_id, managed_dept_id, source, granted_by, note, is_active) "
+                            "VALUES (%s,%s,'auto',%s,%s,1) "
+                            "ON DUPLICATE KEY UPDATE is_active=1, granted_by=VALUES(granted_by), "
+                            "note=VALUES(note), updated_at=NOW()",
+                            (uid, root, kb.user_id, f"confirmed candidate#{cid}"))
+                cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_candidate "
+                            "SET status='confirmed', confirmed_by=%s, confirmed_at=NOW() "
+                            "WHERE id=%s", (kb.user_id, cid))
+                write_audit(doc_id=None, version_no=None, action_type="KB_NODE_ROOT_CONFIRM",
+                            operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
+                            message=f"confirm candidate#{cid} {uid} → node {root}", cursor=cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("kb_node_candidate_decide 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"候选裁决失败 (trace: {trace_id})")
+    return KbNodeCandidateDecideResponse(ok=True, status="confirmed")

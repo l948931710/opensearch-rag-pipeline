@@ -65,9 +65,17 @@ export interface ContributionItem {
 // 采纳前修订（批次ε-1）：后端 KbContributionAcceptRequest 既有契约——缺省字段=保留原值，
 // 故只放【实际变更】的键，绝不传空串覆盖原文（后端 strip 后空文本会 400）。
 export interface ContributionRevision { question?: string; content?: string; category_dept?: string }
+export interface DeptScoreItem {
+  rank: number; dept_id: number; dept_name: string; members: number; score: number
+}
 export interface HeroItem {
   rank: number; author_id: string; author_name: string; count: number
-  hits?: number | null   // 被引用数（批次ε-2 R2）：null=算不出 → 自隐；排名仍按 count
+  hits?: number | null   // 被引用数：null=算不出 → 构成里显「—」，分数按 0 如实少算
+  // 总积分（2026-08-01，预览口径 10/1/3）：score=10×采纳+1×引用+3×有效反馈；
+  // 构成随行回传供副行展示（可审计）。旧后端无这些键 → 按 0 兜底、副行自隐。
+  adopted?: number
+  feedback?: number
+  score?: number
 }
 
 interface GapsResp { items: GapItem[]; summary: GapsSummary; has_more: boolean; window_days?: number }
@@ -86,6 +94,9 @@ const myContribs = ref<ContributionItem[]>([])
 const pendingContribs = ref<ContributionItem[]>([])
 const pendingHasMore = ref(false)   // 批次ε-1：>50 条时后端 has_more 此前被静默丢弃（假满员）
 const heroes = ref<HeroItem[]>([])
+const deptHeroes = ref<DeptScoreItem[]>([])       // 部门榜（同分按一级部门求和）
+const myDeptHeroes = ref<HeroItem[]>([])          // 本部门个人榜
+const myDeptName = ref('')
 const loadingGaps = ref(false)
 const loadErrors = ref<Record<string, string>>({})
 const inflight = ref<Set<string>>(new Set())
@@ -144,9 +155,9 @@ function _previewPending(): ContributionItem[] {
 }
 function _previewHeroes(): HeroItem[] {
   return [
-    { rank: 1, author_id: 'u1', author_name: '李娜', count: 8, hits: 41 },
-    { rank: 2, author_id: 'u2', author_name: '张三', count: 5, hits: 0 },
-    { rank: 3, author_id: 'preview', author_name: '设计预览', count: 3, hits: 12 },
+    { rank: 1, author_id: 'u1', author_name: '李娜', count: 8, hits: 41, adopted: 8, feedback: 2, score: 127 },
+    { rank: 2, author_id: 'u2', author_name: '张三', count: 5, hits: 0, adopted: 5, feedback: 4, score: 62 },
+    { rank: 3, author_id: 'preview', author_name: '设计预览', count: 3, hits: 12, adopted: 3, feedback: 0, score: 42 },
   ]
 }
 
@@ -217,9 +228,14 @@ async function loadHeroes() {
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') { heroes.value = _previewHeroes(); return }
   try {
-    const r = await apiJson<{ items: HeroItem[] }>('/api/kb/contributions/heroes', { auth: true })
+    const r = await apiJson<{ items: HeroItem[]; dept_items?: DeptScoreItem[]
+                              my_dept_items?: HeroItem[]; my_dept_name?: string }>(
+      '/api/kb/contributions/heroes', { auth: true })
     heroes.value = r.items || []
-  } catch { heroes.value = [] }
+    deptHeroes.value = r.dept_items || []
+    myDeptHeroes.value = r.my_dept_items || []
+    myDeptName.value = r.my_dept_name || ''
+  } catch { heroes.value = []; deptHeroes.value = []; myDeptHeroes.value = []; myDeptName.value = '' }
 }
 
 // ── 弹窗 / 提交 ──
@@ -375,6 +391,7 @@ export function useContribute() {
   const reviewCount = computed(() => pendingContribs.value.length)
   return {
     gaps, gapsSummary, gapsWindowDays, myContribs, pendingContribs, pendingHasMore, heroes, loadingGaps, loadErrors, isBusy,
+    deptHeroes, myDeptHeroes, myDeptName,
     modalOpen, formQuestion, formContent, formDept, formWarning, submitBusy, submitErr, submitOk,
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
     loadGaps, toggleGapContext, loadMine, loadPending, loadHeroes,

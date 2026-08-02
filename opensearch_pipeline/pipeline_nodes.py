@@ -109,7 +109,7 @@ def node_scan_raw_files(ctx: dict):
                     # 扩展名排除片段来自 ingest_policy.STAGE1_SQL_EXCLUDED_EXTS（单一来源）——
                     # 必须与 dataworks_orchestrator._count_pending_rows 的 stage-1 计数完全一致，
                     # 否则排空守卫会因"计得到却领不走"误判 stage-1 无进展而中止。
-                    cursor.execute(f"""
+                    _base_sql = f"""
                         SELECT
                             dv.doc_id,
                             dv.version_no,
@@ -117,7 +117,7 @@ def node_scan_raw_files(ctx: dict):
                             dv.raw_key,
                             dv.file_ext,
                             dm.title,
-                            dm.owner_dept
+                            dm.owner_dept{{mode_cols}}
                         FROM document_version dv
                         LEFT JOIN document_meta dm ON dv.doc_id = dm.doc_id
                         WHERE dv.content_process_status = 'NOT_STARTED'
@@ -126,9 +126,19 @@ def node_scan_raw_files(ctx: dict):
                           AND dv.status = 'active'
                         ORDER BY dv.created_at ASC
                         LIMIT 100
-                    """)
+                    """
+                    # 阶段 B：带上 acl_mode/owner_dept_id（060 未 apply → 1054 回退旧列集）。
+                    # node 行的 dept **不得**兜成 "unknown"——那会顺着注册/分类回写把归属轴
+                    # 写脏（codex 阶段 B major：NULL 立刻变 truthy "unknown" 后就再也不会
+                    # 从 raw key 解析）。
+                    _has_mode = _exec_node_guarded(
+                        cursor,
+                        _base_sql.format(mode_cols=", dm.acl_mode, dm.owner_dept_id"),
+                        _base_sql.format(mode_cols=""), (), ())
                     rows = cursor.fetchall()
                     for row in rows:
+                        _mode = (row[7] or "legacy") if _has_mode else "legacy"
+                        _oid = row[8] if _has_mode else None
                         tasks.append({
                             "doc_id": row[0],
                             "version_no": row[1],
@@ -136,7 +146,9 @@ def node_scan_raw_files(ctx: dict):
                             "raw_key": row[3],
                             "file_ext": row[4] or (row[3].split(".")[-1] if row[3] and "." in row[3] else ""),
                             "filename": row[5] or (row[3].split("/")[-1] if row[3] else ""),
-                            "dept": row[6] or "unknown",
+                            "dept": (row[6] or "") if _mode == "node" else (row[6] or "unknown"),
+                            "acl_mode": _mode,
+                            "owner_dept_id": _oid,
                         })
                     print(f"    [Scanner] Scanned {len(tasks)} pending raw tasks from RDS")
             except Exception as e:
@@ -162,8 +174,30 @@ def node_scan_raw_files(ctx: dict):
         dept = task.get("dept")
         filename = task.get("filename")
         file_ext = task.get("file_ext")
-        
-        if raw_key and (not dept or not filename or not file_ext):
+
+        # 阶段 B：node 命名空间（raw/node-<id>/…）——第 2 段是 storage_segment 不是组码，
+        # 绝不能补进 dept（否则注册/分类会把 "node-123" 写进归属轴）。结构化解析一次，
+        # task 补齐 acl_mode/owner_dept_id；node 任务的 dept 固定空串。
+        if raw_key and task.get("acl_mode") != "node":
+            from opensearch_pipeline.kb_upload import parse_raw_owner
+            _ro = parse_raw_owner(raw_key)
+            if _ro["mode"] == "node":
+                task["acl_mode"] = "node"
+                task["owner_dept_id"] = _ro["owner_dept_id"]
+                dept = ""
+
+        if task.get("acl_mode") == "node":
+            dept = ""
+            if raw_key and (not filename or not file_ext):
+                parts = raw_key.split("/")
+                if not filename:
+                    filename = parts[-1]
+                if not file_ext:
+                    file_ext = filename.split(".")[-1] if "." in filename else ""
+            task["dept"] = dept
+            task["filename"] = filename
+            task["file_ext"] = file_ext
+        elif raw_key and (not dept or not filename or not file_ext):
             parts = raw_key.split("/")
             # 如果是 raw/{dept}/{filename} 的结构
             if len(parts) >= 3 and parts[0] == "raw":
@@ -181,7 +215,7 @@ def node_scan_raw_files(ctx: dict):
                     filename = parts[-1]
                 if not file_ext:
                     file_ext = filename.split(".")[-1] if "." in filename else ""
-            
+
             task["dept"] = dept
             task["filename"] = filename
             task["file_ext"] = file_ext
@@ -258,11 +292,33 @@ def node_register_metadata(ctx: dict):
                     doc_id = task["doc_id"]
                     version_no = task["version_no"]
                     title = task.get("filename", "")
-                    owner_dept = task.get("dept", "unknown")
+                    _is_node = task.get("acl_mode") == "node"
+                    # 阶段 B：node 任务的归属轴 = owner_dept_id，legacy 列写 NULL（不是空串，
+                    # 也绝不是路径 dept——codex 阶段 B BLOCKER-2：此处的 ON DUPLICATE 覆写
+                    # 正是「register 写好的 NULL 被 stage-1 重登记冲掉」的第一现场）。
+                    owner_dept = None if _is_node else task.get("dept", "unknown")
 
-                    # 1. 写入 document_meta 表
-                    cursor.execute("""
-                        INSERT INTO document_meta 
+                    # 1. 写入 document_meta 表。守卫版：已是 node 的行 owner_dept/owner_dept_id
+                    # 永不被任务值覆写；acl_mode 保持现值（scanner 永不翻转 mode——迁移唯一
+                    # 入口是 doc-meta 端点）。060 未 apply → 1054 回退旧 SQL（行为逐字节不变）。
+                    _exec_node_guarded(
+                        cursor,
+                        """
+                        INSERT INTO document_meta
+                        (doc_id, title, original_filename, owner_dept, acl_mode, owner_dept_id,
+                         status, current_version_no)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'active', %s)
+                        ON DUPLICATE KEY UPDATE
+                        title = VALUES(title),
+                        original_filename = VALUES(original_filename),
+                        owner_dept = IF(acl_mode='node' OR VALUES(acl_mode)='node',
+                                        owner_dept, VALUES(owner_dept)),
+                        owner_dept_id = IF(acl_mode='node' OR VALUES(acl_mode)='node',
+                                           owner_dept_id, VALUES(owner_dept_id)),
+                        current_version_no = GREATEST(current_version_no, VALUES(current_version_no))
+                        """,
+                        """
+                        INSERT INTO document_meta
                         (doc_id, title, original_filename, owner_dept, status, current_version_no)
                         VALUES (%s, %s, %s, %s, 'active', %s)
                         ON DUPLICATE KEY UPDATE
@@ -270,7 +326,10 @@ def node_register_metadata(ctx: dict):
                         original_filename = VALUES(original_filename),
                         owner_dept = VALUES(owner_dept),
                         current_version_no = GREATEST(current_version_no, VALUES(current_version_no))
-                    """, (doc_id, title, title, owner_dept, version_no))
+                        """,
+                        (doc_id, title, title, owner_dept,
+                         "node" if _is_node else "legacy", task.get("owner_dept_id"), version_no),
+                        (doc_id, title, title, owner_dept or "unknown", version_no))
                     
                     # 2. document_version：先 UPDATE（已存在的记录），无匹配再 INSERT
                     cursor.execute("""
@@ -1539,12 +1598,41 @@ def _dept_from_raw_key(source_key: str, default: str = "unknown") -> str:
     owner_dept 安全相关（驱动 HA3 dept_internal 权限过滤），只认 raw/ 前缀，杜绝把
     processing/、s3:// 等非 raw 路径的第二段误当部门——消除原先 8 处拷贝里 line 573
     缺 startswith("raw/") guard 的漂移。
+    ⚠️ 阶段 B：node 文档的第 2 段是 ``node-<dept_id>``——本函数**语义不变**（图片对象
+    路径等消费方拿它当 storage_segment 用，路径布局照旧）；需要区分归属轴的调用方
+    改用 kb_upload.parse_raw_owner 的结构化结果。
     """
     if source_key and source_key.startswith("raw/"):
         parts = source_key.split("/")
         if len(parts) > 1:
             return parts[1]
     return default
+
+
+# ── 阶段 B：060 mode 列的双路 SQL 执行（1054 TTL 负缓存，与 contribution._exec_gap_sql
+#    同型）——摄取侧对「060 未 apply 的环境」回退旧 SQL，行为逐字节不变；apply 后无须
+#    重启自动恢复带守卫版本。──────────────────────────────────────────────────
+_NODE_MODE_COLS_MISSING_UNTIL = 0.0
+_NODE_MODE_RETRY_SECONDS = 600.0
+
+
+def _exec_node_guarded(cursor, sql_with_mode: str, sql_without: str, params_with, params_without) -> bool:
+    """优先执行带 acl_mode 守卫的 SQL；1054（列缺失）→ TTL 负缓存并回退无守卫版本。
+    返回 True=守卫版已执行。仅 1054 走降级，其他 SQL 错误照抛。"""
+    global _NODE_MODE_COLS_MISSING_UNTIL
+    if time.time() >= _NODE_MODE_COLS_MISSING_UNTIL:
+        try:
+            cursor.execute(sql_with_mode, params_with)
+            return True
+        except Exception as e:   # noqa: BLE001 — 仅 1054 降级
+            errno = e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], int) else None
+            if errno != 1054:
+                raise
+            _NODE_MODE_COLS_MISSING_UNTIL = time.time() + _NODE_MODE_RETRY_SECONDS
+            print("    ⚠️ [node-acl] acl_mode 列缺失（060 未 apply），"
+                  f"{_NODE_MODE_RETRY_SECONDS:.0f}s 内回退无守卫 SQL")
+    cursor.execute(sql_without, params_without)
+    return False
 
 
 def _perm_level_from_path(path: str) -> str:
@@ -2233,9 +2321,14 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     _cm = _get_db_conn(select_db=True)
                     with _cm.cursor() as _cur:
-                        _cur.execute(
+                        # 阶段 B：node 行的归属轴绝不被分类回写覆盖（owner_dept 是 legacy 轴）
+                        _exec_node_guarded(
+                            _cur,
+                            "UPDATE document_meta SET category_l1=%s, category_l2=%s, "
+                            "owner_dept=IF(acl_mode='node', owner_dept, %s) WHERE doc_id=%s",
                             "UPDATE document_meta SET category_l1=%s, category_l2=%s, owner_dept=%s "
                             "WHERE doc_id=%s",
+                            (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["doc_id"]),
                             (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["doc_id"]))
                         _cur.execute(
                             "UPDATE document_version SET classification_method='FROZEN_MAINTENANCE', "
@@ -2265,9 +2358,15 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     _cm = _get_db_conn(select_db=True)
                     with _cm.cursor() as _cur:
-                        _cur.execute(
+                        _exec_node_guarded(
+                            _cur,
+                            "UPDATE document_meta SET category_l1=%s, category_l2=%s, "
+                            "owner_dept=IF(acl_mode='node', owner_dept, %s), "
+                            "permission_level=%s, kb_type=%s WHERE doc_id=%s",
                             "UPDATE document_meta SET category_l1=%s, category_l2=%s, owner_dept=%s, "
                             "permission_level=%s, kb_type=%s WHERE doc_id=%s",
+                            (doc["category_l1"], doc["category_l2"], doc["owner_dept"],
+                             doc["permission_level"], doc["kb_type"], doc["doc_id"]),
                             (doc["category_l1"], doc["category_l2"], doc["owner_dept"],
                              doc["permission_level"], doc["kb_type"], doc["doc_id"]))
                         _cur.execute(
@@ -2426,7 +2525,20 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     conn = _get_db_conn(select_db=True)
                     with conn.cursor() as cursor:
-                        cursor.execute("""
+                        # 阶段 B：node 行的归属轴绝不被 LLM 分类回写覆盖
+                        _exec_node_guarded(
+                            cursor,
+                            """
+                            UPDATE document_meta
+                            SET category_l1 = %s,
+                                category_l2 = %s,
+                                owner_dept = IF(acl_mode='node', owner_dept, %s),
+                                summary = %s,
+                                permission_level = %s,
+                                kb_type = %s
+                            WHERE doc_id = %s
+                            """,
+                            """
                             UPDATE document_meta
                             SET category_l1 = %s,
                                 category_l2 = %s,
@@ -2435,8 +2547,11 @@ def node_classify_and_risk_assess(ctx: dict):
                                 permission_level = %s,
                                 kb_type = %s
                             WHERE doc_id = %s
-                        """, (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
-                              doc["permission_level"], doc["kb_type"], doc["doc_id"]))
+                            """,
+                            (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
+                             doc["permission_level"], doc["kb_type"], doc["doc_id"]),
+                            (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
+                             doc["permission_level"], doc["kb_type"], doc["doc_id"]))
 
                         cursor.execute("""
                             UPDATE document_version
@@ -6023,12 +6138,45 @@ def node_write_chunk_meta(ctx: dict):
                 # allowed_depts（唯一注入点 access_grants.resolve_allowed_depts；约束 2/3）→ 设到内存
                 # chunk（供 ctx 流/首推）+ 下方写 chunk_meta.allowed_depts 列。flag 关 → 不查、写 NULL。
                 # fail-closed：解析失败 → 置空（无授权，绝不放行），不阻断入库。先于 DELETE 的纯读。
+                # ── node-ACL 投影(唯一注入点 acl_policy.project_doc_acl)────────────────
+                # ⚠️ 必须在【所有】写路径执行:chunk.owner_dept 继承自 document_meta 的真实
+                # owner,若 node 模式文档升版 / re-chunk 时不改写,真实 owner 会被写回**检索
+                # 投影轴**,legacy owner 分支静默复活 = **权限重开**(codex 评审 BLOCKER-1)。
+                # 模式互斥:legacy →(真实 owner, 组码);node →(哨兵, 仅 d:/dx:,绝不含组码)。
+                # 廉价路径:先单列批查 acl_mode;全 legacy(今天 100%)时只多一次 SELECT,
+                # 且完全不改 chunk 字段 ⇒ 行为与历史逐字节一致。
+                _node_docs = set()
+                if valid_chunks:
+                    try:
+                        from opensearch_pipeline.access_grants import resolve_acl_modes, resolve_doc_acl
+                        from opensearch_pipeline.acl_policy import ACL_MODE_NODE, project_doc_acl
+                        _modes = resolve_acl_modes({c.doc_id for c in valid_chunks}, cursor)
+                        _node_docs = {d for d, m in _modes.items() if m == ACL_MODE_NODE}
+                        if _node_docs:
+                            _node_acls = resolve_doc_acl(_node_docs, cursor)
+                            for chunk in valid_chunks:
+                                if chunk.doc_id not in _node_docs:
+                                    continue
+                                _a = _node_acls.get(chunk.doc_id)
+                                _owner, _allowed = project_doc_acl(
+                                    ACL_MODE_NODE, chunk.owner_dept, (),
+                                    getattr(_a, "node_ids", ()) if _a else (),
+                                    getattr(_a, "exact_node_ids", ()) if _a else ())
+                                chunk.owner_dept = _owner            # ← 哨兵进检索投影轴
+                                chunk.allowed_depts = _allowed
+                            print(f"    🔐 node-ACL 投影:{len(_node_docs)} 篇文档写哨兵 owner")
+                    except Exception as _nae:   # noqa: BLE001
+                        # fail-closed:投影失败绝不退回"写真实 owner"(那等于重开权限)。
+                        # 抛出中止本批 —— 宁可整批失败重试,也不产出会越权的投影。
+                        raise RuntimeError(f"node-ACL 投影失败,中止写入(绝不退回真实 owner): {_nae}")
+
                 if get_config().rag.allowed_depts_acl and valid_chunks:
                     try:
                         from opensearch_pipeline.access_grants import (
                             resolve_allowed_depts, gate_by_permission,
                         )
-                        _allowed_by_doc = resolve_allowed_depts({c.doc_id for c in valid_chunks}, cursor)
+                        _legacy_ids = {c.doc_id for c in valid_chunks} - _node_docs
+                        _allowed_by_doc = resolve_allowed_depts(_legacy_ids, cursor)
                         # 纵深守卫：只有 permission_level=='dept_internal' 的文档物化 allowed_depts
                         # （用 chunk 自身=新版本权威 permission_level；restricted/public 即便有 approved
                         # 行也不放行——审计 Step 4 backstop a）。
@@ -6036,6 +6184,8 @@ def node_write_chunk_meta(ctx: dict):
                             _allowed_by_doc, {c.doc_id: c.permission_level for c in valid_chunks}
                         )
                         for chunk in valid_chunks:
+                            if chunk.doc_id in _node_docs:
+                                continue      # node 文档已由上方投影(哨兵+d:/dx:),绝不被组码覆盖
                             chunk.allowed_depts = _allowed_by_doc.get(chunk.doc_id, [])
                     except Exception as _ade:
                         print(f"    ⚠️ allowed_depts 解析失败（fail-closed 置空，不放行）: {_ade}")
@@ -6626,7 +6776,11 @@ def node_deactivate_old_chunks(ctx: dict):
 
     正确的安全链路（跨 DAG 依赖顺序）：
       DAG 2: classify → detect → redact → publish → chunk → validate → write_chunk_meta
-      DAG 3: acquire_lock → generate_embeddings → build_opensearch_payload → push_to_opensearch → update_index_status → deactivate_old
+      DAG 3: acquire_lock → generate_embeddings → build_opensearch_payload → push_to_opensearch
+             → update_index_status(04) → **verify_and_repush(04b parity)** → deactivate_old(05)
+      04b 是最后一道闸：对本批全部已推 PK 用官方 fetch 做权威存在性确认（+可选 drift），
+      任一未愈合的 DROP/UNKNOWN/DRIFT 都会 raise ⇒ 05 不执行 ⇒ 旧版本保留（宁可双版本
+      并存，也绝不让新旧都不可检索）。
 
     ⚠️ 完整性前提：本批 chunks 全部 INDEXED ≠ 该 (doc, version) 全部 INDEXED——stage-3 loader
     按 created_at LIMIT 1000 装载、不按文档分组，边界可能把一个文档切成两批。因此停用前必须
@@ -8355,8 +8509,8 @@ def _fail_chunks_with_retry_budget(cursor, chunk_ids, extra_set_sql="", extra_pa
     （沿用 parity 全有或全无语义，由调用方 rollback）。
 
     A4（2026-07-25）count_retry=False：只回写 FAILED，**不消耗重试预算**。用于
-    「无法确认」类瞬态失败（PARITY_UNKNOWN = HA3 读失败，见 _point_read_one 对任何
-    异常都返回 'unknown'）——供应商侧一次读故障不该把健康 chunk 推向 DEAD 死信。
+    「无法确认」类瞬态失败（PARITY_UNKNOWN = HA3 读失败，见 _present_unknown：官方 fetch
+    的批异常/畸形响应整批归 unknown）——供应商侧一次读故障不该把健康 chunk 推向 DEAD 死信。
     死信资格只留给确认性失败（PARITY_DROP / PARITY_DRIFT / embedding 失败）。
     """
     if not chunk_ids:
@@ -8472,8 +8626,8 @@ def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, m
                 # 消除毒 chunk 每轮重推→校验失败→raise 的队头阻塞）。全有或全无语义保留
                 # （expect_all；rowcount 不符 → raise → 下方 rollback）。
                 # A4（2026-07-25）：PARITY_UNKNOWN 不消耗预算——它只表示"读不到、无法确认"
-                # （_point_read_one 对任何异常都返回 'unknown'），一次 HA3 读故障会把整批
-                # 健康 chunk 打进 unknown 桶；若照常 +1，三次读故障即集体转 DEAD。
+                # （_present_unknown：官方 fetch 的批异常/畸形响应整批归 unknown），一次 HA3
+                # 读故障会把整批健康 chunk 打进 unknown 桶；若照常 +1，三次读故障即集体转 DEAD。
                 try:
                     _dead = _fail_chunks_with_retry_budget(
                         cursor, ids,
@@ -8560,7 +8714,6 @@ def node_verify_and_repush(ctx: dict):
 
     config = get_config()
     cfg = config.alibaba_vector
-    dim = config.embedding.dimension
 
     # 本批刚推送、被 04 标 INDEXED 的 chunk（rds_id = HA3 主键）。embedding-FAILED 未进 batches、
     # push-FAILED 已让 04 raise，故正常路径下 expected 即本批全部 chunk。
@@ -8587,69 +8740,77 @@ def node_verify_and_repush(ctx: dict):
             return default
 
     settle = _envf("RAG_STAGE3_PARITY_SETTLE_SEC", 30.0)
+    settle_poll = _envf("RAG_STAGE3_PARITY_SETTLE_POLL_SEC", 5.0)
     max_retries = _envi("RAG_STAGE3_PARITY_MAX_RETRIES", 2)
-    pointread_all_max = _envi("RAG_STAGE3_PARITY_POINTREAD_ALL_MAX", 200)
 
-    from alibabacloud_ha3engine_vector.models import QueryRequest
-    # 解析器与字段清单取自 clients（HA3 客户端层），不再反向依赖 serving retriever 的私有名。
-    # 字段清单特意 pin 为 parity 专属最小集（HA3_PARITY_OUTPUT_FIELDS），不共享 serving 默认
-    # 清单：本守卫 gate 的是不可逆的旧版本 deactivate，判定只消费 id（PK 相符）与
-    # chunk_text_store（drift 子检查），enum hint 另需 chunk_id/doc_id——serving 为答案路径
-    # 增删字段/调整默认清单永远不会改变本安全检查的"存在/漂移"口径。
+    # 字段清单 pin 为 parity 专属最小集（HA3_PARITY_OUTPUT_FIELDS），不共享 serving 默认清单：
+    # 本守卫 gate 的是不可逆的旧版本 deactivate，判定只消费 id（PK 相符）与 chunk_text_store
+    # （drift 子检查）——serving 为答案路径增删字段永远不会改变本安全检查的"存在/漂移"口径。
     from opensearch_pipeline.clients import (
         HA3_PARITY_OUTPUT_FIELDS as _PARITY_OUTPUT_FIELDS,
-        parse_ha3_response as _parse_ha3_response,
+        ha3_fetch_by_pks as _ha3_fetch_by_pks,
     )
 
     text_by_pk = {}  # present pk → returned chunk_text_store (for the drift sub-check); side-effect
 
-    # F#56：point-read 只读、QueryRequest 相互独立 → 小线程池并行（默认 4）。SDK client 每次
-    # query 独立构造请求、无跨调用可变共享态，共用一个 client 安全；=1 时严格串行（原行为）。
-    read_conc = _envi("RAG_PARITY_READ_CONCURRENCY", 4)
-
-    def _point_read_one(pk):
-        """单 PK 权威 point-read → ('present'|'missing'|'unknown', chunk_text)。"""
-        try:
-            req = QueryRequest(table_name=cfg.table_name, vector=[0.0] * dim, top_k=1,
-                               include_vector=False, output_fields=_PARITY_OUTPUT_FIELDS,
-                               filter=f"{cfg.pk_field}={int(pk)}")
-            rows = _parse_ha3_response(client.query(req))
-            match = next((r for r in rows if str(r.get("id")) == str(pk)), None)
-            if match is not None:
-                return "present", match.get("chunk_text")
-            return "missing", None
-        except Exception as e:
-            print(f"    ⚠️ [PARITY] point-read {cfg.pk_field}={pk} UNKNOWN (read failed): {e}")
-            return "unknown", None
-
     def _present_unknown(pks):
-        """对一组 PK 逐个权威 point-read。返回 (present:set, unknown:set)。
-        PRESENT = 返回行 id 等于目标 pk（非空还不够，须 PK 相符）；read 抛异常 = UNKNOWN
-        （无法判定，绝不当作缺失）。read 完成但无匹配行 → MISSING（既不在 present 也不在 unknown）。
-        副作用：对 PRESENT 的 pk 把返回的 chunk_text_store 存入 text_by_pk（drift 子检查用）。"""
-        present, unknown = set(), set()
-        pk_list = list(pks)
-        if read_conc > 1 and len(pk_list) > 1:
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=min(read_conc, len(pk_list))) as _pool:
-                results = list(_pool.map(_point_read_one, pk_list))
-        else:
-            results = [_point_read_one(pk) for pk in pk_list]
-        for pk, (state, txt) in zip(pk_list, results):
-            if state == "present":
-                present.add(pk)
-                text_by_pk[pk] = txt
-            elif state == "unknown":
-                unknown.add(pk)
+        """对一组已知 PK 做**权威存在性判定**——官方主键接口 /vector-service/fetch。
+        返回 (present:set, unknown:set)；MISSING 由调用方 `suspects - present - unknown` 推出。
+
+        ⚠️ 2026-07-22 终局:此前本函数用零向量 `QueryRequest(top_k=1, filter=id=<pk>)` 逐个
+        point-read 并自称"权威"——**已证伪**。零向量与任何向量内积恒为 0 ⇒ 全部文档得分并列
+        ⇒ 返回哪个子集由引擎召回逻辑决定(阿里 07-25 确认:不设向量分阈值,得分 0 也返回;
+        "重扫缺同一批"以索引未变化为前提)。实测某在场行该形态返 0 命中而 fetch 正常取回
+        ⇒ 会把**在场行判 missing** → 无谓补推 → 04b raise → **节点 05 永不执行 ⇒ 旧版本
+        永不停用 ⇒ 双版本长存**。**零向量 query 一律禁止再作存在性判据。**
+
+        三态互斥由 clients.ha3_fetch_by_pks 的批级原子性保证;**unknown 优先**——
+        批异常/畸形(含返回请求集外 PK、同批重复 PK)整批归 unknown,绝不误判 missing。
+        串行发批(每批 ≤100、stage-3 每轮 ≤1000 PK ⇒ ≤10 请求):HA3 SDK 未声明线程安全
+        (见 reconcile.py 为此每线程独立 client),这点请求量不值得引入该复杂度。
+        副作用:对 PRESENT 的 pk 把返回的 chunk_text_store 存入 text_by_pk(drift 子检查用)。"""
+        pk_list = sorted(pks)     # 排序分批:日志/测试/批异常归因确定
+        if not pk_list:
+            return set(), set()
+        fr = _ha3_fetch_by_pks(client, cfg.table_name, pk_list,
+                               output_fields=_PARITY_OUTPUT_FIELDS)
+        unknown = set(fr["unknown_pks"])
+        present = set()
+        for pk, row in fr["rows_by_pk"].items():
+            if pk in unknown:     # unknown 优先（理论上批级原子后不会同时出现，防御性保留）
+                continue
+            present.add(pk)
+            text_by_pk[pk] = row.get("chunk_text_store")
+        if fr["errors"]:
+            # 整批 unknown 会让最多 100 个健康 PK 一起阻断节点 05，必须可归因
+            print(f"    ⚠️ [PARITY] fetch 批异常 {len(fr['errors'])} 起 → "
+                  f"{len(unknown)} 个 PK 判 UNKNOWN: {fr['errors'][:3]}")
         return present, unknown
 
-    settle_poll = _envf("RAG_STAGE3_PARITY_SETTLE_POLL_SEC", 5.0)
-
     def _settle_wait(candidate_pks):
-        """F#56：settle 由固定睡眠改为轮询早退——每 settle_poll 秒对一个刚推 PK point-read，
-        present 即提前返回；最长仍等 settle 秒（与旧固定睡眠上限一致，settle<=0 直接跳过）。
-        probe 只做可见性探测（异常按未就绪处理，继续等待），不写 text_by_pk/unknown、
-        不影响后续权威三态结论。"""
+        """吸收实时索引滞后：轮询早退（探针=**官方 fetch**，与权威判据同平面），
+        最长仍等 settle 秒；settle<=0 直接跳过。
+
+        跨平面时序实证（2026-07-30 生产实测，scratch/crossplane_timing_probe_20260727.py，
+        3 轮独立合成探针 push→并发轮询三平面→即删）：
+
+            轮   fetch    query    inverted      分辨率下界(最大单探 RTT) ≈ 0.58s
+            1    0.006s   0.008s   0.009s        query−fetch = [0.002, 0.001, 0.002]
+            2    0.001s   0.002s   0.005s        → 差值比下界小两个数量级
+            3    0.001s   0.003s   0.005s        → **不存在可测的跨平面窗口**
+
+        即 push 返回时三个平面（fetch / 真实非零向量 query / 纯倒排 search）**已全部可见**。
+        C2 当初禁用早退的理由是「无证据支持 fetch 可见 ⇒ query 可见」——该理由已被实证
+        推翻，故解禁；探针与权威判据同用 fetch，不再有"闸门平面偷换"的问题。
+
+        ⚠️ 方法论教训（第一版实验栽过）：顺序探测三平面 + 把时间戳记在探测**返回后**，
+        会凭空造出一个与 RTT 同量级的递增阶梯（当时误读为 fetch 早 0.294s）。必须并发探测
+        且时间戳记在**发起前**。
+
+        ⚠️ 未验证面：上述实验是**单文档**推送；真实批最多 100 文档/子批、1000 PK/轮，
+        大批建索引延迟未测。本探针也只查**一个** PK（`max(candidate_pks)`），它可见不代表
+        整批可见——但这是既有形态，且权威判据（_present_unknown 全量 fetch）在后面兜底：
+        探早了最坏是白跑一轮补推，不会误放行 deactivate。settle 上限仍是最终兜底。"""
         if settle <= 0:
             return
         probe_pk = max(candidate_pks) if candidate_pks else None
@@ -8658,15 +8819,11 @@ def node_verify_and_repush(ctx: dict):
             return
         deadline = time.time() + settle
         while True:
-            try:
-                req = QueryRequest(table_name=cfg.table_name, vector=[0.0] * dim, top_k=1,
-                                   include_vector=False, output_fields=_PARITY_OUTPUT_FIELDS,
-                                   filter=f"{cfg.pk_field}={int(probe_pk)}")
-                rows = _parse_ha3_response(client.query(req))
-                if any(str(r.get("id")) == str(probe_pk) for r in rows):
-                    return  # 已可见 → 早退
-            except Exception:
-                pass  # 探测失败按未就绪处理，继续等（权威判定在 _present_unknown）
+            # ha3_fetch_by_pks 契约上绝不 raise；探测失败按"未就绪"继续等，
+            # 不写 text_by_pk/unknown，不影响后续权威三态结论。
+            fr = _ha3_fetch_by_pks(client, cfg.table_name, [probe_pk], output_fields=["id"])
+            if probe_pk in fr["rows_by_pk"]:
+                return                      # 已可见 → 早退
             remaining = deadline - time.time()
             if remaining <= 0:
                 return
@@ -8678,20 +8835,13 @@ def node_verify_and_repush(ctx: dict):
     _settle_wait(set(expected))
 
     expected_pks = set(expected)
-    # 1) 嫌疑集：小批直接全量 point-read；大批先用 id-range enum 作廉价 hint（G30：仅 hint）
-    if len(expected_pks) <= pointread_all_max:
-        suspects = set(expected_pks)
-    else:
-        try:
-            from opensearch_pipeline.ha3_reconcile import _enumerate_ha3_pks
-            seen = _enumerate_ha3_pks(client, cfg, _parse_ha3_response, _PARITY_OUTPUT_FIELDS,
-                                      QueryRequest, id_hi=max(expected_pks) + 1,
-                                      id_lo=min(expected_pks))
-            suspects = expected_pks - set(seen)
-        except Exception as e:
-            # hint 失败 → 降级为对全部 expected point-read（绝不 fail-open 跳过校验）
-            print(f"    ⚠️ [PARITY] id-range enumerate failed, degrading to full point-read: {e}")
-            suspects = set(expected_pks)
+    # 1) 嫌疑集 = 全部 expected：本节点的 PK 全部已知，正是官方 fetch 契约覆盖的方向
+    #    （每批 ≤100、stage-3 每轮 ≤1000 PK ⇒ ≤10 请求）。
+    #    ⚠️ 原"大批先用 id-range enum 作廉价 hint"分支已删除（连同 RAG_STAGE3_PARITY_
+    #    POINTREAD_ALL_MAX 旋钮）：①廉价 hint 的前提是逐 PK point-read 昂贵（200 个 PK =
+    #    200 次请求），批量 fetch 后该前提消失；②enum 命中的行会绕过 fetch、拿不到
+    #    chunk_text_store ⇒ 这些行永远做不了 drift 子检查（覆盖缺口）。
+    suspects = set(expected_pks)
 
     # 2) 权威确认嫌疑集
     present, unknown = _present_unknown(suspects)
@@ -8724,12 +8874,12 @@ def node_verify_and_repush(ctx: dict):
         c.index_error_message = None
 
     # 3b) 内容漂移子检查（flag-gated, default OFF: RAG_STAGE3_PARITY_DRIFT；本节点仅在 PARITY_VERIFY
-    #     已开启时运行，故 drift 不会单独生效）。对"确认 PRESENT 且 point-read 拿到 chunk_text_store"
+    #     已开启时运行，故 drift 不会单独生效）。对"确认 PRESENT 且 fetch 拿到 chunk_text_store"
     #     的 chunk，比对 sha256(返回文本) vs sha256(内存 chunk_text)：不一致 = PK 在但内容陈旧（drift）。
     #     有界补推（upsert 覆盖内容）→ 重读**重算 hash**确认（不止 PK 存在）→ 仍不一致 = PARITY_DRIFT。
     #     fail-OPEN：读/hash 异常只跳过该 chunk 的 drift 判定，绝不影响上面的存在性三态结论。
-    #     注：大批模式下 enum 命中(未 point-read)的 chunk 无返回文本 → 不做 drift（设 POINTREAD_ALL_MAX
-    #     ≥ 批量可获得全量 drift 覆盖）。
+    #     注（2026-07-22）：enum-hint 分支删除后全部 expected 都过 fetch ⇒ 每个 PRESENT 行都有
+    #     返回文本，drift 覆盖不再有缺口（旧实现里 enum 命中而未点读的行永远做不了 drift）。
     still_drift = set()
     initial_drift = 0
     drift_enabled = os.environ.get("RAG_STAGE3_PARITY_DRIFT", "").lower() in ("1", "true", "yes")

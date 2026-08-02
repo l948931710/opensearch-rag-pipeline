@@ -141,6 +141,10 @@ class KbIdentity:
     - acl_groups               : 用户【读】权限组列表（仅审计/展示参考；写授权【不】用它推导）。
     - granted_owner_depts      : 【显式 seed】的可管理 owner_dept 列表（dept_admin_grant）。
                                  kb_admin 忽略此字段（拥有全部 owner_dept）。
+    - granted_node_roots       : 【阶段 B 管理轴】管辖子树根 dept_id 列表（dept_admin_node_grant，
+                                 auto+manual 合并后的有效行）。kb_admin 同样忽略。
+                                 两轴独立：legacy 文档看 granted_owner_depts、node 文档看
+                                 本字段展开的后代集，绝不交叉推导。
     """
 
     user_id: str = ""
@@ -148,6 +152,7 @@ class KbIdentity:
     role: str = ROLE_EMPLOYEE
     acl_groups: tuple = ()
     granted_owner_depts: tuple = ()
+    granted_node_roots: tuple = ()
 
     @staticmethod
     def build(
@@ -156,20 +161,32 @@ class KbIdentity:
         role: Optional[str] = None,
         acl_groups: Union[str, Iterable[str], None] = None,
         granted_owner_depts: Union[str, Iterable[str], None] = None,
+        granted_node_roots: Union[Iterable[int], None] = None,
     ) -> "KbIdentity":
-        """归一化构造：role fail-closed，granted_owner_depts 过写白名单。"""
+        """归一化构造：role fail-closed，granted_owner_depts 过写白名单，
+        granted_node_roots 只收正整数（非法项静默丢弃——身份构造不因脏行整体失败，
+        丢弃 = 少一条管辖根 = 收紧方向，安全）。"""
         if isinstance(acl_groups, str):
             groups = tuple(g.strip() for g in acl_groups.split(",") if g.strip())
         elif acl_groups:
             groups = tuple(str(g).strip() for g in acl_groups if str(g).strip())
         else:
             groups = ()
+        roots: List[int] = []
+        for item in granted_node_roots or ():
+            try:
+                v = int(item)
+            except (TypeError, ValueError):
+                continue
+            if v > 0 and v not in roots:
+                roots.append(v)
         return KbIdentity(
             user_id=user_id or "",
             name=name or "",
             role=normalize_role(role),
             acl_groups=groups,
             granted_owner_depts=tuple(sanitize_owner_depts(granted_owner_depts)),
+            granted_node_roots=tuple(roots),
         )
 
 
@@ -219,6 +236,50 @@ def expand_managed_owner_depts(depts: Iterable[str]) -> List[str]:
         if d == "production":
             out |= set(_PRODUCTION_UMBRELLA_OWNERS)
     return sorted(out)
+
+
+# ── 阶段 B：文档域专用管理判定（mode 隔离）───────────────────────────────────
+# ⚠️ 与 _kb_can_manage/_kb_owner_scope_sql（generic，组码域）刻意分函数：贡献审核仍用
+# generic helper 判 category_dept 组码（contribution.py:711,849），直接改 generic 语义
+# 会误伤贡献流（设计稿 §3.5 明令）。文档域一律换用本函数族。
+ACL_MODE_LEGACY_KB = "legacy"
+ACL_MODE_NODE_KB = "node"
+
+
+def can_manage_doc(
+    identity: KbIdentity,
+    acl_mode: Optional[str],
+    legacy_owner: Optional[str],
+    owner_dept_id: Optional[int],
+    descendant_ids: Optional[Set[int]],
+) -> bool:
+    """单文档管理判定（上传/升版/退役/改可见级/共享/审批），严格按 acl_mode 隔离。
+
+    - kb_admin → True（全库）。
+    - dept_admin + legacy 文档 → legacy_owner ∈ 伞形展开后的 managed 集
+      （与既有 _kb_can_manage 同一比对语义，行为对全 legacy 存量逐字节不变）。
+    - dept_admin + node 文档 → owner_dept_id ∈ descendant_ids（管辖根后代集，含根）。
+      descendant_ids=None = 后代集不可得（快照过期/读失败）⇒ **False**（fail-closed，
+      绝不回退 legacy 残值判定——node 文档的 owner_dept 残值命中旧管理员即越权，
+      codex 阶段 B 评审的核心洞）。
+    - 未知 mode / node 缺 owner_dept_id / employee ⇒ False（仅 kb_admin 可继续）。
+    """
+    if identity.role == ROLE_KB_ADMIN:
+        return True
+    if identity.role != ROLE_DEPT_ADMIN:
+        return False
+    mode = (acl_mode or ACL_MODE_LEGACY_KB).strip().lower()
+    if mode == ACL_MODE_LEGACY_KB:
+        owners = set(expand_managed_owner_depts(managed_owner_depts(identity)))
+        return (legacy_owner or "") in owners
+    if mode == ACL_MODE_NODE_KB:
+        if not owner_dept_id or descendant_ids is None:
+            return False
+        try:
+            return int(owner_dept_id) in descendant_ids
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
 def grantable_owner_depts(identity: KbIdentity) -> List[str]:

@@ -204,6 +204,36 @@ def test_fetch_rejects_duplicate_pk_in_batch():
     assert out["unknown_pks"] == [1] and "同批重复 PK" in out["errors"][0]
 
 
+def test_fetch_batch_is_atomic_partial_rows_discarded():
+    """**批级原子**:合法首行之后出现越集行 ⇒ 整批 UNKNOWN 且 `rows_by_pk` 为空。
+
+    非原子实现会把校验通过的前半段留在 present、后半段又把整批标 unknown ⇒ 同一 PK
+    同时 present 与 unknown,破坏 stage-3 parity 赖以成立的三态互斥
+    (present/unknown/missing 三者必须两两不交)。"""
+    cli = _FetchCli(present=[], bad=[{"id": 1, "fields": {"chunk_id": "c1"}},   # 合法
+                                     {"id": 999, "fields": {}}])               # 越集 → 整批废
+    out = ha3_fetch_by_pks(cli, "tbl", [1, 2])
+    assert out["rows_by_pk"] == {}, "整批作废时不得残留任何已解析行"
+    assert out["unknown_pks"] == [1, 2] and out["missing_pks"] == []
+    assert not (set(out["rows_by_pk"]) & set(out["unknown_pks"])), "三态必须互斥"
+
+
+def test_fetch_atomicity_holds_for_duplicate_pk_too():
+    cli = _FetchCli(present=[], bad=[{"id": 1, "fields": {"chunk_id": "c1"}},
+                                     {"id": 1, "fields": {"chunk_id": "c1"}}])  # 重复
+    out = ha3_fetch_by_pks(cli, "tbl", [1, 2])
+    assert out["rows_by_pk"] == {} and out["unknown_pks"] == [1, 2]
+
+
+def test_fetch_healthy_batch_unaffected_by_another_failing_batch():
+    """故障隔离单位是批:批0 正常、批1 异常 ⇒ 批0 的行照常 present。"""
+    cli = _FetchCli(present=range(150), fail_batches=[1])
+    out = ha3_fetch_by_pks(cli, "tbl", list(range(150)))
+    assert set(out["rows_by_pk"]) == set(range(100))
+    assert out["unknown_pks"] == list(range(100, 150))
+    assert out["missing_pks"] == []
+
+
 def test_fetch_error_code_body_is_batch_error():
     class _C:
         def fetch(self, req):

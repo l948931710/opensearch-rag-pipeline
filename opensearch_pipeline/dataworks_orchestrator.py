@@ -549,18 +549,49 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                     # Phase D（RAG_ALLOWED_DEPTS_ACL，默认关）：重推路径也必须经唯一 helper 从 approved
                     # 授权【重解析】allowed_depts（约束 2：不读可能过时的 chunk_meta 投影；约束 3：按
                     # doc_id 聚合、跟随 current version）。fail-closed：失败置空，不放行。
+                    # ── node-ACL 投影(与 stage-2 同一唯一注入点)────────────────────
+                    # ⚠️ stage-3 reload 从 chunk_meta 读回 owner 后直接重推 HA3;若 node 文档
+                    # 不在此改写成哨兵,一次重推就把真实 owner 送回检索面 = 权限重开。
+                    _node_docs = set()
+                    if valid_chunks:
+                        try:
+                            from opensearch_pipeline.access_grants import (
+                                resolve_acl_modes, resolve_doc_acl,
+                            )
+                            from opensearch_pipeline.acl_policy import ACL_MODE_NODE, project_doc_acl
+                            _modes = resolve_acl_modes({c.doc_id for c in valid_chunks}, cursor)
+                            _node_docs = {d for d, m in _modes.items() if m == ACL_MODE_NODE}
+                            if _node_docs:
+                                _nacl = resolve_doc_acl(_node_docs, cursor)
+                                for c in valid_chunks:
+                                    if c.doc_id not in _node_docs:
+                                        continue
+                                    _a = _nacl.get(c.doc_id)
+                                    c.owner_dept, c.allowed_depts = project_doc_acl(
+                                        ACL_MODE_NODE, c.owner_dept, (),
+                                        getattr(_a, "node_ids", ()) if _a else (),
+                                        getattr(_a, "exact_node_ids", ()) if _a else ())
+                                print(f"[Orchestrator] 🔐 node-ACL 投影:{len(_node_docs)} 篇写哨兵 owner")
+                        except Exception as _nae:
+                            # fail-closed:绝不退回"推真实 owner"。中止本批,交下轮重试。
+                            raise RuntimeError(
+                                f"node-ACL 投影失败,中止 stage-3 装载(绝不退回真实 owner): {_nae}")
+
                     if config.rag.allowed_depts_acl and valid_chunks:
                         try:
                             from opensearch_pipeline.access_grants import (
                                 resolve_allowed_depts, gate_by_permission,
                             )
-                            _allowed = resolve_allowed_depts({c.doc_id for c in valid_chunks}, cursor)
+                            _allowed = resolve_allowed_depts(
+                                {c.doc_id for c in valid_chunks} - _node_docs, cursor)
                             # 纵深守卫：只有 permission_level=='dept_internal' 的文档物化 allowed_depts
                             # （用 chunk 自身权威 permission_level；审计 Step 4 backstop a）。
                             _allowed = gate_by_permission(
                                 _allowed, {c.doc_id: c.permission_level for c in valid_chunks}
                             )
                             for c in valid_chunks:
+                                if c.doc_id in _node_docs:
+                                    continue   # 已投影为哨兵+d:/dx:,绝不被组码覆盖
                                 c.allowed_depts = _allowed.get(c.doc_id, [])
                         except Exception as _ade:
                             print(f"[Orchestrator] ⚠️ allowed_depts 重解析失败（fail-closed 置空）: {_ade}")
@@ -1027,6 +1058,8 @@ def _run_stage_drained_locked(stage, bizdate, simulate, run_metrics,
     from opensearch_pipeline.extraction.cost_breaker import CostBreaker
     shared_cost_breaker = CostBreaker(get_config())
 
+    _meta_claims: list = []   # 阶段 B doc-meta 投影 claims（仅 stage-3 pre-drain 填充）
+
     if stage == 3:
         # ── 搁浅版本对账：上一次部分失败可能留下「新版本已全量 INDEXED 但旧版本仍 active」
         # 的文档（双版本同时被检索）。必须在 drain 循环之前跑：这类文档没有待处理 chunk，
@@ -1091,6 +1124,21 @@ def _run_stage_drained_locked(stage, bizdate, simulate, run_metrics,
                       f"locked={ob['locked']} failed={ob['failed']} (processed={ob['processed']})")
         except Exception as e:
             print(f"[Orchestrator] WARNING: ACL projection outbox drain failed (non-fatal): {e}",
+                  file=sys.stderr)
+        # 阶段 B：doc-meta 投影 outbox pre-drain（改标题/分类的持久意图，schema/061）——
+        # 同步 chunk_meta.category + 标 NOT_INDEXED，由本轮 drain 循环载入重推（title 走
+        # loader 的 document_meta JOIN 现读）。claims 只在 drain 循环**成功**后按
+        # (id, generation) CAS 收尾（见循环出口）；失败/中断不收尾 ⇒ 下轮重投影。
+        # 窗口中途的新编辑 generation+1 ⇒ CAS 落空 ⇒ 同样留到下轮（丢更新关死）。
+        try:
+            from opensearch_pipeline.access_grants import pre_drain_meta_projection
+            mp = pre_drain_meta_projection()
+            _meta_claims = mp.get("claims") or []
+            if not mp.get("skipped") and _meta_claims:
+                print(f"[Orchestrator] doc-meta projection pre-drain: claims={len(_meta_claims)} "
+                      f"marked_chunks={mp['marked']} errors={len(mp['errors'])}")
+        except Exception as e:
+            print(f"[Orchestrator] WARNING: doc-meta projection pre-drain failed (non-fatal): {e}",
                   file=sys.stderr)
         # Phase D（flag 开）：跨部门授权投影对账——从 approved authority 重算 allowed_depts，drift
         # 文档标脏（chunk_meta.allowed_depts + index_status='NOT_INDEXED'），交本轮 drain 推 HA3。
@@ -1167,6 +1215,18 @@ def _run_stage_drained_locked(stage, bizdate, simulate, run_metrics,
         prev_remaining = remaining
         _batch_ctx = run_stage(stage, bizdate, simulate, cost_breaker=shared_cost_breaker)
         accumulate_metrics(run_metrics, extract_run_metrics(_batch_ctx))
+
+    # 阶段 B：doc-meta 投影收尾——**只在成功路径到达**（drain 循环内任何失败都 raise，
+    # 走不到这里 ⇒ claims 不收尾、下轮重投影；049 同款「成功才 CAS 完成」前提条款）。
+    if stage == 3 and _meta_claims:
+        try:
+            from opensearch_pipeline.access_grants import complete_meta_projection
+            mc = complete_meta_projection(_meta_claims)
+            print(f"[Orchestrator] doc-meta projection complete: done={mc['completed']} "
+                  f"superseded={mc['superseded']}（superseded=窗口中途再编辑，下轮重投影）")
+        except Exception as e:
+            print(f"[Orchestrator] WARNING: doc-meta projection complete failed (non-fatal，"
+                  f"下轮按未处理重投影): {e}", file=sys.stderr)
 
     return run_metrics
 

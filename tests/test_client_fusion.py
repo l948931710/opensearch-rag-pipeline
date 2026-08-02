@@ -105,7 +105,7 @@ def _run_search(client, config, sparse=([1, 5], [0.5, 0.3]), **kwargs):
          patch.object(retriever, "get_query_embedding",
                       return_value=([0.1] * 4, sparse[0], sparse[1])), \
          patch.object(retriever, "_revalidate_main_hits", side_effect=lambda r: r), \
-         patch.object(retriever, "_deny_revoked_cross_dept", side_effect=lambda r, d: r):
+         patch.object(retriever, "_deny_revoked_cross_dept", side_effect=lambda r, d, **_kw: r):
         return retriever.search_chunks("测试查询", top_k=5, **kwargs)
 
 

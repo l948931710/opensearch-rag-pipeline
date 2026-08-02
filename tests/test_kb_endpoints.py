@@ -9,6 +9,23 @@ employee/匿名在任何 DB 查询【之前】被 401/403 拒绝。授权走 res
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _default_node_capability_absent(monkeypatch):
+    """阶段 B：本文件全部端点测试默认 capability='absent'。
+
+    两个原因：①本文件的桩游标（_stub_multi/_stub_capture）按 execute 次数弹结果，
+    真探针的额外一次 information_schema 查询会让整个序列错位；②absent 生成与旧
+    _kb_owner_scope_sql 逐字节同构的 SQL（tests/test_kb_doc_scope.py 的回归锚钉死），
+    故本文件既有 legacy 断言语义完全不变。node 路径的测试**显式**改打 'present'
+    并在桩行里自带 acl_mode/owner_dept_id 列。
+    ⚠️ kb_console/kb_access 都是 from-import 绑定——三个命名空间都要打。"""
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_access, kb_console
+    monkeypatch.setattr(api, "_kb_node_capability", lambda cur: "absent")
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "absent")
+    monkeypatch.setattr(kb_access, "_kb_node_capability", lambda cur: "absent")
+
+
 def _skip_if_not_sim():
     from opensearch_pipeline.config import get_config
     if not get_config().simulate_api:
@@ -1668,13 +1685,34 @@ def test_stats_owner_depts_facet_and_chunk_status_badge(monkeypatch):
         ("active", "未入索引", "production", 1),   # 0-chunk 经 CASE 归「未入索引」
         ("active", "已上线", "hr", 1),
     ]
-    _stub_multi(monkeypatch, [rows, (7,), (2,)])   # 主 fetchall + chunks fetchone + new_month fetchone
+    sink = _stub_multi(monkeypatch, [rows, (7,), (2,)])   # 主 fetchall + chunks fetchone + new_month fetchone
     from opensearch_pipeline import api
     resp = api.kb_stats(request=None, identity=api.Identity(user_id="dev1"))
     assert resp.owner_depts == ["hr", "marketing", "production"]      # 去重 + 排序
     assert resp.by_badge.get("未入索引") == 1                          # chunk_status 生效（此前漏传会误记「处理中」）
     assert resp.by_badge.get("已上线") == 2
     assert resp.chunks == 7 and resp.new_this_month == 2
+    # kb_admin（无作用域 clause）分块计数保持无 JOIN 原查询：JOIN 会把孤儿分块悄悄减掉
+    chunk_sql = [s for s, _ in sink["calls"] if "chunk_meta" in s][0]
+    assert "document_meta" not in chunk_sql
+
+
+def test_stats_chunk_count_scopes_via_document_meta(monkeypatch):
+    """node-ACL：dept_admin 的分块计数按 document_meta.owner_dept 作用域（JOIN），
+    **不得**按 chunk_meta.owner_dept —— 那是检索投影轴，node 文档在该列上是哨兵
+    `__acl_node_mode_v1__`，按它过滤会让整篇 node 文档的分块从部门统计里消失。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    sink = _stub_multi(monkeypatch, [[("active", "已上线", "marketing", 1)], (7,), (2,)])
+    from opensearch_pipeline import api
+    resp = api.kb_stats(request=None, identity=api.Identity(user_id="da1"))
+    assert resp.chunks == 7
+    chunk_sql = [s for s, _ in sink["calls"] if "chunk_meta" in s][0]
+    assert "JOIN" in chunk_sql and "document_meta m" in chunk_sql
+    assert "m.owner_dept IN" in chunk_sql
+    # 哨兵所在的列绝不可再出现在作用域条件里（回归钉死）
+    assert "c.owner_dept" not in chunk_sql
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1980,7 +2018,9 @@ def _stub_dept_usage(monkeypatch, wow_rows="ok"):
             sql = getattr(self, "_sql", "")
             if "qa_session_log" in sql and "INTERVAL 14 DAY" in sql:
                 return [("marketing", 9, 5)]          # 近7天=9 · 前7天=5
-            if "qa_session_log" in sql and "GROUP BY m.owner_dept" in sql:
+            # 阶段 B：分桶键改稳定表达式（GROUP BY 1），30 天窗口查询以 INTERVAL %s DAY 区分
+            if "qa_session_log" in sql and ("GROUP BY m.owner_dept" in sql
+                                            or ("GROUP BY 1" in sql and "INTERVAL %s DAY" in sql)):
                 return [("marketing", 30, 3)]         # 近30天=30 · REFUSAL=3
             return []
 
@@ -2068,3 +2108,35 @@ def test_my_docs_badge_counts_faceted(monkeypatch):
     assert "owner_dept = %s" in counts_sql and "production" in (counts_params or ())
     # 计数查询不含 badge 自身的筛选（faceted 语义：各状态的数在当前其他筛选下可见）
     assert counts_sql.count("CASE") <= main_sql.count("CASE") and "已上线" not in str(counts_params)
+
+
+def test_org_tree_exposes_node_acl_grant_flag(monkeypatch):
+    """★ org-tree 必须回读侧 `node_acl_grant` —— 上传表单据此决定写 legacy 组码还是 node 节点。
+
+    ⚠️ 这不是"控件做没做"的开关，是**安全开关**：GRANT 关时 `can_read_doc` 对 node 文档
+    无条件 DENY（acl_policy.py:281），此刻若把新上传文档写成 node 授权，它对所有人不可见
+    ——连归属部门自己都看不到（投影轴换哨兵后 legacy owner 分支不再放行）。
+    """
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline import api
+    monkeypatch.setattr(api, "_load_org_tree_snapshot", lambda: {"nodes": [], "stale": True})
+
+    for flag, expect in ((True, True), (False, False)):
+        monkeypatch.setattr("opensearch_pipeline.routes.kb_console._node_acl_grant_enabled",
+                            lambda f=flag: f)
+        resp = api.kb_org_tree(request=None, identity=api.Identity(user_id="dev1"))
+        assert resp.node_acl_grant is expect
+
+
+def test_org_tree_flag_fails_safe_to_legacy(monkeypatch):
+    """读不到 config ⇒ 回 False（继续走 legacy 组码），绝不因异常就把上传切到 node 口径。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline.routes import kb_console
+
+    def _boom():
+        raise RuntimeError("config 不可用")
+
+    monkeypatch.setattr("opensearch_pipeline.config.get_config", _boom)
+    assert kb_console._node_acl_grant_enabled() is False

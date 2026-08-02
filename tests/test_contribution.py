@@ -77,6 +77,8 @@ class _FakeCur:
             return c.ctx_msg_row
         if "hit_mine" in s and "WHERE q.message_id=" in s:   # 缺口上下文：REFUSAL 可见性
             return c.ctx_vis_row
+        if "staff_dim" in s and "staff_id=%s" in s:          # 三榜：请求者本部门
+            return c.staff_me_row
         return None
 
     def fetchall(self):
@@ -95,6 +97,16 @@ class _FakeCur:
             return c.coverage_rows
         if "GROUP BY c.author_id" in s:        # ε-2 R2 heroes 引用数聚合（先于泛 author_id 分支）
             return c.hero_hits_rows
+        if "staff_dim" in s and "IN (" in s:            # 三榜：积分池组织归属
+            return c.staff_pool_rows
+        if "FROM" in s and "dept_dim" in s:             # 三榜：组织树（一级上溯）
+            return c.dept_dim_rows
+        if "handled_status='RESOLVED'" in s and "GROUP_CONCAT" in s:   # 总积分榜：有效反馈聚合
+            if c.boom_feedback:
+                raise Exception("simulated feedback aggregation failure")
+            return c.hero_feedback_rows
+        if "FROM" in s and "user_role" in s and "user_id IN" in s:     # 展示名回填
+            return c.user_role_rows
         if "GROUP BY jt.doc_id" in s:          # ε-2 R2 mine 逐文档引用数
             if c.boom_hits:
                 raise Exception("simulated hits aggregation failure")
@@ -140,6 +152,12 @@ class _FakeConn:
         self.coverage_rows = kw.get("coverage_rows", [])
         self.hero_rows = kw.get("hero_rows", [])
         self.hero_hits_rows = kw.get("hero_hits_rows", [])
+        self.hero_feedback_rows = kw.get("hero_feedback_rows", [])
+        self.staff_pool_rows = kw.get("staff_pool_rows", [])
+        self.dept_dim_rows = kw.get("dept_dim_rows", [])
+        self.staff_me_row = kw.get("staff_me_row")
+        self.boom_feedback = kw.get("boom_feedback", False)
+        self.user_role_rows = kw.get("user_role_rows", [])
         self.doc_hits_rows = kw.get("doc_hits_rows", [])
         self.boom_hits = kw.get("boom_hits", False)
         self.dv_badge_rows = kw.get("dv_badge_rows", [])
@@ -1610,3 +1628,134 @@ def test_gap_context_endpoint_visibility_and_cursor(monkeypatch):
     # (created_at,id) 复合游标进了 SQL（同时间戳不漏不乱）
     prior_sql = next(s for s, _ in conn.calls if "ORDER BY created_at DESC, id DESC" in s)
     assert "created_at < %s OR (created_at = %s AND id < %s)" in prior_sql
+
+
+# ── 总积分榜（2026-08-01，Sam 拍板预览权重 10/1/3）────────────────────────────
+def test_heroes_total_score_composition_and_ranking(monkeypatch):
+    """score = 10×采纳 + 1×引用 + 3×有效反馈；排名按总分。
+    u1: 3 采纳+6 引用+0 反馈=36；u2: 2 采纳+0 引用+8 反馈=44 → u2 反超。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "true")
+    _install_conn(monkeypatch, _FakeConn(
+        hero_rows=[("u1", "李娜", 3), ("u2", "王伟", 2)],
+        hero_hits_rows=[("u1", 6)],
+        hero_feedback_rows=[("u2", 8)]))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    got = [(i.author_id, i.score, i.adopted, i.hits, i.feedback) for i in resp.items]
+    assert got == [("u2", 44, 2, 0, 8), ("u1", 36, 3, 6, 0)]
+    assert [i.rank for i in resp.items] == [1, 2]
+    assert resp.items[0].count == 2      # 旧字段 count=adopted 兼容保留
+
+
+def test_heroes_feedback_only_user_enters_board(monkeypatch):
+    """只反馈没贡献的人也上榜（反馈是办法认可的参与项）；展示名从 user_role 回填。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    _install_conn(monkeypatch, _FakeConn(
+        hero_rows=[("u1", "李娜", 1)],
+        hero_feedback_rows=[("fb9", 5)],
+        user_role_rows=[("fb9", "赵反馈")]))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    got = {i.author_id: (i.score, i.author_name) for i in resp.items}
+    assert got["fb9"] == (15, "赵反馈") and got["u1"] == (10, "李娜")
+    assert resp.items[0].author_id == "fb9"                      # 15 > 10
+
+
+def test_heroes_feedback_sql_invariants(monkeypatch):
+    """有效反馈 SQL 必须带齐三道闸：RESOLVED（④人工确认）、首报去重（⑤GROUP_CONCAT
+    按 created_at,id 最早）、渠道①（conversation_type IS NULL）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    conn = _install_conn(monkeypatch, _FakeConn(hero_rows=[("u1", "李娜", 1)]))
+    from opensearch_pipeline import api
+    api.kb_contribution_heroes(request=None, identity=_ident())
+    sql = next(s for s, _ in conn.calls if "handled_status='RESOLVED'" in s)
+    assert "feedback_type='downvote'" in sql
+    assert "GROUP_CONCAT(f.user_id ORDER BY f.created_at ASC, f.id ASC)" in sql
+    assert "conversation_type IS NULL" in sql and "GROUP BY f.message_id" in sql
+
+
+def test_heroes_feedback_failure_degrades_not_breaks(monkeypatch):
+    """反馈聚合失败 → 该项按 0，榜单照出（单项失败绝不拖垮）。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    _install_conn(monkeypatch, _FakeConn(
+        hero_rows=[("u1", "李娜", 2)], boom_feedback=True))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    assert [(i.author_id, i.score, i.feedback) for i in resp.items] == [("u1", 20, 0)]
+
+
+def test_heroes_fact_off_score_counts_hits_as_zero_honest_none(monkeypatch):
+    """fact 路径关：hits=None（诚实算不出）、分数按 0 如实少算——不伪造引用分。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    _install_conn(monkeypatch, _FakeConn(hero_rows=[("u1", "李娜", 3)]))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    assert resp.items[0].hits is None and resp.items[0].score == 30
+
+
+# ── 三榜切换（2026-08-01）：部门榜 = 同分按一级部门求和；本部门榜 = 归属过滤 ────
+_DEPT_TREE = [
+    (100, 1, "生产中心", 1), (110, 100, "注塑事业部", 2), (111, 110, "注塑制程检", 3),
+    (200, 1, "综合管理中心", 1), (210, 200, "人力资源部", 2),
+]
+
+
+def test_heroes_dept_board_sums_by_l1(monkeypatch):
+    """u1(注塑制程检,深3)与 u2(注塑事业部,深2)都上溯到生产中心求和；u3 归综合管理中心。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    _install_conn(monkeypatch, _FakeConn(
+        hero_rows=[("u1", "李娜", 3), ("u2", "王伟", 2), ("u3", "张三", 1)],
+        staff_pool_rows=[("u1", 111), ("u2", 110), ("u3", 210)],
+        dept_dim_rows=_DEPT_TREE))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    got = [(d.dept_name, d.score, d.members) for d in resp.dept_items]
+    assert got == [("生产中心", 50, 2), ("综合管理中心", 10, 1)]
+    assert [d.rank for d in resp.dept_items] == [1, 2]
+
+
+def test_heroes_my_dept_board_filters_by_requester_l1(monkeypatch):
+    """请求者挂注塑事业部 → 本部门榜只含生产中心成员（u3 不在）；部门内重排名次。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    _install_conn(monkeypatch, _FakeConn(
+        hero_rows=[("u1", "李娜", 3), ("u2", "王伟", 2), ("u3", "张三", 5)],
+        staff_pool_rows=[("u1", 111), ("u2", 110), ("u3", 210)],
+        dept_dim_rows=_DEPT_TREE,
+        staff_me_row=(110,)))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    assert resp.my_dept_name == "生产中心"
+    assert [(i.author_id, i.rank, i.score) for i in resp.my_dept_items] == [
+        ("u1", 1, 30), ("u2", 2, 20)]
+    # 全公司榜不受影响（u3 50 分居首）
+    assert resp.items[0].author_id == "u3"
+
+
+def test_heroes_unattributed_user_skips_dept_board_keeps_company(monkeypatch):
+    """未在册（不在 staff_dim）的人：全公司/本部门个人榜照常，只是不计入部门榜。"""
+    _skip_if_not_sim()
+    _employee(monkeypatch)
+    monkeypatch.setenv("RAG_QA_FACT_JOIN", "false")
+    _install_conn(monkeypatch, _FakeConn(
+        hero_rows=[("u1", "李娜", 3), ("ghost", "外部号", 9)],
+        staff_pool_rows=[("u1", 111)],
+        dept_dim_rows=_DEPT_TREE))
+    from opensearch_pipeline import api
+    resp = api.kb_contribution_heroes(request=None, identity=_ident())
+    assert resp.items[0].author_id == "ghost"                       # 全公司榜照常
+    assert [(d.dept_name, d.score) for d in resp.dept_items] == [("生产中心", 30)]
+    assert resp.my_dept_items == [] and resp.my_dept_name == ""     # 请求者未在册 → 诚实空

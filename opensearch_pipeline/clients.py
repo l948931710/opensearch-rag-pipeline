@@ -198,10 +198,23 @@ HA3_PARITY_OUTPUT_FIELDS = [
 # ──────────────────────────────────────────────────────────────────────────────
 
 # 倒排枚举锚点：双态覆盖（HA3 侧 is_active=0 的僵尸行也要被发现）。
-# ⚠️ 借业务字段作 match-all 锚点是我方 2026-07-22 实测所得、**非官方文档写法**
-# （官方 match-all 三种写法均 errorCode=2000；`id:'[lo, hi]'` 范围语法在本表恒返 0，
-# 范围只能走 filter）。阿里尚未确认其为受支持的全集原语 ⇒ 任何「完整」结论都只在
-# 「双态 is_active 锚点契约内」成立，不得宣称物理全表无条件完整。
+#
+# ✅ 阿里售后 2026-07-25 正式确认：**「通过 is_active 的做法是没有问题的，但是效率不高。
+# 我们没有 match-all 的写法，推荐是通过索引去筛选。」** ⇒ 本锚点是受支持的用法（不再是
+# 未定义行为），且官方确认 match-all 确实不存在。
+#
+# 为什么范围不能写进 queryString（实测 9 种变体恒返 0，无 errorCode）：官方答复
+# 「id 是**主键索引**，可能不支持 range 查询；可以对 id 字段再建一个**数值索引**」。
+# 官方区间语法本身是对的（`索引名:[v1,v2]` 闭 / `(v1,v2)` 开 / `(,v2)` 半开），但前提是
+# 该字段有**数值范围索引**——主键索引只支持精确匹配。故当前范围一律走 `filter` 参数。
+#
+# 【未采纳的优化路径】给 id 加数值索引后可改用 queryString 区间、少发请求。**暂不做**：
+# HA3 加索引很可能要重建表，而全量重建是本项目历史上最高危的操作（曾因回放过期 Swift log
+# 上线空 generation 导致检索中断）；当前口径全表 34s（夜检作业，55 桶×~0.6s），
+# 「效率不高」在这个量级无实际代价。语料量级大幅上涨、或恰好因别的原因重建表时再合并进去。
+#
+# 完整性口径仍限定在「双态 is_active 锚点契约内 + 仅覆盖扫描区间」，不宣称物理全表无条件完整
+# （未写 is_active 的行仍会隐身；helper 的 is_active 健康判据即为此兜底）。
 HA3_ENUM_ANCHOR = "is_active:'1' OR is_active:'0'"
 HA3_ENUM_BUCKET = 500     # 桶宽：必须 ≤ 此值，保证单页装得下
 HA3_ENUM_SIZE = 1000      # size：桶宽 2 倍余量；返回数达此值即判饱和（不可信）
@@ -325,6 +338,11 @@ def ha3_fetch_by_pks(client, table_name: str, pks, output_fields: List[str] = No
     返回 {"rows_by_pk": {pk: {...}}, "missing_pks": [...], "unknown_pks": [...],
           "errors": [str]}。批异常/畸形整批归 unknown（**绝不误判为 missing**）。
     绝不 raise。
+
+    **批级原子**：每批先写局部 `batch_rows`，整批全部校验通过才并入 `rows_by_pk`；
+    任一异常整批丢弃并计 unknown。否则"合法首行 + 后续越集/重复行"会让同一批的前半段
+    已进 present、后半段又把整批标 unknown ⇒ 同一 PK 同时 present 与 unknown，
+    破坏调用方（stage-3 parity）赖以成立的三态互斥。
     """
     from alibabacloud_ha3engine_vector.models import FetchRequest
 
@@ -357,7 +375,7 @@ def ha3_fetch_by_pks(client, table_name: str, pks, output_fields: List[str] = No
             if not isinstance(res, list):
                 raise RuntimeError(f"result 非 list: {type(res).__name__}")
             want = set(sub)
-            seen_batch = set()
+            batch_rows: Dict[int, Dict[str, Any]] = {}   # 批级原子：校验全过才并入全局
             for it in res:
                 f = it.get("fields", it) if isinstance(it, dict) else {}
                 try:
@@ -366,10 +384,10 @@ def ha3_fetch_by_pks(client, table_name: str, pks, output_fields: List[str] = No
                     raise RuntimeError(f"PK 不可解析: {str(it)[:120]}")
                 if pk not in want:
                     raise RuntimeError(f"返回 PK={pk} 不在请求集合内")
-                if pk in seen_batch:
+                if pk in batch_rows:
                     raise RuntimeError(f"同批重复 PK={pk}")
-                seen_batch.add(pk)
-                rows_by_pk[pk] = dict(f, id=str(pk))
+                batch_rows[pk] = dict(f, id=str(pk))
+            rows_by_pk.update(batch_rows)                # 仅在整批无异常后生效
         except Exception as e:  # noqa: BLE001 — 单批失败只废该批，绝不染成 missing
             unknown.extend(sub)
             errors.append(f"batch@{i}: {type(e).__name__}: {e}"[:200])
@@ -452,6 +470,10 @@ def _ensure_opensearch_index(client, index_name: str, dimension: int):
                     },
                     "chunk_type": {"type": "keyword"},
                     "owner_dept": {"type": "keyword"},
+                    # node-ACL：节点值 d:<id>/dx:<id> 与 legacy 组码共用该多值字段
+                    # （与 HA3 的 allowed_depts MULTI_STRING 同语义）。keyword 数组 ⇒
+                    # term 查询即成员匹配；不声明会走 dynamic mapping 变 text 而 term 失配。
+                    "allowed_depts": {"type": "keyword"},
                     "permission_level": {"type": "keyword"},
                     "is_active": {"type": "boolean"}
                 }

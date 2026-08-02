@@ -18,7 +18,7 @@ const {
   docsPage, docsTotal, docsPerPage, docsMaxPage, loadDocsPage,
   setQuery, sortBy, setScope, enterVersionMode, retire, restore, openHistory, openDocPreview,
   openAccessRequest, accessStateOf, accessNoteOf, loadDocs, loadErrors,
-  openShare, grantedLabelsByDoc, openVisibility,
+  openShare, openDocMeta, grantedLabelsByDoc, openVisibility,
   selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
 } = useKb()
 
@@ -415,6 +415,11 @@ async function onRestore(d: DocItem) {
                   class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-foreground transition hover:bg-panel"
                   @click="menuAct(() => openShare(d))"
                 ><Share2 :size="14" :stroke-width="1.75" class="text-muted-foreground" /> 跨部门共享 / 权限</button>
+                <button
+                  type="button" role="menuitem" data-testid="doc-meta"
+                  class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-foreground transition hover:bg-panel"
+                  @click="menuAct(() => openDocMeta(d))"
+                ><Settings :size="14" :stroke-width="1.75" class="text-muted-foreground" /> 编辑信息</button>
                 <button
                   type="button" role="menuitem"
                   class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-foreground transition hover:bg-panel"

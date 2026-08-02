@@ -209,6 +209,12 @@ class Chunk:
             "chunk_type": self.chunk_type,
             "title": self.title or "",
             "owner_dept": self.owner_dept or "",
+            # node-ACL（2026-07-31）：本地 OpenSearch 回退链此前**不输出**该字段 ⇒ node 文档的
+            # d:/dx: 在本地 E2E / 灾备回退里全部丢失 ⇒ 那条路径上 node 文档谁也搜不到
+            # （不越权，是功能缺失；设计稿 §4 已列此条）。与 to_ha3_doc 不同，这里**不按
+            # flag 门控**：本地 mapping 由我们自己建（clients.py 已声明该 keyword 字段），
+            # 不存在"推未知字段被拒"的风险，而少推一次就等于回退链上 node 语义默认失效。
+            "allowed_depts": list(self.allowed_depts or []),
             "permission_level": self.permission_level or "public",
             "category_l1": self.category_l1 or "",
             "category_l2": self.category_l2 or "",

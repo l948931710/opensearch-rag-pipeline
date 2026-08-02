@@ -135,7 +135,7 @@ def _wire(monkeypatch, *, rerank, probe, tiebreak, pool_chunks):
              multi_query_mode="off", doc_diversity_cap=0)
     calls = {}
 
-    def _fake_search(query, top_k=7, user_dept=None, query_embedding=None):
+    def _fake_search(query, top_k=7, user_dept=None, query_embedding=None, **_kw):
         calls["fetch_k"] = top_k
         return [dict(c) for c in pool_chunks][:top_k]
 
