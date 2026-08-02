@@ -38,11 +38,15 @@ def build_gates(r: Dict) -> Dict:
             "ci": _g(l1, "ranking", "recall@5_ci"),
             "pass": (r5 is not None and r5 >= 0.85)}
         # source attribution is the 来源标注 module specifically (doc-level top-1 accuracy)
+        # bar 0.95→0.94（2026-08-02 Sam 拍板）：07-27 冻结 run（rerank ON 正确口径）实测
+        # 0.947，长期是唯一卡杠项；miss 已经 07-27 subject-drift 调查逐条定性
+        # （docs/evidence/rerank_subject_drift_20260727/drift.json：net improved 19 / worse 13 /
+        # harmful 1，非系统性退化）。0.94 保住「不再恶化」的告警力，不再拦 0.947 的既知水位。
         src_r1 = _g(l1, "by_module", "source_attribution", "recall@1")
         if src_r1 is not None:
             gates["source attribution recall@1 (L1, 来源标注)"] = {
-                "target": ">= 0.95 (xlsx 来源标注)", "value": src_r1,
-                "pass": src_r1 >= 0.95}
+                "target": ">= 0.94 (xlsx 来源标注; 08-02 由 0.95 降杠)", "value": src_r1,
+                "pass": src_r1 >= 0.94}
         # xlsx RAG retrieval module (clean gold) — the authoritative recall signal
         rag_r5 = _g(l1, "by_module", "rag_retrieval", "recall@5")
         if rag_r5 is not None:
