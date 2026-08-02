@@ -496,7 +496,13 @@ def test_g_stale_recovery_failure_reset():
     # Stage 3 PROCESSING timeout lease filter (prevents orphaned lock starvation after OOMKill)
     assert "dv.index_status != '{DocVersionIndexStatus.PROCESSING}'" in source, \
         "Stage 3 query must filter out PROCESSING documents"
-    assert "INTERVAL 2 HOUR" in source, "Stage 3 query must have 2-hour timeout lease for stale PROCESSING recovery"
+    # PR-4：2h 字面量收进 ingest_lease.takeover_where_sql 种子（off 臂逐字节渲染 2h 现状；
+    # on 臂=租约到期 + 无租约行 2h 兜底双臂）。源检改断言 seam + 渲染兜底仍在。
+    assert 'ingest_lease.takeover_where_sql("dv.")' in source, \
+        "Stage 3 query must admit stale PROCESSING via the lease-aware takeover predicate (PR-4)"
+    from opensearch_pipeline import ingest_lease as _il
+    assert "INTERVAL 2 HOUR" in _il.takeover_where_sql("dv."), \
+        "takeover predicate must keep the 2h age fallback (lease-off arm / unleased rows)"
 
 
 # Test H: node_acquire_index_lock must be able to TAKE OVER a stale PROCESSING lock.
@@ -506,9 +512,13 @@ def test_h_stale_processing_lock_takeover():
     import inspect
     source = inspect.getsource(node_acquire_index_lock)
     assert "index_status = '{DocVersionIndexStatus.PROCESSING}'" in source, "lock claim must touch PROCESSING state"
-    assert "updated_at < NOW() - INTERVAL 2 HOUR" in source, (
-        "node_acquire_index_lock must take over stale (>2h) PROCESSING locks, "
-        "matching the orchestrator loader's admission window"
+    # PR-4：同 test_g——字面量收进 takeover_where_sql seam；off 臂渲染
+    # "updated_at < NOW() - INTERVAL 2 HOUR" 逐字节现状（test_ingest_lease 钉死），
+    # loader 准入窗与锁接管窗仍同源同窗。
+    assert "ingest_lease.takeover_where_sql()" in source, (
+        "node_acquire_index_lock must take over stale PROCESSING locks via the "
+        "lease-aware takeover predicate (PR-4), matching the orchestrator loader's "
+        "admission window"
     )
 
 

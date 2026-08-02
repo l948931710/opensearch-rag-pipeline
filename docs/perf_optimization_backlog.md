@@ -23,7 +23,9 @@
 > `RAG_ACL_DENY_CACHE_TTL_S=0`（默认关，机密性兜底） / `RAG_QUERY_EMBED_TIMEOUT_S=8` + `RAG_QUERY_EMBED_RETRIES=1` /
 > `RAG_HISTORY_CHAR_BUDGET=12000`（0=关）。**user-gated 尾巴**：① ~~H#72 = schema/007 idx_etag~~ **已 apply
 > 生产 2026-07-02**（见 K 桶）；② 摄取侧并发开关（PUBLISH/HA3_PUSH/LOADER_FETCH）由 DataWorks 节点自行
-> setdefault 开启；③ SAE/DataWorks 重打包部署后线上才生效。
+> setdefault 开启——**正确性前置=PR-4 摄取租约/fencing**（schema/048 三环境已 apply +
+> `RAG_INGEST_LEASE_ENABLE` 默认 off；开并发前先按启用 runbook 开 flag，见
+> docs/ingest_lease_fencing_scope_2026-07-17.md 附录 A）；③ SAE/DataWorks 重打包部署后线上才生效。
 >
 > **K 桶落地（2026-07-02，同分支第二 commit）**：#80-96 全部完成（#85 早前已落地；#83+#96 合并为
 > `schema/015_kb_audit_log_history_index.sql`——(operator_type, action_type, created_at) 一个索引覆盖两条

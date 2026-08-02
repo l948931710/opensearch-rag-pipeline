@@ -31,6 +31,7 @@ import time
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from opensearch_pipeline.config import get_config, load_config
+from opensearch_pipeline import ingest_lease
 from opensearch_pipeline.reindex_states import (
     RETRY_COUNT_INC_SQL,
     STAGE3_CHUNK_RESELECT_INDEX_STATUS,
@@ -238,13 +239,18 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                         print("[Orchestrator] No pending canonical documents found (or all preempted by another instance).")
                     else:
                         # 仅对本实例锁定到的行置 LOADING（按 id），提交后释放行锁。
+                        # PR-4：认领顺带盖租约戳（flag off 时片段为空=SQL 逐字节现状），
+                        # 并在同一认领事务内回读 epoch 登记——后续 DAG-2 节点经共享 ctx
+                        # 的 LeaseSet 续租/栅栏（dag.run 浅拷贝 ctx，对象共享）。
                         claimed_ids = [r[12] for r in rows]
                         _ph = ",".join(["%s"] * len(claimed_ids))
                         cursor.execute(
                             "UPDATE document_version SET content_process_status = 'LOADING', "
-                            f"updated_at = NOW() WHERE id IN ({_ph})",
-                            claimed_ids,
+                            f"updated_at = NOW(){ingest_lease.claim_set_sql()} WHERE id IN ({_ph})",
+                            ingest_lease.claim_set_params() + tuple(claimed_ids),
                         )
+                        ingest_lease.get_lease_set(ctx).fetch_and_register(
+                            cursor, [(r[0], int(r[1])) for r in rows])
                         conn.commit()
                         print(f"[Orchestrator] Preempted {preempted_count} documents for processing.")
                     has_load_errors = False
@@ -309,16 +315,28 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                             has_load_errors = True
                             print(f"    ⚠️ OSS/Local canonical read failure: {read_error}")
                             if not simulate_db:
+                                # PR-4：终态写带栅栏+清租约（off/未登记时片段为空=现状）；
+                                # 被接管的行 rowcount=0 → LeaseLost → 该文档归新持有者，跳过。
+                                # RETRY_COUNT_INC 恒改行，rowcount 判租无 changed-rows 歧义。
+                                _lk = (doc_id, int(version_no))
+                                _ls = ingest_lease.get_lease_set(ctx)
                                 try:
                                     cursor.execute(f"""
                                         UPDATE document_version
                                         SET content_process_status = 'FAILED',
                                             content_process_error = %s,
                                             {RETRY_COUNT_INC_SQL},
-                                            processed_at = NOW()
-                                        WHERE doc_id = %s AND version_no = %s
-                                    """, (read_error, doc_id, version_no))
+                                            processed_at = NOW(){ingest_lease.clear_set_sql()}
+                                        WHERE doc_id = %s AND version_no = %s{_ls.fence_where_sql(_lk)}
+                                    """, (read_error, doc_id, version_no)
+                                       + _ls.fence_where_params(_lk))
+                                    _ls.check_fenced_write(cursor, _lk)
                                     conn.commit()
+                                    _ls.discard(_lk)  # 终态已落，本地释放
+                                except ingest_lease.LeaseLost:
+                                    conn.rollback()
+                                    print(f"    ⚠️ Lease lost on {doc_id} v{version_no} — "
+                                          f"skipped (preempted by another holder)")
                                 except Exception as db_err:
                                     print(f"    ⚠️ Failed to update document_version status for OSS read error: {db_err}")
                             continue
@@ -468,7 +486,7 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                           AND cm.is_active = 1
                           AND (
                               dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
-                              OR dv.updated_at < NOW() - INTERVAL 2 HOUR
+                              OR {ingest_lease.takeover_where_sql("dv.")}
                           )
                         ORDER BY cm.created_at ASC
                         LIMIT 1000
@@ -619,14 +637,28 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                 print(f"[Orchestrator] DAG 3 failed. Rolling back PROCESSING locks for {len(preempted)} doc versions...")
                 try:
                     from opensearch_pipeline.pipeline_nodes import _get_db_conn
+                    # 批次5（ultra P2 orchestrator:587）：回滚补 PR-4 租约纪律——此前
+                    # WHERE 只 CAS PROCESSING：本 run 停滞超 TTL 被接管后，回滚会把新持有
+                    # 者的在跑 PROCESSING 锁改写成 FAILED（文档被第三个 run 中途再认领）；
+                    # 良性路径也留下 lease 列残留在 FAILED 行上（破坏「租约列非空⇔有人自认
+                    # 在跑」不变量）。修法与节点内 FAILED 路径同款：epoch 栅栏 + clear_set_sql；
+                    # 节点内已判 LeaseLost 的 key（墓碑）直接跳过——文档归新持有者收敛。
+                    # LeaseSet 在 dag.run 的内部 ctx 副本里（对象共享，经 result_ctx 取）。
+                    # flag off 时栅栏/清列均为空串 = 字节级旧 SQL。
+                    _rls = ingest_lease.get_lease_set(result_ctx)
                     conn_rb = _get_db_conn(select_db=True)
                     with conn_rb.cursor() as cursor:
                         for doc_id, ver in preempted:
+                            _rk = (doc_id, int(ver))
+                            if ingest_lease.lease_enabled() and _rls.epoch(_rk) is None:
+                                print(f"[Orchestrator]   ├─ skip rollback {doc_id} v{ver} "
+                                      f"(lease already lost — owned by new holder)")
+                                continue
                             cursor.execute(f"""
                                 UPDATE document_version
-                                SET index_status = '{DocVersionIndexStatus.FAILED}'
-                                WHERE doc_id = %s AND version_no = %s AND index_status = '{DocVersionIndexStatus.PROCESSING}'
-                            """, (doc_id, ver))
+                                SET index_status = '{DocVersionIndexStatus.FAILED}'{ingest_lease.clear_set_sql()}
+                                WHERE doc_id = %s AND version_no = %s AND index_status = '{DocVersionIndexStatus.PROCESSING}'{_rls.fence_where_sql(_rk)}
+                            """, (doc_id, ver) + _rls.fence_where_params(_rk))
                         conn_rb.commit()
                 except Exception as e:
                     if 'conn_rb' in locals() and conn_rb:
@@ -659,16 +691,22 @@ def _reset_stale_stage2_locks() -> int:
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cur:
+            # PR-4（R4a 共识）：接管谓词走 takeover seam（off 渲染=原 2h 字节）；
+            # 复位顺带清租约列（off 空串）。留痕文本条件化：off 输出与旧实现逐字节
+            # 相同；on 才说 lease expired（谓词此时确实按到期放行）。
+            _stale_reason = (" stale (lease expired / >2h no progress); reset for retry"
+                             if ingest_lease.lease_enabled()
+                             else " >2h without progress; reset for retry")
             cur.execute(f"""
                 UPDATE document_version
                 SET content_process_status = 'FAILED',
                     content_process_error = CONCAT('[STALE_LOCK_TAKEOVER] was ',
-                        content_process_status, ' >2h without progress; reset for retry'),
+                        content_process_status, '{_stale_reason}'),
                     {RETRY_COUNT_INC_SQL},
-                    updated_at = NOW()
+                    updated_at = NOW(){ingest_lease.clear_set_sql()}
                 WHERE content_process_status IN ('LOADING', 'PROCESSING')
                   AND status = 'active'
-                  AND updated_at < NOW() - INTERVAL 2 HOUR
+                  AND {ingest_lease.takeover_where_sql()}
             """)
             n = cur.rowcount
             conn.commit()
@@ -688,7 +726,8 @@ def _count_pending_rows(stage: int) -> int:
                & file_ext ∉ ingest_policy.STAGE1_SQL_EXCLUDED_EXTS（与认领 SQL 同一常量；
                不一致 = 计数器看得到、认领挑不走 → 无进展守卫永久判死 stage-1）& active
       Stage 2: (NOT_STARTED 或 FAILED&retry_count<3) & active & canonical_json_key IS NOT NULL
-      Stage 3: chunk_meta NOT_INDEXED/FAILED & is_active & (dv 非 PROCESSING 或 已过 2h 失效锁)
+      Stage 3: chunk_meta NOT_INDEXED/FAILED & is_active & (dv 非 PROCESSING 或 已过
+               失效判定——takeover seam：off=2h 年龄（字节同旧），on=租约到期/无租约 2h 兜底)
     """
     from opensearch_pipeline.ingest_policy import stage1_ext_exclusion_sql
     from opensearch_pipeline.pipeline_nodes import _get_db_conn
@@ -716,7 +755,7 @@ def _count_pending_rows(stage: int) -> int:
             WHERE cm.index_status IN ({sql_in_list(STAGE3_CHUNK_RESELECT_INDEX_STATUS)})
               AND cm.is_active = 1
               AND (dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
-                   OR dv.updated_at < NOW() - INTERVAL 2 HOUR)
+                   OR {ingest_lease.takeover_where_sql("dv.")})
         """,
     }
     conn = None
@@ -773,13 +812,27 @@ _UNCLAIMABLE_PROBES = {
          """,
          "达 RAG_STAGE3_CHUNK_MAX_RETRIES 上限，不在 loader 重选集内；"
          "所属文档已置 chunk_status='NEEDS_REVIEW'，需人工复位 NOT_INDEXED + 计数清零"),
-        ("stage-3 版本锁未释放 (index_status=PROCESSING 且未满 2h)",
-         f"""
+        # PR-4（R4b 共识）：live-lock 探针按执行期 flag 惰性生成——模块级 f-string 会把
+        # import 时的 flag 状态冻死。off 分支返回与 pre-port 逐字节相同的 (label, sql, hint)；
+        # on 分支用 NOT(takeover) 补集（lease 到期即可抢 ⇒ 不再算"未释放"）。
+        # updated_at=NULL 的无租约行两臂一致不计数（SQL 三值：NOT(UNKNOWN)=UNKNOWN，
+        # 与旧 `>=` 行为相同——known limitation，真值表测试钉住）。
+        (lambda: (
+            ("stage-3 版本锁未释放 (index_status=PROCESSING 且租约未到期)",
+             f"""
+            SELECT COUNT(*) FROM document_version
+            WHERE index_status = '{DocVersionIndexStatus.PROCESSING}'
+              AND NOT ({ingest_lease.takeover_where_sql()})
+         """,
+             "租约未到期（或无租约且未满 2h）的锁不可抢占；持续不降即上一轮中断残留")
+            if ingest_lease.lease_enabled() else
+            ("stage-3 版本锁未释放 (index_status=PROCESSING 且未满 2h)",
+             f"""
             SELECT COUNT(*) FROM document_version
             WHERE index_status = '{DocVersionIndexStatus.PROCESSING}'
               AND updated_at >= NOW() - INTERVAL 2 HOUR
          """,
-         "2h 内的锁按设计不可抢占（正常并发/刚崩溃都会出现）；持续不降即上一轮中断残留"),
+             "2h 内的锁按设计不可抢占（正常并发/刚崩溃都会出现）；持续不降即上一轮中断残留"))),
     ],
 }
 
@@ -796,7 +849,9 @@ def _probe_unclaimable_rows(stage: int) -> list:
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cur:
-            for label, sql, hint in probes:
+            for _entry in probes:
+                # PR-4：条目可为惰性 callable（返回 (label, sql, hint)）——flag 在执行期读取
+                label, sql, hint = _entry() if callable(_entry) else _entry
                 try:
                     cur.execute(sql)
                     cnt = int(cur.fetchone()[0])

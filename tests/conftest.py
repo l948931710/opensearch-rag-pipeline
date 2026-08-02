@@ -185,6 +185,9 @@ _LOCAL_STACK_SERIAL_MODULES = {
     "test_simulate_prod_guard.py",  # 操纵 prod-guard/config 全局态
     "test_kb_db_integration.py",    # kb console 端点真库回归（qa/feedback/doc 真实 DML）
     "test_reconcile_races.py",      # F3 双连接锁序测试（真实行锁/两连接并发 DML）
+    # PR-4：摄取租约故障注入——document_version 真实 DML + 行锁阻塞用例，与
+    # test_pipeline（整表清空）/test_concurrency（行锁语义）同表，必须同组串行
+    "test_ingest_lease_db.py",
 }
 
 

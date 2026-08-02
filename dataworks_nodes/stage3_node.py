@@ -62,9 +62,12 @@ os.environ["RAG_ENVIRONMENT"] = "production"
 # 用 [] 直赋而非 setdefault:守卫要的是"确定为真",setdefault 在外部注入 false 时会失守。
 os.environ["RAG_REQUIRE_AUTH"] = "true"
 os.environ["RAG_ACL_FAIL_CLOSED"] = "true"
-# ── PR-4 摄取租约(RAG_INGEST_LEASE_ENABLE)已随 op0 包退场(main 包无该模块)──
-# 旧节点此处 setdefault "true";main 包读不到该 flag,设了也是死值,故整行移除留碑。
-# 移植回 main 的任务在跑(task_68097fb4);移植落地+开 flag 前**不得提高摄取并发**。
+# ── PR-4 摄取租约(RAG_INGEST_LEASE_ENABLE)：模块已移植回 main(2026-08-02,task_68097fb4),
+# flag **默认关**——本模板刻意不设该 env(关=逐字节 legacy 行为)。启用走
+# docs/ingest_lease_fencing_scope_2026-07-17.md 附录 A 的 runbook(先清残留租约列再开)。
+# ⚠️ 重贴正式节点必须用 main 生成器版(本文件):旧 op0 paste 版此处有 setdefault "true",
+# 若沿用旧贴片+新 main 包(现已含租约模块),租约会**隐式开启**,绕过 runbook 前置清理。
+# 开 flag 前**不得提高摄取并发**;开 flag 后并发才允许升(设计顺序约束)。
 
 # ── Robustness features (validated GO 2026-06-23; default-OFF in code, enabled here for prod) ──
 # Stage-3 node 04b. setdefault → overridable (set the env var to 'false' to disable).

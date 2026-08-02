@@ -446,7 +446,7 @@ quarantine/   高风险隔离区
 
 尚未修复、做架构决策时需要知晓的事项（与 `CLAUDE.md` Gotchas 同步）：
 
-1. **乐观锁无通用租约/心跳**：stage-3 有 2h 失锁接管，但 stage-1/2 的 `content_process_status` 没有任何年龄守卫——进程崩溃会永久卡住行。
+1. **摄取租约已回 main、默认关**（2026-08-02 PR-4 移植，schema/048 三环境已 apply）：`opensearch_pipeline/ingest_lease.py` 提供认领租约+续租+fencing epoch，stage-2/3 台账写回全部接线；`RAG_INGEST_LEASE_ENABLE` **默认 off**（off=逐字节 legacy：2h 年龄式接管兜底）。启用前置 runbook 见 `docs/ingest_lease_fencing_scope_2026-07-17.md` 附录 A；**提高摄取并发之前必须先开租约**。
 2. **跨云无两阶段提交**：HA3 删除是不可逆操作，与 RDS 之间没有 2PC。`spot_checker.py` 的 `PENDING_DELETE` 对账模式是待推广的解法；`ha3_reconcile.py::reconcile_ha3_orphan_pks` 已作为**事后自愈**部分缓解（按 HA3 主键清掉同 chunk_id 重灌产生的孤儿物理行），但写入时刻的强一致仍缺。
 3. **部分批失败的双版本在线**：批内个别文档失败时，已 INDEXED 的文档其旧版本仍处激活态，新旧两版同时可检。
 4. **会话内存态**：见 §9.3，横向扩容前必须迁 Redis。

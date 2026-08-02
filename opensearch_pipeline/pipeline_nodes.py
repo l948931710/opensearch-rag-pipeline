@@ -27,6 +27,7 @@ from opensearch_pipeline.ingest_flags import (
     effective_funnel_policy_version,
     image_content_override_enabled,
 )
+from opensearch_pipeline import ingest_lease
 from opensearch_pipeline.reindex_states import (
     RETRY_COUNT_INC_SQL,
     STAGE3_CLAIMABLE_INDEX_STATUS,
@@ -66,6 +67,35 @@ from opensearch_pipeline.pii_patterns import (  # noqa: F401
     _image_ocr_fp_ignore,
     scrub_image_text,
 )
+
+
+def _lease_renew_tick(ctx: dict):
+    """PR-4 摄取租约批量续租触点（stage-2/3 长循环内逐文档/逐批调用）。
+
+    免 DB 节流预判（should_renew）到期才开一次池连接；批语义整集续租——逐 key
+    续护不住还在队尾排队的文档。丢锁不在这里 raise（renew_all 内部记墓碑出集，
+    失主文档走到栅栏写时 LeaseLost 弃单——墓碑保证拒绝是强制的）。任何异常
+    fail-open：续租失败的最坏结果=到期被接管，方向安全；绝不因续租故障打断
+    主流程。flag off 时 should_renew 恒 False，零开销零行为。"""
+    ls = ingest_lease.get_lease_set(ctx)
+    if not ls.should_renew():
+        return
+    conn = None
+    try:
+        conn = _get_db_conn(select_db=True)
+        with conn.cursor() as cur:
+            ls.renew_all(cur)
+        conn.commit()
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print(f"    ⚠️ lease renew tick failed (fail-open): {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 
@@ -2209,12 +2239,14 @@ def node_classify_and_risk_assess(ctx: dict):
                         _dv_clause = " OR ".join(
                             ["(doc_id = %s AND version_no = %s)"] * len(_claim_keys))
                         _dv_params = tuple(p for k in _claim_keys for p in k)
+                        # PR-4：认领顺带盖租约戳（off 时片段空=SQL 逐字节现状）；epoch 恒 +1
+                        # 也顺带消解了同值 UPDATE 的 changed-rows 歧义（LOADING 行重认领必改行）。
                         cursor.execute(f"""
                             UPDATE document_version
-                            SET content_process_status = 'PROCESSING'
+                            SET content_process_status = 'PROCESSING'{ingest_lease.claim_set_sql()}
                             WHERE ({_dv_clause})
                               AND content_process_status IN ('NOT_STARTED', 'LOADING', 'FAILED')
-                        """, _dv_params)
+                        """, ingest_lease.claim_set_params() + _dv_params)
                         _all_claimed = cursor.rowcount == len(_claim_keys)
                     if _all_claimed:
                         _dedup_seen = set()
@@ -2225,22 +2257,27 @@ def node_classify_and_risk_assess(ctx: dict):
                                 continue
                             _dedup_seen.add(_k)
                             valid_canonicals.append(doc)
+                        ingest_lease.get_lease_set(ctx).fetch_and_register(cursor, _claim_keys)
                         conn.commit()
                     else:
                         # 兜底：回滚集合式认领后按旧语义逐行认领（rowcount>0 = 本次真的改到了行）
                         if _claim_keys:
                             conn.rollback()
+                        _fb_claimed_keys = []
                         for doc in canonicals:
-                            cursor.execute("""
+                            cursor.execute(f"""
                                 UPDATE document_version
-                                SET content_process_status = 'PROCESSING'
+                                SET content_process_status = 'PROCESSING'{ingest_lease.claim_set_sql()}
                                 WHERE doc_id = %s AND version_no = %s
                                   AND content_process_status IN ('NOT_STARTED', 'LOADING', 'FAILED')
-                            """, (doc["doc_id"], doc["version_no"]))
+                            """, ingest_lease.claim_set_params()
+                               + (doc["doc_id"], doc["version_no"]))
                             if cursor.rowcount > 0:
                                 valid_canonicals.append(doc)
+                                _fb_claimed_keys.append((doc["doc_id"], doc["version_no"]))
                             else:
                                 print(f"    └─ Task {doc['doc_id']} v{doc['version_no']} skipped (preempted or already processing content)")
+                        ingest_lease.get_lease_set(ctx).fetch_and_register(cursor, _fb_claimed_keys)
                         conn.commit()
                 break  # 预占成功，退出重试循环
             except Exception as e:
@@ -2330,11 +2367,26 @@ def node_classify_and_risk_assess(ctx: dict):
                             "WHERE doc_id=%s",
                             (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["doc_id"]),
                             (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["doc_id"]))
+                        # PR-4（R1 共识）：dv 写前同事务验租（FOR UPDATE 行锁持至 commit）。
+                        # 本路径 SET 全为确定性字面量，重试必同值 changed-rows=0——不得以
+                        # rowcount 判租；fence 谓词在行锁下恒命中，纯防御。语句序保持 main
+                        # 的 meta→dv 全局纪律；LeaseLost ⇒ 整事务回滚（meta 也不落）。
+                        _fk = (doc["doc_id"], doc["version_no"])
+                        _ffs = ingest_lease.get_lease_set(ctx)
+                        _ffs.verify_for_update(_cur, _fk)
                         _cur.execute(
                             "UPDATE document_version SET classification_method='FROZEN_MAINTENANCE', "
-                            "classification_status='CONTENT_CLASSIFIED' WHERE doc_id=%s AND version_no=%s",
-                            (doc["doc_id"], doc["version_no"]))
+                            "classification_status='CONTENT_CLASSIFIED' WHERE doc_id=%s AND version_no=%s"
+                            + _ffs.fence_where_sql(_fk),
+                            (doc["doc_id"], doc["version_no"]) + _ffs.fence_where_params(_fk))
                         _cm.commit()
+                except ingest_lease.LeaseLost:
+                    if _cm:
+                        try: _cm.rollback()
+                        except Exception: pass
+                    print(f"    ⚠️ Lease lost on {doc['doc_id']} v{doc['version_no']} — "
+                          f"frozen classification persist skipped (preempted)")
+                    return False
                 finally:
                     if _cm:
                         _cm.close()
@@ -2369,12 +2421,24 @@ def node_classify_and_risk_assess(ctx: dict):
                              doc["permission_level"], doc["kb_type"], doc["doc_id"]),
                             (doc["category_l1"], doc["category_l2"], doc["owner_dept"],
                              doc["permission_level"], doc["kb_type"], doc["doc_id"]))
+                        # PR-4（R1 共识）：同 frozen 路径——verify_for_update 判租，
+                        # 不依赖 rowcount（SET 确定性字面量）；LeaseLost ⇒ 整事务回滚。
+                        _bk = (doc["doc_id"], doc["version_no"])
+                        _bfs = ingest_lease.get_lease_set(ctx)
+                        _bfs.verify_for_update(_cur, _bk)
                         _cur.execute(
                             "UPDATE document_version SET classification_method='CONTRIBUTION_FAQ', "
                             "faq_eligible=1, classification_status='CONTENT_CLASSIFIED' "
-                            "WHERE doc_id=%s AND version_no=%s",
-                            (doc["doc_id"], doc["version_no"]))
+                            "WHERE doc_id=%s AND version_no=%s" + _bfs.fence_where_sql(_bk),
+                            (doc["doc_id"], doc["version_no"]) + _bfs.fence_where_params(_bk))
                         _cm.commit()
+                except ingest_lease.LeaseLost:
+                    if _cm:
+                        try: _cm.rollback()
+                        except Exception: pass
+                    print(f"    ⚠️ Lease lost on {doc['doc_id']} v{doc['version_no']} — "
+                          f"contribution classification persist skipped (preempted)")
+                    return False
                 finally:
                     if _cm:
                         _cm.close()
@@ -2469,6 +2533,11 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     conn_dv = _get_db_conn(select_db=True)
                     with conn_dv.cursor() as cursor:
+                        # PR-4：FAILED 终态带栅栏+清租约——被接管的文档归新持有者，僵尸
+                        # 不落终态。RETRY_COUNT_INC 恒改行，无 changed-rows 歧义，可用
+                        # rowcount 判租（check_fenced_write）。
+                        _lk = (doc["doc_id"], doc["version_no"])
+                        _lls = ingest_lease.get_lease_set(ctx)
                         cursor.execute(f"""
                             UPDATE document_version
                             SET classification_method = 'LLM',
@@ -2477,10 +2546,19 @@ def node_classify_and_risk_assess(ctx: dict):
                                 classification_status = 'PENDING_AUDIT',
                                 content_process_status = 'FAILED',
                                 content_process_error = %s,
-                                {RETRY_COUNT_INC_SQL}
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (api_error_reason, doc["doc_id"], doc["version_no"]))
+                                {RETRY_COUNT_INC_SQL}{ingest_lease.clear_set_sql()}
+                            WHERE doc_id = %s AND version_no = %s{_lls.fence_where_sql(_lk)}
+                        """, (api_error_reason, doc["doc_id"], doc["version_no"])
+                           + _lls.fence_where_params(_lk))
+                        _lls.check_fenced_write(cursor, _lk)
                         conn_dv.commit()
+                        _lls.discard(_lk)  # 终态已落，本地释放
+                except ingest_lease.LeaseLost:
+                    if conn_dv:
+                        try: conn_dv.rollback()
+                        except Exception: pass
+                    print(f"    ⚠️ Lease lost on {doc['doc_id']} v{doc['version_no']} — "
+                          f"FAILED write skipped (preempted by another holder)")
                 except Exception as dv_err:
                     if conn_dv:
                         try: conn_dv.rollback()
@@ -2553,6 +2631,15 @@ def node_classify_and_risk_assess(ctx: dict):
                             (doc["category_l1"], doc["category_l2"], doc["owner_dept"], doc["summary"],
                              doc["permission_level"], doc["kb_type"], doc["doc_id"]))
 
+                        # PR-4（R1 共识）：dv 写前同事务验租（行锁持至 commit）——此前
+                        # 无栅栏时 TTL 接管后停滞僵尸的迟到分类照样 last-writer-wins 落库，
+                        # document_meta 的 category/permission 与新持有者实际切块入索引的
+                        # chunk 集分道扬镳。SET 可能全同值（LLM 重掷同结果），不得以
+                        # rowcount 判租；LeaseLost ⇒ 整事务回滚（上方 meta 写也不落）。
+                        # flag off 时 verify no-op、fence 空串 = 字节级旧行为。
+                        _ck = (doc["doc_id"], doc["version_no"])
+                        _cfs = ingest_lease.get_lease_set(ctx)
+                        _cfs.verify_for_update(cursor, _ck)
                         cursor.execute("""
                             UPDATE document_version
                             SET classification_method = 'LLM',
@@ -2560,9 +2647,17 @@ def node_classify_and_risk_assess(ctx: dict):
                                 risk_level = %s,
                                 faq_eligible = %s,
                                 classification_status = 'CONTENT_CLASSIFIED'
-                            WHERE doc_id = %s AND version_no = %s
-                        """, (confidence, doc["llm_risk_level"], doc["faq_eligible"], doc["doc_id"], doc["version_no"]))
+                            WHERE doc_id = %s AND version_no = %s""" + _cfs.fence_where_sql(_ck) + """
+                        """, (confidence, doc["llm_risk_level"], doc["faq_eligible"], doc["doc_id"], doc["version_no"])
+                           + _cfs.fence_where_params(_ck))
                         conn.commit()
+                except ingest_lease.LeaseLost:
+                    if conn:
+                        try: conn.rollback()
+                        except Exception: pass
+                    print(f"    ⚠️ Lease lost on {doc['doc_id']} v{doc['version_no']} — "
+                          f"classification persist skipped (preempted; doc abandoned this run)")
+                    return False   # 弃单文档继续批（归新持有者），不 abort 节点
                 except Exception as db_err:
                     if conn: conn.rollback()
                     print(f"    ⚠️ Failed to persist metadata to RDS: {db_err}")
@@ -2585,6 +2680,9 @@ def node_classify_and_risk_assess(ctx: dict):
             success = _classify_single_doc(doc)
             if not success:
                 failed_doc_ids.add(doc["doc_id"])
+            # PR-4：批语义续租（免 DB 节流预判，到期才真跑；fail-open）——
+            # 大批 LLM 分类是 stage-2 最长阶段，队尾文档的租约在这里保活。
+            _lease_renew_tick(ctx)
     else:
         # ⚠️ 与单文档路径对齐（F-13）：worker `return False` = 业务性失败（LLM API 不可达的
         # fail-safe 降级）→ 按文档跳过；worker 抛异常 = 应中止类（DB 持久化失败 RuntimeError /
@@ -2607,6 +2705,7 @@ def node_classify_and_risk_assess(ctx: dict):
                     raise
                 if not success:
                     failed_doc_ids.add(doc["doc_id"])
+                _lease_renew_tick(ctx)  # PR-4：同上（并发臂，主线程节拍）
 
     elapsed = _time.time() - t0
     success_count = len(valid_canonicals) - len(failed_doc_ids)
@@ -6020,10 +6119,12 @@ def node_publish_to_rag_ready(ctx: dict):
                 for job, _fut in zip(upload_jobs, _futs):
                     _fut.result()
                     _persist_publish_status(job)
+                    _lease_renew_tick(ctx)  # PR-4：大批 OSS 上传期保活租约（节流+fail-open）
         else:
             for job in upload_jobs:
                 _upload_published_files(job)
                 _persist_publish_status(job)
+                _lease_renew_tick(ctx)  # PR-4：同上（串行臂）
     finally:
         if _pub_conn_box["conn"] is not None:
             try:
@@ -6124,6 +6225,9 @@ def node_write_chunk_meta(ctx: dict):
         rag_ready_map[doc["doc_id"]] = rag_ready_key
 
     written = 0
+    # PR-4：本次 run 内验租失败（被接管）的 (doc_id, version_no)——chunk 写与状态收尾
+    # 全部跳过（文档归新持有者）；flag off 恒空=现状。函数级作用域：收尾循环也要读。
+    _lease_lost_dvs = set()
     if not simulate_db and valid_chunks:
         from opensearch_pipeline.env_guard import assert_destructive_write_allowed
         assert_destructive_write_allowed("write_chunk_meta", get_config().rds.host, kind="rds")
@@ -6198,6 +6302,25 @@ def node_write_chunk_meta(ctx: dict):
                 #    按 (doc_id, version_no) 全量删除 = 幂等重试 + 消除 strand；DELETE 与下方 INSERT
                 #    同一事务，任一失败整体 rollback。旧版本（version_no 不同）不受影响，仍由 stage-3
                 #    deactivate 处理（保留旧版本直到 stage-3 验证 + scoped purge）。
+                # PR-4：DELETE→INSERT 是租约要防的头号撕裂点——同一事务内先对每个
+                # (doc_id,version_no) FOR UPDATE 验租（通过后本事务内不可能再被接管：
+                # 接管 UPDATE 会阻塞在 dv 行锁上直到 commit）。丢锁的文档整篇剔除
+                # （delete_targets 与 insert 同步剔——文档粒度弃单，绝不产生 doc 内
+                # partial；归属守卫 _rechunk_delete_targets 的「完整替换」不变量保持）。
+                # off/未登记时 verify 是 no-op，_lease_lost_dvs 恒空=现状。
+                _wls = ingest_lease.get_lease_set(ctx)
+                for _dv in list(delete_targets):
+                    try:
+                        _wls.verify_for_update(cursor, (_dv[0], int(_dv[1])))
+                    except ingest_lease.LeaseLost:
+                        _lease_lost_dvs.add((_dv[0], int(_dv[1])))
+                        print(f"    ⚠️ Lease lost on {_dv[0]} v{_dv[1]} — chunk write "
+                              f"abandoned (preempted by another holder)")
+                if _lease_lost_dvs:
+                    delete_targets = [dv for dv in delete_targets
+                                      if (dv[0], int(dv[1])) not in _lease_lost_dvs]
+                    valid_chunks = [c for c in valid_chunks
+                                    if (c.doc_id, int(c.version_no)) not in _lease_lost_dvs]
                 if delete_targets:
                     dv_clause = " OR ".join(["(doc_id=%s AND version_no=%s)"] * len(delete_targets))
                     dv_params = tuple(p for dv in delete_targets for p in dv)
@@ -6338,8 +6461,14 @@ def node_write_chunk_meta(ctx: dict):
     # 事务提交，见 audit_log.py 文档），复用会把「审计失败绝不阻断摄取」的 fail-open 契约改成
     # fail-closed，故保持自开短连接。
     _closure_conn = None
+    _cls = ingest_lease.get_lease_set(ctx)
     try:
         for doc_id, ver in sorted(doc_versions_to_process):
+            # PR-4：验租失败的文档整篇跳过收尾（chunk 写已剔，终态归新持有者）；
+            # 其余文档顺带走一次节流续租（大批收尾期保活）。
+            if (doc_id, int(ver)) in _lease_lost_dvs:
+                continue
+            _lease_renew_tick(ctx)
             doc_chunks = _chunks_by_dv.get((doc_id, ver), [])
             chunk_cnt = len(doc_chunks)
 
@@ -6354,17 +6483,25 @@ def node_write_chunk_meta(ctx: dict):
                         if _closure_conn is None:
                             _closure_conn = _get_db_conn(select_db=True)
                         with _closure_conn.cursor() as cursor:
-                            cursor.execute("""
+                            _lk = (doc_id, int(ver))
+                            cursor.execute(f"""
                                 UPDATE document_version
                                 SET chunk_status = 'QUARANTINED_EXPLOSION',
                                     content_process_status = 'QUARANTINED',
                                     content_process_error = %s,
                                     publish_status = 'SKIPPED_EXPLOSION',
                                     rag_ready_key = NULL,
-                                    processed_at = NOW()
-                                WHERE doc_id = %s AND version_no = %s
-                            """, (f"chunk-explosion: {_exp_reason}"[:255], doc_id, ver))
+                                    processed_at = NOW(){ingest_lease.clear_set_sql()}
+                                WHERE doc_id = %s AND version_no = %s{_cls.fence_where_sql(_lk)}
+                            """, (f"chunk-explosion: {_exp_reason}"[:255], doc_id, ver)
+                               + _cls.fence_where_params(_lk))
+                            _cls.check_fenced_write(cursor, _lk)
                             _closure_conn.commit()
+                            _cls.discard(_lk)  # 终态已落，本地释放（后续同 doc 辅助写不再拼栅栏）
+                    except ingest_lease.LeaseLost:
+                        _closure_conn = _rollback_or_discard(_closure_conn)
+                        print(f"    ⚠️ Lease lost on {doc_id} v{ver} — explosion-quarantine "
+                              f"write skipped (preempted)")
                     except Exception as db_err:
                         _closure_conn = _rollback_or_discard(_closure_conn)
                         print(f"    ⚠️ Failed to write explosion-quarantine status for {doc_id} v{ver}: {db_err}")
@@ -6433,15 +6570,23 @@ def node_write_chunk_meta(ctx: dict):
                             _closure_conn = _get_db_conn(select_db=True)
                         with _closure_conn.cursor() as cursor:
                             # _retry_clause 是上面二选一的常量字面量（非用户输入）→ 无注入风险。
+                            _lk = (doc_id, int(ver))
                             cursor.execute(f"""
                                 UPDATE document_version
                                 SET chunk_status = %s,
                                     content_process_status = %s,
                                     content_process_error = %s{_retry_clause},
-                                    processed_at = NOW()
-                                WHERE doc_id = %s AND version_no = %s
-                            """, (_chunk_status, _cps, _cpe, doc_id, ver))
+                                    processed_at = NOW(){ingest_lease.clear_set_sql()}
+                                WHERE doc_id = %s AND version_no = %s{_cls.fence_where_sql(_lk)}
+                            """, (_chunk_status, _cps, _cpe, doc_id, ver)
+                               + _cls.fence_where_params(_lk))
+                            _cls.check_fenced_write(cursor, _lk)
                             _closure_conn.commit()
+                            _cls.discard(_lk)  # 终态已落，本地释放
+                    except ingest_lease.LeaseLost:
+                        _closure_conn = _rollback_or_discard(_closure_conn)
+                        print(f"    ⚠️ Lease lost on {doc_id} v{ver} — 0-chunk closure "
+                              f"write skipped (preempted)")
                     except Exception as db_err:
                         _closure_conn = _rollback_or_discard(_closure_conn)
                         print(f"    ⚠️ Failed to update failed status in RDS: {db_err}")
@@ -6458,19 +6603,30 @@ def node_write_chunk_meta(ctx: dict):
                             # B1a（2026-07-25）：成功出口清零 retry_count（与 EMPTY/DONE 出口同型）。
                             # 语义 = 「连续失败次数」；只增不减会让一篇曾失败 2 次、后来正常收口的
                             # 文档带着旧计数，下次再失败一次就提前进死信。合入同一条原子 UPDATE：
-                            # 不新增目标集合、不新增写次数，因此不新增所有权暴露面
-                            # （该 closure 本身仍无 per-claim fence，属 B1b 的遗留风险，未修复）。
-                            cursor.execute("""
+                            # 不新增目标集合、不新增写次数，因此不新增所有权暴露面。
+                            # （B1b 后记 2026-08-02：per-claim fence 已随 PR-4 租约移植补上——
+                            # flag on 时本写带 holder/epoch 谓词；off 时空串=旧行为。）
+                            _lk = (doc_id, int(ver))
+                            cursor.execute(f"""
                                 UPDATE document_version
                                 SET content_process_status = 'DONE',
                                     chunk_status = 'DONE',
                                     chunk_count = %s,
                                     retry_count = 0,
                                     processed_at = NOW(),
-                                    content_process_error = NULL
-                                WHERE doc_id = %s AND version_no = %s
-                            """, (chunk_cnt, doc_id, ver))
+                                    content_process_error = NULL{ingest_lease.clear_set_sql()}
+                                WHERE doc_id = %s AND version_no = %s{_cls.fence_where_sql(_lk)}
+                            """, (chunk_cnt, doc_id, ver) + _cls.fence_where_params(_lk))
+                            _cls.check_fenced_write(cursor, _lk)
                             _closure_conn.commit()
+                            _cls.discard(_lk)  # 终态已落，本地释放——紧随的 vlm 覆写走无栅栏旧语义
+                    except ingest_lease.LeaseLost:
+                        # 丢锁≠故障：文档归新持有者，跳过 DONE 收尾即可——绝不为此 abort 节点
+                        # （chunk 写入已在同一 run 的验租点保护；此处只是终态归属权判负）。
+                        _closure_conn = _rollback_or_discard(_closure_conn)
+                        print(f"    ⚠️ Lease lost on {doc_id} v{ver} — DONE closure "
+                              f"write skipped (preempted)")
+                        continue
                     except Exception as db_err:
                         _closure_conn = _rollback_or_discard(_closure_conn)
                         print(f"    ⚠️ Failed to update DONE status in RDS for document {doc_id} v{ver}: {db_err}")
@@ -6535,13 +6691,19 @@ def node_write_chunk_meta(ctx: dict):
                             if _closure_conn is None:
                                 _closure_conn = _get_db_conn(select_db=True)
                             with _closure_conn.cursor() as cursor:
-                                cursor.execute("""
+                                _lk = (doc_id, int(ver))
+                                cursor.execute(f"""
                                     UPDATE document_version
                                     SET content_process_status = 'NEEDS_REVIEW',
-                                        content_process_error = %s
-                                    WHERE doc_id = %s AND version_no = %s
-                                """, (_vlm_note, doc_id, ver))
+                                        content_process_error = %s{ingest_lease.clear_set_sql()}
+                                    WHERE doc_id = %s AND version_no = %s{_cls.fence_where_sql(_lk)}
+                                """, (_vlm_note, doc_id, ver) + _cls.fence_where_params(_lk))
+                                _cls.check_fenced_write(cursor, _lk)
                                 _closure_conn.commit()
+                        except ingest_lease.LeaseLost:
+                            _closure_conn = _rollback_or_discard(_closure_conn)
+                            print(f"    ⚠️ Lease lost on {doc_id} v{ver} — vlm NEEDS_REVIEW "
+                                  f"write skipped (preempted)")
                         except Exception as db_err:
                             _closure_conn = _rollback_or_discard(_closure_conn)
                             print(f"    ⚠️ Failed to mark NEEDS_REVIEW (vlm degraded) for "
@@ -6594,10 +6756,10 @@ def node_acquire_index_lock(ctx: dict):
                     _dv_params = tuple(p for dv in doc_versions for p in dv)
                     cursor.execute(f"""
                         UPDATE document_version
-                        SET index_status = '{DocVersionIndexStatus.PROCESSING}'
+                        SET index_status = '{DocVersionIndexStatus.PROCESSING}'{ingest_lease.claim_set_sql()}
                         WHERE ({_dv_clause})
                           AND index_status IN ({sql_in_list(STAGE3_CLAIMABLE_INDEX_STATUS)})
-                    """, _dv_params)
+                    """, ingest_lease.claim_set_params() + _dv_params)
                     _all_claimed = cursor.rowcount == len(doc_versions)
                 if _all_claimed:
                     valid_doc_versions.update(doc_versions)
@@ -6607,20 +6769,20 @@ def node_acquire_index_lock(ctx: dict):
                     for doc_id, ver in doc_versions:
                         cursor.execute(f"""
                             UPDATE document_version
-                            SET index_status = '{DocVersionIndexStatus.PROCESSING}'
+                            SET index_status = '{DocVersionIndexStatus.PROCESSING}'{ingest_lease.claim_set_sql()}
                             WHERE doc_id = %s AND version_no = %s
                               AND index_status IN ({sql_in_list(STAGE3_CLAIMABLE_INDEX_STATUS)})
-                        """, (doc_id, ver))
+                        """, ingest_lease.claim_set_params() + (doc_id, ver))
                         # ── 修复：如果文档已被标记 SUCCESS（前一批次处理了部分 chunk），
                         # 仍然需要允许重新进入以处理残留的 NOT_INDEXED chunk。
                         if cursor.rowcount == 0:
                             # 尝试从 SUCCESS 状态重新锁定
                             cursor.execute(f"""
                                 UPDATE document_version
-                                SET index_status = '{DocVersionIndexStatus.PROCESSING}'
+                                SET index_status = '{DocVersionIndexStatus.PROCESSING}'{ingest_lease.claim_set_sql()}
                                 WHERE doc_id = %s AND version_no = %s
                                   AND index_status = '{DocVersionIndexStatus.SUCCESS}'
-                            """, (doc_id, ver))
+                            """, ingest_lease.claim_set_params() + (doc_id, ver))
                         # ── 接管失效锁：仍处于 PROCESSING 且 >2h 未更新，说明持锁的运行已崩溃。
                         # 没有这一支，崩溃残留的 PROCESSING 文档永远无法被重新入队（loader 会反复
                         # 加载其 chunk 再被过滤掉，整批永远排不空）。2h 阈值与 orchestrator 的
@@ -6634,15 +6796,19 @@ def node_acquire_index_lock(ctx: dict):
                         if cursor.rowcount == 0:
                             cursor.execute(f"""
                                 UPDATE document_version
-                                SET index_status = '{DocVersionIndexStatus.PROCESSING}', updated_at = NOW()
+                                SET index_status = '{DocVersionIndexStatus.PROCESSING}', updated_at = NOW(){ingest_lease.claim_set_sql()}
                                 WHERE doc_id = %s AND version_no = %s
                                   AND index_status = '{DocVersionIndexStatus.PROCESSING}'
-                                  AND updated_at < NOW() - INTERVAL 2 HOUR
-                            """, (doc_id, ver))
+                                  AND {ingest_lease.takeover_where_sql()}
+                            """, ingest_lease.claim_set_params() + (doc_id, ver))
                         if cursor.rowcount > 0:
                             valid_doc_versions.add((doc_id, ver))
                         else:
                             print(f"    └─ Task {doc_id} v{ver} skipped (preempted or already indexing)")
+                # PR-4：认领事务内回读 epoch 登记（off 时 no-op）——embed/push 循环续租、
+                # update_index_status/deactivate 栅栏写皆凭此集
+                ingest_lease.get_lease_set(ctx).fetch_and_register(
+                    cursor, [(d, int(v)) for d, v in valid_doc_versions])
                 conn.commit()
             # 仅保留成功抢占锁的版本的 chunks
             chunks = [c for c in chunks if (c.doc_id, c.version_no) in valid_doc_versions]
@@ -7015,6 +7181,37 @@ def node_deactivate_old_chunks(ctx: dict):
                 for doc_id, ver in current_versions.items():
                     print(f"       {{ \"doc_id\": \"{doc_id}\", \"version_no\": {{ \"lt\": {ver} }} }}")
         elif current_versions:
+            # PR-4：不可逆 HA3 删除前的归属过滤（无锁快照验租——这里不能抱着行锁跨
+            # 网络调用）。丢锁文档从本批剔除：其旧版本停用归新持有者收尾。窗口内
+            # （快照后、删除中）再被接管的残余风险=双方都会删同一批旧 PK，幂等无害；
+            # 失败路径的 conn_fail 事务另有逐 doc 验租（R2）收窄写回窗口。
+            _dls = ingest_lease.get_lease_set(ctx)
+            _deact_lost = set()
+            if ingest_lease.lease_enabled() and not simulate_db:
+                try:
+                    _vconn = _get_db_conn(select_db=True)
+                    try:
+                        with _vconn.cursor() as _vcur:
+                            for _dvk in sorted(current_versions.items()):
+                                _k = (_dvk[0], int(_dvk[1]))
+                                if not _dls.verify_still_held(_vcur, _k):
+                                    _deact_lost.add(_dvk[0])
+                                    print(f"    ⚠️ Lease lost on {_k[0]} v{_k[1]} — old-version "
+                                          f"deactivation abandoned (preempted)")
+                    finally:
+                        _vconn.close()
+                except Exception as _ve:
+                    # 验租通道故障 fail-closed：宁可整批推迟停用（复位路径兜底），绝不带
+                    # 未知归属跑不可逆删除
+                    raise RuntimeError(f"lease pre-check failed before HA3 delete: {_ve}") from _ve
+                if _deact_lost:
+                    # 丢锁文档三处同步剔除：HA3 删除集（current_versions）、收尾集
+                    # （valid_doc_versions——verify_still_held 已留墓碑，后续栅栏会拒绝，
+                    # 但收尾集合仍须显式剔除以免空转弃单打印）；dv 行零触碰（归新持有者）。
+                    current_versions = {d: v for d, v in current_versions.items()
+                                        if d not in _deact_lost}
+                    valid_doc_versions = {(d, v) for d, v in valid_doc_versions
+                                          if d not in _deact_lost}
             try:
                 client = _get_opensearch_client(ctx)
                 index_name = ctx.get("opensearch_index") or get_config().opensearch.index_name
@@ -7056,16 +7253,27 @@ def node_deactivate_old_chunks(ctx: dict):
                     try:
                         conn_fail = _get_db_conn(select_db=True)
                         with conn_fail.cursor() as cur:
+                            _fls_fail = ingest_lease.get_lease_set(ctx)
                             for doc_id, ver in current_versions.items():
+                                # PR-4（R2 共识）：HA3 网络调用期间可能被接管——本失败事务
+                                # 逐 doc 先验租（FOR UPDATE 行锁持至 commit），丢锁则跳过该
+                                # doc 的全部三组写（FAILED CAS/chunk FAILED/PENDING_DELETE），
+                                # 归新持有者收敛。off/未登记 no-op=现状。
+                                try:
+                                    _fls_fail.verify_for_update(cur, (doc_id, int(ver)))
+                                except ingest_lease.LeaseLost:
+                                    print(f"    ⚠️ Lease lost on {doc_id} v{ver} — failure-path "
+                                          f"writeback skipped (preempted)")
+                                    continue
                                 # CAS 收尾（对齐成功路径 6208 / node_update_index_status 7340）：
                                 # 只允许 PROCESSING→FAILED。此前无谓词无条件写 FAILED，会把控制台
                                 # 中途置的 PENDING_DELETE 删除握手（set-visibility→restricted / retire）
                                 # 覆盖掉；FAILED 是 stage-3 可认领态，下批 loader 遂把受限文档以旧
                                 # permission 重推 HA3，且基于 reconcile 的删除永不触发（ultra P1
-                                # 2026-07-17）。（分支版此处还清 ingest 租约；main 无租约列，仅 CAS。）
+                                # 2026-07-17）。clear_set_sql() 顺手清租约（flag off 时空串，现网零副作用）。
                                 cur.execute(f"""
                                     UPDATE document_version
-                                    SET index_status = '{DocVersionIndexStatus.FAILED}'
+                                    SET index_status = '{DocVersionIndexStatus.FAILED}'{ingest_lease.clear_set_sql()}
                                     WHERE doc_id = %s AND version_no = %s
                                       AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                                 """, (doc_id, ver))
@@ -7131,6 +7339,25 @@ def node_deactivate_old_chunks(ctx: dict):
             try:
                 conn = _get_db_conn(select_db=True)
                 with conn.cursor() as cursor:
+                    # PR-4：收尾事务首验租（FOR UPDATE 行锁持至 commit）——丢锁文档从
+                    # is_active 翻转/终态/supersede 三段全部剔除，终态归新持有者。
+                    _fls = ingest_lease.get_lease_set(ctx)
+                    _fin_lost = set()
+                    for _dvk in sorted(set(current_versions.items())
+                                       | {(d, v) for (d, v) in failed_counts
+                                          if (d, v) in valid_doc_versions}):
+                        _k = (_dvk[0], int(_dvk[1]))
+                        try:
+                            _fls.verify_for_update(cursor, _k)
+                        except ingest_lease.LeaseLost:
+                            _fin_lost.add(_dvk)
+                            print(f"    ⚠️ Lease lost on {_k[0]} v{_k[1]} — finalize "
+                                  f"abandoned (preempted)")
+                    if _fin_lost:
+                        current_versions = {d: v for d, v in current_versions.items()
+                                            if (d, v) not in _fin_lost}
+                        valid_doc_versions = {dv for dv in valid_doc_versions
+                                              if dv not in _fin_lost}
                     # Update older chunks
                     # E#45：逐 doc UPDATE → 一条 OR-链合并（谓词逐字对应，行集合一致）
                     # （本批全部被 LIMIT 边界推迟时 current_versions 为空：跳过，仅做状态收尾）
@@ -7174,7 +7401,7 @@ def node_deactivate_old_chunks(ctx: dict):
                         # 的旧权限行删掉，最终一致。
                         cursor.execute(f"""
                             UPDATE document_version
-                            SET index_status = %s
+                            SET index_status = %s{ingest_lease.clear_set_sql()}
                             WHERE ({_st_clause})
                               AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                         """, _st_params)
@@ -7224,6 +7451,8 @@ def node_deactivate_old_chunks(ctx: dict):
     _audit_deactivations = _deact_audit_rows or [
         (d["doc_id"], d["old_version"], d["chunk_id"]) for d in deactivated
     ]
+    # PR-4：丢锁被剔除的文档未真正执行停用——审计行同步剔除（审计=已实现的删除）。
+    _audit_deactivations = [r for r in _audit_deactivations if r[0] in current_versions]
     if _audit_deactivations:
         # A7（2026-07-25）：批量写。此前逐条 write_audit(cursor=None) 每次都「取连接 → INSERT →
         # COMMIT → close」，按【旧 chunk 条数】计费——万级旧 chunk 即万级提交。行粒度不变
@@ -7451,9 +7680,11 @@ def node_generate_embeddings(ctx: dict):
                     _futs = [_ex.submit(_embed_one_batch, bn, b) for bn, b in enumerate(batches)]
                     for _f in as_completed(_futs):
                         _f.result()  # 让未预期的异常冒泡
+                        _lease_renew_tick(ctx)  # PR-4：大批嵌入期保活租约（节流+fail-open）
             else:
                 for bn, b in enumerate(batches):
                     _embed_one_batch(bn, b)
+                    _lease_renew_tick(ctx)  # PR-4：同上（串行臂）
             _store.finalize(_CACHE_MAX_ENTRIES)
             print(f"    └─ Embedding cache updated: {_store.count()} total entries")
         elif not is_dashscope and miss_chunks:
@@ -8030,6 +8261,7 @@ def node_push_to_opensearch(ctx: dict):
     for i, batch in enumerate(batches):
         chunk_count = len(batch["chunks"])
         job_id = batch["job_id"]
+        _lease_renew_tick(ctx)  # PR-4：大批 HA3 推送期保活租约（节流+fail-open）
 
         if simulate_opensearch:
             # 模拟写入延迟
@@ -8257,6 +8489,7 @@ def node_update_index_status(ctx: dict):
             )
     else:
         conn = None
+        _l3_lost = set()  # PR-4：本事务验租失败（被接管）的 (doc_id,ver)——回写整篇剔除
         try:
             conn = _get_db_conn(select_db=True)
             with conn.cursor() as cursor:
@@ -8264,6 +8497,20 @@ def node_update_index_status(ctx: dict):
                 # 一次 SELECT 换掉"写失败再回退"——后者会连带丢弃本事务里已做的 bulk_job 更新，
                 # 详见 _chunk_meta_has_index_retry 的 docstring。
                 _has_retry_col = _chunk_meta_has_index_retry(cursor)
+                # PR-4：事务首对本批全部 (doc_id,ver) FOR UPDATE 验租——通过后行锁持至
+                # commit，接管不可能发生在回写中途；丢锁文档 chunk/终态回写全部跳过
+                # （新持有者会重嵌重推，HA3 cmd=add 同 PK 幂等）。off/未登记 no-op。
+                _uls = ingest_lease.get_lease_set(ctx)
+                _all_l3_dvs = {(c.doc_id, int(c.version_no))
+                               for b in batches for c in b["chunks"]}
+                _all_l3_dvs |= {(c.doc_id, int(c.version_no)) for c in embedding_failed_chunks}
+                for _dvk in sorted(_all_l3_dvs):
+                    try:
+                        _uls.verify_for_update(cursor, _dvk)
+                    except ingest_lease.LeaseLost:
+                        _l3_lost.add(_dvk)
+                        print(f"    ⚠️ Lease lost on {_dvk[0]} v{_dvk[1]} — index-status "
+                              f"writeback abandoned (preempted by another holder)")
                 # Update bulk job records
                 for batch in batches:
                     result = batch.get("result", {})
@@ -8310,6 +8557,8 @@ def node_update_index_status(ctx: dict):
                     # opensearch_doc_id 原逐条写的就是自身 chunk_id → 合并版用列自引用等价表达。
                     _ok_groups = {}
                     for chunk in batch["chunks"]:
+                        if (chunk.doc_id, int(chunk.version_no)) in _l3_lost:
+                            continue  # PR-4：丢锁文档的 chunk 回写归新持有者
                         dim = len(chunk.embedding_vector) if chunk.embedding_vector else None
 
                         # Get optional error properties safely
@@ -8406,7 +8655,8 @@ def node_update_index_status(ctx: dict):
                 # 下轮 loader 按 index_status IN ('NOT_INDEXED','FAILED') 重新加载并重试。
                 # G9：带重试预算——持续 embedding 失败的毒 chunk 达上限转 DEAD 死信 +
                 # 文档 NEEDS_REVIEW，不再每轮占用 loader 队头。
-                _emb_failed_ids = [c.chunk_id for c in embedding_failed_chunks]
+                _emb_failed_ids = [c.chunk_id for c in embedding_failed_chunks
+                                   if (c.doc_id, int(c.version_no)) not in _l3_lost]
                 _emb_dead = _fail_chunks_with_retry_budget(
                     cursor, _emb_failed_ids, extra_set_sql=", embedding_status = 'FAILED'")
                 _mark_docs_needs_review_for_dead(cursor, _emb_dead)
@@ -8414,12 +8664,16 @@ def node_update_index_status(ctx: dict):
                 # If there are failed doc versions, update their document_version status to 'FAILED'
                 if failed_doc_versions:
                     for doc_id, ver in failed_doc_versions:
+                        if (doc_id, int(ver)) in _l3_lost:
+                            continue  # PR-4：终态归新持有者
                         # CAS（盲区审计 P2-2 同款）：只允许 PROCESSING→FAILED——控制台中途置
                         # PENDING_DELETE 的删除握手不被覆盖（覆盖成 FAILED 会让下一批 loader
                         # 重新认领并把受限文档以旧 permission 重推 HA3）。
+                        # PR-4：FAILED 是复位型终态（等下轮重认领）——只清租约不拼栅栏谓词：
+                        # 事务首验租+行锁已保证归属，再拼 epoch 谓词会与 CAS rowcount 语义打架。
                         cursor.execute(f"""
                             UPDATE document_version
-                            SET index_status = '{DocVersionIndexStatus.FAILED}'
+                            SET index_status = '{DocVersionIndexStatus.FAILED}'{ingest_lease.clear_set_sql()}
                             WHERE doc_id = %s AND version_no = %s
                               AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                         """, (doc_id, ver))
@@ -8606,6 +8860,103 @@ def _persist_parity_failed_and_raise(ctx, config, drop_chunks, unknown_chunks, m
         (drift_chunks, "PARITY_DRIFT", drift_msg),
     )
 
+    # ── PR-4 on-arm（R3/B3 共识）：两臂刻意分离——off 臂必须与 pre-port main 逐字节
+    # 一致（评审 B3：flag 关时不得新增任何 DV 写/改变调用序列）。on 臂在**任何**内存
+    # 状态修改/DB 写/失败计数之前，同一事务内对受影响 dv 验租（FOR UPDATE 行锁持至
+    # commit）并按 doc 过滤；全部丢锁 ⇒ 不写不抛直接 return（弃单归新持有者，下游
+    # deactivate 的 verify_still_held 墓碑兜底）；混合批 ⇒ 仅幸存项写回+计数+照常
+    # raise，并补批次5 的 dv PROCESSING→FAILED CAS+清租约（此前只写 chunk_meta 就
+    # raise，dv 卡 PROCESSING 要等 TTL/2h 接管才能重选）。改 off 臂逻辑时必须同步改
+    # 本臂（结构性重复是 B3 的代价，勿合并）。
+    if ingest_lease.lease_enabled():
+        _pls = ingest_lease.get_lease_set(ctx)
+        _dv_keys = sorted({(c.doc_id, int(c.version_no))
+                           for chunks, _c, _m in buckets for c in chunks})
+        _par_lost = set()
+        _live_buckets = buckets
+        conn = None
+        try:
+            conn = _get_db_conn(select_db=True)
+            with conn.cursor() as cursor:
+                for _dk in _dv_keys:
+                    try:
+                        _pls.verify_for_update(cursor, _dk)
+                    except ingest_lease.LeaseLost:
+                        _par_lost.add(_dk)
+                        print(f"    ⚠️ parity: lease lost on {_dk[0]} v{_dk[1]} — "
+                              f"writeback abandoned (owned by new holder)")
+                _live_buckets = tuple(
+                    ([c for c in chunks
+                      if (c.doc_id, int(c.version_no)) not in _par_lost], code, msg)
+                    for chunks, code, msg in buckets)
+                if not any(chunks for chunks, _c, _m in _live_buckets):
+                    conn.rollback()
+                    print("    ⚠️ parity: all affected docs preempted — no writeback, "
+                          "not failing the stage (new holders own convergence)")
+                    return
+                for chunks, code, msg in _live_buckets:
+                    for c in chunks:
+                        c.index_status = ChunkIndexStatus.FAILED
+                        c.index_error_code = code
+                        c.index_error_message = msg
+                _all_dead = []
+                for chunks, code, msg in _live_buckets:
+                    if not chunks:
+                        continue
+                    ids = [c.chunk_id for c in chunks]
+                    try:
+                        _dead = _fail_chunks_with_retry_budget(
+                            cursor, ids,
+                            extra_set_sql=", index_error_code=%s, index_error_message=%s",
+                            extra_params=[code, msg], expect_all=True,
+                            count_retry=(code != "PARITY_UNKNOWN"))
+                    except RuntimeError as _pe:
+                        conn.rollback()
+                        raise RuntimeError(
+                            f"PARITY {_pe} ({code}); rolled back to avoid a partial write "
+                            f"that strands INDEXED-but-absent chunks (never re-selected).") from _pe
+                    _all_dead.extend(_dead)
+                    for c in chunks:
+                        if c.chunk_id in set(_dead):
+                            c.index_status = ChunkIndexStatus.DEAD
+                _mark_docs_needs_review_for_dead(cursor, _all_dead)
+                # 批次5（ultra 评审）：同事务把幸存 dv 从 PROCESSING CAS 回 FAILED+清租约。
+                # CAS on PROCESSING 保住控制台 PENDING_DELETE 握手；fence 在验租行锁下恒
+                # 命中，刻意不 check_fenced_write（CAS miss=行已离开 PROCESSING，合法）。
+                for _dk in _dv_keys:
+                    if _dk in _par_lost:
+                        continue
+                    cursor.execute(f"""
+                        UPDATE document_version
+                        SET index_status = '{DocVersionIndexStatus.FAILED}'{ingest_lease.clear_set_sql()}
+                        WHERE doc_id = %s AND version_no = %s
+                          AND index_status = '{DocVersionIndexStatus.PROCESSING}'{_pls.fence_where_sql(_dk)}
+                    """, (_dk[0], _dk[1]) + _pls.fence_where_params(_dk))
+            conn.commit()
+        except Exception:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            raise
+        finally:
+            if conn:
+                conn.close()
+
+        fdv = ctx.setdefault("failed_doc_versions", set())
+        for chunks, _code, _msg in _live_buckets:
+            for c in chunks:
+                fdv.add((c.doc_id, c.version_no))
+        _n = {code: len(chunks) for chunks, code, _m in _live_buckets}
+        raise RuntimeError(
+            f"Stage-3 parity: {_n.get('PARITY_DROP', 0)} absent (PARITY_DROP) + "
+            f"{_n.get('PARITY_UNKNOWN', 0)} unconfirmable (PARITY_UNKNOWN) + "
+            f"{_n.get('PARITY_DRIFT', 0)} content-drift (PARITY_DRIFT); "
+            f"marked FAILED and aborting DAG to prevent deactivating older chunk versions."
+        )
+
+    # ── off 臂：与 pre-port main 逐字节一致（评审 B3 硬约束）──
     # 内存状态同步（DAG 随后中断，主要为可读性/可测性；RDS 才是下轮重选的事实源）
     for chunks, code, msg in buckets:
         for c in chunks:

@@ -14,8 +14,9 @@ apply 脚本落库并记台账。
 2. **修订已发布文件**记 `NNNa` 修订号（台账 filename 记 `NNN_xxx.sql@NNNa`），不改原行。
 3. **编号严格单调递增，且跨分支全局分配**（Majors ε3 纠偏 2026-07-22：本注长期停在
    022 已过时）——`claude/ontology-p0` 与 main 共用同一号池，agent/ontology 域文件
-   （022-031/033-038/042-048/052-058）只存在于分支侧，main 只落共享/主域号（032/039/
-   040/041/049/050/051）。**下一个可用号 = 060**（059 已由本分支占：image_funnel_verdict），取号前先查两侧 `schema/` 目录与分支
+   （022-031/033-038/042-047/052-058）只存在于分支侧，main 只落共享/主域号（032/039/
+   040/041/048/049/050/051/059/060/061）。048 于 2026-08-02 随 PR-4 租约移植回 main
+   （文件与分支侧逐字节一致，checksum 台账不变）。**下一个可用号 = 062**，取号前先查两侧 `schema/` 目录与分支
    README。历史上有三对编号冲突（002/003/006 各两个文件，见下表）——**不改名**（外部
    引用会悬空），台账里用 `002b/003b/006b` 区分，新文件绝不再冲突。
 4. **`CREATE DATABASE` 必须显式 `CHARSET utf8mb4 COLLATE utf8mb4_unicode_ci`**，每张新表
@@ -57,6 +58,7 @@ apply 脚本落库并记台账。
 | 039_qa_question_hash.sql | fuling_operation | 缺口语义去重 Layer-1（pmc 远期立项，2026-07-15）：qa_session_log.question_hash 归一化哈希列 + 索引——写侧 qa_logger 落列（对脱敏后文本，contribution.question_hash 同口径；1054 负缓存降级，**代码可先行**）；存量回填=scripts/backfill_qa_question_hash.py |
 | 040_qa_gap_semantic_group.sql | fuling_operation | 缺口语义去重 Layer-2：qa_gap_semantic_group 相似问法语义组映射表——生成=scripts/build_qa_gap_semantic_groups.py（embedding 贪心归组，阈值 0.90 保守）；读侧 RAG_QA_GAP_SEMANTIC 默认关且 fail-open；**预注册边界：仅展示层归并，绝不驱动缺口自动关闭**（022-038 agent/ontology 表族条目随 ontology-p0 大合并） |
 | 041_qa_gap_dismissal.sql | fuling_operation | 「忽略此缺口」台账（ε-4 遗留，2026-07-15 拍板交 dept_admin）：question_hash 主键 + revoked_at 可撤销留痕——dismiss/restore 端点写入（语义组开时联动全组成员），kb_gaps 读侧排除 active 行（fail-open）；员工 403 |
+| 048_ingest_lease.sql | fuling_knowledge | PR-4 摄取台账租约/栅栏（2026-07-17 立项，2026-08-02 随移植回 main；**三环境已 apply**）：document_version 加 lease_holder/lease_expires_at/lease_epoch + idx_lease_expiry——认领带租约、运行中续租、终态/破坏性写带 fencing 谓词；协议在 opensearch_pipeline/ingest_lease.py，总闸 RAG_INGEST_LEASE_ENABLE **默认关**（关=代码不读写本组列，先 apply 后部署与先部署后 apply 均安全）；头注引用的 schema/043 是分支侧历史类比（main 无该文件，**勿改原文**——checksum 台账约束）；启用前置 runbook 见 docs/ingest_lease_fencing_scope_2026-07-17.md 附录 |
 | 050_qa_rewritten_query.sql | fuling_operation | 多轮追问检索前改写（RAG_FOLLOWUP_REWRITE 默认关，2026-07-18）：qa_session_log.rewritten_query 存改写后的独立问题（脱敏后）——写侧 qa_logger 落列（1054 **TTL** 负缓存降级，apply 后无须重启恢复；改写行 question_hash 改按改写后文本计算）；读侧 kb_gaps 对本列 1054 回退无列 SQL（**代码可先行**）；无存量 backfill |
 | 051_dingtalk_msg_dedup.sql | fuling_operation | 钉钉消息 msgId 去重 RDS 兜底（B7-P2-04 四态机，2026-07-18）：msg_id 主键+state/attempts/message_id——主层（memory/redis）失效时的第二层幂等；写侧 dingtalk_bot（1146 负缓存 1h 降级，**先部署后 apply 安全**）；kill switch RAG_MSG_DEDUP_RDS_FALLBACK（默认开、simulate 关）；无存量 backfill |
 | 059_image_funnel_verdict.sql | fuling_knowledge | 图片漏斗判决记录（选项 E，2026-07-26）：内容寻址主键 (image_sha256, namespace, funnel_policy_version)——把判决从可淘汰的 VLM 缓存升级为**不淘汰、显式失效**的记录，让已判过的图免疫 VLM 制度漂移（实测 6.5% 判决单向翻 DISCARD，4 张是 GT 期望的步骤配图）；**载荷刻意不含 ocr_text/visual_summary**（派生内容可能含 PII，留在既有缓存那个已存在的暴露面，不复制进 RDS 新查询面）；读写侧 extraction/unified_extractor（1146 → 恒 UNAVAILABLE 降级为纯缓存行为，**先部署后 apply 安全**）；flag RAG_FUNNEL_VERDICT_STORE 默认关且与 RAG_VLM_DOC_CONTEXT 互斥；无存量 backfill |

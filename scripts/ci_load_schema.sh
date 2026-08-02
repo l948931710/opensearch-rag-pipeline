@@ -97,6 +97,7 @@ MANIFEST="
 039_qa_question_hash.sql operation
 040_qa_gap_semantic_group.sql operation
 041_qa_gap_dismissal.sql operation
+048_ingest_lease.sql knowledge
 049_acl_outbox_generation.sql knowledge
 050_qa_rewritten_query.sql operation
 051_dingtalk_msg_dedup.sql operation
