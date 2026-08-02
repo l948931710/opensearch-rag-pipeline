@@ -283,6 +283,10 @@ def test_orchestrator_calls_reconciler_for_stage3_only():
     """run_stage_drained：stage-3 生产跑在 drain 计数之前对账一次；stage-2/模拟不跑；
     对账抛异常也不阻断当日入库。"""
     import opensearch_pipeline.dataworks_orchestrator as orch
+    import os as _os
+    # A12 互斥锁显式关（test_cost_breaker 同款）：CI 无本地 MySQL，真锁路径必 sys.exit(1)
+    _lockoff = patch.dict(_os.environ, {"RAG_INGEST_SINGLETON_LOCK": "false"})
+    _lockoff.start()
 
     order = []
     with patch("opensearch_pipeline.spot_checker.reconcile_stranded_versions",
@@ -316,7 +320,7 @@ def test_orchestrator_calls_reconciler_for_stage3_only():
          patch.object(orch, "run_stage", MagicMock()):
         orch.run_stage_drained(stage=3, bizdate="20260610", simulate=False)
     assert counted, "对账失败不得阻断 drain"
-
+    _lockoff.stop()
 
 def test_spot_check_pipeline_wires_stranded_reconcile():
     """run_spot_check_pipeline 生产路径里必须挂上搁浅对账（独立于 orchestrator 的兜底）。"""

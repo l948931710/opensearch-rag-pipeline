@@ -124,7 +124,10 @@ def test_probe_is_fail_open_when_db_unreachable():
 # ── drain 收尾的措辞 ────────────────────────────────────────────────────────
 
 def _run_drain_stage2(probe_result):
-    with patch.object(orch, "_count_pending_rows", lambda stage: 0), \
+    # A12 互斥锁显式关（test_cost_breaker 同款）：simulate=False 会真连 config.rds 取
+    # GET_LOCK——CI 无本地 MySQL 必 sys.exit(1)（锁语义另有专测覆盖）。
+    with patch.dict(os.environ, {"RAG_INGEST_SINGLETON_LOCK": "false"}), \
+         patch.object(orch, "_count_pending_rows", lambda stage: 0), \
          patch.object(orch, "_reset_stale_stage2_locks", lambda: None), \
          patch.object(orch, "_probe_unclaimable_rows", lambda stage: probe_result), \
          patch.object(orch, "run_stage", lambda *a, **kw: None):

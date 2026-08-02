@@ -620,8 +620,11 @@ def test_i_drain_loop_raises_on_no_progress():
     def fake_run_stage(stage, bizdate, simulate, cost_breaker=None):
         calls["run_stage"] += 1  # no-op: never drains the queue
 
+    import os as _os
     # remaining stays > 0 and never decreases → no-progress guard
-    with patch.object(orch, "_count_pending_rows", lambda stage: 5), \
+    # A12 互斥锁显式关（test_cost_breaker 同款）：CI 无本地 MySQL，真锁路径必 sys.exit(1)
+    with patch.dict(_os.environ, {"RAG_INGEST_SINGLETON_LOCK": "false"}), \
+         patch.object(orch, "_count_pending_rows", lambda stage: 5), \
          patch.object(orch, "run_stage", fake_run_stage):
         with pytest.raises(RuntimeError) as excinfo:
             orch.run_stage_drained(stage=3, bizdate="20260609", simulate=False)
@@ -922,8 +925,11 @@ def test_q_stale_stage2_lock_reset_sql(mock_get_db_conn):
 def test_r_drain_loop_resets_stage2_before_count():
     import opensearch_pipeline.dataworks_orchestrator as orch
 
+    import os as _os
     order = []
-    with patch.object(orch, "_reset_stale_stage2_locks",
+    # A12 互斥锁显式关（同上）
+    with patch.dict(_os.environ, {"RAG_INGEST_SINGLETON_LOCK": "false"}), \
+         patch.object(orch, "_reset_stale_stage2_locks",
                       side_effect=lambda: order.append("reset") or 0), \
          patch.object(orch, "_count_pending_rows",
                       side_effect=lambda stage: order.append("count")

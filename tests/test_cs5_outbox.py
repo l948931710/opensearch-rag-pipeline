@@ -66,6 +66,10 @@ def test_stage3_drain_orphan_pk_reconcile_is_gated_by_purge_flag():
 def _run_stage3_drain_head(monkeypatch, purge_env):
     """只跑 stage-3 drain 的前置对账块（pending 计数直接给 0 立刻收尾），记录 orphan 调用次数。"""
     from opensearch_pipeline import dataworks_orchestrator as orch
+    # A12 互斥锁显式关（test_cost_breaker 同款）：本测只验对账时序，simulate=False 会
+    # 真连 config.rds 取 GET_LOCK——CI 无本地 MySQL 必 sys.exit(1)（本地有 MySQL 才侥幸绿，
+    # 2026-08-02 CI 复活后首次暴露；锁语义另有专测覆盖）。
+    monkeypatch.setenv("RAG_INGEST_SINGLETON_LOCK", "false")
     calls = []
     import opensearch_pipeline.ha3_reconcile as hr
     monkeypatch.setattr(hr, "reconcile_ha3_orphan_pks",
