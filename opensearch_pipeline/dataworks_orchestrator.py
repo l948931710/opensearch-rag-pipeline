@@ -725,30 +725,36 @@ def _count_pending_rows(stage: int) -> int:
       Stage 1: NOT_STARTED & canonical_json_key IS NULL
                & file_ext ∉ ingest_policy.STAGE1_SQL_EXCLUDED_EXTS（与认领 SQL 同一常量；
                不一致 = 计数器看得到、认领挑不走 → 无进展守卫永久判死 stage-1）& active
+               & raw_key 不含 `_quarantine/`（批次5：scanner 从不处理隔离暂存行——
+               此前计数含它们，只剩隔离行时 remaining 恒 >0 → 无进展守卫误杀 stage-1；
+               已知残留：本计数无 ctx 可读 process_quarantine，该未来通道开启时计数会
+               先于认领归零——通道从未启用，按 op0 原样保留）
       Stage 2: (NOT_STARTED 或 FAILED&retry_count<3) & active & canonical_json_key IS NOT NULL
       Stage 3: chunk_meta NOT_INDEXED/FAILED & is_active & (dv 非 PROCESSING 或 已过
                失效判定——takeover seam：off=2h 年龄（字节同旧），on=租约到期/无租约 2h 兜底)
     """
-    from opensearch_pipeline.ingest_policy import stage1_ext_exclusion_sql
+    from opensearch_pipeline.ingest_policy import (
+        stage1_ext_exclusion_sql, stage1_quarantine_like_pattern)
     from opensearch_pipeline.pipeline_nodes import _get_db_conn
 
     queries = {
-        1: f"""
+        1: (f"""
             SELECT COUNT(*) FROM document_version
             WHERE content_process_status = 'NOT_STARTED'
               AND canonical_json_key IS NULL
               AND file_ext NOT IN {stage1_ext_exclusion_sql()}
+              AND raw_key NOT LIKE %s
               AND status = 'active'
-        """,
-        2: """
+        """, (stage1_quarantine_like_pattern(),)),
+        2: ("""
             SELECT COUNT(*) FROM document_version
             WHERE (content_process_status = 'NOT_STARTED'
                    OR (content_process_status = 'FAILED' AND retry_count < 3))
               AND status = 'active'
               AND canonical_json_key IS NOT NULL
               AND (publish_status IS NULL OR publish_status != 'QUARANTINED')
-        """,
-        3: f"""
+        """, ()),
+        3: (f"""
             SELECT COUNT(*) FROM chunk_meta cm
             JOIN document_version dv
               ON cm.doc_id = dv.doc_id AND cm.version_no = dv.version_no
@@ -756,13 +762,14 @@ def _count_pending_rows(stage: int) -> int:
               AND cm.is_active = 1
               AND (dv.index_status != '{DocVersionIndexStatus.PROCESSING}'
                    OR {ingest_lease.takeover_where_sql("dv.")})
-        """,
+        """, ()),
     }
     conn = None
     try:
         conn = _get_db_conn(select_db=True)
         with conn.cursor() as cur:
-            cur.execute(queries[stage])
+            _sql, _params = queries[stage]
+            cur.execute(_sql, _params)
             return int(cur.fetchone()[0])
     finally:
         if conn:

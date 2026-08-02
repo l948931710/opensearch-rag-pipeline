@@ -132,13 +132,23 @@ def node_scan_raw_files(ctx: dict):
             tasks = []
             conn = None
             try:
-                from opensearch_pipeline.ingest_policy import stage1_ext_exclusion_sql
+                from opensearch_pipeline.ingest_policy import (
+                    stage1_ext_exclusion_sql, stage1_quarantine_like_pattern)
                 conn = _get_db_conn(select_db=True)
                 with conn.cursor() as cursor:
                     # 查询未开始内容处理的所有活跃文档版本，并关联 document_meta 获取文件名和部门。
                     # 扩展名排除片段来自 ingest_policy.STAGE1_SQL_EXCLUDED_EXTS（单一来源）——
                     # 必须与 dataworks_orchestrator._count_pending_rows 的 stage-1 计数完全一致，
                     # 否则排空守卫会因"计得到却领不走"误判 stage-1 无进展而中止。
+                    # 批次5（ultra P3 orchestrator:661；2026-08-02 自 op0 移植，适配 node-ACL
+                    # 双 SQL seam——两臂同传 _q_params）：`_quarantine/` 行改在 SQL 侧排除
+                    # （同一单一来源谓词，计数侧同步）——此前只靠下方 Python 过滤：隔离行
+                    # 照选照占 LIMIT 100 名额（混批时真实行被队头挤占、纯隔离批零产出），
+                    # 计数器又算它 pending → 无进展守卫误杀。process_quarantine=True 的
+                    # 未来通道保留（SQL 谓词随之关闭，Python 过滤同门）。
+                    _pq_on = ctx.get("process_quarantine", False)
+                    _q_pred = "" if _pq_on else "AND dv.raw_key NOT LIKE %s\n                          "
+                    _q_params = () if _pq_on else (stage1_quarantine_like_pattern(),)
                     _base_sql = f"""
                         SELECT
                             dv.doc_id,
@@ -153,7 +163,7 @@ def node_scan_raw_files(ctx: dict):
                         WHERE dv.content_process_status = 'NOT_STARTED'
                           AND dv.canonical_json_key IS NULL
                           AND dv.file_ext NOT IN {stage1_ext_exclusion_sql()}
-                          AND dv.status = 'active'
+                          {_q_pred}AND dv.status = 'active'
                         ORDER BY dv.created_at ASC
                         LIMIT 100
                     """
@@ -164,7 +174,7 @@ def node_scan_raw_files(ctx: dict):
                     _has_mode = _exec_node_guarded(
                         cursor,
                         _base_sql.format(mode_cols=", dm.acl_mode, dm.owner_dept_id"),
-                        _base_sql.format(mode_cols=""), (), ())
+                        _base_sql.format(mode_cols=""), _q_params, _q_params)
                     rows = cursor.fetchall()
                     for row in rows:
                         _mode = (row[7] or "legacy") if _has_mode else "legacy"
