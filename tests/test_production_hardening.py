@@ -922,14 +922,15 @@ def test_q_stale_stage2_lock_reset_sql(mock_get_db_conn):
 # Test R: the drain loop must run the stage-2 lock reset BEFORE each pending-count
 # (reset rows become FAILED&retry<3 and are visible to the same iteration's count),
 # and must not run it for stage 3 or in simulate mode.
+# A12 互斥锁显式关（test_cost_breaker 同款）——装饰器覆盖【整个测试】：本测有三个
+# 独立 with 块、多次 simulate=False 调用，只包第一块会漏后面的（CI 无 MySQL 第三轮红
+# 的教训：第二块 stage=3 裸调仍走真锁路径 sys.exit(1)）。
+@patch.dict("os.environ", {"RAG_INGEST_SINGLETON_LOCK": "false"})
 def test_r_drain_loop_resets_stage2_before_count():
     import opensearch_pipeline.dataworks_orchestrator as orch
 
-    import os as _os
     order = []
-    # A12 互斥锁显式关（同上）
-    with patch.dict(_os.environ, {"RAG_INGEST_SINGLETON_LOCK": "false"}), \
-         patch.object(orch, "_reset_stale_stage2_locks",
+    with patch.object(orch, "_reset_stale_stage2_locks",
                       side_effect=lambda: order.append("reset") or 0), \
          patch.object(orch, "_count_pending_rows",
                       side_effect=lambda stage: order.append("count")
