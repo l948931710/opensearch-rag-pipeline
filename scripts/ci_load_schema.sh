@@ -104,6 +104,7 @@ MANIFEST="
 059_image_funnel_verdict.sql knowledge
 060_node_acl.sql knowledge
 061_node_owner_axis.sql knowledge
+062_acl_projection_epoch.sql knowledge
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }

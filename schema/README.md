@@ -15,8 +15,8 @@ apply 脚本落库并记台账。
 3. **编号严格单调递增，且跨分支全局分配**（Majors ε3 纠偏 2026-07-22：本注长期停在
    022 已过时）——`claude/ontology-p0` 与 main 共用同一号池，agent/ontology 域文件
    （022-031/033-038/042-047/052-058）只存在于分支侧，main 只落共享/主域号（032/039/
-   040/041/048/049/050/051/059/060/061）。048 于 2026-08-02 随 PR-4 租约移植回 main
-   （文件与分支侧逐字节一致，checksum 台账不变）。**下一个可用号 = 062**，取号前先查两侧 `schema/` 目录与分支
+   040/041/048/049/050/051/059/060/061/062）。048 于 2026-08-02 随 PR-4 租约移植回 main
+   （文件与分支侧逐字节一致，checksum 台账不变）。**下一个可用号 = 063**，取号前先查两侧 `schema/` 目录与分支
    README。历史上有三对编号冲突（002/003/006 各两个文件，见下表）——**不改名**（外部
    引用会悬空），台账里用 `002b/003b/006b` 区分，新文件绝不再冲突。
 4. **`CREATE DATABASE` 必须显式 `CHARSET utf8mb4 COLLATE utf8mb4_unicode_ci`**，每张新表
@@ -64,6 +64,7 @@ apply 脚本落库并记台账。
 | 059_image_funnel_verdict.sql | fuling_knowledge | 图片漏斗判决记录（选项 E，2026-07-26）：内容寻址主键 (image_sha256, namespace, funnel_policy_version)——把判决从可淘汰的 VLM 缓存升级为**不淘汰、显式失效**的记录，让已判过的图免疫 VLM 制度漂移（实测 6.5% 判决单向翻 DISCARD，4 张是 GT 期望的步骤配图）；**载荷刻意不含 ocr_text/visual_summary**（派生内容可能含 PII，留在既有缓存那个已存在的暴露面，不复制进 RDS 新查询面）；读写侧 extraction/unified_extractor（1146 → 恒 UNAVAILABLE 降级为纯缓存行为，**先部署后 apply 安全**）；flag RAG_FUNNEL_VERDICT_STORE 默认关且与 RAG_VLM_DOC_CONTEXT 互斥；无存量 backfill |
 | 060_node_acl.sql | fuling_knowledge | node-ACL 阶段 A（2026-07-29 已 apply staging+**生产**）：document_meta 加 acl_mode/owner_dept_id/acl_revision + idx_acl_mode_owner_node；新表 kb_doc_node_grant（+scope subtree\|exact）/dept_admin_node_grant/dept_dim/staff_dim；存量全 legacy 行为逐字节不变；读写侧 access_grants/acl_policy（information_schema 探测降级，**先部署后 apply 安全**）|
 | 061_node_owner_axis.sql | fuling_knowledge | node-ACL 阶段 B 归属轴（2026-08-01，codex 4 轮 APPROVE；**同日已 apply staging+生产**，台账 checksum fb9b03ed）：kb_doc_meta_projection_outbox（doc-meta 改标题/分类的持久投影意图，generation CAS 防 stage-3 loader 窗口丢更新——语义与 049 逐字一致）+ dept_admin_node_candidate（管辖根自动派生候选，与权威表分离防静默提权）+ acl_revision 注释扩展为「文档管理面编辑 CAS」；读写侧 routes/kb_console(doc-meta)/dataworks_orchestrator(pre-drain)/org_sync(派生)；1054 负缓存回退，**先部署后 apply 安全** |
+| 062_acl_projection_epoch.sql | fuling_knowledge | **⚠️ 草稿 v2，未 apply 任何环境**（2026-08-03，等 Sam 勾拍板单 `docs/ops/c3prime_acl_projection_convergence_signoff_2026-08-03.md`；codex 两轮 REVISE 后修订）：C3/C3′ ACL 投影收敛——**只两列** `document_meta.acl_epoch`（投影失效代次，单调只增）+ `chunk_meta.acl_epoch`（投影水位，NULL=从未投影过）。修的是「diff 在无上次结果时恒为空 ⇒ 从未投影过的 node 文档永远判 unchanged」这一**结构性**缺陷（Kendra/Coveo/Azure/Elastic/OpenText 五系统收敛结论）。**认证输出严格 = project_doc_acl 产出的 (owner_dept, allowed_depts)；permission_level 不在【认证输出】内**（其同步归 C9）——⚠️ 但有效的每版本 permission 是 allowed_depts 的 **gate 输入，其变化仍须 bump**（否则 flag 关时改级别、开 flag 后 epoch 相等致授权永不投影）；epoch 只证明 RDS 投影、**不证明 HA3 已发布**（后者是 index_status）。**刻意不复用 acl_revision**（管理面编辑 CAS，含 title/category）。v1 的 `acl_state` 与 `idx_acl_projection_state` **已删**（三态皆可由 epoch 推导且不防"忘记 bump"；索引待生产 EXPLAIN 后另取号）。上线次序硬约束：**DDL 先 apply → 再部署 bump/stamp 写方（含 stage-2 node_write_chunk_meta，漏则新 chunk 天生 NULL 永久 dirty）→ 全版本 sweep 必须与 C3′ 多版本 materializer 同批启用**；bump **不得受 RAG_ALLOWED_DEPTS_ACL 门控**。回填走 certify-only / projection-changed 二分（前者只 stamp 不动 index_status），**不是**全量重推。**必须 apply-before-enable**（缺列 1054 直接报错不降级，与 048 不同）；本地 scratch 库实测幂等 ×2 |
 
 ## 台账（schema_migrations）
 
