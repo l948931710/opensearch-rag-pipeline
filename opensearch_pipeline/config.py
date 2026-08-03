@@ -456,6 +456,15 @@ class RAGConfig:
     general_stream_gate: bool = True    # RAG_GENERAL_STREAM_GATE
     # 敏感词运维追加（CSV，逐词按字面匹配并入前置硬红线与禁兜底词表）。
     sensitive_extra_words: str = ""     # RAG_SENSITIVE_EXTRA_WORDS
+    # ── 敏感查询独立 guard（2026-08-02 release-gate RAG-50/57 存量缺口修复）────
+    # v2 规则族（具名个人 PII 代查 / 敏感台账访问 / 业务系统实时数据），独立于
+    # general_ability_mode 总闸 —— mode=off 时同样可达（历史缺口：敏感硬红线挂在
+    # 通用能力开关后面，生产 off 姿态下是死代码）。默认 off = 全链路逐字节不变；
+    # 生产开启须 Sam 拍板（先跑 eval_harness/sensitive_guard_ab 零正例误伤铁门）。
+    sensitive_query_guard: bool = False   # RAG_SENSITIVE_QUERY_GUARD
+    # prompt 层第二道防线：SENSITIVE_BOUNDARY_RULE 条件追加进 system prompt
+    # （llm_generator._select_system_prompt，gen_nothink 同源）。默认 off。
+    sensitive_prompt_guard: bool = False  # RAG_SENSITIVE_PROMPT_GUARD
     # ── 纯文本生成开关（pure-text mode） ─────────────────────────
     # True  → 生成纯文字回答：system prompt 去掉 <<IMG:N>> 图片插入规则，
     #         context 不再注入 <<IMG:N>> 标记，卡片只展示文字（图片语义仍以
@@ -1047,6 +1056,8 @@ def load_config() -> PipelineConfig:
             guided_refusal=_env_bool("GUIDED_REFUSAL", False),                  # RAG_GUIDED_REFUSAL
             general_stream_gate=_env_bool("GENERAL_STREAM_GATE", True),         # RAG_GENERAL_STREAM_GATE
             sensitive_extra_words=_env("SENSITIVE_EXTRA_WORDS", ""),            # RAG_SENSITIVE_EXTRA_WORDS
+            sensitive_query_guard=_env_bool("SENSITIVE_QUERY_GUARD", False),    # RAG_SENSITIVE_QUERY_GUARD
+            sensitive_prompt_guard=_env_bool("SENSITIVE_PROMPT_GUARD", False),  # RAG_SENSITIVE_PROMPT_GUARD
             dingtalk_streaming=_env_bool("DINGTALK_STREAMING", False),          # RAG_DINGTALK_STREAMING
             dingtalk_stream_interval_ms=_env_int("DINGTALK_STREAM_INTERVAL_MS", 500),  # RAG_DINGTALK_STREAM_INTERVAL_MS
             image_cosurface=_env_bool("IMAGE_COSURFACE", True),                 # RAG_IMAGE_COSURFACE

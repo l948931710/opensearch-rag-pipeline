@@ -69,6 +69,13 @@ REALTIME_BLOCK_MESSAGE = (
     "我目前没有实时信息来源，无法提供天气、汇率、新闻等实时内容。"
     "公司制度、流程与操作类问题随时可以问我。"
 )
+# v2 guard F3：业务系统实时数据边界（RAG_SENSITIVE_QUERY_GUARD）。
+# 措辞约束：必须以「抱歉，当前」开场——同时命中本模块 _REFUSAL_STRONG_PATTERN
+# 与 eval_harness/matching.py 的 hard_refusal 口径（实测验证，codex 共识 2026-08-02）。
+REALTIME_DATA_BLOCK_MESSAGE = (
+    "抱歉，当前暂不支持接入ERP/OA/考勤等业务系统，无法查询库存、余额、考勤等实时数据。"
+    "如需了解相关系统的操作步骤（例如在哪个模块查询），可以直接问我。"
+)
 # 通用问题但通用层未开档/未放开
 GENERAL_TIER_OFF_MESSAGE = (
     "这个问题不在公司知识库范围内，我目前主要解答公司制度、流程与操作类问题。"
@@ -184,6 +191,35 @@ def build_failure_action(
                 "tier": "", "intent_type": "refuse_uncovered_enterprise"}
     return {"action": ACTION_PASSTHROUGH, "text": "", "tier": "",
             "intent_type": "refuse_uncovered_enterprise"}
+
+
+# v2 guard 的 route 字面量（canonical 定义在 intent_router.ROUTE_SENSITIVE /
+# ROUTE_REALTIME_DATA；本模块保持零重依赖不 import intent_router——两份字面量的
+# 一致性由 tests/test_answer_flow.py 的 parity 断言钉死）。
+_GUARD_ROUTE_SENSITIVE = "sensitive_block"
+_GUARD_ROUTE_REALTIME_DATA = "realtime_data_block"
+
+
+def build_guard_outcome(route: str) -> Optional[Dict[str, Any]]:
+    """v2 敏感 guard 命中 → 回答链路 outcome（纯函数；api/钉钉/eval L3 三处共用的
+    route→话术/状态单一来源，防三份手写映射漂移）。
+
+    sensitive → BLOCKED + refuse_sensitive + risk_blocked（同 T0① 既有词表）；
+    realtime_data → SUCCESS + refuse_system_integration（新词——与 refuse_realtime
+    的"公共实时信息"分桶，不复用；SUCCESS 使其不入 NO_RESULT/REFUSAL 缺口挖掘，
+    与 T0③ 同前例）。未知 route → None（调用方照常走知识库）。
+    """
+    if route == _GUARD_ROUTE_SENSITIVE:
+        return {"answer": SENSITIVE_BLOCK_MESSAGE, "model": "N/A", "usage": {},
+                "answer_status": "BLOCKED", "intent_type": "refuse_sensitive",
+                "risk_level": "sensitive", "risk_blocked": True,
+                "no_result": False, "source": "guard"}
+    if route == _GUARD_ROUTE_REALTIME_DATA:
+        return {"answer": REALTIME_DATA_BLOCK_MESSAGE, "model": "N/A", "usage": {},
+                "answer_status": "SUCCESS", "intent_type": "refuse_system_integration",
+                "risk_level": None, "risk_blocked": False,
+                "no_result": False, "source": "guard"}
+    return None
 
 
 def top_score_of(chunks: Optional[List[Dict[str, Any]]]) -> Optional[float]:
@@ -306,7 +342,8 @@ def build_qa_log_kwargs(
     intent_type 词表（通用能力分级开放的新维度；NULL = 知识库默认路径 ——
     存量行为不写 'kb'，保证 flag off 时落库载荷逐字节不变）：
       smalltalk / office / general / refuse_sensitive / refuse_uncovered_enterprise /
-      refuse_uncovered_general / refuse_realtime / refuse_quota
+      refuse_uncovered_general / refuse_realtime / refuse_quota /
+      refuse_system_integration（v2 guard F3：业务系统实时数据边界，SUCCESS 状态）
     企业相关未覆盖仍落 NO_RESULT/REFUSAL（contribution 缺口挖掘与 SLO 口径零漂移），
     只多 intent_type 标签。
     """

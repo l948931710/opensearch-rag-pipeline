@@ -37,6 +37,11 @@ ROUTE_SMALLTALK = "smalltalk"          # T1：canned 模板直答
 ROUTE_OFFICE = "office"                # T2：办公辅助（含确定性计算）
 ROUTE_SENSITIVE = "sensitive_block"    # T0①：敏感硬红线 → BLOCKED
 ROUTE_REALTIME = "realtime_block"      # T0③：实时公共信息 → 恒拒话术
+# 业务系统实时数据（v2 guard F3，RAG_SENSITIVE_QUERY_GUARD）：ERP/OA 等系统的
+# 实时值询问 → 边界说明话术（SUCCESS + intent_type=refuse_system_integration，
+# 与 T0③ 同理不污染缺口挖掘口径）。与 ROUTE_REALTIME（天气/汇率等公共实时信息）
+# 刻意分开：一个是"没接系统"，一个是"没有实时信息源"，看板不混桶。
+ROUTE_REALTIME_DATA = "realtime_data_block"
 
 # 分诊类别（triage_failed_query 返回值；enterprise = 维持今日拒答）
 TRIAGE_ENTERPRISE = "enterprise"
@@ -185,6 +190,161 @@ def hits_no_fallback(query: str) -> bool:
     return bool(extra and extra.search(query))
 
 
+# ═══════════════════════════════════════════════════════════════
+# v2 敏感查询 guard（RAG_SENSITIVE_QUERY_GUARD，2026-08-02）
+# ─────────────────────────────────────────────────────────────
+# 背景：release-gate 双轮评委判罚 RAG-50/57 未拦（具名个人工资代查 / 敏感台账
+# 打开），根因三层：①敏感硬红线挂在 general_ability_mode 总闸后（生产 off =
+# 死代码）；②现有 _SENSITIVE_PATTERNS 只拦疑问代词形态（"谁的工资"），不拦
+# 具名形态（"张三的工资"）；③eval L3 直调检索+生成，规则层测不到。
+# 本段新增三个家族（F1 具名个人 PII 代查 / F2 敏感台账访问 / F3 业务系统实时
+# 数据），经 classify_sensitive_v2 纯判定 + sensitive_guard_route flag 门控入口
+# 暴露，独立于通用能力总闸。误伤铁门：eval_harness/sensitive_guard_ab 对金集
+# 258 题零正例误伤 + test_intent_router 钉死相邻正例（codex 共识 2026-08-02）。
+# ═══════════════════════════════════════════════════════════════
+
+# 常见单姓（含金集负例出现的 申/包/郭/徐/赵/李/张）。姓名判定 = 姓氏锚 + 长度
+# 2-3 + 停用词排除 —— 无 NER 条件下的两阶段验证（codex 共识：不用"任意 CJK
+# 即姓名"的巨型正则，那会把"加班工资"的"加班"当姓名）。
+_CN_SURNAMES = (
+    "王李张刘陈杨黄赵吴周徐孙马朱胡郭何罗高林郑梁谢宋唐许韩冯邓曹彭曾肖田董袁潘"
+    "蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦傅方白邹孟熊秦邱江尹"
+    "薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤温殷申包倪严阮柯"
+)
+_COMPOUND_SURNAMES = ("欧阳", "司马", "诸葛", "上官", "皇甫", "司徒")
+# 以姓氏字开头但绝非人名的高频词（泛指/职务/时间/常用名词）——防"何时/金额/
+# 白班/申请"这类形态误判。职务词（刘主任等"姓+职务"形态刻意不排除：指向特定
+# 个人的 PII 打探，语义上正当拦截对象）。
+_NAME_STOPWORDS = frozenset({
+    "何时", "何处", "何种", "金额", "金牌", "白班", "白天", "周末", "周一", "周二",
+    "周三", "周四", "周五", "周六", "周日", "申请", "申报", "方法", "方案", "方式",
+    "石墨", "马上", "高温", "高低", "高层", "叶片", "万一", "万元", "史上", "向上",
+    "任何", "任职", "许可", "常温", "余额", "余量", "武器", "文员", "同事", "员工",
+    "人员", "大家", "领导", "老板", "杜绝", "严禁", "严格", "范围", "汪洋", "江苏",
+    "浙江", "湖南", "湖北", "河南", "河北", "山东", "广东", "台州", "临海",
+})
+
+
+def _valid_person_name(tok: str) -> bool:
+    """两阶段姓名验证：复姓+名 或 单姓+1~2 字，且不在停用词表。"""
+    if not tok or tok in _NAME_STOPWORDS:
+        return False
+    if any(tok.startswith(cs) and len(tok) > len(cs) for cs in _COMPOUND_SURNAMES):
+        return True
+    return len(tok) in (2, 3) and tok[0] in _CN_SURNAMES
+
+
+# F1：个人敏感字段（值型属性——查的是"某个人的数值/记录"，不是制度条款）
+_PII_FIELD_RE = re.compile(
+    r"工资|薪资|薪酬|奖金|绩效|得分|评分|里程|短号|手机号|电话|车牌号?|"
+    r"身份证|考勤|打卡|社保|公积金|银行卡|档案"
+)
+# 名与字段之间允许的时间限定（"张三上个月的工资"）
+_TIME_INFIX_RE = re.compile(r"(?:上个?月|本月|这个?月|\d{1,2}月份?|今年|去年|最近)+$")
+# 锚B：查询动词（动词…名+字段，无"的"也拦——"查一下张三工资"）
+_LOOKUP_VERB_RE = re.compile(r"查一?下?|查询|帮我?查|告诉我|调出|看一?下|想知道")
+
+
+def _pii_person_lookup(q: str) -> bool:
+    """F1 具名个人 PII 代查。锚A：姓名+时间?+的+敏感字段（"张三上个月的工资明细"
+    "车牌统计汇总里赵六的车牌号"）；锚B：查询动词…姓名+敏感字段（无"的"形态）。
+    制度性问题（"加班工资是多少""工资几号发"）无具名姓名锚，不拦。"""
+    for m in _PII_FIELD_RE.finditer(q):
+        pre = q[: m.start()]
+        has_de = pre.endswith("的")
+        core = pre[:-1] if has_de else pre
+        core = _TIME_INFIX_RE.sub("", core)
+        for length in (3, 2):
+            tok = core[-length:]
+            if len(tok) == length and _valid_person_name(tok):
+                if has_de:
+                    return True                       # 锚A
+                if _LOOKUP_VERB_RE.search(pre):
+                    return True                       # 锚B
+    return False
+
+
+# F2：敏感台账/统计表。表名 = 敏感前缀 + 表型后缀（花名册/通讯录本身即台账）。
+_SENSITIVE_TABLE_RE = re.compile(
+    r"(?:车牌|工资|薪酬|薪资|考勤|绩效|花名册|通讯录|短号|私车公用|固定资产|药品|"
+    r"员工信息|人员信息|身份证)[^，。？！?!]{0,6}"
+    r"(?:统计|汇总|明细|台账|清单|名单|登记)[表册]?|花名册|通讯录"
+)
+# 方向1：访问动词 → 表名（"打开车牌统计汇总表"）
+_TABLE_ACCESS_BEFORE_RE = re.compile(r"打开|查看|调出|导出|下载|发我?一?下?|给我看?|翻开|浏览")
+# 方向2：表名 → 内容意图（"药品清单表里的库存怎么看""固定资产明细表里的车辆信息"）
+_TABLE_CONTENT_AFTER_RE = re.compile(
+    r"^[^，。？！?!]{0,8}(?:里|中|上)|^[^，。？！?!]{0,6}(?:查看|打开|看一?下|有什么|有哪些|内容|信息|数据)"
+)
+# 具名个人表单（RAG-56 家族）：姓名 + 表单名 + 内容访问意图。裸表名不拦
+# （"岗位工作分析表怎么填写"是模板/制度问题，知识库正当领地）。
+_PERSONAL_FORM_RE = re.compile(r"工作内容描述|岗位工作分析|绩效考核评价")
+_FORM_CONTENT_INTENT_RE = re.compile(r"里|内容|有什么|是什么|查看|打开|发我?|给我")
+
+
+def _sensitive_table_access(q: str) -> bool:
+    """F2 敏感台账访问/披露意图（双向）+ 具名个人表单。"""
+    m = _SENSITIVE_TABLE_RE.search(q)
+    if m:
+        if _TABLE_ACCESS_BEFORE_RE.search(q[: m.start()]):
+            return True
+        if _TABLE_CONTENT_AFTER_RE.search(q[m.end():]):
+            return True
+    fm = _PERSONAL_FORM_RE.search(q)
+    if fm and _FORM_CONTENT_INTENT_RE.search(q[fm.end():]):
+        pre = q[: fm.start()]
+        for length in (3, 2):
+            tok = pre[-length:]
+            if len(tok) == length and _valid_person_name(tok):
+                return True
+    return False
+
+
+# F3：业务系统实时数据（"ERP里库存还有多少"）。正向 = 显式系统名 + 实时值询问；
+# 排除 = 操作方法类（"U8现存量查询怎么操作"照走知识库——这正是手册的领地）。
+_SYSTEM_TOKEN_RE = re.compile(r"ERP|U8|OA|MES|WMS|考勤系统|考勤机", re.IGNORECASE)
+_REALTIME_VALUE_RE = re.compile(
+    r"还有多少|还剩多少|余额|库存.{0,4}(?:还有|还剩|多少)|实时|现在有|当前有"
+)
+_HOWTO_EXCLUDE_RE = re.compile(r"怎么|如何|哪里|在哪|步骤|操作|流程|教程|方法|填写")
+
+
+def _realtime_data_query(q: str) -> bool:
+    """F3 业务系统实时数据询问（问的是"值"，不是"怎么查"）。"""
+    return (bool(_SYSTEM_TOKEN_RE.search(q))
+            and bool(_REALTIME_VALUE_RE.search(q))
+            and not _HOWTO_EXCLUDE_RE.search(q))
+
+
+def classify_sensitive_v2(query: str) -> Optional[str]:
+    """v2 敏感分类纯判定（不看 flag——A/B 工具与单测直调）。
+    返回 "sensitive"（F1/F2/现有硬红线）| "realtime_data"（F3）| None。"""
+    q = (query or "").strip()
+    if not q:
+        return None
+    if hits_sensitive(q) or _pii_person_lookup(q) or _sensitive_table_access(q):
+        return "sensitive"
+    if _realtime_data_query(q):
+        return "realtime_data"
+    return None
+
+
+def sensitive_guard_route(query: str) -> Optional[RouteDecision]:
+    """独立敏感 guard 入口（四条回答链路检索前调用，**不受 general_ability_mode
+    门控**）。RAG_SENSITIVE_QUERY_GUARD 关（默认）→ 恒 None，全链路逐字节不变。"""
+    try:
+        if not get_config().rag.sensitive_query_guard:
+            return None
+    except Exception:
+        return None   # config 不可用（测试 mock 等）→ 维持现状，不阻塞回答链路
+    cat = classify_sensitive_v2(query)
+    if cat == "sensitive":
+        return RouteDecision(ROUTE_SENSITIVE)
+    if cat == "realtime_data":
+        return RouteDecision(ROUTE_REALTIME_DATA)
+    return None
+
+
 def _dept_allowed(user_dept: Union[str, List[str], None], depts_csv: str) -> bool:
     """T2/T3 灰度部门白名单：CSV 为空 = 全员；无部门（匿名）= 不放行。"""
     csv = (depts_csv or "").strip()
@@ -225,6 +385,14 @@ def pre_route(
     # 若先被否决进知识库，会多一轮检索+生成才在失败路径拦下（终态相同但更慢、
     # 且给了 LLM 拼凑的机会）。敏感样式已收紧到个案/打探/对抗形态，
     # 制度性问题不受影响（见 _SENSITIVE_PATTERNS 注释与 test_intent_router）。
+    # v2 guard（flag on 时）也必须在公司信号之前：F3 的 ERP/U8 是强公司信号，
+    # 排后面就永不可达。flag off → 本分支零正则，行为逐字节不变。
+    if cfg.sensitive_query_guard:
+        _v2 = classify_sensitive_v2(q)
+        if _v2 == "sensitive":
+            return RouteDecision(ROUTE_SENSITIVE)
+        if _v2 == "realtime_data":
+            return RouteDecision(ROUTE_REALTIME_DATA)
     if hits_sensitive(q):
         return RouteDecision(ROUTE_SENSITIVE)
     if has_company_signal(q):

@@ -66,6 +66,7 @@ from opensearch_pipeline.answer_flow import (
     REALTIME_BLOCK_MESSAGE,
     SENSITIVE_BLOCK_MESSAGE,
     build_failure_action,
+    build_guard_outcome,
     build_qa_log_kwargs,
     history_answer_text,
     is_refusal_answer,
@@ -80,6 +81,7 @@ from opensearch_pipeline.intent_router import (
     ROUTE_SENSITIVE,
     ROUTE_SMALLTALK,
     pre_route,
+    sensitive_guard_route,
     triage_failed_query,
 )
 from opensearch_pipeline.config import get_config
@@ -1070,6 +1072,14 @@ def _general_pre_route_decision(req: AskRequest,
     T1 → canned 模板（零 LLM）；T2 → 确定性计算 / quick 档通用回答（经日配额）。
     T2 执行失败回落知识库（返回 None）。检索从未发生 —— 落库 chunks=None。
     """
+    # v2 敏感 guard 先行（RAG_SENSITIVE_QUERY_GUARD，默认 off 恒 None）：
+    # 不受 general_ability_mode 门控 —— 敏感硬红线不能挂在通用能力总闸后面
+    # （2026-08-02 release-gate RAG-50/57 缺口根因之一）。
+    guard = sensitive_guard_route(req.question)
+    if guard is not None:
+        outcome = build_guard_outcome(guard.route)
+        if outcome is not None:
+            return outcome
     mode, _guided_on, _on = _general_flags()
     if mode == "off":
         return None

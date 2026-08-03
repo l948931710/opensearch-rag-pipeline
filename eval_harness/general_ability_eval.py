@@ -45,21 +45,58 @@ def _set_mode(mode: str):
     _reset_config()
 
 
+def _set_guard(on: bool):
+    os.environ["RAG_SENSITIVE_QUERY_GUARD"] = "true" if on else "false"
+    _reset_config()
+
+
 def gate2_anti_hijack(goldset_path: str) -> dict:
-    """门2：金集问题在 mode=full 下零题离开知识库路径（I1/I5 防劫持）。"""
-    from opensearch_pipeline.intent_router import ROUTE_KB, pre_route
+    """门2：防劫持（I1/I5）双臂（2026-08-02 v2 guard 语义化）。
+
+    正例臂（任何姿态零劫持）：kind=positive 的金集问题在 mode=full 下，
+      guard off 与 guard on 两臂 pre_route 都必须 == kb。
+    负例臂：guard off 时同样必须全 kb（旧不变量对负例原样保留——off 姿态
+      逐字节兼容）；guard on 时允许且仅允许 kb / sensitive_block /
+      realtime_data_block（其余 route 仍算劫持）。
+    环境处理：try/finally 恢复 mode 与 guard flag 的调用前值 + 配置单例重置
+    （原实现结束时无条件钉成 office，泄漏到调用方）。
+    """
+    from opensearch_pipeline.intent_router import (
+        ROUTE_KB, ROUTE_REALTIME_DATA, ROUTE_SENSITIVE, pre_route)
 
     with open(goldset_path, encoding="utf-8") as f:
         gold = json.load(f)
-    queries = [g.get("query", "") for g in gold if g.get("query")]
-    _set_mode("full")   # 最宽档 = 最大放行压力
+    pos_q = [g["query"] for g in gold if g.get("query") and g.get("kind") != "negative"]
+    neg_q = [g["query"] for g in gold if g.get("query") and g.get("kind") == "negative"]
+    _neg_allowed_on = {ROUTE_KB, ROUTE_SENSITIVE, ROUTE_REALTIME_DATA}
+
+    prev_mode = os.environ.get("RAG_GENERAL_ABILITY_MODE")
+    prev_guard = os.environ.get("RAG_SENSITIVE_QUERY_GUARD")
     hijacked = []
-    for q in queries:
-        d = pre_route(q, is_user=True, user_dept=["it"])
-        if d.route != ROUTE_KB:
-            hijacked.append({"query": q, "route": d.route})
-    _set_mode("office")
-    return {"total": len(queries), "hijacked": hijacked, "ok": not hijacked}
+    try:
+        _set_mode("full")   # 最宽档 = 最大放行压力
+        for guard_on in (False, True):
+            _set_guard(guard_on)
+            arm = "guard_on" if guard_on else "guard_off"
+            for q in pos_q:
+                d = pre_route(q, is_user=True, user_dept=["it"])
+                if d.route != ROUTE_KB:
+                    hijacked.append({"query": q, "route": d.route, "arm": arm, "kind": "positive"})
+            for q in neg_q:
+                d = pre_route(q, is_user=True, user_dept=["it"])
+                allowed = _neg_allowed_on if guard_on else {ROUTE_KB}
+                if d.route not in allowed:
+                    hijacked.append({"query": q, "route": d.route, "arm": arm, "kind": "negative"})
+    finally:
+        for key, prev in (("RAG_GENERAL_ABILITY_MODE", prev_mode),
+                          ("RAG_SENSITIVE_QUERY_GUARD", prev_guard)):
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+        _reset_config()
+    return {"total": len(pos_q) + len(neg_q), "n_positive": len(pos_q),
+            "n_negative": len(neg_q), "hijacked": hijacked, "ok": not hijacked}
 
 
 def _offline_case(case: dict) -> dict:

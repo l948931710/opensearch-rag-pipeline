@@ -22,7 +22,10 @@ from .metrics import bootstrap_ci, mean
 # 先例）。judge 产出 faithfulness/correctness/completeness/fabrication 四个硬门,rubric 变
 # 即 regime 变：该值随 judge_model 一起进 run_eval._regime() / baseline._REGIME_KEYS,
 # 防 rubric 静默改写重基答案质量硬门。
-JUDGE_RUBRIC_VERSION = "answer_rubric_v1"
+# v2 (2026-08-02)：新增 guard-blocked 条款（policy canned 拒答不因空 context 判
+# fabricated）+ appropriate_refusal 的 policy-boundary 拒答口径 —— rubric 语义变，
+# regime 随之变（强制与旧 baseline 不可比，重冻由 Sam 拍板后执行）。
+JUDGE_RUBRIC_VERSION = "answer_rubric_v2"
 
 # Rubric shown to each Claude judge (the Workflow injects per-item bundle data).
 JUDGE_RUBRIC = """You are an impartial QA evaluator for an enterprise Chinese knowledge-base
@@ -44,6 +47,16 @@ Also set:
 - fabricated (boolean): did the answer state facts not supported by context?
 - appropriate_refusal (boolean): ONLY for negatives — did it correctly decline / say the
   info isn't available, instead of inventing an answer? (positives: set true.)
+  A refusal is NOT limited to "not found": a policy-boundary decline (e.g. "涉及敏感信息，
+  无法回答" or "暂不支持接入ERP等系统查实时数据") counts as an appropriate refusal for a
+  negative whose gold expectation is a refusal.
+- GUARD-BLOCKED items: some items carry guard_route/guard_policy metadata — the query was
+  deterministically intercepted by a sensitive-query rule BEFORE retrieval, so CONTEXT is
+  empty BY DESIGN. For these items the canned policy refusal must NOT be scored as
+  fabrication merely because its boundary statement (e.g. "无法查询实时数据") is not in the
+  (empty) context; set fabricated=true only if the answer additionally invents query results
+  or corpus facts. Score correctness/appropriate_refusal on whether declining was right for
+  the item kind.
 - image_binding (1-5): ONLY meaningful when KIND="binding" (L4-ingestion bundle item).
   5 = 每张图都贴在对应步骤旁、语义完全对齐;3 = 部分正确或弱身份对齐;1 = 张冠李戴或缺图。
   For non-binding items (positive/negative quality), set 3 (neutral, not applicable).
@@ -305,6 +318,15 @@ def merge_panel(bundle: List[Dict], panels: List[Dict]) -> Dict:
             agg["overall_stdev"] = round(sd, 3)
             overall_disagreements.append(sd)
         agg["fabricated_any"] = any(v.get("fabricated") for v in vs)
+        # appropriate_refusal 多数票（2026-08-02，负例拦截权威口径）：True 票 > False 票
+        # → True；反向 → False；平票或零票 → None（缺票绝不静默算通过——run_judge 的
+        # 批次跳过机制会让个别 qid 缺 verdict）。
+        _ar = [v["appropriate_refusal"] for v in vs if isinstance(v.get("appropriate_refusal"), bool)]
+        if _ar and _ar.count(True) != _ar.count(False):
+            agg["appropriate_refusal_majority"] = _ar.count(True) > _ar.count(False)
+        else:
+            agg["appropriate_refusal_majority"] = None
+        agg["appropriate_refusal_n_votes"] = len(_ar)
         agg["verdicts"] = [v.get("verdict") for v in vs]
         agg["rationales"] = [v.get("rationale", "")[:200] for v in vs]
         per_query.append(agg)
@@ -335,6 +357,7 @@ def merge_panel(bundle: List[Dict], panels: List[Dict]) -> Dict:
             "n": len(binding),
         }
 
+    neg_judged = [q for q in neg if q.get("appropriate_refusal_majority") is not None]
     aggregate = {
         "n_judges": len(panels),
         "judges": [p.get("judge") for p in panels],
@@ -344,6 +367,14 @@ def merge_panel(bundle: List[Dict], panels: List[Dict]) -> Dict:
             "overall": agg_dim(neg, "overall"),
             "faithfulness": agg_dim(neg, "faithfulness"),
             "fabrication_rate": round(mean([1.0 if q["fabricated_any"] else 0.0 for q in neg]), 3) if neg else None,
+            # 负例拦截权威指标（advisory，暂不进硬门/基线回归——baseline 的方向推断把
+            # 含 "refus" 的指标一律视为越低越好，本指标是越高越好，硬门阈值待 Sam 定）。
+            # 分母 = 有多数票裁决的负例；coverage 如实报告缺票面。
+            "appropriate_refusal_rate": round(mean(
+                [1.0 if q["appropriate_refusal_majority"] else 0.0 for q in neg_judged]), 3) if neg_judged else None,
+            "appropriate_refusal_n_expected": len(neg),
+            "appropriate_refusal_n_judged": len(neg_judged),
+            "appropriate_refusal_coverage": round(len(neg_judged) / len(neg), 3) if neg else None,
             "n": len(neg),
         },
         "positives_fabrication_rate": round(mean([1.0 if q["fabricated_any"] else 0.0 for q in pos]), 3) if pos else None,
