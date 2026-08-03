@@ -215,6 +215,13 @@ def compare(baseline: Dict, results: Dict, delta: float = DEFAULT_DELTA) -> Dict
     cur = extract_metrics(results)
     base_m = baseline.get("metrics") or {}
     delta = baseline.get("delta", delta)
+    # ── 按量纲分档容差（2026-08-02 Sam 拍板）：全局 delta(0.03) 是按 0-1 比率标定的；
+    # 套在 5 分制评委均分上=要求满刻度 0.6% 的稳定性，远小于面板抽样噪声（同一 run 三评委
+    # 负例均分 4.000/4.212/4.424 极差 0.42；同日两独立 run 逐题分数一致——量具噪声非行为
+    # 回归）。5 分制均分族用 0.25（满刻度 5%，仍能抓真实退化）；比率类（fabrication_rate
+    # 等 0-1 指标）不在此列，维持全局 delta。
+    _scale5 = ("judge.faithfulness", "judge.correctness", "judge.completeness",
+               "judge.negatives.overall", "judge.mm.image_relevance")
     # Split regressions by classification: HARD deltas block --strict; ADVISORY/trend deltas are
     # reported visibly but never block (registry above). An advisory metric that REGRESSES must not
     # silently become a hard blocker; a hard metric that regresses must still fail strict mode.
@@ -225,7 +232,8 @@ def compare(baseline: Dict, results: Dict, delta: float = DEFAULT_DELTA) -> Dict
         cv = cur.get(path)
         if cv is None:
             continue  # metric absent this run; coverage/not-executed handled by the strict guards
-        regressed = (cv < bv - delta) if _direction(path) == "higher" else (cv > bv + delta)
+        d = 0.25 if path in _scale5 else delta
+        regressed = (cv < bv - d) if _direction(path) == "higher" else (cv > bv + d)
         if _is_advisory(path):
             adv_n += 1
             if regressed:
