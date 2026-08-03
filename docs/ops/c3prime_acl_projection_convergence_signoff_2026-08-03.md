@@ -14,6 +14,17 @@
 
 ---
 
+## 0-pre. 🔴 现网实测（2026-08-03，prod_ro 只读）—— 记忆已过时，以此为准
+
+**生产语料已清空完毕**：`document_meta` 1938 行全部非 active（307 inactive / 1562 retired /
+69 superseded）；`chunk_meta` **63,882 行全部 `is_active=0`**；**node 文档 0 / 生效 node 授权 0 /
+approved 跨部门授权 0**；`RAG_ALLOWED_DEPTS_ACL` env 未设 ⇒ 默认 **False（关）**。
+
+⇒ **epoch 没有任何存量要收敛，本单 §④「回填」整节对当前语料是空转**；062 的价值全在前方：
+让**重灌进来的新语料从出生就带正确 epoch**。这也是姿态选 A 的决定性依据（见 ②）。
+
+---
+
 ## 0. 一条必须先纠正的判断（我核验后与研究文档不同）
 
 研究文档 §1.5 把「`chunk_meta.allowed_depts IS NULL` 的检索语义」列为决定 C3 优先级的前置问题，
@@ -59,7 +70,7 @@
 
 | 项 | 内容 | 状态 |
 |---|---|---|
-| 待拍板 | `document_meta.acl_epoch`（投影失效代次，单调只增）+ `chunk_meta.acl_epoch`（投影水位，NULL=从未投影过） | ☐ |
+| ✅ 已 apply | `document_meta.acl_epoch` + `chunk_meta.acl_epoch` —— **2026-08-03 已 apply staging+生产**（`PROD-RW:2026-08-03`，台账 checksum d98971f6） | ✅ |
 | 三态判定（**含不变量破坏态**） | `cm.acl_epoch = dm.acl_epoch` ⇒ clean；`IS NULL` 或 `<` ⇒ dirty；**`>` ⇒ 不变量破坏**（正常路径不可能，但错误 writer / 局部恢复 / 人工 SQL 可造成）⇒ **阻断告警，不得判 unchanged、不得 certify**。无需改 DDL，但实施协议必须覆盖 | ☐ |
 | 证据 | Kendra `PutPrincipalMapping.OrderingId` 单调 last-writer-wins + `ListGroupsOlderThanOrderingId`（官方内置的陈旧权限检测）。⚠️ Kendra 2026-06-30 维护模式、07-30 起不接新客户 —— **设计可参考，不可选型** | |
 | 建议 | **采纳。** 唯一「谓词天然覆盖『从未投影过』且不会退化」的方案；现落码的 stale-owner 候选源只覆盖 owner 一轴、且只覆盖 current 版 | |
@@ -75,11 +86,11 @@
 | 为何必须有 fingerprint（不是可选） | 投影结果还受**代码/配置语义**影响：`resolve_allowed_depts` 读运行时组码白名单、`project_doc_acl` 的哨兵/规范化规则也可能改 —— 这类变化**不触发任何 DB writer**，epoch 不动而谓词照判 clean。**trigger 同样抓不到**。且静态 allowlist 只能强制"新增写点被审阅"，测试自己就承认 `join/format` 动态构造会漏报 | |
 | fingerprint 的硬要求 | 必须**完全绕过 epoch 候选集**做全量；发现"epoch 相等但 fingerprint 不等"须至少 bump+enqueue 或**阻断告警**，**不得只记日志后继续宣称收敛**；投影规则变更须配套全局 invalidate（或引入 policy version） | ☐ |
 | 为何不上 trigger | 仓库**零 trigger 先例**；且可能破坏既有 meta-first 锁序纪律（spot_checker 明确要求）。生产 RDS 的 TRIGGER 权限/迁移工具兼容/锁序**均未实测** | |
-| ⚠️ 硬约束 | bump **不得受 `RAG_ALLOWED_DEPTS_ACL` 门控** —— flag 关闭期的权威变化若不 bump，水位永久丢失，开 flag 后这批文档永远判 unchanged | ☐ |
+| ✅ 硬约束（Sam 2026-08-03 已确认） | bump **不得受 `RAG_ALLOWED_DEPTS_ACL` 门控** —— flag 关闭期的权威变化若不 bump，水位永久丢失，开 flag 后这批文档永远判 unchanged | ☐ |
 | stamp 点（codex 穷举确认） | 只有三处写 RDS 投影：materializer 的 node UPDATE、materializer 的 legacy UPDATE、**stage-2/re-chunk 共用的 `node_write_chunk_meta` INSERT**。⚠️ 漏第三处 ⇒ **每篇新摄取文档的 chunk 天生 `acl_epoch=NULL`、永久 dirty，sweep 对新文档永不收敛**。stage-3 reload 只改内存后推 HA3、spot_checker 只停用 chunk、rebuild 脚本只改 index_status —— **均不是 stamp 点** | |
-| 🔴 **`projection_complete` 不变量（必须拍板，否则会重造 C3）** | **`chunk_meta.acl_epoch=E` 当且仅当 `(owner_dept, allowed_depts)` 已由 strict authority snapshot 完整成功计算。任何门控跳过、capability/mode/grant 读取失败或 fallback 都不得 stamp。** 适用于 materializer / certify / stage-2 **三类** stamp | ☐ |
+| ✅ **`projection_complete` 不变量（Sam 2026-08-03 已确认）** | **`chunk_meta.acl_epoch=E` 当且仅当 `(owner_dept, allowed_depts)` 已由 strict authority snapshot 完整成功计算。任何门控跳过、capability/mode/grant 读取失败或 fallback 都不得 stamp。** 适用于 materializer / certify / stage-2 **三类** stamp | ☐ |
 | 为何这条是必须的（已核验） | 当前 stage-2 **三处都不满足**：①legacy `allowed_depts` 受默认关闭的 `RAG_ALLOWED_DEPTS_ACL` 门控，注释明写"flag 关 → 不查、写 NULL"（`pipeline_nodes.py:6251`）；②即使 flag 开，解析失败也只 `print` 后继续写空投影（`pipeline_nodes.py:6304`）；③node 模式识别仍走 fail-loose 的 `resolve_acl_modes`（`pipeline_nodes.py:6265`）。⇒ 若无条件 stamp，新 chunk 会被"认证为最新"而其 `allowed_depts` **根本没算过**；日后开 flag 时 epoch 相等、sweep 不修 —— **正好重造"从未投影却被判 clean"** | |
-| 🔴 **姿态二选一（Sam 拍板，建议 A）** | **A（建议）**：RDS 的 owner/allowed 投影**始终计算**，`RAG_ALLOWED_DEPTS_ACL` 只控制 **HA3 字段推送与检索消费**，解析失败则不 stamp 或中止该文档。<br>**B（低改动后备）**：门关闭时允许写 NULL，但**一律不 stamp**，启用后由 sweep 补齐。 | ☐ |
+| ✅ **姿态：Sam 2026-08-03 拍板选 A** | **A（已选）**：RDS 的 owner/allowed 投影**始终计算**，`RAG_ALLOWED_DEPTS_ACL` 只控制 **HA3 字段推送与检索消费**，解析失败则不 stamp 或中止该文档。<br>**依据**：重灌在即而 flag 为关 —— 选 B 会让新语料每个 chunk 都带 `acl_epoch=NULL`，开 flag 时必须对整个新语料全量回填。<br>**安全性已核实**：`to_ha3_doc(include_allowed_depts=False)` 默认不推 `allowed_depts`，推送由调用点单独门控 ⇒ **A 不改变进 HA3 的载荷**，serving 行为逐字节不变。 | ✅ |
 | 待实现方案选择（不阻塞拍板） | strict authority 读取失败时是"整篇中止"还是"写 chunk 但 epoch 留 NULL" —— 留到实现评审；Sam 现在只需拍**"失败不得 stamp"这个不变量** | |
 
 ### ③ C3′ 多版本 materializer —— **必须与「全版本 epoch sweep / 消费启用」同批**（不要求与纯 DDL apply 同批）
