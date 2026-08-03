@@ -59,6 +59,7 @@ from opensearch_pipeline.answer_flow import (
     REALTIME_BLOCK_MESSAGE,
     SENSITIVE_BLOCK_MESSAGE,
     build_failure_action,
+    build_guard_outcome,
     build_qa_log_kwargs,
     history_answer_text,
     is_refusal_answer,
@@ -73,6 +74,7 @@ from opensearch_pipeline.intent_router import (
     ROUTE_SENSITIVE,
     ROUTE_SMALLTALK,
     pre_route,
+    sensitive_guard_route,
     triage_failed_query,
 )
 from opensearch_pipeline.rate_limiter import LIMITER
@@ -1138,6 +1140,13 @@ def _bot_execute_general_llm(question: str, *, history, tier: str, sender_staff_
 def _bot_pre_route(question: str, *, sender_staff_id: str, user_dept,
                    conversation_type: str):
     """前置确定性路由（检索之前）。None = 照常走知识库。语义与 api 侧同源。"""
+    # v2 敏感 guard 先行（RAG_SENSITIVE_QUERY_GUARD，默认 off 恒 None）——
+    # 与 api._general_pre_route_decision 同源，不受 general_ability_mode 门控。
+    guard = sensitive_guard_route(question)
+    if guard is not None:
+        outcome = build_guard_outcome(guard.route)
+        if outcome is not None:
+            return outcome
     mode, _guided, _on = _bot_general_flags(conversation_type)
     if mode == "off":
         return None

@@ -161,6 +161,9 @@ def regime_of(results: Dict) -> Dict:
 _REGIME_KEYS = ("eval_set_sha", "fusion", "rerank_enable", "llm_model",
                 "embedding_model", "reranker_models", "threshold_version",
                 "judge_model", "judge_rubric_version",
+                # v2 敏感 guard 姿态（2026-08-02）：guard on/off 改写负例路径本身，
+                # 跨姿态比较必须硬失败（不进宽容窗口）——重冻由 Sam 拍板后执行。
+                "sensitive_query_guard", "sensitive_prompt_guard",
                 "vlm_model", "vlm_cache_version", "l4_gt_sha",
                 "l4_ingestion_evaluator_version", "funnel_policy",
                 "l6_evaluator_version",

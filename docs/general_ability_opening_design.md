@@ -54,6 +54,21 @@
 
 判定顺序（任何不确定 → kb；`mode=off` 首行短路，连正则都不跑）：
 
+> **v2 敏感查询 guard 补遗（2026-08-02，release-gate RAG-50/57 缺口修复）**：
+> `RAG_SENSITIVE_QUERY_GUARD`（默认 off）开启后，api/`_general_pre_route_decision`
+> 与 bot/`_bot_pre_route` 在 mode 判定**之前**先跑 `intent_router.sensitive_guard_route`
+> —— 敏感硬红线不再挂在本 mode 总闸后面（mode=off 也拦）。v2 新增三家族
+> （`classify_sensitive_v2`）：F1 具名个人 PII 代查（"张三上个月的工资明细"，两阶段
+> 姓名验证：姓氏 allowlist + 停用词 blacklist + 强锚）、F2 敏感台账访问（"打开车牌
+> 统计汇总表"，双向意图）、F3 业务系统实时数据（"ERP里库存还有多少" →
+> `ROUTE_REALTIME_DATA`，`SUCCESS`+`intent_type=refuse_system_integration` 新词——与
+> ③refuse_realtime 的公共实时信息分桶）。flag on 时 pre_route 内 v2 判定同样先于
+> 公司信号（F3 的 ERP 是强公司信号，排后面永不可达）。误伤铁门 =
+> `python -m eval_harness.sensitive_guard_ab`（金集 258 题零正例误伤）；eval L3 镜像
+> 同一 guard（release-gate 从此测得到规则层）；prompt 层第二道防线 =
+> `RAG_SENSITIVE_PROMPT_GUARD`（`SENSITIVE_BOUNDARY_RULE` 条件追加，默认 off）。
+> 两 flag 均进 eval regime 严格键，生产开启须 Sam 拍板。
+
 1. **敏感硬红线** → BLOCKED。只拦【个案/打探/对抗】形态（"谁的工资比我高""哪个同事被
    辞退""怎么起诉公司"）；**制度性问题不拦**（"工资几号发""加班工资是多少""辞退赔偿的
    制度规定"照走知识库——误拦制度问题比放行打探更伤，那是知识库的正当领地）。

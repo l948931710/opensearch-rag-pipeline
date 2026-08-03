@@ -367,3 +367,29 @@ def test_api_ready_degrades_on_contract_mismatch(monkeypatch):
     monkeypatch.setattr(api, "_EMBEDDING_CONTRACT_MISMATCH", False)
     r2 = TestClient(api.app).get("/api/ready")
     assert r2.json()["embedding_contract"] == "ok"
+
+
+def test_sensitive_boundary_prompt_flag(monkeypatch):
+    """RAG_SENSITIVE_PROMPT_GUARD（2026-08-02 v2 guard prompt 层）：off 逐字节不变；
+    on 时 default/pure/custom 全分支统一追加（安全边界不因调用形态豁免），
+    prompt_flags 新增 sensitive_boundary 成员判定。"""
+    import opensearch_pipeline.config as CONF
+    from opensearch_pipeline import llm_generator as G
+
+    monkeypatch.delenv("RAG_SENSITIVE_PROMPT_GUARD", raising=False)
+    CONF._config = None
+    p_off = G._select_system_prompt(None, True, "")
+    assert p_off == G.TEXT_ONLY_SYSTEM_PROMPT          # off = 逐字节现状
+    assert G.build_gen_meta(p_off, temperature=0.1, model="qwen-test")[
+        "prompt_flags"]["sensitive_boundary"] is False
+
+    monkeypatch.setenv("RAG_SENSITIVE_PROMPT_GUARD", "true")
+    CONF._config = None
+    for args in ((None, True, ""),                      # 纯文本分支
+                 (None, False, "x <<IMG:1>> y"),        # 图文默认分支
+                 ("自定义提示词", False, "")):            # 显式覆盖分支
+        p_on = G._select_system_prompt(*args)
+        assert G.SENSITIVE_BOUNDARY_RULE in p_on, args
+    assert G.build_gen_meta(p_on, temperature=0.1, model="qwen-test")[
+        "prompt_flags"]["sensitive_boundary"] is True
+    CONF._config = None

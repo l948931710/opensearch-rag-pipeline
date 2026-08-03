@@ -175,3 +175,49 @@ class TestAskRequestIdentifierLimits:
         with pytest.raises(ValidationError):
             AskRequest(question="q", user_id="u" * 129)
         assert AskRequest(question="q", session_id="s" * 128).session_id == "s" * 128
+
+
+class TestBuildGuardOutcome:
+    """v2 guard 的 route→outcome 单一来源（api/钉钉/eval L3 三处共用）。"""
+
+    def test_route_literal_parity_with_intent_router(self):
+        # answer_flow 为保零重依赖不 import intent_router，两份 route 字面量
+        # 的一致性由本断言钉死（漂移即红）。
+        import opensearch_pipeline.answer_flow as AF
+        import opensearch_pipeline.intent_router as IR
+        assert AF._GUARD_ROUTE_SENSITIVE == IR.ROUTE_SENSITIVE
+        assert AF._GUARD_ROUTE_REALTIME_DATA == IR.ROUTE_REALTIME_DATA
+
+    def test_sensitive_outcome(self):
+        from opensearch_pipeline.answer_flow import (
+            SENSITIVE_BLOCK_MESSAGE, build_guard_outcome)
+        out = build_guard_outcome("sensitive_block")
+        assert out["answer"] == SENSITIVE_BLOCK_MESSAGE
+        assert out["answer_status"] == "BLOCKED"
+        assert out["intent_type"] == "refuse_sensitive"
+        assert out["risk_level"] == "sensitive" and out["risk_blocked"] is True
+        assert out["source"] == "guard"
+
+    def test_realtime_data_outcome(self):
+        from opensearch_pipeline.answer_flow import (
+            REALTIME_DATA_BLOCK_MESSAGE, build_guard_outcome)
+        out = build_guard_outcome("realtime_data_block")
+        assert out["answer"] == REALTIME_DATA_BLOCK_MESSAGE
+        # SUCCESS + 新 intent 词：不入 NO_RESULT/REFUSAL 缺口挖掘口径（T0③ 前例）
+        assert out["answer_status"] == "SUCCESS"
+        assert out["intent_type"] == "refuse_system_integration"
+        assert out["risk_blocked"] is False
+
+    def test_unknown_route_none(self):
+        from opensearch_pipeline.answer_flow import build_guard_outcome
+        assert build_guard_outcome("kb") is None
+        assert build_guard_outcome("") is None
+
+    def test_canned_messages_hit_refusal_matchers(self):
+        # 话术措辞约束（codex 共识实测口径）：两条 canned 必须命中 serving 侧
+        # is_refusal_answer（=eval hard_refusal 同款正则），否则 eval 的
+        # interception_rate_rulebased 与看板拒答口径测不到 guard。
+        from opensearch_pipeline.answer_flow import (
+            REALTIME_DATA_BLOCK_MESSAGE, SENSITIVE_BLOCK_MESSAGE, is_refusal_answer)
+        assert is_refusal_answer(SENSITIVE_BLOCK_MESSAGE)
+        assert is_refusal_answer(REALTIME_DATA_BLOCK_MESSAGE)

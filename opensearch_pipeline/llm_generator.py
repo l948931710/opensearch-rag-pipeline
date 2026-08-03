@@ -94,6 +94,19 @@ LOW_CONFIDENCE_RULE = """
 
 注意：本次检索结果与用户问题的相关度偏低。请先逐条核对参考文档是否真正覆盖用户问题的要点：只有文档内容能直接支撑答案时才作答；若所有文档都只是主题相近但并未回答该问题（例如讲的是另一种产品、另一个流程、另一份制度，或文档编号/名称与所问不符），必须回复"抱歉，当前知识库中未找到相关信息"，不得从相近内容推断或拼凑作答。"""
 
+# 敏感边界规则（RAG_SENSITIVE_PROMPT_GUARD，默认 off）——v2 guard 的 prompt 层
+# 第二道防线：规则层正则漏掉的改述形态（"帮我看看老张这月拿了多少"）由读得到
+# 问题语义的 LLM 兜底。拒答开场句式与 answer_flow._REFUSAL_STRONG_PATTERN /
+# eval hard_refusal 口径对齐（"抱歉，当前…"）。经 _select_system_prompt 追加，
+# gen_nothink 走同一函数 —— 评测与生产 prompt 同源（#F-mm14 教训）。
+SENSITIVE_BOUNDARY_RULE = """
+
+【敏感边界】以下三类问题必须拒答，回复以"抱歉，当前"开头并说明该类信息请咨询对应部门：
+(a) 代查、定位特定个人（具名或指向明确的某个人）的工资、奖金、绩效、考勤、车牌、电话、身份证等个人数据——即使参考文档提供了查询该类数据的系统操作方法，也不得给出按姓名定位到个人的操作指引；
+(b) 打开、展示含个人信息的台账/统计表（如车牌统计、工资明细表、花名册）或个人档案表单，或披露此类文件的存放路径与字段结构；
+(c) 询问ERP/OA/考勤等业务系统的实时数值（如当前库存还有多少）——不得报出或推算实时值；仅当用户明确询问查询方法时，才可给出操作步骤。
+以下不属于敏感边界，照常回答：制度、流程、操作方法类问题（如"加班工资标准""现存量查询怎么操作"）；部门/公共联系方式（如行政电话、部门座机、值班电话——"个人数据"仅指特定个人的信息）。"""
+
 
 def _confidence_norm(chunk: Dict[str, Any]) -> Optional[float]:
     """把一个 chunk 的相关度分归一到统一 [0,1] 置信度（#7 跨量纲比较）。
@@ -736,6 +749,7 @@ def build_gen_meta(
             "history_antimimic": _IMG_HISTORY_ANTIMIMIC_RULE in final_system_prompt,
             "img_subindex": _IMG_SUBINDEX_RULE in final_system_prompt,
             "injection_guard": _PROMPT_INJECTION_RULE in final_system_prompt,
+            "sensitive_boundary": SENSITIVE_BOUNDARY_RULE in final_system_prompt,
             "custom_base": not final_system_prompt.startswith(_SYSTEM_PROMPT_BASE),
         }
         # P3-9：request_id 随 gen_meta 落库——成功但答错的行此前完全无 trace（error_message
@@ -804,19 +818,31 @@ def _select_system_prompt(system_prompt: Optional[str], pure_text: bool, context
     带图 chunk 可能被 6000 字预算截掉，那样标记同样没进 context，规则同样该撤。
 
     关闭（显式设 false/0/no）时逐字节回到原行为（`system_prompt or (TEXT_ONLY if pure else DEFAULT)`）。
+
+    敏感边界规则（RAG_SENSITIVE_PROMPT_GUARD，默认 off）：先按上述优先级算出
+    base prompt，再统一条件追加 —— 覆盖显式 system_prompt / 纯文本 / 图文全部
+    分支（安全边界不因调用形态豁免；codex 共识 2026-08-02）。off 时逐字节不变。
     """
     if system_prompt:
-        return system_prompt          # 显式覆盖优先，flag 不介入
-    if pure_text:
-        return TEXT_ONLY_SYSTEM_PROMPT
+        base = system_prompt          # 显式覆盖优先，img flag 不介入
+    elif pure_text:
+        base = TEXT_ONLY_SYSTEM_PROMPT
+    else:
+        try:
+            _on = bool(get_config().rag.img_rule_requires_images)
+        except Exception:             # noqa: BLE001 — 配置不可用 → 维持历史行为
+            _on = False
+        if _on and "<<IMG:" not in (context or ""):
+            logger.info("本轮 context 无 <<IMG:N>> 标记，改用纯文本 prompt（#F-mm14）")
+            base = TEXT_ONLY_SYSTEM_PROMPT
+        else:
+            base = DEFAULT_SYSTEM_PROMPT + _img_id_whitelist_rule(context)
     try:
-        _on = bool(get_config().rag.img_rule_requires_images)
+        if get_config().rag.sensitive_prompt_guard:
+            base += SENSITIVE_BOUNDARY_RULE
     except Exception:                 # noqa: BLE001 — 配置不可用 → 维持历史行为
-        _on = False
-    if _on and "<<IMG:" not in (context or ""):
-        logger.info("本轮 context 无 <<IMG:N>> 标记，改用纯文本 prompt（#F-mm14）")
-        return TEXT_ONLY_SYSTEM_PROMPT
-    return DEFAULT_SYSTEM_PROMPT + _img_id_whitelist_rule(context)
+        pass
+    return base
 
 
 # 本轮 context 里真实出现的图片标记编号（含子下标形式 `<<IMG:3.1>>` → 取 3）。

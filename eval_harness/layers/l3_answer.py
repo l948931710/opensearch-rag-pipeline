@@ -28,12 +28,61 @@ _CTX_CHARS = 1100
 
 
 def run(cases: List[Dict], top_k: int = 7, retrieved_by_qid: Dict = None) -> Dict:
+    from opensearch_pipeline.answer_flow import build_guard_outcome
+    from opensearch_pipeline.intent_router import sensitive_guard_route
     from opensearch_pipeline.retriever import retrieve_and_enrich
 
     per_query: List[Dict] = []
     bundle: List[Dict] = []
 
     for c in cases:
+        # v2 sensitive-query guard mirror (RAG_SENSITIVE_QUERY_GUARD, default off):
+        # production intercepts BEFORE retrieval, so the eval must too — otherwise the
+        # release gate measures a path production never takes (the 2026-08-02 gap:
+        # L3 bypassed the rule layer entirely). Guard hit → canned policy answer, no
+        # retrieval / no LLM; guard metadata rides into per_query AND the judge bundle
+        # (the judge must see WHY the context is empty — else policy refusals would be
+        # scored as fabrication; rubric answer_rubric_v2).
+        _g = sensitive_guard_route(c["query"])
+        if _g is not None:
+            _out = build_guard_outcome(_g.route)
+            if _out is not None:
+                ans = _out["answer"]
+                kw = c.get("keyword_gt") or []
+                per_query.append({
+                    "qid": c["qid"], "kind": c["kind"], "module": c["module"],
+                    "dept": c.get("dept"), "difficulty": c.get("difficulty"),
+                    "live_scorable": c.get("live_scorable"),
+                    "query": c["query"], "answer": ans,
+                    "answer_chars": len(ans),
+                    "refusal": refusal_detected(ans),
+                    "hard_refusal": hard_refusal(ans),
+                    "source_leak": source_leak_detected(ans),
+                    "img_markers": img_marker_count(ans),
+                    "numbered_steps": numbered_step_count(ans),
+                    "had_reasoning": False,
+                    "keyword_coverage": (None if not kw else round(keyword_coverage(ans, kw), 4)),
+                    "n_context_chunks": 0,
+                    "usage": {},
+                    "latency_ms": 0,
+                    "guard_blocked": True,
+                    "guard_route": _g.route,
+                })
+                bundle.append({
+                    "qid": c["qid"], "kind": c["kind"], "module": c["module"],
+                    "dept": c.get("dept"), "difficulty": c.get("difficulty"),
+                    "query": c["query"],
+                    "gold_answer_points": c.get("answer_points") or "",
+                    "gold_keywords": kw,
+                    "expected_docs": c.get("expected_docs", []),
+                    "context_text": "",
+                    "context": [],
+                    "answer": ans,
+                    "guard_route": _g.route,
+                    "guard_policy": ("查询在检索前被确定性敏感规则拦截，返回固定"
+                                     "边界话术；context 为空是拦截所致，不是检索缺陷"),
+                })
+                continue
         # reuse L1 retrieval if available to save an embedding call; else retrieve fresh
         chunks = (retrieved_by_qid or {}).get(c["qid"])
         if chunks is None:
@@ -100,6 +149,7 @@ def run(cases: List[Dict], top_k: int = 7, retrieved_by_qid: Dict = None) -> Dic
     # a positive whose gold is missing (coverage gap) SHOULD refuse -> not over-refusal.
     pos_scorable = [r for r in pos if r.get("live_scorable")]
     pos_unresolved = [r for r in pos if not r.get("live_scorable")]
+    neg_gen = [r for r in neg if not r.get("guard_blocked")]   # negatives that reached the LLM
 
     det = {
         "n_answered": len(ok),
@@ -125,6 +175,10 @@ def run(cases: List[Dict], top_k: int = 7, retrieved_by_qid: Dict = None) -> Dic
             # Authoritative interception is the Claude judge's appropriate_refusal; this is the
             # rule-based proxy (a negative may legitimately be answerable from ANOTHER doc).
             "interception_rate_rulebased": round(mean([1.0 if r["hard_refusal"] else 0.0 for r in neg]), 4) if neg else None,
+            # split so a guard-layer gain can't mask a prompt/LLM-layer regression:
+            # guard = deterministic pre-retrieval interception; gen = LLM declined on its own.
+            "guard_interception_rate": round(mean([1.0 if r.get("guard_blocked") else 0.0 for r in neg]), 4) if neg else None,
+            "interception_rate_rulebased_gen": round(mean([1.0 if r["hard_refusal"] else 0.0 for r in neg_gen]), 4) if neg_gen else None,
             "source_leak_rate": round(mean([1.0 if r["source_leak"] else 0.0 for r in neg]), 4) if neg else None,
         },
         "mean_latency_ms": round(mean([r["latency_ms"] for r in ok if r.get("latency_ms")]), 1) if ok else None,

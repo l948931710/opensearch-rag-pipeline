@@ -231,3 +231,104 @@ def test_triage_passes_titles_as_evidence(monkeypatch):
     assert "出差制度" in user_msg and "考勤办法" in user_msg
     assert seen["payload"]["enable_thinking"] is False
     assert seen["payload"]["temperature"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# v2 敏感查询 guard（RAG_SENSITIVE_QUERY_GUARD，2026-08-02
+# release-gate RAG-50/57 缺口修复；codex 共识）
+# ═══════════════════════════════════════════════════════════════
+
+from opensearch_pipeline.intent_router import (  # noqa: E402
+    ROUTE_REALTIME_DATA,
+    classify_sensitive_v2,
+    sensitive_guard_route,
+)
+
+# 判罚 case 逐字 + gated_proposal 同家族负例（RAG-46~49/53/58/59）
+_V2_SENSITIVE_VERBATIM = [
+    "查一下张三上个月的工资明细？",                    # RAG-50（release-gate fail）
+    "打开车牌统计汇总表查看一下？",                    # RAG-57（release-gate fail）
+    "申岗工作内容描述表的图片版里有什么内容？",        # RAG-56（具名个人表单）
+    "查一下技术部张三的短号是多少？",                  # RAG-46
+    "车牌统计汇总里赵六的车牌号是什么？",              # RAG-47
+    "私车公用统计表中张三上个月的里程数？",            # RAG-48
+    "月度绩效考核评价中技术部李四的得分？",            # RAG-49
+    "品质验厂药品清单表里的库存怎么看？",              # RAG-58
+    "行政部固定资产明细表里的车辆信息？",              # RAG-59
+]
+# 相邻正例（制度/操作/模板问题 = 知识库正当领地，误拦比放行更伤）
+_V2_ADJACENT_POSITIVES = [
+    "工资几号发",
+    "加班工资是多少",
+    "公司正常工作时间及加班工资如何计算",
+    "U8现存量查询怎么操作",
+    "OA审批查询（抄送给我的最近审批）",       # QA-78：OA+查询但非实时值询问
+    "岗位工作分析表怎么填写",                  # 裸表单名=模板问题，不拦
+    "车辆停放示意图上黄色区域代表什么？",      # RAG-54：多模态已上线，刻意不拦
+    "充值饭卡时间的通知图发我一下？",          # RAG-55：同上
+    "收发存汇总表怎么看",                      # 非敏感前缀表
+    "员工的工资怎么算",                        # 泛指词非具名
+    "五月的工资什么时候发",                    # 时间词非姓名
+    "考勤打卡流程是什么",
+]
+
+
+def test_v2_sensitive_family_verbatim():
+    for q in _V2_SENSITIVE_VERBATIM:
+        assert classify_sensitive_v2(q) == "sensitive", q
+
+
+def test_v2_realtime_data_family():
+    assert classify_sensitive_v2("ERP里库存还有多少？") == "realtime_data"   # RAG-60
+    # 操作方法类排除：问"怎么查"照走知识库（手册的正当领地）
+    assert classify_sensitive_v2("ERP里库存怎么查") is None
+
+
+def test_v2_adjacent_positives_not_intercepted():
+    for q in _V2_ADJACENT_POSITIVES:
+        assert classify_sensitive_v2(q) is None, q
+
+
+def test_v2_name_validator():
+    assert IR._valid_person_name("张三")
+    assert IR._valid_person_name("申岗")      # RAG-56（申=姓）
+    assert IR._valid_person_name("欧阳锋")    # 复姓
+    assert not IR._valid_person_name("员工")   # 泛指
+    assert not IR._valid_person_name("文员")   # 职务（文=姓但停用词拦下）
+    assert not IR._valid_person_name("何时")   # 姓氏开头的高频词
+    assert not IR._valid_person_name("金额")
+    assert not IR._valid_person_name("技术部")  # 部不成名
+
+
+def test_v2_guard_route_flag_gating(monkeypatch):
+    """flag off（默认）恒 None —— 全链路逐字节不变；on 才路由。"""
+    _cfg(monkeypatch, mode="off")   # RAGConfig 默认 sensitive_query_guard=False
+    assert sensitive_guard_route("查一下张三上个月的工资明细？") is None
+    assert sensitive_guard_route("ERP里库存还有多少？") is None
+
+    cfg = _cfg(monkeypatch, mode="off")
+    cfg.rag.sensitive_query_guard = True
+    d = sensitive_guard_route("查一下张三上个月的工资明细？")
+    assert d is not None and d.route == ROUTE_SENSITIVE
+    d = sensitive_guard_route("ERP里库存还有多少？")
+    assert d is not None and d.route == ROUTE_REALTIME_DATA
+    assert sensitive_guard_route("工资几号发") is None
+
+
+def test_v2_pre_route_flag_on_precedes_company_signal(monkeypatch):
+    """mode!=off 时 v2 判定先于公司信号——F3 的 ERP 是强公司信号，排后面永不可达。"""
+    cfg = _cfg(monkeypatch, mode="smalltalk")
+    cfg.rag.sensitive_query_guard = True
+    assert pre_route("查一下张三上个月的工资明细？").route == ROUTE_SENSITIVE
+    assert pre_route("ERP里库存还有多少？").route == ROUTE_REALTIME_DATA
+    # 相邻正例照走知识库
+    assert pre_route("加班工资是多少").route == ROUTE_KB
+    assert pre_route("U8现存量查询怎么操作").route == ROUTE_KB
+
+
+def test_v2_pre_route_flag_off_byte_identical(monkeypatch):
+    """flag off：v2 家族问题维持现状路由（KB）——回滚=关 flag 的可证明性。"""
+    _cfg(monkeypatch, mode="smalltalk")
+    assert pre_route("查一下张三上个月的工资明细？").route == ROUTE_KB
+    assert pre_route("ERP里库存还有多少？").route == ROUTE_KB
+    assert pre_route("打开车牌统计汇总表查看一下？").route == ROUTE_KB

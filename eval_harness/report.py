@@ -295,6 +295,15 @@ def build_gates(r: Dict) -> Dict:
         if nfab is not None:
             gates["negative fabrication (Claude, L3)"] = {"target": "<= 0.10", "value": nfab,
                                                           "pass": nfab <= 0.10}
+        # 负例拦截权威指标（2026-08-02 起聚合；advisory 展示、恒 pass —— 硬门阈值
+        # 待 Sam 拍板且 RAG-54/55 金集重裁前该率天然到不了 1.0；coverage 一并带出，
+        # 缺票面不许被均值遮住）。
+        ar = _g(j, "negatives", "appropriate_refusal_rate")
+        if ar is not None:
+            cov = _g(j, "negatives", "appropriate_refusal_coverage")
+            gates["negative appropriate-refusal (Claude, L3, advisory)"] = {
+                "target": "advisory (no hard gate yet — threshold pending Sam)",
+                "value": f"{ar} (coverage={cov})", "pass": True}
         # ① inter-judge agreement gate (L3 answer panel). sd None = no positives judged this run →
         # expected_na (the answer-correctness gates above already carry the not-judged signal).
         sd = j.get("mean_overall_interjudge_stdev")

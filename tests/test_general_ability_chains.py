@@ -401,3 +401,95 @@ class TestCalcQuotaExemption:
                                            sender_staff_id="s1")
         assert out is not None and out["model"] == "calc"
         assert "36" in out["answer"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# v2 敏感查询 guard（RAG_SENSITIVE_QUERY_GUARD，2026-08-02）：
+# 不受 general_ability_mode 总闸门控 —— mode=off 也拦（历史缺口修复）。
+# ═══════════════════════════════════════════════════════════════
+
+from opensearch_pipeline.answer_flow import REALTIME_DATA_BLOCK_MESSAGE  # noqa: E402
+
+
+@pytest.fixture
+def v2_guard_on(monkeypatch):
+    """只开 v2 guard，general_ability_mode 保持 off —— 钉死"独立于总闸"。"""
+    monkeypatch.setenv("RAG_SENSITIVE_QUERY_GUARD", "true")
+    monkeypatch.delenv("RAG_GENERAL_ABILITY_MODE", raising=False)
+    CONF._config = None
+    yield
+    CONF._config = None
+
+
+class TestSensitiveQueryGuardV2:
+
+    @patch("opensearch_pipeline.api.log_qa_session")
+    @patch("opensearch_pipeline.api.retrieve_and_enrich")
+    def test_pii_lookup_blocked_with_mode_off(self, mock_retrieve, mock_log,
+                                              client, v2_guard_on):
+        """RAG-50 家族：mode=off + guard on → BLOCKED，检索不发生。"""
+        mock_retrieve.side_effect = AssertionError("guard 命中不应触发检索")
+        resp = client.post("/api/ask", json={"question": "查一下张三上个月的工资明细？"})
+        data = resp.json()
+        assert data["answer"] == SENSITIVE_BLOCK_MESSAGE
+        kw = mock_log.call_args.kwargs
+        assert kw["answer_status"] == "BLOCKED"
+        assert kw["risk_blocked"] is True
+        assert kw["intent_type"] == "refuse_sensitive"
+
+    @patch("opensearch_pipeline.api.log_qa_session")
+    @patch("opensearch_pipeline.api.retrieve_and_enrich")
+    def test_table_open_blocked(self, mock_retrieve, mock_log, client, v2_guard_on):
+        """RAG-57：敏感台账打开意图。"""
+        mock_retrieve.side_effect = AssertionError("guard 命中不应触发检索")
+        resp = client.post("/api/ask", json={"question": "打开车牌统计汇总表查看一下？"})
+        assert resp.json()["answer"] == SENSITIVE_BLOCK_MESSAGE
+
+    @patch("opensearch_pipeline.api.log_qa_session")
+    @patch("opensearch_pipeline.api.retrieve_and_enrich")
+    def test_realtime_data_boundary(self, mock_retrieve, mock_log, client, v2_guard_on):
+        """RAG-60：业务系统实时数据 → SUCCESS + refuse_system_integration。"""
+        mock_retrieve.side_effect = AssertionError("guard 命中不应触发检索")
+        resp = client.post("/api/ask", json={"question": "ERP里库存还有多少？"})
+        assert resp.json()["answer"] == REALTIME_DATA_BLOCK_MESSAGE
+        kw = mock_log.call_args.kwargs
+        assert kw["answer_status"] == "SUCCESS"
+        assert kw["intent_type"] == "refuse_system_integration"
+        assert kw["risk_blocked"] is False
+
+    @patch("opensearch_pipeline.api.log_qa_session")
+    @patch("opensearch_pipeline.api.retrieve_and_enrich")
+    def test_adjacent_positive_goes_kb(self, mock_retrieve, mock_log,
+                                       client, v2_guard_on):
+        """相邻正例（操作方法类）照走知识库。"""
+        mock_retrieve.return_value = []
+        client.post("/api/ask", json={"question": "U8现存量查询怎么操作"})
+        assert mock_retrieve.called
+
+    @patch("opensearch_pipeline.api.log_qa_session")
+    @patch("opensearch_pipeline.api.retrieve_and_enrich")
+    def test_flag_off_byte_identical(self, mock_retrieve, mock_log, client):
+        """默认双关：RAG-50 照走知识库（现状），回滚可证明。"""
+        mock_retrieve.return_value = []
+        client.post("/api/ask", json={"question": "查一下张三上个月的工资明细？"})
+        assert mock_retrieve.called
+
+    def test_bot_seam_blocked_with_mode_off(self, v2_guard_on):
+        """钉钉接缝（同步/流式共用 _bot_pre_route）：mode=off + guard on → BLOCKED。"""
+        from opensearch_pipeline.dingtalk_bot import _bot_pre_route
+        pre = _bot_pre_route("查一下张三上个月的工资明细？", sender_staff_id="U1",
+                             user_dept=["it"], conversation_type="1")
+        assert pre is not None
+        assert pre["answer"] == SENSITIVE_BLOCK_MESSAGE
+        assert pre["answer_status"] == "BLOCKED"
+        pre2 = _bot_pre_route("ERP里库存还有多少？", sender_staff_id="U1",
+                              user_dept=["it"], conversation_type="1")
+        assert pre2 is not None
+        assert pre2["intent_type"] == "refuse_system_integration"
+
+    def test_bot_seam_flag_off_none(self):
+        from opensearch_pipeline.dingtalk_bot import _bot_pre_route
+        CONF._config = None
+        pre = _bot_pre_route("查一下张三上个月的工资明细？", sender_staff_id="U1",
+                             user_dept=["it"], conversation_type="1")
+        assert pre is None

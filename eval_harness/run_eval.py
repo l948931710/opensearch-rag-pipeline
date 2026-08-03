@@ -214,6 +214,11 @@ def _regime(cfg, goldset_path: str) -> dict:
         "threshold_version": thr,
         "judge_model": judge_model,
         "judge_rubric_version": judge_rubric_version,
+        # v2 敏感 guard 姿态（2026-08-02）：guard on/off 直接改写负例拦截与生成路径
+        # （guard 命中的 case 根本不生成），两种姿态的 run 不可比 —— 进 regime 且
+        # 走严格键（baseline._REGIME_KEYS，不进宽容窗口），姿态一变强制重冻。
+        "sensitive_query_guard": bool(_cfg_get(getattr(cfg, "rag", None), "sensitive_query_guard", False)),
+        "sensitive_prompt_guard": bool(_cfg_get(getattr(cfg, "rag", None), "sensitive_prompt_guard", False)),
         "vlm_model": vlm_model,
         "vlm_cache_version": vlm_cache_version,
         # L4-GT 指纹哨兵(2026-07-20):L4-ing 绑定分的 GT 在 repo 外数据仓,不在金集
