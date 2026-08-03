@@ -2658,6 +2658,10 @@ class KbVersionItem(BaseModel):
     status_badge: str = ""
     error_message: str = ""
     created_at: str = ""
+    # 历史版本下载（2026-08-02）：has_raw=该版本有原件实物（COALESCE(raw_key,'')<>''）；
+    # quarantined=publish_status/gate_status 任一命中隔离（原件不外发，前端按钮置灰）。
+    has_raw: bool = False
+    quarantined: bool = False
 
 
 class KbVersionHistoryResponse(BaseModel):

@@ -1969,7 +1969,9 @@ def kb_version_history(request: Request, doc_id: str,
                 cur.execute(
                     f"""
                     SELECT version_no, content_process_status, chunk_status, index_status,
-                           publish_status, error_message, created_at
+                           publish_status, gate_status,
+                           COALESCE(raw_key, '') <> '' AS has_raw,
+                           error_message, created_at
                     FROM {_kb_db()}.document_version
                     WHERE doc_id=%s ORDER BY version_no DESC
                     """,
@@ -1987,12 +1989,19 @@ def kb_version_history(request: Request, doc_id: str,
 
     versions = []
     for r in rows:
-        (vno, cps, chs, ixs, pubs, err, created) = r
+        (vno, cps, chs, ixs, pubs, gate, has_raw, err, created) = r
+        # 隔离徽章统一走 _kb_version_quarantined（gate-only 隔离此前会显「已上线」——
+        # 存量 bug，codex 评审 2026-08-02 抓出；publish_status/chunk_status 同时补传给
+        # badge helper，EMPTY/NEEDS_REVIEW 语义在版本行同样生效）。
+        _is_q = _kb_version_quarantined(pubs, gate)
         versions.append(KbVersionItem(
             version_no=int(vno or 0), content_process_status=cps or "",
             chunk_status=chs or "", index_status=ixs or "", publish_status=pubs or "",
-            status_badge=_kb_status_badge(cps, ixs, _doc_status),   # 传 doc 级状态 → 退役文档各版本如实显「已退役」(B4)
+            status_badge=("已隔离" if _is_q else _kb_status_badge(
+                cps, ixs, _doc_status,   # 传 doc 级状态 → 退役文档各版本如实显「已退役」(B4)
+                publish_status=pubs, chunk_status=chs)),
             error_message=err or "", created_at=str(created) if created else "",
+            has_raw=bool(has_raw), quarantined=_is_q,
         ))
     return KbVersionHistoryResponse(doc_id=doc_id, owner_dept=owner_dept, versions=versions)
 
@@ -2066,6 +2075,10 @@ class KbDocPreviewResponse(BaseModel):
     url: str = ""              # 短时签名 GET URL；'' = 原件缺失 / OSS 未配置（前端据 available 提示）
     expires_in: int = 0
     available: bool = False
+    # 2026-08-02（Sam 拍板「一视同仁不外露」）：blocked='quarantined' = 该版本被安全隔离
+    # （PII/敏感内容），原件不经业务端点外发（含 kb_admin；取证走 OSS 控制台）。
+    # 前端据此区分「已封存」与「文件缺失」两种不可用提示。
+    blocked: str = ""
 
 
 @router.get("/api/kb/doc-preview", response_model=KbDocPreviewResponse)
@@ -2092,9 +2105,10 @@ def kb_doc_preview(request: Request, doc_id: str, version: int = 0,
             with conn.cursor() as cur:
                 _cap = _kb_node_capability(cur)
                 _mc = ", m.acl_mode, m.owner_dept_id" if _cap == "present" else ""
-                # 一次 JOIN 取 归属 + 原文件名 + 该版本 raw_key（version=0 → 落到 current_version_no）。
+                # 一次 JOIN 取 归属 + 原文件名 + 该版本 raw_key + 隔离标记（version=0 → current_version_no）。
                 cur.execute(
-                    f"SELECT m.owner_dept, m.original_filename, v.raw_key, v.version_no{_mc}"
+                    f"SELECT m.owner_dept, m.original_filename, v.raw_key, v.version_no,"
+                    f" v.publish_status, v.gate_status{_mc}"
                     f" FROM {_kb_db()}.document_meta m"
                     f" JOIN {_kb_db()}.document_version v"
                     "   ON v.doc_id = m.doc_id AND v.version_no = IF(%s > 0, %s, m.current_version_no)"
@@ -2114,17 +2128,25 @@ def kb_doc_preview(request: Request, doc_id: str, version: int = 0,
     if not row:
         raise HTTPException(status_code=404, detail="文档或版本不存在")
     owner_dept, filename, raw_key, vno = (row[0] or ""), (row[1] or ""), (row[2] or ""), int(row[3] or 0)
-    _mode, _oid = ((row[4] or "legacy"), row[5]) if len(row) > 4 else ("legacy", None)
+    _pubs, _gate = row[4], row[5]
+    _mode, _oid = ((row[6] or "legacy"), row[7]) if len(row) > 6 else ("legacy", None)
     # 授权先于任何 URL 生成：受限/他部门原件绝不外露（dept_admin 越权直接 403）。
     if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
         raise HTTPException(status_code=403, detail="无权预览该文档")
+    # 隔离软拒先于签名（2026-08-02 Sam 拍板「一视同仁不外露」，含 kb_admin/当前版本入口）：
+    # 旧版本原件可能是门内脱敏前实物，被隔离即不经业务端点外发；取证走 OSS 控制台。
+    if _kb_version_quarantined(_pubs, _gate):
+        return KbDocPreviewResponse(doc_id=doc_id, version_no=vno, filename=filename,
+                                    available=False, blocked="quarantined")
     if not raw_key:
         return KbDocPreviewResponse(doc_id=doc_id, version_no=vno, filename=filename, available=False)
     from opensearch_pipeline.oss_url import generate_signed_url, mime_for_ext
     url = generate_signed_url(raw_key, expires=_KB_PREVIEW_TTL_SECONDS, method="GET")
     return KbDocPreviewResponse(
         doc_id=doc_id, version_no=vno, filename=filename,
-        content_type=mime_for_ext(filename), url=url or "",
+        # MIME 按该版本实物扩展名推导（raw_key），文档级 filename 只兜底——旧版本
+        # 扩展名可能与 current 不同（codex minor 2026-08-02）。
+        content_type=mime_for_ext(raw_key or filename), url=url or "",
         expires_in=_KB_PREVIEW_TTL_SECONDS, available=bool(url),
     )
 
@@ -2913,6 +2935,14 @@ def kb_retire(req: KbRetireRequest, request: Request,
         note="已退役：已标记下线并加入索引清除队列，下次入库批处理自动从检索移除（本操作可逆）")
 
 
+def _kb_version_quarantined(publish_status, gate_status) -> bool:
+    """隔离判定唯一权威（codex 共识 2026-08-02）：publish_status='QUARANTINED' OR
+    gate_status='quarantined'，两字段任一命中即隔离。preview 软拒、版本列表徽章、
+    restore/set-visibility 409 三处共用，避免 OR 语义三份漂移。"""
+    return (str(publish_status or "").upper() == "QUARANTINED"
+            or str(gate_status or "").lower() == "quarantined")
+
+
 def _assert_version_not_quarantined(cur, doc_id: str, version_no: int) -> None:
     """安全隔离防线（restore / set-visibility 共用）：spot_checker/cost_breaker 的追溯隔离只写
     document_version（publish_status='QUARANTINED' / gate_status='quarantined'）+ 停 chunk
@@ -2923,8 +2953,7 @@ def _assert_version_not_quarantined(cur, doc_id: str, version_no: int) -> None:
     cur.execute(f"SELECT publish_status, gate_status FROM {_kb_db()}.document_version "
                 "WHERE doc_id=%s AND version_no=%s", (doc_id, version_no))
     vrow = cur.fetchone()
-    if vrow and (str(vrow[0] or "").upper() == "QUARANTINED"
-                 or str(vrow[1] or "").lower() == "quarantined"):
+    if vrow and _kb_version_quarantined(vrow[0], vrow[1]):
         raise HTTPException(
             status_code=409,
             detail="该文档处于安全隔离（PII/敏感内容），不能经可见范围/恢复操作重新上线；请走脱敏重灌流程")

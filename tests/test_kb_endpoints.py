@@ -1071,8 +1071,8 @@ def test_version_history_retired_doc_badges(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     ver_rows = [
-        (2, "SUCCESS", "", "SUCCESS", "", "", "2026-06-20"),   # 退役前是「已上线」，doc 退役后应显已退役
-        (1, "SUCCESS", "", "SUCCESS", "", "", "2026-06-10"),
+        (2, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-20"),   # 退役前是「已上线」，doc 退役后应显已退役
+        (1, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-10"),
     ]
     _stub_multi(monkeypatch, [("marketing", "retired"), ver_rows])   # meta(fetchone) + versions(fetchall)
     from opensearch_pipeline import api
@@ -1085,7 +1085,7 @@ def test_version_history_active_doc_pipeline_badge(monkeypatch):
     """对照：active 文档版本仍显流水线态（已上线），doc_status 传入不误伤。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    _stub_multi(monkeypatch, [("marketing", "active"), [(1, "SUCCESS", "", "SUCCESS", "", "", "2026-06-10")]])
+    _stub_multi(monkeypatch, [("marketing", "active"), [(1, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-10")]])
     from opensearch_pipeline import api
     resp = api.kb_version_history(request=None, doc_id="D1", identity=api.Identity(user_id="kb1"))
     assert resp.versions[0].status_badge == "已上线"
@@ -1796,7 +1796,7 @@ def test_doc_preview_signs_raw_key(monkeypatch):
     """kb_admin：有 raw_key → 返回签名 GET URL（available=True）。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    _stub_multi(monkeypatch, [("marketing", "报价单.pdf", "raw/marketing/D1/v2/报价单.pdf", 2)])
+    _stub_multi(monkeypatch, [("marketing", "报价单.pdf", "raw/marketing/D1/v2/报价单.pdf", 2, "", None)])
     monkeypatch.setattr("opensearch_pipeline.oss_url.generate_signed_url",
                         lambda key, expires=None, method="GET": f"https://oss.example/{key}?sig=x")
     from opensearch_pipeline import api
@@ -1810,7 +1810,7 @@ def test_doc_preview_no_raw_key_unavailable(monkeypatch):
     """raw_key 缺失 → available=False，url 空（前端如实提示不可预览）。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    _stub_multi(monkeypatch, [("marketing", "老文档.pdf", None, 1)])
+    _stub_multi(monkeypatch, [("marketing", "老文档.pdf", None, 1, "", None)])
     from opensearch_pipeline import api
     resp = api.kb_doc_preview(request=None, doc_id="D1", identity=api.Identity(user_id="adm1"))
     assert resp.available is False and resp.url == ""
@@ -1821,7 +1821,7 @@ def test_doc_preview_dept_admin_foreign_403(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
     monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
-    _stub_multi(monkeypatch, [("hr", "考勤.pdf", "raw/hr/D9/v1/考勤.pdf", 1)])
+    _stub_multi(monkeypatch, [("hr", "考勤.pdf", "raw/hr/D9/v1/考勤.pdf", 1, "", None)])
     from opensearch_pipeline import api
     with pytest.raises(Exception) as ei:
         api.kb_doc_preview(request=None, doc_id="D9", identity=api.Identity(user_id="da1"))
@@ -1845,6 +1845,115 @@ def test_doc_preview_employee_forbidden(monkeypatch):
     with pytest.raises(Exception) as ei:
         api.kb_doc_preview(request=None, doc_id="D1", identity=api.Identity(user_id="e1"))
     assert getattr(ei.value, "status_code", None) == 403
+
+
+# ── 历史版本下载（2026-08-02，codex 共识）：隔离软拒 / MIME 按实物 / node 列位移 ──
+def _boom_signer(monkeypatch):
+    """签名函数装成炸弹：断言「签名前拒绝」——隔离/缺件路径绝不能触发 URL 生成。"""
+    def _boom(*a, **kw):
+        raise AssertionError("generate_signed_url 不该被调用（隔离/缺件必须在签名前拒绝）")
+    monkeypatch.setattr("opensearch_pipeline.oss_url.generate_signed_url", _boom)
+
+
+def test_doc_preview_quarantined_blocked_no_sign(monkeypatch):
+    """publish_status='QUARANTINED'：available=False + blocked='quarantined'，签名零调用。
+    一视同仁（Sam 拍板 2026-08-02）：kb_admin 也不外发——旧版本原件可能是门内脱敏前实物。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _boom_signer(monkeypatch)
+    _stub_multi(monkeypatch, [("hr", "工资表.xlsx", "raw/hr/D3/v1/工资表.xlsx", 1, "QUARANTINED", None)])
+    from opensearch_pipeline import api
+    resp = api.kb_doc_preview(request=None, doc_id="D3", version=1, identity=api.Identity(user_id="adm1"))
+    assert resp.available is False and resp.blocked == "quarantined" and resp.url == ""
+
+
+def test_doc_preview_gate_only_quarantine_blocked(monkeypatch):
+    """gate_status='quarantined' 而 publish_status 为空：OR 语义必须同样拒绝（双字段权威）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _boom_signer(monkeypatch)
+    _stub_multi(monkeypatch, [("hr", "截图.docx", "raw/hr/D4/v2/截图.docx", 2, "", "quarantined")])
+    from opensearch_pipeline import api
+    resp = api.kb_doc_preview(request=None, doc_id="D4", version=2, identity=api.Identity(user_id="adm1"))
+    assert resp.available is False and resp.blocked == "quarantined"
+
+
+def test_doc_preview_current_version_quarantined_blocked(monkeypatch):
+    """version=0（current 入口，DocTable 下载按钮同路径）：隔离软拒同样生效——端点级统一。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _boom_signer(monkeypatch)
+    _stub_multi(monkeypatch, [("hr", "名单.pdf", "raw/hr/D5/v3/名单.pdf", 3, "QUARANTINED", "quarantined")])
+    from opensearch_pipeline import api
+    resp = api.kb_doc_preview(request=None, doc_id="D5", identity=api.Identity(user_id="adm1"))
+    assert resp.available is False and resp.blocked == "quarantined"
+
+
+def test_doc_preview_mime_from_raw_key_ext(monkeypatch):
+    """MIME 按该版本实物扩展名（raw_key）推导：文档级 filename=.pdf、旧版实物=.docx → docx MIME。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _stub_multi(monkeypatch, [("marketing", "合同.pdf", "raw/marketing/D6/v1/合同初稿.docx", 1, "", None)])
+    monkeypatch.setattr("opensearch_pipeline.oss_url.generate_signed_url",
+                        lambda key, expires=None, method="GET": f"https://oss.example/{key}?sig=x")
+    from opensearch_pipeline import api
+    resp = api.kb_doc_preview(request=None, doc_id="D6", version=1, identity=api.Identity(user_id="adm1"))
+    assert resp.available is True
+    assert resp.content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _force_capability_present(monkeypatch):
+    """覆盖本文件 autouse 的 absent 钉桩（kb_console 是 from-import 绑定，按其命名空间打）。"""
+    from opensearch_pipeline.routes import kb_console
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "present")
+
+
+def test_doc_preview_node_mode_kb_admin_ok(monkeypatch):
+    """capability=present：8 列行 (owner,filename,raw_key,vno,pubs,gate,acl_mode,owner_dept_id)
+    解包位置锁定——node 文档 kb_admin 正向可下载（列位移回归锚）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _force_capability_present(monkeypatch)
+    _stub_multi(monkeypatch, [("", "SOP.pdf", "raw/node-42/D7/v1/SOP.pdf", 1, "", None, "node", 42)])
+    monkeypatch.setattr("opensearch_pipeline.oss_url.generate_signed_url",
+                        lambda key, expires=None, method="GET": f"https://oss.example/{key}?sig=x")
+    from opensearch_pipeline import api
+    resp = api.kb_doc_preview(request=None, doc_id="D7", version=1, identity=api.Identity(user_id="adm1"))
+    assert resp.available is True and resp.version_no == 1
+
+
+def test_doc_preview_node_mode_legacy_dept_admin_403(monkeypatch):
+    """capability=present：node 文档对仅有 legacy 部门授权的 dept_admin fail-closed 403
+    （owner_dept 残值绝不回落 legacy 轴——mode 隔离回归锚）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "hr")
+    _force_capability_present(monkeypatch)
+    _boom_signer(monkeypatch)
+    _stub_multi(monkeypatch, [("hr", "SOP.pdf", "raw/node-42/D7/v1/SOP.pdf", 1, "", None, "node", 42)])
+    from opensearch_pipeline import api
+    with pytest.raises(Exception) as ei:
+        api.kb_doc_preview(request=None, doc_id="D7", version=1, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403
+
+
+def test_version_history_gate_only_quarantine_badge_and_flags(monkeypatch):
+    """版本列表：gate-only 隔离行 → quarantined=True + 徽章「已隔离」（此前存量 bug 显「已上线」）；
+    has_raw 按 COALESCE 非空语义回传（0 → False，按钮置灰依据）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    ver_rows = [
+        (3, "SUCCESS", "", "SUCCESS", "", "quarantined", 1, "", "2026-07-01"),   # gate-only 隔离
+        (2, "SUCCESS", "", "SUCCESS", "QUARANTINED", "", 1, "", "2026-06-20"),   # publish 路径隔离
+        (1, "SUCCESS", "", "SUCCESS", "", "", 0, "", "2026-06-10"),              # 正常但无原件
+    ]
+    _stub_multi(monkeypatch, [("marketing", "active"), ver_rows])
+    from opensearch_pipeline import api
+    resp = api.kb_version_history(request=None, doc_id="D1", identity=api.Identity(user_id="kb1"))
+    v3, v2, v1 = resp.versions
+    assert v3.quarantined is True and v3.status_badge == "已隔离" and v3.has_raw is True
+    assert v2.quarantined is True and v2.status_badge == "已隔离"
+    assert v1.quarantined is False and v1.status_badge == "已上线" and v1.has_raw is False
 
 
 # ── GET/POST /api/kb/review-tasks：入库复审任务队列（盲区审计 P2-33）────────────

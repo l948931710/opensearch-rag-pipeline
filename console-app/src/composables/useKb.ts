@@ -129,6 +129,7 @@ export interface KbOpsMetrics {
 export interface VersionItem {
   version_no: number; content_process_status: string; chunk_status: string
   index_status: string; publish_status: string; status_badge: string; error_message: string; created_at: string
+  has_raw?: boolean; quarantined?: boolean   // 历史版本下载：无原件/已封存 → 按钮置灰
 }
 interface UploadUrlResp { upload_token: string; put_url: string; raw_key: string; doc_id: string; expires_in: number; requires_kb_admin_approval: boolean; content_type?: string }
 interface RegisterResp { doc_id: string; version_no: number; content_process_status: string; requires_kb_admin_approval: boolean; status_badge: string; idempotent: boolean; title: string; content_dups: DupDoc[]; content_dups_other: number }
@@ -763,9 +764,13 @@ async function openDocPreview(docId: string, version = 0): Promise<void> {
   if (import.meta.env.DEV && s.token === 'dev-preview') { w?.close(); void notice({ title: '预览原件', message: '演示环境无真实文件。' }); return }
   try {
     const qs = version ? `&version=${version}` : ''
-    const r = await apiJson<{ url: string; available: boolean; filename: string }>(
+    const r = await apiJson<{ url: string; available: boolean; filename: string; blocked?: string }>(
       `/api/kb/doc-preview?doc_id=${encodeURIComponent(docId)}${qs}`, { auth: true })
     if (r.available && r.url) { if (w) w.location.href = r.url; else window.open(r.url, '_blank', 'noopener') }
+    else if (r.blocked === 'quarantined') {
+      // 与「文件缺失」区分：封存是政策拒绝（PII/敏感原件不外发），不是故障。
+      w?.close(); void notice({ title: '原件已安全封存', message: '该版本含敏感内容（PII），原件不外发；如需处理请走脱敏重灌流程。', danger: true })
+    }
     else { w?.close(); void notice({ title: '原件暂不可预览', message: '文件缺失或对象存储未配置。', danger: true }) }
   } catch (e: any) {
     w?.close()

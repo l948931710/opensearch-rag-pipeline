@@ -1,11 +1,18 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted } from 'vue'
-import { History, X } from '@lucide/vue'
+import { Download, History, X } from '@lucide/vue'
 import { useKb } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 
 // 版本历史弹窗（Atlas 时间线）：数据来自 /api/kb/version-history（后端现成）；每版显示徽章 + 时间 + 报错。
-const { verHistory, closeHistory } = useKb()
+// 每版可下载原件（openDocPreview 带版本号）；无原件/已封存（PII 隔离）置灰——封存原件不外发是政策。
+const { verHistory, closeHistory, openDocPreview } = useKb()
+
+function verDownloadTitle(h: { has_raw?: boolean; quarantined?: boolean }): string {
+  if (h.quarantined) return '该版本已安全封存（敏感内容），原件不外发'
+  if (!h.has_raw) return '该版本无原件记录（早期批量入库）'
+  return '下载该版本原件'
+}
 function onKey(e: KeyboardEvent) { if (e.key === 'Escape') closeHistory() }
 onMounted(() => window.addEventListener('keydown', onKey))
 onUnmounted(() => window.removeEventListener('keydown', onKey))
@@ -49,6 +56,15 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
                 <StatusPill :badge="h.status_badge" />
                 <div class="flex-1" />
                 <span class="shrink-0 font-mono text-[11.5px] text-faint">{{ (h.created_at || '').slice(0, 16) }}</span>
+                <button
+                  type="button" data-testid="ver-download"
+                  class="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition enabled:hover:bg-secondary enabled:hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35"
+                  :disabled="!h.has_raw || h.quarantined"
+                  :aria-label="verDownloadTitle(h)" :title="verDownloadTitle(h)"
+                  @click="verHistory?.doc && openDocPreview(verHistory.doc.doc_id, h.version_no)"
+                >
+                  <Download :size="13.5" :stroke-width="1.9" />
+                </button>
               </div>
               <p v-if="h.error_message" class="mt-1.5 text-[11.5px] leading-relaxed text-st-fail">{{ h.error_message }}</p>
             </div>
