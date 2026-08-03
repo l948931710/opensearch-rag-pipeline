@@ -4832,30 +4832,45 @@ def node_chunk_documents(ctx: dict):
         is_step_mode = (m_mode == "step")
         if blocks:
             assets = doc.get("assets", [])
-            if assets and is_step_mode:
+            # ⚠️ 判断顺序：**位置性 ref 的清理不得受 `assets` 门控**（C0，2026-08-03）。
+            # 旧写法两支都要求 `assets` 非空；而漏斗把整篇的图全判 DISCARD/QUARANTINE 时
+            # `assets` 恰是 []，于是抽取器产出的 image_ref 一个都不被清理 ⇒ 留下没有
+            # oss_key/source_image 的**空洞 ref**，serving 渲染不出、llm_generator 却按
+            # image_refs 的 truthiness 照样注 <<IMG:N>> 标记。C0 让表内装饰 logo 也开始产
+            # ref 后，"整篇全 DISCARD" 从罕见变常见（抬头表 logo 就是典型），必须先修这条。
+            _has_refs = any(
+                (b.get("block_type") if isinstance(b, dict)
+                 else getattr(b, "block_type", "")) == "image_ref"
+                for b in blocks
+            )
+            if _has_refs:
+                # 已有位置性 ref（DOCX 抽取器产出）⇒ 无条件 enrich/清理，assets 为空即清成零 ref
+                blocks = _enrich_existing_image_refs(blocks, assets, doc)
+                print(f"    ├─ [ref-enrich] Enriched/pruned positional image_refs for {doc['doc_id']}")
+            elif assets and is_step_mode:
+                # 无位置性 ref 且有存活图 ⇒ step 模式才做启发式插入（非 step 模式无插入语义）
                 blocks = _inject_image_ref_blocks(blocks, assets, doc)
                 print(f"    ├─ [step-inject] Injected image_refs into block sequence for {doc['doc_id']}")
-            elif assets:
-                # 非 step 模式不做启发式插入，但已存在的位置性 image_ref（DOCX 抽取器
-                # 产出）仍须注入 funnel 数据 —— 否则 refs 只剩 rel_id/target_ref，
-                # serving 端没有 oss_key/source_image/visual_summary 可渲染，
-                # 图片在非步骤文档上整体失效（2026-06-10 诊断确认 live 即如此）。
-                _has_refs = any(
-                    (b.get("block_type") if isinstance(b, dict)
-                     else getattr(b, "block_type", "")) == "image_ref"
-                    for b in blocks
-                )
-                if _has_refs:
-                    blocks = _enrich_existing_image_refs(blocks, assets, doc)
-                    print(f"    ├─ [ref-enrich] Enriched positional image_refs (non-step mode) for {doc['doc_id']}")
 
         if blocks:
+            # C0：每篇独立 list（绝不复用/共享，否则跨文档串诊断）
+            _c0_diags: list = []
             chunks = chunker.chunk_from_blocks(
                 blocks=blocks,
                 doc_id=doc["doc_id"],
                 version_no=doc["version_no"],
                 metadata=metadata,
+                diagnostics=_c0_diags,
             )
+            if _c0_diags:
+                _n = sum(d.get("count", 0) for d in _c0_diags)
+                _tbls = sorted({d.get("table_index") for d in _c0_diags})
+                print(f"    🚨 [C0_TABLE_IMAGE_UNBOUND] {doc['doc_id']}: {_n} 张表内图无前置步骤"
+                      f"、已显式丢弃（tables={_tbls}）—— 语料版式漂移，须人工复核")
+                ctx.setdefault("table_image_drop_notes", {}).setdefault(
+                    (doc["doc_id"], doc["version_no"]), []).append(
+                        f"C0_TABLE_IMAGE_UNBOUND: {_n} table image(s) in {len(_tbls)} table(s) "
+                        f"had no preceding step and were dropped (not misbound)")
         else:
             chunks = chunker.chunk_document(
                 text=text,
@@ -6685,6 +6700,9 @@ def node_write_chunk_meta(ctx: dict):
                     (_canon_by_dv.get((doc_id, ver), {}) or {}).get("partial_loss_notes") or [])
                 # B4：超长 table_chunk 丢弃留痕**合并追加**进同一通道（不覆盖 B5/既有 note）。
                 _partial_notes.extend((ctx.get("table_drop_notes") or {}).get((doc_id, ver)) or [])
+                # C0（2026-08-03）：表内图无前置步骤 ⇒ 被显式丢弃（不静默错绑到下一步），
+                # 走同一 NEEDS_REVIEW 通道。**预期计数为 0**——生产出现即语料版式漂移。
+                _partial_notes.extend((ctx.get("table_image_drop_notes") or {}).get((doc_id, ver)) or [])
                 if _vlm_degraded_n > 0 or _partial_notes:
                     _note_parts = []
                     if _vlm_degraded_n > 0:

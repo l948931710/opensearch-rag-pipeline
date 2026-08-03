@@ -438,6 +438,38 @@ def extract_docx_with_images(
         return ""
 
     body = document.element.body
+    table_counter = 0        # C0：表格身份（table block 与其单元格内图 refs 共享）
+
+    def _emit_image_ref(rid: str, *, table_index=None, row_index=None) -> None:
+        """发射一张图的 (image_ref block + ImageAsset) —— 段落与表格单元格共用。
+
+        C0（2026-08-03）：抽出共用发射器，避免两条路径的 image_index/target_ref/ImageAsset
+        实现再次漂移（此前只有段落路径有，表格单元格内的图一张都不产 ref ⇒ serving-dead）。
+
+        table_index/row_index 仅在表格路径给值，**只作 canonical 内审计**：
+        ⚠️ 它们**不进** chunker 的 image_refs 白名单（chunker.py 的 img_ref_entry），
+           stage-2 落库与 serving 端都会丢弃这两个键。想让它们端到端可追踪须另行改白名单。
+        """
+        nonlocal image_counter
+        target_ref = _rel_id_to_target_ref(rid) if rid else ""
+        extra = {"image_index": image_counter, "rel_id": rid, "target_ref": target_ref}
+        if table_index is not None:
+            extra["table_index"] = table_index
+            extra["row_index"] = row_index      # 0-based；纵向合并取【首次出现行】
+        blocks.append(ExtractedBlock(
+            block_type="image_ref",
+            text="",
+            section_path=current_section,
+            source="native",
+            extra=extra,
+        ))
+        image_assets.append(ImageAsset(
+            local_path="",          # 尚未导出到磁盘
+            page_num=None,          # DOCX 无原生页码
+            image_index=image_counter,
+            original_name=target_ref,
+        ))
+        image_counter += 1
 
     def _walk(parent_elm, parent_obj) -> None:
         """按物理阅读序递归遍历 <w:p>/<w:tbl>（G6 修复，2026-07-06）。
@@ -450,7 +482,7 @@ def extract_docx_with_images(
         旧实现逐位一致（承重契约：绑定链 image_index 不能漂移）——本修复只
         【新增】此前被丢的 table block。
         """
-        nonlocal current_section, image_counter
+        nonlocal current_section, image_counter, table_counter
 
         for child in parent_elm.iterchildren():
             tag = child.tag
@@ -503,27 +535,7 @@ def extract_docx_with_images(
                         rel_ids = [""]
 
                     for rid in rel_ids:
-                        target_ref = _rel_id_to_target_ref(rid) if rid else ""
-
-                        blocks.append(ExtractedBlock(
-                            block_type="image_ref",
-                            text="",
-                            section_path=current_section,
-                            source="native",
-                            extra={
-                                "image_index": image_counter,
-                                "rel_id": rid,
-                                "target_ref": target_ref,
-                            },
-                        ))
-
-                        image_assets.append(ImageAsset(
-                            local_path="",          # 尚未导出到磁盘
-                            page_num=None,          # DOCX 无原生页码
-                            image_index=image_counter,
-                            original_name=target_ref,
-                        ))
-                        image_counter += 1
+                        _emit_image_ref(rid)
 
             # ── 表格 ──────────────────────────────────────────
             elif tag.endswith('}tbl') or tag == 'tbl':
@@ -541,16 +553,31 @@ def extract_docx_with_images(
                     # identity stable.
                     # G1: spanned/empty grid positions emit "" placeholders to keep column alignment.
                     seen_tc = set()
-                    for row in table.rows:
+                    # C0（2026-08-03）：单元格内嵌图 —— 此前本分支【只取文字】，
+                    # 表内 <w:drawing>/<w:pict> 一张都不产 image_ref 块。但
+                    # extract_images_from_docx 按 document.part.rels **全量导出**它们、
+                    # 照常过付费 OCR/VLM 漏斗 ⇒ 图进了 canonical assets，却没有任何 chunk
+                    # 携带其 image_refs ⇒ **serving 端永远渲染不出、零告警**（真实语料
+                    # 实测：12 篇 / 392 张含图表格 / 543 张图，一张 ref 都没产）。
+                    # 收集在此、发射在 table block 之后 —— 表整块并入 current_step，
+                    # 故 refs 跟着表走即绑到同一步（实测 392 张里 390 张有前置步骤）。
+                    tbl_imgs = []          # [(row_index, rel_id)]
+                    this_table_index = table_counter
+                    table_counter += 1
+                    for _ri, row in enumerate(table.rows):
                         cells = []
                         for cell in row.cells:
                             tc = getattr(cell, "_tc", None)
                             if tc is not None:
                                 if tc in seen_tc:
                                     cells.append("")
-                                    continue
+                                    continue        # 合并单元格：文字与图都只算首次出现
                                 seen_tc.add(tc)
                             cells.append(_cell_text_with_textboxes(cell))
+                            # ⚠️ 扫描必须在 seen_tc 去重【之后】，否则合并单元格重复发 ref
+                            if tc is not None and _has_images(tc):
+                                for _rid in (_find_image_rel_ids(tc) or [""]):
+                                    tbl_imgs.append((_ri, _rid))
                         if any(cells):
                             rows_text.append(" | ".join(cells))
 
@@ -561,8 +588,21 @@ def extract_docx_with_images(
                             text=table_md,
                             section_path=current_section,
                             source="native",
-                            extra={"row_count": len(rows_text)},
+                            extra={
+                                "row_count": len(rows_text),
+                                # C0：table block 与其单元格图 refs 共享同一身份，
+                                # 否则 chunker 无法证明某个 ref 属于哪张表。
+                                "table_index": this_table_index,
+                                # ⚠️ 原始抽取审计值，**不等于 funnel survivor 数**
+                                # （装饰性 logo 会被漏斗 DISCARD，最终 ref 数更少）。
+                                "image_occurrence_count": len(tbl_imgs),
+                            },
                         ))
+
+                    # 表内图 refs 紧跟在 table block 之后发射（表无文字时 rows_text 为空、
+                    # 不产 table block —— 实测该形态为 0，仍按同序发射不丢图）。
+                    for _ri, _rid in tbl_imgs:
+                        _emit_image_ref(_rid, table_index=this_table_index, row_index=_ri)
 
     _walk(body, document)
 

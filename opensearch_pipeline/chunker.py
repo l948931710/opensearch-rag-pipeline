@@ -640,6 +640,7 @@ class DocumentChunker:
         doc_id: str,
         version_no: int,
         metadata: Optional[Dict[str, Any]] = None,
+        diagnostics: Optional[list] = None,
     ) -> List[Chunk]:
         """
         SOP 步骤感知切分器。
@@ -792,6 +793,30 @@ class DocumentChunker:
             if block_type == "image_ref":
                 if current_step is not None:
                     current_step["image_refs"].append(extra)
+                elif extra.get("table_index") is not None:
+                    # C0（2026-08-03）：**表内图无前置步骤时不进 pending**。
+                    # pending 会被【下一个】步骤吸收（文末则塞给最后一步）⇒ 对表内图是
+                    # 确定性错绑：该图属于它所在的那张表，而不是表之后的某一步。
+                    # 宁可显式丢弃 + 留痕（→ NEEDS_REVIEW），也不静默错绑。
+                    # 实测：真实语料 392 张含图表格中仅 2 张无前置步骤，且都是公司抬头表的
+                    # 装饰 logo（漏斗 DISCARD 后 ref 已被清零、根本走不到这里）⇒ 本分支
+                    # 对真实内容预期零命中，生产出现一次即语料版式漂移，须告警。
+                    if diagnostics is not None:
+                        _ti = extra.get("table_index")
+                        _hit = next((d for d in diagnostics
+                                     if d.get("code") == "C0_TABLE_IMAGE_UNBOUND"
+                                     and d.get("table_index") == _ti), None)
+                        if _hit is None:
+                            # 按 table 聚合而非逐图一条 —— content_process_error 有 255 截断
+                            diagnostics.append({
+                                "code": "C0_TABLE_IMAGE_UNBOUND",
+                                "table_index": _ti,
+                                "image_indices": [extra.get("image_index")],
+                                "count": 1,
+                            })
+                        else:
+                            _hit["image_indices"].append(extra.get("image_index"))
+                            _hit["count"] += 1
                 else:
                     # 缓存 orphan images，等下一个步骤创建时归入
                     # 典型场景：跨页 table 关闭了步骤，但后续 image_ref 属于下一个步骤
@@ -2009,6 +2034,7 @@ class DocumentChunker:
         doc_id: str,
         version_no: int,
         metadata: Optional[Dict[str, Any]] = None,
+        diagnostics: Optional[list] = None,
     ) -> List[Chunk]:
         """
         从 ExtractedBlock 列表生成 chunks（推荐入口）。
@@ -2023,6 +2049,11 @@ class DocumentChunker:
             doc_id: 文档 ID
             version_no: 版本号
             metadata: 继承到每个 chunk 的 metadata
+            diagnostics: **可选** sink（C0，2026-08-03）——传入一个 list 即收集结构化诊断
+                （目前只有 `C0_TABLE_IMAGE_UNBOUND`）。**返回契约仍是 List[Chunk] 不变**：
+                全仓 92 处调用 chunk_from_blocks，改返回值会全线打爆，故走 sink 旁路。
+                ⚠️ 默认必须是 None、由调用方每篇文档新建独立 list，绝不能用可变默认值
+                （否则跨文档串诊断）。
         """
         blocks = self._flatten_prose_tables(blocks)
         if self.split_mode == "faq":
@@ -2030,7 +2061,8 @@ class DocumentChunker:
         if self.split_mode == "clause":
             return self._chunk_by_clause(blocks, doc_id, version_no, metadata)
         if self.split_mode == "step":
-            return self._chunk_by_step(blocks, doc_id, version_no, metadata)
+            return self._chunk_by_step(blocks, doc_id, version_no, metadata,
+                                       diagnostics=diagnostics)
         if self.split_mode == "slide":
             return self._chunk_by_slide(blocks, doc_id, version_no, metadata)
         if self.xlsx_layout_type == "procedure_image_guide":
@@ -2047,10 +2079,27 @@ class DocumentChunker:
         non-table blocks. Handles dict- and ExtractedBlock-shaped blocks (see _blk_get)."""
         if not blocks:
             return blocks
+        # C0（2026-08-03）：**带存活图的表格禁止拍平**。拍平后该表会按步骤标记被拆成多个
+        # step_group，而表内图的 image_ref 块统一发射在 table block 之后 ⇒ N 张图会全部
+        # 落到【最后一个】step，造成确定性错绑。
+        # ⚠️ 判据是**清理后仍存活的 ref**（`_enrich_existing_image_refs` 已在 stage-2 先跑），
+        #    不是抽取期的 `image_occurrence_count` —— 一张长条款表若只有装饰 logo 且全被漏斗
+        #    DISCARD，就没有误绑风险，仍应允许拍平（否则会退化成超长 table_chunk）。
+        # 实测：真实语料 12 篇 / 392 张含图表格中 `_is_prose_table` 命中 0 张 ⇒ 本守卫是
+        #    关死潜在危险，不改变现行行为。
+        _img_tables = {
+            (_blk_get(b, "extra", {}) or {}).get("table_index")
+            for b in blocks
+            if _blk_get(b, "block_type", "") == "image_ref"
+        }
+        _img_tables.discard(None)
         out = []
         for b in blocks:
             bt = _blk_get(b, "block_type", "")
             txt = _blk_get(b, "text", "")
+            if bt == "table" and (_blk_get(b, "extra", {}) or {}).get("table_index") in _img_tables:
+                out.append(b)          # 带存活图 ⇒ 保持整表粒度，refs 跟着表走
+                continue
             if bt == "table" and _is_prose_table(txt):
                 out.append({
                     "block_type": "paragraph",
