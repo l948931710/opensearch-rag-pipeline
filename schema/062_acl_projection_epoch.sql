@@ -8,7 +8,10 @@
 --   （在 remote 分支 claude/code-review-ultra-console-74ccdf@c92fed6，未合 main）
 -- codex 评审 2026-08-03（第二批第 1 轮 REVISE → 本文件为修订版 v2）
 --
--- ⚠️ **本文件是草稿：Sam 未勾销拍板单之前不得 apply。** 代码侧未消费这两列。
+-- ✅ **2026-08-03 已 apply staging + 生产**（Sam 当日授权 PROD-RW:2026-08-03）。
+-- ⚠️ 但**代码侧仍零消费这两列** —— bump/stamp 写方、certify 回填、全版本 sweep 与 C3′
+--    多版本 materializer 全部仍待拍板单勾选。当前状态 = 列已就位、水位恒 0/NULL、
+--    行为与 apply 前逐字节一致。
 --
 -- ── 为何需要（C3/C3′ 的机制根）─────────────────────────────────────────────
 -- allowed_depts_reconcile._prescreen_unchanged 用 **diff** 判"无漂移"：want(权威) vs
