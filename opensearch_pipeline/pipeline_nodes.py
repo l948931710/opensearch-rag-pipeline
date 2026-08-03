@@ -6299,7 +6299,14 @@ def node_write_chunk_meta(ctx: dict):
                         # 抛出中止本批 —— 宁可整批失败重试,也不产出会越权的投影。
                         raise RuntimeError(f"node-ACL 投影失败,中止写入(绝不退回真实 owner): {_nae}")
 
-                if get_config().rag.allowed_depts_acl and valid_chunks:
+                # 姿态 A（Sam 2026-08-03 拍板）：**RDS 侧投影始终计算**，不再受
+                # RAG_ALLOWED_DEPTS_ACL 门控——该 flag 只管 HA3 字段推送与检索消费
+                # （`to_ha3_doc(include_allowed_depts=...)` 由推送点单独门控，故本改动
+                # **不改变进 HA3 的载荷**，serving 行为逐字节不变）。
+                # 为何必须这样：重灌在即而 flag 为关，若沿用旧门控，新语料每个 chunk 都会
+                # 带 acl_epoch=NULL，开 flag 时必须对整个新语料全量回填（63k+ chunk）。
+                _proj_ok = True          # projection_complete：解析失败即不 stamp
+                if valid_chunks:
                     try:
                         from opensearch_pipeline.access_grants import (
                             resolve_allowed_depts, gate_by_permission,
@@ -6317,7 +6324,12 @@ def node_write_chunk_meta(ctx: dict):
                                 continue      # node 文档已由上方投影(哨兵+d:/dx:),绝不被组码覆盖
                             chunk.allowed_depts = _allowed_by_doc.get(chunk.doc_id, [])
                     except Exception as _ade:
-                        print(f"    ⚠️ allowed_depts 解析失败（fail-closed 置空，不放行）: {_ade}")
+                        # fail-closed：置空不放行（既有语义）。**并且不 stamp epoch** ——
+                        # projection_complete 不变量：投影没算成就绝不盖章，否则这批 chunk
+                        # 会被"认证为最新"而其 allowed_depts 根本没算过，日后 sweep 也不会修
+                        # （epoch 相等）⇒ 正好重造 C3。留 NULL 即下轮仍判 dirty。
+                        _proj_ok = False
+                        print(f"    ⚠️ allowed_depts 解析失败（fail-closed 置空，不放行、不 stamp）: {_ade}")
 
                 # 1. 全量替换：删除本次涉及的每个 (doc_id, version_no) 现存的全部 chunk，再整体重插。
                 #    ⚠️ 旧实现只按新 chunk_id 删（仅为幂等/重试）——但同版本 re-chunk 时，如果新切分的
@@ -6352,24 +6364,59 @@ def node_write_chunk_meta(ctx: dict):
                     cursor.execute(f"DELETE FROM chunk_meta WHERE {dv_clause}", dv_params)
 
                 # 2. 批量插入新 chunk 记录（executemany 减少 RDS 往返）
-                insert_sql = """
+                # C3′/062：**capability 探测决定是否带 acl_epoch 列**（与仓库既有
+                # _kb_node_capability / _mc 同型）。062 未 apply 的环境（本地 dev、旧 staging）
+                # 若硬带该列会 1054 直接打挂整个 chunk 写入 —— 摄取全线中断。
+                # 探测后降级为 27 列（不 stamp，留 NULL ⇒ 下轮判 dirty），
+                # 从而恢复「**先部署后 apply 安全**」，与 048/049/050 一致。
+                _has_epoch_col = False
+                try:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE()"
+                        " AND TABLE_NAME=%s AND COLUMN_NAME=%s",
+                        ("chunk_meta", "acl_epoch"))
+                    _r = cursor.fetchone()
+                    _has_epoch_col = bool(_r and _r[0])
+                except Exception:   # noqa: BLE001 — 探测失败按未 apply 处理（保守）
+                    _has_epoch_col = False
+                _epoch_col = ", acl_epoch" if _has_epoch_col else ""
+                _epoch_ph = ", %s" if _has_epoch_col else ""
+                insert_sql = f"""
                     INSERT INTO chunk_meta (
                         chunk_id, doc_id, version_no, chunk_index, page_num, section_title,
                         chunk_text_preview, source_url, chunk_type, chunk_text, token_count,
                         source, rag_ready_key, permission_level, owner_dept, category_l1,
                         category_l2, sensitive_redacted, is_active, embedding_status,
                         index_status, embedding_model, extra_json,
-                        parent_chunk_id, step_no, image_refs_json, allowed_depts
+                        parent_chunk_id, step_no, image_refs_json, allowed_depts{_epoch_col}
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s, %s
+                        %s, %s, %s, %s{_epoch_ph}
                     )
                 """
                 import json as _json
+                # C3′/062 stamp 点③（三处 RDS 投影写之一）：**新 chunk 出生即带 acl_epoch**。
+                # 漏这处 ⇒ 每篇新摄取文档的 chunk 天生 NULL、永久 dirty，sweep 对新文档永不收敛
+                # （codex 第一批 BLOCKER）。一条 IN 批查权威水位，避免 N+1。
+                # projection_complete：`_proj_ok` 为假（allowed_depts 解析失败）或 062 未 apply
+                # ⇒ 一律不 stamp（留 NULL，下轮判 dirty），绝不"认证"没算成的投影。
+                _epoch_by_doc = {}
+                if _proj_ok and valid_chunks and _has_epoch_col:
+                    try:
+                        _dids = sorted({c.doc_id for c in valid_chunks})
+                        _ph = ",".join(["%s"] * len(_dids))
+                        cursor.execute(
+                            f"SELECT doc_id, acl_epoch FROM document_meta WHERE doc_id IN ({_ph})",
+                            tuple(_dids))
+                        _epoch_by_doc = {r[0]: r[1] for r in cursor.fetchall()}
+                    except Exception as _ee:   # noqa: BLE001 — 062 未 apply ⇒ 不 stamp
+                        if "1054" not in str(_ee) and "Unknown column" not in str(_ee):
+                            raise
+                        _epoch_by_doc = {}
                 # L3 provenance: per-run code/model versions (ctx['run_provenance'] from L1, with a
                 # read-only fallback) + per-(doc,version) chunk_set_hash, merged into extra_json so a
                 # stored chunk is traceable to its producing revision and re-chunk parity is verifiable
@@ -6428,7 +6475,8 @@ def node_write_chunk_meta(ctx: dict):
                         chunk.source, rag_ready_key, chunk.permission_level, chunk.owner_dept, chunk.category_l1,
                         chunk.category_l2, chunk.sensitive_redacted, chunk.is_active, chunk.embedding_status,
                         chunk.index_status, chunk.embedding_model, extra_json_val,
-                        parent_chunk_id, step_no, image_refs_json_val, allowed_depts_json_val
+                        parent_chunk_id, step_no, image_refs_json_val, allowed_depts_json_val,
+                        *((_epoch_by_doc.get(chunk.doc_id),) if _has_epoch_col else ())
                     ))
 
                 if insert_rows:

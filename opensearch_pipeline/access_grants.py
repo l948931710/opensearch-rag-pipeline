@@ -393,6 +393,27 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         return {"status": "skipped_locked", "reset_chunks": 0, "version_no": None}
     ver = int(row[0] or 1)
 
+    # C3′/062：**同一事务快照**内读权威 epoch，供下方两处 UPDATE stamp。
+    # projection_complete 不变量（Sam 2026-08-03 拍板）：只有在
+    #   ①062 已 apply（列存在）② acl_mode 判定确定（非 fail-loose 退化）
+    # 两条同时成立时才 stamp；否则 acl_epoch 保持原值（NULL/旧值）⇒ 下轮仍判 dirty。
+    # ⚠️ 刻意"照常投影、只是不 stamp" —— 不改既有 materializer 的投影行为，只约束盖章。
+    _auth_epoch = None
+    try:
+        cursor.execute(
+            f"SELECT acl_epoch FROM {_kb_db()}.document_meta WHERE doc_id=%s", (doc_id,))
+        _r = cursor.fetchone()
+        _auth_epoch = int(_r[0]) if _r and _r[0] is not None else None
+    except Exception as e:   # noqa: BLE001 — 062 未 apply ⇒ 不 stamp（降级不阻断）
+        if "1054" not in str(e) and "Unknown column" not in str(e):
+            raise
+        _auth_epoch = None
+    try:
+        _mode_certain = _node_acl_columns_present(cursor, strict=True) or True
+    except Exception:   # noqa: BLE001 — 列探测失败 ⇒ 模式不确定 ⇒ 绝不 stamp
+        _mode_certain = False
+    _stamp = ", acl_epoch=%s" if (_auth_epoch is not None and _mode_certain) else ""
+
     # 2a. node-ACL:模式决定投影形态(唯一注入点 acl_policy.project_doc_acl)。
     #     ⚠️ 本函数是 ACL 变更的【唯一写实现】(decide 端点 + reconcile 共用),node 文档
     #     必须在这里把检索投影轴的 owner 一并改成哨兵 —— 只改 allowed_depts 而留着真实
@@ -414,10 +435,10 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
             return {"status": status, "reset_chunks": 0, "version_no": ver}
         aj = _json.dumps(want, ensure_ascii=False) if want else None
         cursor.execute(
-            f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, owner_dept=%s, "
-            f"index_status='{ChunkIndexStatus.NOT_INDEXED}' "
+            f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, owner_dept=%s"
+            f"{_stamp}, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
             "WHERE doc_id=%s AND version_no=%s AND is_active=1",
-            (aj, _owner, doc_id, ver),
+            ((aj, _owner, _auth_epoch, doc_id, ver) if _stamp else (aj, _owner, doc_id, ver)),
         )
         return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver}
 
@@ -452,15 +473,49 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         return {"status": status, "reset_chunks": 0, "version_no": ver}
     aj = _json.dumps(want, ensure_ascii=False) if want else None
     cursor.execute(
-        f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, owner_dept=%s, "
-        f"index_status='{ChunkIndexStatus.NOT_INDEXED}' "
+        f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, owner_dept=%s"
+        f"{_stamp}, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
         "WHERE doc_id=%s AND version_no=%s AND is_active=1",
-        (aj, _owner, doc_id, ver),
+        ((aj, _owner, _auth_epoch, doc_id, ver) if _stamp else (aj, _owner, doc_id, ver)),
     )
     return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver}
 
 
 # ── 投影 outbox：decide 同事务入队 + stage-3 幂等 drain（与全扫 reconcile 互补）──
+def record_acl_projection_invalidation(cursor, doc_id: str, reason: str = "") -> None:
+    """**ACL 投影失效的唯一登记入口**（C3′ / schema 062，2026-08-03，codex 五轮共识）。
+
+    同事务做两件事：① `document_meta.acl_epoch += 1`（投影失效代次）② outbox 入队。
+    任何改变本文档【有效投影输入】的写都必须调用它 —— 输入 = `project_doc_acl` 的产出
+    `(owner_dept, allowed_depts)` 所依赖的一切：`acl_mode`、legacy `owner_dept`、
+    node grant 生效集（授/撤/scope/dept）、access_request 的 **approved 态与 requester_depts**、
+    以及**有效的每版本 `permission_level`**（它是 allowed_depts 的 gate 输入 —— 由 public 变
+    dept_internal 会让期望的 allowed_depts 从空变成 approved groups）。
+
+    ⚠️ **`permission_level` 是失效【输入】但不在 epoch 的认证【输出】范围**：epoch 相等
+    不证明 dm/chunk 的 permission 副本已同步（那归 C9）。两者别混。
+    ⚠️ **pending 态的 access_request INSERT 不调用本函数** —— 尚未改变有效授权。
+    ⚠️ **绝不受 `RAG_ALLOWED_DEPTS_ACL` 门控**（Sam 2026-08-03 拍板）：flag 关闭期间发生的
+      权威变更若不 bump，水位永久丢失，开 flag 后这批文档永远判 unchanged = 原样复现 C3。
+    ⚠️ **不提交事务**（连接/事务由调用方掌控），与 `enqueue_acl_projection` 同约定。
+
+    062 未 apply 的环境：`acl_epoch` 列不存在 ⇒ 1054，此时**只入队不 bump**（降级但不阻断，
+    与 049/050 同型；apply 后自动恢复）。
+    """
+    if not doc_id:
+        return
+    try:
+        cursor.execute(
+            f"UPDATE {_kb_db()}.document_meta SET acl_epoch = acl_epoch + 1 WHERE doc_id=%s",
+            (doc_id,),
+        )
+    except Exception as e:   # noqa: BLE001 — 仅 1054（062 未 apply）降级；其余照抛
+        if "1054" not in str(e) and "Unknown column" not in str(e):
+            raise
+        logger.warning("acl_epoch bump 跳过（schema/062 未 apply）: doc=%s", doc_id)
+    enqueue_acl_projection(cursor, doc_id, reason=reason)
+
+
 def enqueue_acl_projection(cursor, doc_id: str, reason: str = "") -> None:
     """把一篇文档持久入队到 allowed_depts 投影 outbox（kb_acl_projection_outbox）。
 

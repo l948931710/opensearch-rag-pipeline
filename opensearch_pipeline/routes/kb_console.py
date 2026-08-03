@@ -102,6 +102,7 @@ def kb_org_tree(request: Request, identity: Optional[Identity] = Depends(current
         my_role=kb.role,
         my_managed_owner_depts=managed_owner_depts(kb),
         my_grantable_owner_depts=grantable_owner_depts(kb),
+        my_managed_node_roots=sorted(int(r) for r in (kb.granted_node_roots or ())),
         org_tree=_load_org_tree_snapshot(),
         # 读侧真实姿态（不是"控件做没做"）——上传侧据此决定写 legacy 组码还是 node 节点。
         # 读不到 config 时按 False 兜底：宁可继续走 legacy（现状可用），也不要写出对所有人
@@ -2671,8 +2672,8 @@ def kb_register(req: KbRegisterRequest, request: Request,
                             "ON DUPLICATE KEY UPDATE revoked_at=NULL, revoked_by=NULL, "
                             "granted_by=VALUES(granted_by), granted_at=NOW(), note=VALUES(note)",
                             (doc_id, int(_d), "subtree" if _s else "exact", kb.user_id, "register"))
-                    from opensearch_pipeline.access_grants import enqueue_acl_projection
-                    enqueue_acl_projection(cur, doc_id, reason="node_register")
+                    from opensearch_pipeline.access_grants import record_acl_projection_invalidation
+                    record_acl_projection_invalidation(cur, doc_id, reason="node_register")
                 else:
                     version_no = 1
                     cur.execute(
@@ -3157,11 +3158,14 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                                     "WHERE doc_id=%s AND version_no=%s AND is_active=1", (req.doc_id, cur_ver))
                 # 3) ACL 重投影（flag 门控，与主动共享/decide 同一注入点）：读己写的新 permission_level →
                 #    dept_internal 投影 approved 授权 / public·restricted 清空 allowed_depts。
+                from opensearch_pipeline.access_grants import (
+                    materialize_doc_allowed_depts, record_acl_projection_invalidation,
+                )
+                # C3′/062（Sam 2026-08-03 拍板）：**bump+入队不受 flag 门控** —— flag 关闭期间
+                # 发生的权威变更若不 bump，水位永久丢失，开 flag 后这批文档永远判 unchanged
+                # = 原样复现 C3。materialize（消费侧）仍按 flag 门控。
+                record_acl_projection_invalidation(cur, req.doc_id, reason="set_visibility")
                 if get_config().rag.allowed_depts_acl:
-                    from opensearch_pipeline.access_grants import (
-                        enqueue_acl_projection, materialize_doc_allowed_depts,
-                    )
-                    enqueue_acl_projection(cur, req.doc_id, reason="set_visibility")
                     try:
                         materialize_doc_allowed_depts(cur, req.doc_id)
                     except Exception as _pe:
@@ -3390,7 +3394,8 @@ def kb_doc_meta_save(req: KbDocMetaSaveRequest, request: Request,
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     from opensearch_pipeline.access_grants import (
-        enqueue_acl_projection, enqueue_meta_projection, materialize_doc_allowed_depts,
+        enqueue_meta_projection, materialize_doc_allowed_depts,
+        record_acl_projection_invalidation,
     )
     from opensearch_pipeline.audit_log import write_audit
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
@@ -3449,7 +3454,7 @@ def kb_doc_meta_save(req: KbDocMetaSaveRequest, request: Request,
                     cur.execute(f"UPDATE {_kb_db()}.document_meta SET acl_mode='legacy', "
                                 "owner_dept=%s, owner_dept_id=NULL, updated_at=NOW() "
                                 "WHERE doc_id=%s", (legacy_owner, req.doc_id))
-                    enqueue_acl_projection(cur, req.doc_id, reason="node_to_legacy")
+                    record_acl_projection_invalidation(cur, req.doc_id, reason="node_to_legacy")
                     changed.append("mode")
                     final_mode = "legacy"
                 elif req.owner_dept_id is not None or req.visible_nodes is not None:
@@ -3518,7 +3523,7 @@ def kb_doc_meta_save(req: KbDocMetaSaveRequest, request: Request,
                                          (req.reason or "")[:255]))
                         if before != after:
                             changed.append("visible_nodes")
-                    enqueue_acl_projection(cur, req.doc_id, reason="doc_meta_save")
+                    record_acl_projection_invalidation(cur, req.doc_id, reason="doc_meta_save")
 
                 # ── title / category（D5：字段级刷新）─────────────────────────
                 new_title = req.title.strip() if isinstance(req.title, str) else None

@@ -265,10 +265,20 @@ def test_decide_enqueues_outbox_same_transaction_after_status_change():
     # 经 api re-export 取函数源码（F-A2 后实现体在 routes/kb_access.py；inspect 跟随
     # 函数对象而非源文件路径，后续搬移不再破坏本不变量测试）
     body = inspect.getsource(api._kb_access_decide)
+    # C3′/062（2026-08-03）：入口从 enqueue_acl_projection 升级为
+    # record_acl_projection_invalidation —— 同事务里 **bump acl_epoch + 入队** 两件事一起做。
+    # 原子性不变量不变（仍须在 status 变更之后、同游标），故本断言只换名不放松。
     assert "SET status=%s" in body, "decide 应改 kb_access_request.status"
-    assert "enqueue_acl_projection(cur" in body, "decide 应同游标入队投影 outbox"
-    assert body.index("SET status=%s") < body.index("enqueue_acl_projection(cur"), \
-        "enqueue 必须在 status 变更之后（同事务原子入队，读己写）"
+    assert "record_acl_projection_invalidation(cur" in body, \
+        "decide 应同游标登记投影失效（bump epoch + 入队 outbox）"
+    assert body.index("SET status=%s") < body.index("record_acl_projection_invalidation(cur"), \
+        "登记必须在 status 变更之后（同事务原子，读己写）"
+    # bump **不得受 flag 门控**（Sam 2026-08-03 拍板）：flag 关闭期的权威变更若不 bump，
+    # 水位永久丢失，开 flag 后这批文档永远判 unchanged = 原样复现 C3。
+    _i_gate = body.find("rag.allowed_depts_acl")
+    _i_bump = body.index("record_acl_projection_invalidation(cur")
+    assert _i_gate == -1 or _i_bump < _i_gate, \
+        "record_acl_projection_invalidation 被 allowed_depts_acl 门控了——flag 关闭期水位会丢"
 
 
 # ── 批次8（ultra schema/009:34）：代次 CAS——mid-drain 复活的撤销不再被擦掉 ─────
@@ -313,3 +323,79 @@ def test_drain_falls_back_when_generation_column_absent(monkeypatch):
     assert res["done"] == 1
     done = [w for w in store["writes"] if "done_at=NOW()" in w[0]]
     assert done and "generation" not in done[0][0] and done[0][1] == (1,)
+
+
+# ── C3′/062（2026-08-03）：投影失效代次的写方语义 ─────────────────────────────
+class _EpochCur:
+    """记录所有 execute 的假游标；可模拟 062 未 apply（acl_epoch 列不存在 → 1054）。"""
+
+    def __init__(self, has_epoch=True):
+        self.has_epoch = has_epoch
+        self.sqls = []
+
+    def execute(self, sql, params=None):
+        self.sqls.append((" ".join(sql.split()), params))
+        if not self.has_epoch and "acl_epoch" in sql:
+            raise Exception(1054, "Unknown column 'acl_epoch' in 'field list'")
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
+def test_record_invalidation_bumps_epoch_and_enqueues_same_cursor():
+    """★ 唯一登记入口必须【同游标】做两件事：acl_epoch+1 与 outbox 入队。"""
+    from opensearch_pipeline.access_grants import record_acl_projection_invalidation
+    cur = _EpochCur()
+    record_acl_projection_invalidation(cur, "D1", reason="unit")
+    joined = " || ".join(s for s, _ in cur.sqls)
+    assert "SET acl_epoch = acl_epoch + 1" in joined, "未 bump 投影失效代次"
+    assert "kb_acl_projection_outbox" in joined, "未入队 outbox"
+    # bump 必须在入队之前/同事务内（顺序不强制，但两者都必须发生在同一游标）
+    assert len(cur.sqls) >= 2
+
+
+def test_record_invalidation_degrades_when_062_not_applied():
+    """062 未 apply（1054）⇒ 只入队不 bump，**不得阻断调用方事务**（与 049/050 同型降级）。"""
+    from opensearch_pipeline.access_grants import record_acl_projection_invalidation
+    cur = _EpochCur(has_epoch=False)
+    record_acl_projection_invalidation(cur, "D1", reason="unit")   # 不应抛
+    joined = " || ".join(s for s, _ in cur.sqls)
+    assert "kb_acl_projection_outbox" in joined, "降级路径仍必须入队"
+
+
+def test_record_invalidation_reraises_non_1054():
+    """非 1054 的错误照抛 —— 持久保证不吞（与 enqueue 同纪律）。"""
+    import pytest as _pt
+    from opensearch_pipeline.access_grants import record_acl_projection_invalidation
+
+    class _Boom(_EpochCur):
+        def execute(self, sql, params=None):
+            raise Exception(1213, "Deadlock found")
+
+    with _pt.raises(Exception):
+        record_acl_projection_invalidation(_Boom(), "D1")
+
+
+def test_stage2_chunk_insert_stamps_epoch_and_is_capability_aware():
+    """★ stamp 点③：新 chunk 出生即带 acl_epoch；062 未 apply 时降级为 27 列不带该列。
+
+    漏这处 ⇒ 每篇新摄取文档的 chunk 天生 NULL、永久 dirty，sweep 对新文档永不收敛
+    （codex 第一批 BLOCKER）。capability 探测保证「先部署后 apply 安全」。
+    """
+    import inspect
+    from opensearch_pipeline import pipeline_nodes
+    src = inspect.getsource(pipeline_nodes.node_write_chunk_meta)
+    assert "_has_epoch_col" in src, "缺 capability 探测 ⇒ 062 未 apply 的库会 1054 打挂整个 chunk 写入"
+    # ⚠️ 钉住【条件表达式本身】——只查 "acl_epoch" in src 会被注释/批查语句满足（假绿）
+    assert '", acl_epoch" if _has_epoch_col' in src, "INSERT 列未按 capability 条件带 acl_epoch"
+    assert '", %s" if _has_epoch_col' in src, "INSERT 占位符未随列条件变化"
+    assert "_epoch_by_doc.get(chunk.doc_id)" in src, "参数元组未 stamp 权威 epoch"
+    assert "{_epoch_col}" in src and "{_epoch_ph}" in src, "insert_sql 未插入条件列/占位符"
+    # projection_complete：解析失败即不 stamp
+    assert "_proj_ok" in src, "缺 projection_complete 守卫"
+    assert src.index("_proj_ok = False") > 0
+    # 姿态 A：RDS 投影不再受 flag 门控
+    assert "if valid_chunks:" in src, "allowed_depts 计算仍被 flag 门控（应为姿态 A：始终计算）"

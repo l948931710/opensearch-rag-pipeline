@@ -169,7 +169,7 @@ def kb_doc_node_grants_save(req: KbNodeGrantsSave, request: Request,
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     from opensearch_pipeline.access_grants import (
-        enqueue_acl_projection, materialize_doc_allowed_depts,
+        materialize_doc_allowed_depts, record_acl_projection_invalidation,
     )
     from opensearch_pipeline.acl_policy import (
         ACL_MODE_NODE, MAX_DOC_NODES, format_node_value, normalize_node_ids,
@@ -281,7 +281,7 @@ def kb_doc_node_grants_save(req: KbNodeGrantsSave, request: Request,
                     (ACL_MODE_NODE, new_rev, req.doc_id))
 
                 # ⑤⑥ 投影:持久入队(不吞异常)+ 内联标脏 best-effort
-                enqueue_acl_projection(cur, req.doc_id, reason="node_grants_save")
+                record_acl_projection_invalidation(cur, req.doc_id, reason="node_grants_save")
                 try:
                     materialize_doc_allowed_depts(cur, req.doc_id)
                 except Exception as _pe:   # noqa: BLE001 — outbox + reconcile 兜底
@@ -660,11 +660,14 @@ def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
                     granted.append(t)
                 if granted:
                     # 与 _kb_access_decide 同款投影：outbox 同事务持久入队 + 内联标脏 best-effort
+                    from opensearch_pipeline.access_grants import (
+                        materialize_doc_allowed_depts, record_acl_projection_invalidation,
+                    )
+                    # C3′/062（Sam 2026-08-03 拍板）：**bump+入队不受 flag 门控** —— flag 关闭期间
+                    # 发生的权威变更若不 bump，水位永久丢失，开 flag 后这批文档永远判 unchanged
+                    # = 原样复现 C3。materialize（消费侧）仍按 flag 门控。
+                    record_acl_projection_invalidation(cur, req.doc_id, reason="direct_grant")
                     if get_config().rag.allowed_depts_acl:
-                        from opensearch_pipeline.access_grants import (
-                            enqueue_acl_projection, materialize_doc_allowed_depts,
-                        )
-                        enqueue_acl_projection(cur, req.doc_id, reason="direct_grant")
                         try:
                             materialize_doc_allowed_depts(cur, req.doc_id)
                         except Exception as _pe:
@@ -1235,20 +1238,25 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
                 # 标脏被 stage-3 写回 INDEXED 覆盖而 HA3 仍旧 ACL 的自愈失败漂移。**绝不写 HA3 / 不
                 # re-embed**（重活留给 stage-3）。flag 关 = no-op；失败只记日志、**不回滚 status**
                 # （allowed_depts_reconcile 每轮 stage-3 兜底）。
-                if get_config().rag.allowed_depts_acl and doc_id:
+                if doc_id:
                     from opensearch_pipeline.access_grants import (
-                        enqueue_acl_projection, materialize_doc_allowed_depts,
+                        materialize_doc_allowed_depts, record_acl_projection_invalidation,
                     )
                     # 持久入队（同事务、不吞异常）：权威变更与投影意图原子提交——enqueue 失败则整笔回滚，
                     # 绝不出现「权威已改而无 outbox 行」的撕裂。stage-3 outbox drain 据此定向幂等重试至成功。
-                    enqueue_acl_projection(cur, doc_id, reason=decision)
+                    # C3′/062（Sam 2026-08-03 拍板）：**bump+入队不受 flag 门控** —— flag 关闭期间
+                    # 发生的权威变更若不 bump，水位永久丢失，开 flag 后这批文档永远判 unchanged
+                    # = 原样复现 C3。materialize（消费侧）仍按 flag 门控。
+                    record_acl_projection_invalidation(cur, doc_id, reason=decision)
                     # 内联标脏 = best-effort 快路径：成功则本轮 stage-3 即可重推；抛/skipped_locked → 上面
                     # 的 outbox 行兜底（+ allowed_depts_reconcile 全扫）。失败只记日志、**不回滚 status**。
-                    try:
-                        materialize_doc_allowed_depts(cur, doc_id)
-                    except Exception as _pe:
-                        logger.warning("decide allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
-                                       doc_id, _pe)
+                    # ⚠️ 消费侧（materialize）仍按 flag 门控 —— 只有上面的 bump+入队不受门控。
+                    if get_config().rag.allowed_depts_acl:
+                        try:
+                            materialize_doc_allowed_depts(cur, doc_id)
+                        except Exception as _pe:
+                            logger.warning("decide allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
+                                           doc_id, _pe)
                 # 审计行入【同事务】（commit 前、同 cursor）：与 status 变更 + outbox 入队原子提交（B1）。
                 write_audit(doc_id=doc_id, version_no=None, action_type=f"ACCESS_REQUEST_{decision.upper()}",
                             operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
