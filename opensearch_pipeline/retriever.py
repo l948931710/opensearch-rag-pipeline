@@ -2008,15 +2008,30 @@ def expand_step_context(
                 pass
 
     # ── 去重：相同 chunk_id 保留最高分 ──
+    # ⚠️ direct 证据的合并与"选最高分 winner"是【两件事】，必须分开(C2，2026-08-03)：
+    # 同一 chunk_id 既可能来自 HA3 直接命中，也可能是【别的】命中行展开出的 RDS 兄弟
+    # (expand 时 `dict(chunk)` 继承原 hit 的 id、仅覆写 chunk_id)。若展开行分数更高，
+    # winner 就是展开行，"该 chunk 曾被 HA3 直接命中"这个事实会随败者一起丢掉 ——
+    # ha3_verify 据此判在场/缺失，丢了就会把【真实命中】判成 missing(假红)。
+    # 故：无论保留哪一行，只要任一候选是 direct，winner 一律标 `_direct_hit=True`(OR 合并)。
+    # 原始 HA3 行根本不带 `is_expanded` 键 ⇒ 缺键即 direct。
+    def _is_direct(row: Dict[str, Any]) -> bool:
+        return not row.get("is_expanded", False)
+
     seen: Dict[str, Dict[str, Any]] = {}
+    direct_seen: Dict[str, bool] = {}
     for c in expanded_all:
         cid = c.get("chunk_id") or c.get("id", "")
+        direct_seen[cid] = direct_seen.get(cid, False) or _is_direct(c)
         if cid in seen:
             if c.get("score", 0) > seen[cid].get("score", 0):
                 seen[cid] = c
         else:
             seen[cid] = c
-    deduped = list(seen.values())
+    deduped = []
+    for cid, row in seen.items():
+        row["_direct_hit"] = direct_seen.get(cid, False)
+        deduped.append(row)
 
     # ── 排序：按 parent_chunk_id 分组 → 组间按最高分降序 → 组内按 step_no 升序 ──
     groups: Dict[Optional[str], List[Dict[str, Any]]] = {}

@@ -77,7 +77,10 @@ def _job_exit(job: str, report: dict) -> int:
     """0 ok/skipped · 2 drift|breach · 3 error/incomplete."""
     if report.get("skipped"):
         return 0
-    if report.get("error") or report.get("complete") is False:
+    # `errors`（复数列表）与 `error`（单数字符串）是两套并存的失败契约：raw_inventory 写
+    # `errors: []`，其余作业写 `error: str`。只认单数会把 raw_inventory 的真失败降级成
+    # exit 2（drift）而非 3（error）—— 监控看板会把"探针坏了"读成"数据漂移"（C1，2026-08-03）。
+    if report.get("error") or report.get("errors") or report.get("complete") is False:
         return 3
     if job == "qa_rollup":
         return 0 if report.get("slo_ok", 1) == 1 else 2
@@ -100,7 +103,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         for job, rep in reports.items():
             tag = ("skipped" if rep.get("skipped")
-                   else "ERROR" if rep.get("error")
+                   else "ERROR" if (rep.get("error") or rep.get("errors"))
                    else "ok" if _job_exit(job, rep) == 0 else "ALERT")
             print(f"[ops_monitor] {job}: {tag}")
     return max((_job_exit(j, r) for j, r in reports.items()), default=0)

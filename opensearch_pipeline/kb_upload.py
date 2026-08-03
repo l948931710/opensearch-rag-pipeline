@@ -97,6 +97,11 @@ def expected_mime(ext: str) -> str:
 # raw/<dept>/<doc>/... 无段 → 管线 stage-2 默认 public 覆盖回写 → dept_internal/restricted 被静默升公开
 # (staging 实测)。故把可见范围编码进路径,让管线解析回登记值。
 _PERM_PATH_SEG = {"dept_internal": "internal", "internal": "internal", "restricted": "restricted"}
+# 「扁平即 public」是【有意】的旧行为(省略 permission_level = 向后兼容)。因此 _PERM_PATH_SEG
+# 查不到的值绝不能静默走扁平——那等于把任何漏归一的入参悄悄发成全公司可见(C7:legacy
+# upload-url 直传 "private" → 查无段 → 扁平 → stage-2 解析回 public，绕过 kb_admin 审批)。
+# 故显式区分「合法的无段」与「未知值」：前者放行，后者 fail-closed 抛错。
+_PERM_FLAT_OK = frozenset({"", "public"})
 
 
 def _require_clean_seg(name: str, value: str) -> str:
@@ -117,11 +122,25 @@ def build_raw_key(owner_dept: str, doc_id: str, upload_id: str, filename: str,
     各段拒绝空值/内嵌 '/'（调用方须先过 kb_authz.sanitize_owner_dept 等净化）。
     阶段 B：node 文档的第 2 段 = ``node-<dept_id>``（node_storage_segment 构造），
     经 parse_raw_owner 自描述解析；perm 段语义不变（路径启发式照常工作）。
+
+    permission_level 契约（C7 起 fail-closed）：
+      · ``None`` / ``""`` / ``"public"``           → 扁平（合法的无段）
+      · ``dept_internal`` / ``restricted``          → 带段（canonical）
+      · ``internal``                                → 带段（**兼容别名**，非 canonical 终值）
+      · 其余任何值（``private``、垃圾、未归一的大小写变体）→ **抛 ValueError**
+    调用方须先过 ``kb_authz.normalize_permission_level`` 或等价归一；抛错代表调用方漏归一
+    （内部不变量破坏），不是普通用户输入面——用户输入应在端点侧先 400。
     """
     owner_dept = _require_clean_seg("owner_dept", owner_dept)
     doc_id = _require_clean_seg("doc_id", doc_id)
     upload_id = _require_clean_seg("upload_id", upload_id)
-    seg = _PERM_PATH_SEG.get((permission_level or "").strip().lower())
+    _perm = (permission_level or "").strip().lower()
+    seg = _PERM_PATH_SEG.get(_perm)
+    if not seg and _perm not in _PERM_FLAT_OK:
+        raise ValueError(
+            f"build_raw_key 收到未归一的 permission_level={permission_level!r}："
+            "扁平 raw_key 会被 stage-2 解析回 public（静默全员公开）。"
+            "调用方须先归一（kb_authz.normalize_permission_level）。")
     head = f"{owner_dept}/{seg}" if seg else owner_dept
     return f"raw/{head}/{doc_id}/{upload_id}/{safe_filename(filename)}"
 

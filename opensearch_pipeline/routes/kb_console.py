@@ -2400,6 +2400,18 @@ def kb_upload_url(req: KbUploadUrlRequest, request: Request,
         _is_node_upgrade, _oid = False, None
         doc_id = kb_upload.new_doc_id()
 
+    # C7 同族（2026-08-03）：legacy 分支此前把客户端原值直通 build_raw_key/token/落库，而
+    # authorize_upload 只在【局部副本】上归一别名（kb_authz:363-366）——"private" 被判
+    # dept_internal 免审批放行，却因 _PERM_PATH_SEG 不认它而生成【无权限段的扁平 raw_key】，
+    # stage-2 按路径解析回 public 覆盖回写 ⇒ 本意仅本部门可见的文档未经 kb_admin 审批全公司可检索。
+    # node 分支(上方)与 contribution 早已归一，唯此最常用分支漏掉。与 2026-07-17 尾斜杠 P0
+    # 同一机制根（validate-one/use-another）：授权、raw_key、token、落库必须消费【同一净值】。
+    # ⚠️ 必须落在升版继承（`perm = row[1] or perm`）【之后】——否则继承回来的 RDS 原值绕过归一。
+    perm = {"internal": "dept_internal", "private": "dept_internal"}.get(
+        (perm or "").strip().lower(), (perm or "").strip().lower())
+    if perm not in ("dept_internal", "public", "restricted"):
+        raise HTTPException(status_code=400, detail="非法可见级别")
+
     if _is_node_upgrade:
         # node 升版无 legacy 白名单可裁——授权已在上方 mode 隔离判定完成；公开继承原级别
         # 不产生新审批（升版不得改可见范围）。

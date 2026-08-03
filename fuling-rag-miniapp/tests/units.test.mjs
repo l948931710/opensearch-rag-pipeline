@@ -300,3 +300,44 @@ test('capIndex：按 updatedAt 倒序裁剪，evictedIds = 被淘汰的最旧行
   const r2 = capIndex(list, 10);
   assert.equal(r2.evictedIds.length, 0);
 });
+
+// ── C10（2026-08-03）：「猜你想问」必须带 Bearer 且串在登录之后 ──────────────
+// api.js/chat.js 依赖小程序 dd.* 运行时，无法在 node 里直接执行 ⇒ 用源码契约断言
+// 钉死这两条不变量（等价于冷启动时序测试）。
+import { readFileSync } from 'node:fs';
+
+test('C10: getHotQuestions 必须带 auth:true（否则服务端只回静态兜底）', () => {
+  const src = readFileSync(join(here, '../utils/api.js'), 'utf8');
+  const m = src.match(/export function getHotQuestions\(\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(m, 'getHotQuestions 未找到');
+  // ⚠️ 必须只对【代码】断言：函数体注释里也写着 "auth:true"，整段匹配会被注释满足（假绿）。
+  const code = m[0].split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+  const call = code.match(/request\(\s*'\/api\/hot-questions'\s*,\s*(\{[^}]*\})/);
+  assert.ok(call, 'hot-questions 请求调用未找到');
+  assert.match(call[1], /auth:\s*true/,
+    '未带 Bearer：/api/hot-questions 对无身份请求只回静态兜底，部门 cohort 热问永久 inert');
+});
+
+test('C10: hot-questions 必须串在 ensureLogin 之后，不得与登录并发', () => {
+  const src = readFileSync(join(here, '../pages/chat/chat.js'), 'utf8');
+  // 唯一调用点应在 _loadHotQuestions 内；onLoad 里只出现 this._loadHotQuestions()
+  const callSites = src.match(/[^_.\w]getHotQuestions\(/g) || [];
+  assert.equal(callSites.length, 1, `getHotQuestions 调用点应恰为 1 处，实为 ${callSites.length}`);
+  const helper = src.match(/_loadHotQuestions\(\)\s*\{[\s\S]*?\n  \},/);
+  assert.ok(helper && /getHotQuestions\(/.test(helper[0]), '调用点不在 _loadHotQuestions 内');
+
+  // onLoad 中的 ensureLogin 链：从 ensureLogin() 到该链结束（顶格 4 空格的 `});`）
+  const start = src.indexOf('ensureLogin()');
+  assert.ok(start > 0, 'onLoad 未找到 ensureLogin()');
+  const chainEnd = src.indexOf('\n      });', start);
+  assert.ok(chainEnd > start, 'ensureLogin 链结尾未识别');
+  const chain = src.slice(start, chainEnd);
+  assert.match(chain, /this\._loadHotQuestions\(\)/,
+    '热问请求不在 ensureLogin 链内：request() 同步读 token，冷启动竞态下必然匿名');
+
+  // 反向断言：链外（onLoad 剩余部分）不得再有裸调用
+  const after = src.slice(chainEnd, src.indexOf('_loadHotQuestions()  {') > 0
+    ? src.indexOf('_loadHotQuestions()  {') : src.length);
+  assert.ok(!/^\s{4}this\._loadHotQuestions\(\)/m.test(after),
+    '存在与登录并发的裸调用');
+});

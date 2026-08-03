@@ -331,7 +331,18 @@ def verify_chunks_present(
                     served.add(int(rid))
                 except (TypeError, ValueError):
                     pass
-                if str(rid) == str(c["id"]) or r.get("chunk_id") == c.get("chunk_id"):
+                # ⚠️ `chunk_id` 相等【不足以】证明该 chunk 在 HA3(C2，2026-08-03)：生产
+                # `expand_step_context` 会把命中行的兄弟/子步骤从 **RDS** 拉出，并把展开行的
+                # `chunk_id` 覆写成兄弟的(`id/doc_id` 仍继承命中行)。于是一个 HA3 里根本不存在
+                # 的 step_card，只要任一同家族兄弟被索引，就会"命中兄弟→展开出自身 RDS 行→判
+                # present" —— 把【从 RDS 展开取回】误当【HA3 可召回】，正是本模块要消灭的假绿。
+                # `id` 分支不受影响：展开行继承的 `id` 恰是【产生该展开的原始 HA3 命中】的 id，
+                # 对该 id 而言是真证据，滤掉反而制造假红。
+                # 缺 `_direct_hit` 键时按 `is_expanded` 兜底、再缺则视为 direct —— 覆盖
+                # expand_step_context 异常/无 RDS 连接时"回退到原始结果"(全是裸 HA3 命中)的路径。
+                _direct = r.get("_direct_hit", not r.get("is_expanded", False))
+                if str(rid) == str(c["id"]) or (
+                        _direct and r.get("chunk_id") == c.get("chunk_id")):
                     present.add(int(c["id"]))
             elif rid is not None:
                 try:

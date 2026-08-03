@@ -325,10 +325,16 @@ def _purge_jobs(user_id: str) -> List[dict]:
     qa_retrieved_doc（schema/013 事实表）没有 user_id 列，必须经 qa_session_log.message_id
     关联删除，且必须先于 qa_session_log 本体——先删日志则事实行成永久孤儿、再也定位不到。
     count 与 act 同谓词；act 为单表 DELETE + LIMIT（子查询指向他表，MySQL 允许 LIMIT）。
+
+    `needs_anchor`/`is_anchor` 编码这条依赖（C6，2026-08-03）：仅靠"列表顺序"不够——顺序
+    只保证【先尝试】，不保证【先成功】。前序表撞锁超时(1205)/死锁(1213)或打满 max_batches
+    时，主循环此前照样继续删掉锚点表，把残余事实行的唯一定位键销毁 ⇒ 次日重跑 count 子查询
+    返 0、报"全表 ok"，PIPL 擦除被报告为完成，而该主体的检索/引用轨迹永久留库且再也无法归属清除。
     """
     op = _op_db()
     return [
         {"table": "qa_retrieved_doc", "optional": True,   # schema/013 可选迁移，1146 → skip
+         "needs_anchor": True,                            # 经 qa_session_log.message_id 定位
          "count": (f"SELECT COUNT(*) FROM {op}.qa_retrieved_doc WHERE message_id IN "
                    f"(SELECT message_id FROM {op}.qa_session_log WHERE user_id = %s)"),
          "act": (f"DELETE FROM {op}.qa_retrieved_doc WHERE message_id IN "
@@ -345,6 +351,7 @@ def _purge_jobs(user_id: str) -> List[dict]:
          "count": f"SELECT COUNT(*) FROM {op}.qa_conversation WHERE user_id = %s",
          "act": f"DELETE FROM {op}.qa_conversation WHERE user_id = %s LIMIT %s"},
         {"table": "qa_session_log", "optional": False,    # 最后删（事实行的 message_id 锚点）
+         "is_anchor": True,                               # 前序 needs_anchor 表未全清 ⇒ 不得删
          "count": f"SELECT COUNT(*) FROM {op}.qa_session_log WHERE user_id = %s",
          "act": f"DELETE FROM {op}.qa_session_log WHERE user_id = %s LIMIT %s"},
     ]
@@ -395,10 +402,23 @@ def purge_subject(user_id: str, *, commit: bool = False, batch: int = DEFAULT_BA
 
     from opensearch_pipeline.db import _get_db_conn
 
+    # C6：锚点依赖门 —— 记录每张 needs_anchor 表是否【真正清空】。合法的 1146 skip
+    # （可选迁移未 apply ⇒ 表不存在 ⇒ 不可能有孤儿）不算未清，不阻断锚点删除。
+    anchor_blockers: List[str] = []
+
     for job in _purge_jobs(user_id):
         table = job["table"]
         rep: dict = {"ok": False, "affected": 0, "batches": 0}
         result["tables"][table] = rep
+        if job.get("is_anchor") and anchor_blockers:
+            # 锚点表是残余关联行【唯一】的定位键。前序未清干净就删它 = 制造永久不可定位的
+            # 个人数据孤儿，与本函数目的直接相悖 ⇒ 宁可本轮不删、次日重跑（幂等），也不销毁锚点。
+            rep["blocked_by"] = sorted(anchor_blockers)
+            rep["error"] = (f"前序关联表未全部清空（{', '.join(sorted(anchor_blockers))}）："
+                            "删除锚点表会使残余事实行永久无法归属清除，本轮拒绝删除。")
+            result["ok"] = False
+            print(f"[purge_subject] {table}: ⛔ 阻断（前序未清：{', '.join(sorted(anchor_blockers))}）")
+            continue
         try:
             conn = _get_db_conn()
             try:
@@ -424,6 +444,9 @@ def purge_subject(user_id: str, *, commit: bool = False, batch: int = DEFAULT_BA
                     time.sleep(SLEEP_BETWEEN_BATCHES)
                 else:
                     rep["capped"] = True   # 打满上限：次日续跑（幂等）
+                    if job.get("needs_anchor"):
+                        # capped = 还有残行没删完。此时删锚点表 = 残行永久失去定位键。
+                        anchor_blockers.append(f"{table}(capped)")
                 rep["deleted"] = deleted
                 rep["ok"] = True
                 print(f"[purge_subject] {table}: 删除 {deleted} 行 / {rep['batches']} 批"
@@ -433,11 +456,15 @@ def purge_subject(user_id: str, *, commit: bool = False, batch: int = DEFAULT_BA
         except Exception as e:
             errno = e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], int) else None
             if job["optional"] and errno == 1146:
-                # 可选迁移（schema/006、013）未 apply 的环境：表不存在不算失败
+                # 可选迁移（schema/006、013）未 apply 的环境：表不存在不算失败。
+                # ⚠️ 这是【合法 skip】而非未清：表都不存在，不可能有孤儿 ⇒ 不进 anchor_blockers。
                 rep["ok"] = True
                 rep["skipped"] = f"{table} 不存在（可选迁移未应用）"
                 print(f"[purge_subject] {table}: skip（表未建）")
             else:
+                if job.get("needs_anchor"):
+                    # 撞锁超时(1205)/死锁(1213) 等真失败：残行仍在，锚点不能删。
+                    anchor_blockers.append(f"{table}(error)")
                 rep["error"] = str(e)
                 result["ok"] = False
                 print(f"[purge_subject] {table}: ✗ {e}")

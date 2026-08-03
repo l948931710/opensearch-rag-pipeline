@@ -58,7 +58,11 @@ class _Conn:
 
 
 def _run(monkeypatch, objects, rows):
-    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: object())
+    # 桩必须复刻生产契约 **二元组** `(bucket, is_simulated)`：此前打成裸 object() 恰好掩盖了
+    # raw_inventory 漏解包的 bug（元组恒 truthy → is None 恒 False → 真实环境 100% 失效），
+    # 测试全绿而探针从未产出过数据（C1，2026-08-03）。
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket",
+                        lambda *a, **k: (object(), False))
     monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn",
                         lambda **kw: _Conn(rows))
     import oss2
@@ -69,7 +73,11 @@ def _run(monkeypatch, objects, rows):
 def test_single_list_shared_by_both_probes(monkeypatch):
     """B10 与 B11 的对象集合完全重叠 —— 必须只 LIST 一次。"""
     calls = {"n": 0}
-    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: object())
+    # 桩必须复刻生产契约 **二元组** `(bucket, is_simulated)`：此前打成裸 object() 恰好掩盖了
+    # raw_inventory 漏解包的 bug（元组恒 truthy → is None 恒 False → 真实环境 100% 失效），
+    # 测试全绿而探针从未产出过数据（C1，2026-08-03）。
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket",
+                        lambda *a, **k: (object(), False))
     monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda **kw: _Conn([]))
     import oss2
 
@@ -136,6 +144,48 @@ def test_fail_open_on_any_error(monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("oss down")))
     out = RI.run_raw_inventory()      # 不得抛
     assert out["ok"] is False and out["errors"]
+
+
+def test_unpacks_oss_bucket_tuple_contract(monkeypatch):
+    """★ C1 回归：必须解包 `(bucket, is_simulated)`，且把 bucket 本体（非元组）交给 ObjectIterator。
+
+    漏解包时 ObjectIterator 拿到的是元组，迭代即 AttributeError → 被 broad except 吞成
+    ok=False/四桶恒 0：这个为"自助上传孤儿"建的唯一探针在真实环境 100% 产不出数据。
+    """
+    sentinel = object()
+    got = {}
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket",
+                        lambda *a, **k: (sentinel, False))
+    monkeypatch.setattr("opensearch_pipeline.pipeline_nodes._get_db_conn", lambda **kw: _Conn([]))
+    import oss2
+
+    def _iter(bucket, *a, **k):
+        got["bucket"] = bucket
+        return iter([])
+
+    monkeypatch.setattr(oss2, "ObjectIterator", _iter)
+    out = RI.run_raw_inventory()
+    assert got["bucket"] is sentinel, "传给 ObjectIterator 的仍是元组 —— 漏解包"
+    assert out["ok"] is True and not out["errors"]
+
+
+def test_simulate_is_skipped_not_silently_green(monkeypatch):
+    """simulate（无真实对象可盘）必须显式 skipped，不得伪装成"盘点成功且零孤儿"。"""
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket",
+                        lambda *a, **k: (None, True))
+    out = RI.run_raw_inventory()
+    assert out.get("skipped") == "simulate"
+
+
+def test_ops_monitor_treats_errors_list_as_error_exit(monkeypatch):
+    """★ C1 同族：raw_inventory 写复数 `errors`，_job_exit 只认单数 `error` 会把真失败
+    降级成 exit 2（drift）而非 3（error）—— 监控把"探针坏了"读成"数据漂移"。"""
+    from opensearch_pipeline import ops_monitor
+    assert ops_monitor._job_exit("raw_inventory", {"ok": False, "errors": ["oss down"]}) == 3
+    # 单数契约与 skipped 不受影响
+    assert ops_monitor._job_exit("raw_inventory", {"error": "x"}) == 3
+    assert ops_monitor._job_exit("raw_inventory", {"skipped": "simulate"}) == 0
+    assert ops_monitor._job_exit("raw_inventory", {"ok": True, "errors": []}) == 0
 
 
 def test_registered_in_ops_monitor_job_list():

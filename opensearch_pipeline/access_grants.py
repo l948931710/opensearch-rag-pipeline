@@ -335,19 +335,24 @@ def gate_by_permission(
     return out
 
 
-def _current_owner_for_doc(cursor, doc_id: str, version_no: int) -> str:
-    """该 doc 指定版本 active chunk 的**检索投影轴** owner_dept(不一致时返回首个,供 diff)。
+def _current_owner_set_for_doc(cursor, doc_id: str, version_no: int) -> set:
+    """该 doc 指定版本 active chunk 的**检索投影轴** owner_dept **集合**。
 
     ⚠️ 读的是 `chunk_meta.owner_dept`(检索投影轴),**不是** `document_meta.owner_dept`
     (归属/管理轴,node 模式下保持真实属主不变)。
+
+    返回集合而非"首个值"(C3,2026-08-03):旧实现 `sorted(...)[0]` 在**混合 owner**
+    (同版本部分 chunk 已投影、部分还挂旧 owner —— 上一轮写到一半失败/并发)时,只要排序
+    首项恰好等于期望值就判一致 ⇒ 剩余错 owner 的 chunk 永久不被修正,旧 owner 组持续可读。
+    调用方按 `owner_set == {expected}` 判定;空集 = 该版本无 active chunk(与 owner 漂移
+    是两回事,不可混为一谈)。
     """
     cursor.execute(
         f"SELECT DISTINCT owner_dept FROM {_kb_db()}.chunk_meta "
         "WHERE doc_id=%s AND version_no=%s AND is_active=1",
         (doc_id, version_no),
     )
-    vals = sorted({(r[0] or "") for r in cursor.fetchall()})
-    return vals[0] if vals else ""
+    return {(r[0] or "") for r in cursor.fetchall()}
 
 
 def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) -> Dict[str, object]:
@@ -400,8 +405,9 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
             getattr(_acl, "node_ids", ()) if _acl else (),
             getattr(_acl, "exact_node_ids", ()) if _acl else ())
         have = current_allowed_for_doc(cursor, doc_id, ver)
-        _cur_owner = _current_owner_for_doc(cursor, doc_id, ver)
-        if sorted(want) == have and _cur_owner == _owner:
+        # 集合相等而非"首项相等"：混合 owner（部分 chunk 已投影、部分还挂旧 owner）必须判漂移
+        _owner_set = _current_owner_set_for_doc(cursor, doc_id, ver)
+        if sorted(want) == have and _owner_set == {_owner}:
             return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
         status = "materialized" if want else "retracted"
         if not apply:
@@ -438,8 +444,8 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
     _owner, want = project_doc_acl(ACL_MODE_LEGACY, (orow[0] if orow else "") or "", gated)
     # 3. diff vs 现存投影（owner 与集合都比：owner 漂移也必须触发重投影）
     have = current_allowed_for_doc(cursor, doc_id, ver)
-    _cur_owner = _current_owner_for_doc(cursor, doc_id, ver)
-    if sorted(want) == have and _cur_owner == _owner:
+    _owner_set = _current_owner_set_for_doc(cursor, doc_id, ver)
+    if sorted(want) == have and _owner_set == {_owner}:
         return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
     status = "materialized" if want else "retracted"
     if not apply:

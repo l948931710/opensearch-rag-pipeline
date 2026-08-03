@@ -77,6 +77,34 @@ def test_build_raw_key_rejects_dirty_segments():
         ku.build_raw_key("marketing", "DOC_X", "", "f.pdf")
 
 
+# ── C7 根因回归(2026-08-03 ultra 评审)：未归一 permission_level fail-closed ──────────
+def test_build_raw_key_rejects_unnormalized_permission_level():
+    """未知/未归一的 permission_level 必须抛，绝不静默产扁平 key。
+
+    扁平 = stage-2 路径解析回 public。别名 "private" 曾在 legacy upload-url 直通到这里：
+    authorize_upload 只在局部副本上归一 → 免审批放行，raw_key 却无权限段 → 文档未经
+    kb_admin 审批全公司可检索。静默走扁平就是这条越权链的最后一环。
+    """
+    import pytest
+    for bad in ("private", "PRIVATE", " private ", "internal_only", "dept-internal", "都不认识"):
+        with pytest.raises(ValueError, match="未归一"):
+            ku.build_raw_key("marketing", "DOC_X", "UP1", "f.pdf", permission_level=bad)
+
+
+def test_build_raw_key_flat_and_alias_still_allowed():
+    """fail-closed 不得误伤既有契约：None/""/public 仍扁平，internal 兼容别名仍带段。"""
+    flat_none = ku.build_raw_key("marketing", "DOC_X", "UP1", "f.pdf", permission_level=None)
+    flat_empty = ku.build_raw_key("marketing", "DOC_X", "UP1", "f.pdf", permission_level="")
+    flat_pub = ku.build_raw_key("marketing", "DOC_X", "UP1", "f.pdf", permission_level="public")
+    assert flat_none == flat_empty == flat_pub == "raw/marketing/DOC_X/UP1/f.pdf"
+    # internal 是【兼容别名】(非 canonical 终值)，仍须带段——否则历史调用方会静默降级成 public
+    assert "/internal/" in ku.build_raw_key(
+        "marketing", "DOC_X", "UP1", "f.pdf", permission_level="internal")
+    # 大小写/空白归一后命中 canonical 的，照常带段
+    assert "/restricted/" in ku.build_raw_key(
+        "marketing", "DOC_X", "UP1", "f.pdf", permission_level="  RESTRICTED ")
+
+
 def test_perm_from_raw_key_fail_closed_on_malformed():
     """结构畸形一律 restricted,绝不落 public——失效开放曾是尾斜杠越权 P0 的机制根。"""
     # P0 原始形态:尾斜杠 dept 挤出的双斜杠 key(7 段)
@@ -244,6 +272,61 @@ def test_upload_url_version_forces_original_permission(monkeypatch):
     assert p["permission_level"] == "dept_internal"   # 强制继承，忽略伪造的 public
     assert p["action"] == "version" and p["doc_id"] == "DOC_X"
     assert resp.requires_kb_admin_approval is False    # 若伪造转 public 成功会要求审批
+
+
+def test_upload_url_legacy_normalizes_private_alias(monkeypatch):
+    """★ C7 越权回归：legacy 新建传别名 "private" 必须归一为 dept_internal 并编进 raw_key 权限段。
+
+    此前 legacy 分支直传客户端原值：authorize_upload 只在【局部副本】上归一 → 判 dept_internal
+    免审批放行；但 _PERM_PATH_SEG 不认 "private" → 生成【无权限段的扁平 raw_key】→ stage-2 按
+    路径解析回 public 覆盖回写 ⇒ 本意仅本部门可见的文档未经 kb_admin 审批全公司可检索、零告警。
+    """
+    _sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "finance")
+    monkeypatch.setenv("RAG_SESSION_SIGNING_KEY", "k" * 40)
+    from opensearch_pipeline import api
+    req = api.KbUploadUrlRequest(action="new", filename="f.pdf",
+                                 owner_dept="finance", permission_level="private")
+    resp = api.kb_upload_url(req=req, request=None, identity=api.Identity(user_id="dev1"))
+    p = ku.verify_upload_token(resp.upload_token)
+    assert p["permission_level"] == "dept_internal", "别名未归一 → 落库/审批口径分叉"
+    # 关键断言：raw_key 必须带权限段，否则 stage-2 会按扁平路径解析回 public
+    assert "/internal/" in p["raw_key"], f"raw_key 无权限段，将被 stage-2 升为 public: {p['raw_key']}"
+    assert ku.perm_from_raw_key(p["raw_key"]) == "dept_internal"
+
+
+def test_upload_url_legacy_rejects_unknown_permission(monkeypatch):
+    """C7 同族：canonical 集合外的可见级别在端点侧 400，不落到 build_raw_key 才炸。"""
+    _sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "finance")
+    monkeypatch.setenv("RAG_SESSION_SIGNING_KEY", "k" * 40)
+    from opensearch_pipeline import api
+    req = api.KbUploadUrlRequest(action="new", filename="f.pdf",
+                                 owner_dept="finance", permission_level="top_secret")
+    with pytest.raises(Exception) as ei:
+        api.kb_upload_url(req=req, request=None, identity=api.Identity(user_id="dev1"))
+    assert getattr(ei.value, "status_code", None) == 400
+
+
+def test_upload_url_version_inherits_then_normalizes(monkeypatch):
+    """★ C7 顺序回归：归一必须在【升版继承之后】——继承回来的 RDS 原值也要过归一。
+
+    若把归一放在读请求之后、继承之前，`perm = row[1] or perm` 会把库里的历史别名
+    (存量 "private"/"internal") 原样带回 build_raw_key，绕过整条防线。
+    """
+    _sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setenv("RAG_SESSION_SIGNING_KEY", "k" * 40)
+    _stub_doc(monkeypatch, owner="production", perm="private")   # 库里存的是历史别名
+    from opensearch_pipeline import api
+    req = api.KbUploadUrlRequest(action="version", doc_id="DOC_L", filename="v2.pdf",
+                                 owner_dept="production", permission_level="dept_internal")
+    resp = api.kb_upload_url(req=req, request=None, identity=api.Identity(user_id="dev1"))
+    p = ku.verify_upload_token(resp.upload_token)
+    assert p["permission_level"] == "dept_internal"
+    assert "/internal/" in p["raw_key"], "继承的历史别名未过归一 → 扁平 key → 升 public"
 
 
 def test_upload_url_version_on_retired_doc_409(monkeypatch):

@@ -167,21 +167,18 @@ Page({
       .then((g) => {
         ensureOwner(g.userId || 'anon');
         this._restoreLast();
+        // 「猜你想问」必须**串在登录之后**（C10，2026-08-03）：request() 是同步读 token 的，
+        // 冷启动时与 ensureLogin 并列发出必然拿不到 Bearer；而服务端 /api/hot-questions
+        // 对无身份请求只回静态兜底且是 200（不触发 401 自动重登），于是整条 P2-7 部门
+        // cohort 动态热问链路对小程序永久 inert——零报错、零日志，看不出来。
+        this._loadHotQuestions();
       })
       .catch(() => {
         // ensureLogin already toasted; leave the page usable so a retry on send works.
         // 刻意不 ensureOwner('anon')：网络抖动的登录失败绝不能把单人设备的本地缓存清掉。
+        // 登录失败仍拉一次：拿不到部门 cohort 也好过连静态兜底都不刷新（fail open）。
+        this._loadHotQuestions();
       });
-
-    // 「猜你想问」：服务端近 30 天高频问题；失败保持静态兜底（fail open）
-    getHotQuestions()
-      .then((resp) => {
-        const qs = (resp && resp.questions) || [];
-        if (qs.length) {
-          this.setData({ quick: qs });
-        }
-      })
-      .catch(() => {});
 
     // 首屏定位完成后再启用平滑滚动
     setTimeout(() => {
@@ -241,6 +238,19 @@ Page({
         // 忽略：见上
       }
     }
+  },
+
+  // 「猜你想问」：服务端近 30 天部门高频问题；失败保持静态兜底（fail open）。
+  // 只在 ensureLogin 落定后调用 —— 见 onLoad 里的说明（C10）。
+  _loadHotQuestions() {
+    getHotQuestions()
+      .then((resp) => {
+        const qs = (resp && resp.questions) || [];
+        if (qs.length) {
+          this.setData({ quick: qs });
+        }
+      })
+      .catch(() => {});
   },
 
   // ── 多会话：恢复 / 新建 / 抽屉 ──────────────────────────────────

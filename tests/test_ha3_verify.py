@@ -99,6 +99,61 @@ def test_self_query_false_negative_when_retrieve_empty_is_caught():
     assert not r["ok"] and r["missing_ids"] == [10, 11, 12]
 
 
+def test_rds_expanded_sibling_does_not_prove_ha3_presence():
+    """★ C2 假绿回归：缺失的 step_card 不得因"同家族兄弟被命中并展开出它"而判 present。
+
+    生产 expand_step_context 把兄弟从 **RDS** 拉出，覆写展开行的 chunk_id(id/doc_id 仍继承
+    命中行)。于是 c2 明明不在 HA3，只要 c1 被索引，自查就会命中 c1 → 展开出携带 c2 chunk_id
+    的 RDS 行 → 判 present ⇒ missing_ids=[] 报全绿，修复被跳过、用户持续召回失败。
+    """
+    ch = _chunks()
+
+    def rf(query, *, top_k=5, user_dept=None):
+        # c2 不在 HA3。但用 c2 自己的文本自查时，语义上会命中同家族的 c1（c1 在 HA3），
+        # 生产 expand_step_context 随即把 c1 的兄弟 c2 从 RDS 拉出并覆写 chunk_id ——
+        # 于是返回集里【出现了 c2 的 chunk_id】，却没有任何 HA3 侧证据。
+        if query not in ((ch[1]["chunk_text"] or "")[:160], (ch[2]["chunk_text"] or "")[:160]):
+            return []
+        return [
+            {"id": "11", "doc_id": "D", "chunk_id": "D_c1", "_direct_hit": True},
+            # 展开行：id 继承命中行 c1(11)——注意 ≠ c2 的 id(12)，故只能经 chunk_id 分支匹配
+            {"id": "11", "doc_id": "D", "chunk_id": "D_c2",
+             "is_expanded": True, "_direct_hit": False},
+        ]
+
+    r = verify_chunks_present("D", conn=_Conn(ch, _legacy_authority()), retrieve_fn=rf)
+    assert 12 in r["missing_ids"], "RDS 展开行被误当 HA3 在场证据 —— 假绿复现"
+    assert not r["ok"]
+
+
+def test_direct_hit_displaced_by_higher_scored_sibling_is_still_present():
+    """★ C2 假红回归：同家族双直接命中时，展开行可能在去重中压掉 direct 行(分数更高)，
+    但该 chunk 【确实】被 HA3 命中过 —— 必须仍判 present。
+
+    这正是"整行过滤 is_expanded"会踩的坑：幸存行 is_expanded=True，但 retriever 已按
+    OR 合并把 direct 证据保留在 `_direct_hit` 上。
+    """
+    ch = _chunks()
+
+    def rf(query, *, top_k=5, user_dept=None):
+        if (ch[2]["chunk_text"] or "")[:160] != query:
+            return []
+        # c2 的幸存行来自 c1 展开(分数更高)，但 _direct_hit 记着"它也曾被直接命中"
+        return [{"id": "11", "doc_id": "D", "chunk_id": "D_c2",
+                 "is_expanded": True, "_direct_hit": True}]
+
+    r = verify_chunks_present("D", conn=_Conn(ch, _legacy_authority()), retrieve_fn=rf)
+    assert 12 not in r["missing_ids"], "OR 合并的 direct 证据被忽略 —— 真实命中被判假红"
+
+
+def test_unexpanded_results_default_to_direct():
+    """expand_step_context 异常/无 RDS 连接时"回退到原始结果"——那些裸 HA3 行既无
+    `_direct_hit` 也无 `is_expanded`，必须默认按 direct 处理，否则整轮验证全判缺失。"""
+    ch = _chunks()
+    r = verify_chunks_present("D", conn=_Conn(ch, _legacy_authority()), retrieve_fn=_retrieve(ch, "D"))
+    assert r["ok"] and r["missing_ids"] == []
+
+
 def test_foreign_doc_surfaced_recorded():
     ch = _chunks()
     foreign = {"id": "999", "doc_id": "OTHER", "chunk_id": "OTHER_c0"}

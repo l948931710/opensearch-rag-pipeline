@@ -195,7 +195,11 @@ export function getHistory(offset) {
  * 「猜你想问」快捷栏（服务端近 30 天高频问题；失败时调用方用静态兜底）。
  */
 export function getHotQuestions() {
-  return request('/api/hot-questions', {});
+  // C10（2026-08-03）：必须带 Bearer —— 服务端 /api/hot-questions（P2-7）对无身份/无部门
+  // cohort 的请求只回**静态兜底**，真实"近 30 天部门高频问题"仅对已认证请求下发。
+  // ⚠️ auth:true 只是必要条件：request() 同步读 token，冷启动时若与 ensureLogin 并发发出
+  // 仍然拿不到 token。调用方（chat.js）必须把本请求串在 ensureLogin 之后。
+  return request('/api/hot-questions', { auth: true });
 }
 
 // ── 知识库管理（部门管理员）──────────────────────────────────────

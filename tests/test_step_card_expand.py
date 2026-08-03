@@ -295,3 +295,29 @@ def test_parent_children_stepcard_reaches_render_layer(monkeypatch):
     blocks = cb.build_content_blocks(f"第一步如图 <<IMG:{n}>>。", out, max_images=3)
     imgs = [b for b in blocks if b["type"] == "image"]
     assert len(imgs) == 1 and imgs[0]["oss_key"] == "c1.png"
+
+
+# ── C2（2026-08-03）：direct-hit provenance ────────────────────────────────
+def test_direct_hit_provenance_survives_dedup_by_higher_scored_sibling(monkeypatch):
+    """★ 去重按最高分选 winner，但 direct 证据必须 OR 合并、不随败者丢掉。
+
+    同家族两个【都被 HA3 直接命中】的 step_card，若 S04 的展开行分数高过 S05 自身的
+    直接命中行，winner 就是那条 is_expanded=True 的展开行。此时若不 OR 合并，
+    "S05 曾被 HA3 直接命中"的事实就消失了 —— ha3_verify 会把真实在场判成缺失（假红）。
+    """
+    _set_rag(monkeypatch, expand_image_keep=0)
+    meta = [{"chunk_id": c, "parent_chunk_id": "P1", "step_no": n,
+             "extra_json": None, "image_refs_json": None}
+            for c, n in (("S04", 4), ("S05", 5))]
+    siblings = [_sib(f"S{i:02d}", i) for i in range(3, 8)]
+    cur = _RoutingCursor(meta, siblings, [])
+    # S04 直接命中且分数更高 → 其展开出的 S05 行会压掉 S05 自己的直接命中行
+    chunks = [{"chunk_type": "step_card", "chunk_id": "S04", "score": 9.0},
+              {"chunk_type": "step_card", "chunk_id": "S05", "score": 1.0}]
+    out = _expand(cur, chunks, "报检作业")
+    by_id = {c["chunk_id"]: c for c in out}
+    assert by_id["S05"]["_direct_hit"] is True, "direct 证据未 OR 合并 → 会造成 ha3_verify 假红"
+    assert by_id["S04"]["_direct_hit"] is True
+    # 纯展开出来、从未被直接命中的兄弟必须标 False —— 这是消除假绿的那一半
+    assert by_id["S06"]["_direct_hit"] is False
+    assert by_id["S03"]["_direct_hit"] is False

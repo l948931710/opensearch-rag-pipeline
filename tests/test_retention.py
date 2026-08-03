@@ -258,3 +258,110 @@ def test_main_exit_codes(monkeypatch, live_db):
         raise RuntimeError("db down")
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", _boom)
     assert retention.main(["--only", "audit"]) == 3
+
+
+# ── C6（2026-08-03）：主体擦除的锚点依赖门 ───────────────────────────────────
+class _PurgeConn(_ScriptedConn):
+    """按表名脚本化 purge_subject：可让指定表在 DELETE 时抛错，或恒返回满批（capped）。"""
+
+    def __init__(self, *, counts, fail_on=None, always_full=(), batch=1000):
+        super().__init__()
+        self.counts = dict(counts)
+        self.fail_on = dict(fail_on or {})
+        self.always_full = set(always_full)
+        self.batch = batch
+        self.deleted_tables = []
+
+    def cursor(self):
+        return _PurgeCursor(self)
+
+
+class _PurgeCursor:
+    def __init__(self, conn):
+        self._c = conn
+        self.rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    @staticmethod
+    def _table_of(sql):
+        for t in ("qa_retrieved_doc", "user_feedback", "escalation_ticket",
+                  "qa_conversation", "qa_session_log"):
+            if t in sql:
+                return t
+        return ""
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        # 子查询也含 qa_session_log —— DELETE 目标表恒在 "DELETE FROM <db>.<table>" 处
+        t = (self._table_of(s.split("WHERE")[0]) if s.startswith(("DELETE", "SELECT COUNT"))
+             else self._table_of(s))
+        if s.startswith("DELETE"):
+            if t in self._c.fail_on:
+                raise Exception(self._c.fail_on[t], f"simulated {t} failure")
+            self._c.deleted_tables.append(t)
+            self.rowcount = self._c.batch if t in self._c.always_full else 1
+        elif s.startswith("SELECT COUNT"):
+            self._row = (self._c.counts.get(t, 0),)
+        return None
+
+    def fetchone(self):
+        return getattr(self, "_row", None)
+
+    def fetchall(self):
+        return []
+
+
+def _purge(monkeypatch, live_db, conn, **kw):
+    monkeypatch.setenv("RAG_SUBJECT_PURGE_ENABLE", "true")
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    monkeypatch.setattr("opensearch_pipeline.env_guard.assert_destructive_write_allowed",
+                        lambda *a, **k: None)
+    return retention.purge_subject("U1", commit=True, **kw)
+
+
+def test_purge_blocks_anchor_when_fact_table_errors(monkeypatch, live_db):
+    """★ C6：qa_retrieved_doc 撞锁失败时，绝不能继续删 qa_session_log 锚点。
+
+    锚点是残余事实行【唯一】的定位键（该表无 user_id 列）。先删日志 ⇒ 残行永久孤儿，
+    次日重跑 count 子查询返 0、报"全表 ok" ⇒ PIPL 擦除被报告为完成而实际未完成。
+    """
+    conn = _PurgeConn(counts={"qa_retrieved_doc": 5, "qa_session_log": 3},
+                      fail_on={"qa_retrieved_doc": 1205})   # 锁等待超时
+    out = _purge(monkeypatch, live_db, conn)
+    assert "qa_session_log" not in conn.deleted_tables, "锚点被删 —— 制造永久不可定位的孤儿行"
+    assert out["tables"]["qa_session_log"].get("blocked_by") == ["qa_retrieved_doc(error)"]
+    assert out["ok"] is False
+
+
+def test_purge_blocks_anchor_when_fact_table_capped(monkeypatch, live_db):
+    """★ C6：打满 max_batches（还有残行没删完）同样必须阻断锚点删除。"""
+    conn = _PurgeConn(counts={"qa_retrieved_doc": 10_000, "qa_session_log": 3},
+                      always_full={"qa_retrieved_doc"}, batch=2)
+    out = _purge(monkeypatch, live_db, conn, batch=2, max_batches=2)
+    assert out["tables"]["qa_retrieved_doc"].get("capped") is True
+    assert "qa_session_log" not in conn.deleted_tables
+    assert out["tables"]["qa_session_log"].get("blocked_by") == ["qa_retrieved_doc(capped)"]
+    assert out["ok"] is False
+
+
+def test_purge_missing_optional_table_does_not_block_anchor(monkeypatch, live_db):
+    """1146（可选迁移未 apply）是【合法 skip】不是未清：表都不存在，不可能有孤儿 ⇒ 不得阻断。"""
+    conn = _PurgeConn(counts={"qa_session_log": 3}, fail_on={"qa_retrieved_doc": 1146})
+    out = _purge(monkeypatch, live_db, conn)
+    assert "qa_session_log" in conn.deleted_tables, "合法 skip 被误判为未清 —— 擦除被无谓阻断"
+    assert out["tables"]["qa_retrieved_doc"]["ok"] is True
+    assert "blocked_by" not in out["tables"]["qa_session_log"]
+
+
+def test_purge_happy_path_deletes_anchor_last(monkeypatch, live_db):
+    """全部前序成功时，锚点照常删除，且顺序恒为最后一项。"""
+    conn = _PurgeConn(counts={"qa_retrieved_doc": 2, "qa_session_log": 3})
+    out = _purge(monkeypatch, live_db, conn)
+    assert conn.deleted_tables[0] == "qa_retrieved_doc"
+    assert conn.deleted_tables[-1] == "qa_session_log"
+    assert out["ok"] is True

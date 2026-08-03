@@ -39,17 +39,41 @@ def _prescreen_unchanged(cur, targets) -> set:
     复算。只有明细数据完整且 want==have 的 doc 才判 unchanged；任何数据缺失 / 行形状异常 /
     坏 JSON 一律【不判】——保守方向：宁可多跑 materialize 复核，绝不把真实漂移误判成 unchanged。
     本函数只读；写路径与 2h 反抢锁语义完全由单一注入点 helper 保持不变。
+
+    ⚠️ **node 文档一律不预筛**（C3，2026-08-03）：预筛的 want 只来自 legacy 权威
+    (`resolve_allowed_depts` 读 kb_access_request)，而 materialize 对 node 文档的 want 来自
+    `kb_doc_node_grant` 投影的 `d:/dx:` 值、且要一并比 owner 投影轴。想在预筛里复刻这几维，
+    等于把唯一写实现的判定逻辑抄第二份 —— 而"两份判定逻辑漂移"正是本条缺陷的根因。
+    node 直接交给单一注入点复核；legacy 保留预筛（perf E#36 的 N+1 收益）。
     """
     import json as _json
-    from opensearch_pipeline.access_grants import resolve_allowed_depts
+    from opensearch_pipeline.access_grants import _node_acl_columns_present, resolve_allowed_depts
+    from opensearch_pipeline.acl_policy import ACL_MODE_NODE
 
     targets = list(targets)
     if not targets:
         return set()
+    # ⚠️ 这里【不用】resolve_acl_modes：它对读失败会静默按 legacy 返回，而"读不出模式"与
+    # "确实是 legacy"在预筛里后果完全不同——前者会让 node 文档被 legacy 口径误判 unchanged
+    # 而永久跳过复核。故自行区分两种情形，读失败一律整体放弃预筛（全量交单一注入点复核）。
+    if _node_acl_columns_present(cur):        # 060 未 apply ⇒ 不存在 node 文档 ⇒ 照常预筛
+        try:
+            _ph = ",".join(["%s"] * len(targets))
+            cur.execute(
+                f"SELECT doc_id, acl_mode FROM {_kb_db()}.document_meta "
+                f"WHERE doc_id IN ({_ph})", tuple(targets))
+            _modes = {r[0]: str(r[1] or "").strip().lower() for r in cur.fetchall()}
+        except Exception as e:  # noqa: BLE001 — 模式读失败 ⇒ 保守全量复核，绝不按 legacy 蒙混
+            logger.warning("预筛 acl_mode 批查失败，本轮放弃预筛、全量复核: %s", e)
+            return set()
+        targets = [d for d in targets if _modes.get(d) != ACL_MODE_NODE]
+        if not targets:
+            return set()
     grants = resolve_allowed_depts(targets, cur)         # ① 应有授权（一条 IN 查询）
     placeholders = ",".join(["%s"] * len(targets))
     cur.execute(                                         # ② 现存投影 + 版本限定权限（一条查询）
-        f"SELECT DISTINCT cm.doc_id, cm.allowed_depts, cm.permission_level "
+        f"SELECT DISTINCT cm.doc_id, cm.allowed_depts, cm.permission_level, "
+        f"       cm.owner_dept, dm.owner_dept "
         f"FROM {_kb_db()}.chunk_meta cm "
         f"JOIN {_kb_db()}.document_meta dm "
         f"  ON dm.doc_id=cm.doc_id AND cm.version_no=dm.current_version_no "
@@ -59,12 +83,17 @@ def _prescreen_unchanged(cur, targets) -> set:
     rows = cur.fetchall()
     have_map: dict = {}
     perm_map: dict = {}
+    owner_map: dict = {}          # doc → chunk 投影轴 owner 集合（集合语义，见下）
+    want_owner: dict = {}         # doc → 应有 owner（legacy = document_meta 真实 owner）
     bad: set = set()
     for row in rows:
         try:
             d, ad, perm = row[0], row[1], row[2]
+            cm_owner, dm_owner = row[3], row[4]
         except Exception:  # noqa: BLE001 — 行形状异常（桩/驱动差异）→ 整体放弃预筛，全量复核
             return set()
+        owner_map.setdefault(d, set()).add(cm_owner or "")
+        want_owner[d] = dm_owner or ""
         perm_map.setdefault(d, set())
         if perm is not None:                     # 与 GROUP_CONCAT 同口径：NULL 权限不计入 gate 判定
             perm_map[d].add(perm)
@@ -86,8 +115,16 @@ def _prescreen_unchanged(cur, targets) -> set:
         # 版本限定 gate（与 materialize 的 GROUP_CONCAT==‘dept_internal’ 等价）：
         # 唯一权限级且为 dept_internal 才保留 want，否则 want=[]。
         want = raw_want if perm_map[d] == {"dept_internal"} else []
-        if sorted(want) == sorted(have_map.get(d, set())):
-            unchanged.add(d)
+        if sorted(want) != sorted(have_map.get(d, set())):
+            continue
+        # owner 投影轴（C3）：allowed_depts 一致但 chunk owner 与应有值不符也是漂移，
+        # 此前预筛完全不看这一维 ⇒ stale-owner 文档被判 unchanged、materialize 永不执行。
+        # 这一维读的是【投影结果】(chunk_meta.owner_dept vs document_meta.owner_dept)，
+        # 不是重算权威，故不构成"判定逻辑抄第二份"。
+        # 集合相等而非首项相等：混合 owner（写到一半/并发）必须判漂移，与 materialize 同口径。
+        if owner_map.get(d, set()) != {want_owner.get(d, "")}:
+            continue
+        unchanged.add(d)
     return unchanged
 
 
@@ -136,10 +173,34 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
             except Exception as e:   # noqa: BLE001 — schema/060 未 apply
                 logger.debug("kb_doc_node_grant 候选跳过（表不存在?）: %s", e)
                 node_granted = set()
+            # 2c. C3（2026-08-03）：**零 active grant** 的 node 文档三源全不命中 —— 它没有
+            #     kb_access_request 行、allowed_depts 是 NULL、kb_doc_node_grant 里也没有
+            #     未撤销行（从未授权 / 授权已全部撤销）。但 project_doc_acl 对 node 模式
+            #     **无论节点集是否为空**都要求 owner 投影为哨兵；漏掉它 ⇒ chunk 仍挂旧真实
+            #     owner ⇒ legacy owner 分支持续放行旧 owner 组 = stale-owner 越权【永久态】,
+            #     而本对账正是最后一道自愈防线。
+            #     INNER JOIN 到 current_version 的 active chunk：结构上排除"current 无 chunk"
+            #     的文档（否则 owner 期望哨兵、实得空集，每轮判漂移、零行写、白占 _LIMIT 预算）。
+            #     `<=>` 是 null-safe 比较：`<> 哨兵` 在三值逻辑下会漏掉 owner_dept IS NULL。
+            #     非 current 的旧服务版本不在此列 —— 那是 materializer 版本轴问题（C3′，另立）。
+            try:
+                from opensearch_pipeline.acl_policy import NODE_OWNER_SENTINEL
+                cur.execute(
+                    f"SELECT DISTINCT dm.doc_id FROM {_kb_db()}.document_meta dm "
+                    f"JOIN {_kb_db()}.chunk_meta cm "
+                    "  ON cm.doc_id=dm.doc_id AND cm.version_no=dm.current_version_no "
+                    " AND cm.is_active=1 "
+                    "WHERE dm.acl_mode='node' AND NOT (cm.owner_dept <=> %s)",
+                    (NODE_OWNER_SENTINEL,),
+                )
+                node_stale_owner = {r[0] for r in cur.fetchall() if r and r[0]}
+            except Exception as e:   # noqa: BLE001 — schema/060 未 apply（无 acl_mode 列）
+                logger.debug("node stale-owner 候选跳过（060 未 apply?）: %s", e)
+                node_stale_owner = set()
             # 全量扫描候选，但按【实际漂移写】数封顶（_LIMIT）——unchanged 文档只读不占写预算，故高位
             # 漂移文档绝不会被一致文档挤出（旧实现 sorted(...)[:_LIMIT] 固定切片会饿死高位漂移；Step 5
             # 审计）。漂移文档本轮处理后下轮即变 unchanged，预算自然腾给后续漂移 → 自清、最终全覆盖。
-            targets = sorted(set(approved) | have_ad | node_granted)
+            targets = sorted(set(approved) | have_ad | node_granted | node_stale_owner)
 
             # perf E#36：批量预筛（2 条聚合查询）先在内存 diff 出确定无漂移的 doc，跳过其
             # 逐 doc 4×SQL 复核；漂移/存疑子集仍走单一注入点 materialize 复核+写（锁/gate/

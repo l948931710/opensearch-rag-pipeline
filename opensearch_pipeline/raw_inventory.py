@@ -63,7 +63,15 @@ def run_raw_inventory(*, alert: bool = True) -> dict:
         from opensearch_pipeline.kb_upload import UPLOAD_TOKEN_TTL
         from opensearch_pipeline.pipeline_nodes import _get_db_conn
 
-        bucket = _get_oss_bucket()
+        # ⚠️ `_get_oss_bucket()` 返回的是 **二元组** `(bucket_or_None, is_simulated)`——此前这里
+        # 漏解包：元组恒 truthy 使 `is None` 恒 False，`ObjectIterator(元组)` 迭代时抛
+        # AttributeError 被下方 broad except 吞掉 ⇒ 本探针在【任何】环境恒返回 ok=False、四桶计数
+        # 恒 0。全仓其余 8 处调用方均正确解包，唯此一处笔误（C1，2026-08-03）。
+        bucket, is_sim = _get_oss_bucket()
+        if is_sim:
+            # simulate 无真实对象可盘 —— 明确 skipped，别伪装成"盘点成功且零孤儿"（假绿）
+            result["skipped"] = "simulate"
+            return result
         if bucket is None:
             result["ok"] = False
             result["errors"].append("OSS bucket unavailable")
