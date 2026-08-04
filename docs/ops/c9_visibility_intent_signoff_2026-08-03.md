@@ -30,7 +30,15 @@ quarantine），但**无 `content_process_status` 守卫**；而 raw_key 的权�
 
 ---
 
-## 2. 🔴 三选一（Sam 拍板；codex 推荐 B′）
+## 2. 🟢 三选一 —— **Sam 2026-08-03 已拍板：B′**
+
+> 🟢 **Sam 2026-08-03 已拍板：方案 B′**（版本级 `permission_override` + 双锁 + fence）。
+> 业务含义：可见范围变更**只对可安全接管的版本立即生效**，正在被 stage-2 认领/处理的
+> 版本一律 409，不做 last-writer-wins。
+> **尚未实施**——B′ 需要 schema 迁移（`document_version.permission_override`）+ 改真
+> loader（`dataworks_orchestrator.py:225/344`）+ 并发协议，属跨模块协议变更；
+> 且 §4 的**状态矩阵仍须填满**（逐格「允许 / 409 / 允许但不 override」）才能动工。
+
 
 ### 方案 B′（codex 推荐）：版本级 `permission_override` + 双锁 + fence
 

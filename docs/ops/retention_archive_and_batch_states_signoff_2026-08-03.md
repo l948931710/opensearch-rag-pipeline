@@ -1,4 +1,14 @@
-# retention 归档冲突(C5) + 批处理状态模型(C6) 拍板单（2026-08-03）
+# retention 归档与批次状态 拍板单（2026-08-03）
+
+> 🟢 **Sam 2026-08-03 已拍板：选 A（打通删前冷归档）**。
+> 实施进度：`4898e44`（run id 抗碰撞 + 启动即 preflight + 节点装 oss2 + 钉版镜像 parity）
+> · `cbe0ec0`（主体擦除覆盖 OSS 归档面 —— 选 A 引入的 PIPL 缺口，同批堵上）。
+> **仍待 Sam 执行的 ops 动作**（代码已就绪、我不能代做）：
+>   1. DataWorks retention 节点「凭据」段补 **OSS 四件套**（endpoint/bucket/AK/SK）——
+>      缺任一项节点启动即失败（preflight 有意 fail-closed）。
+>   2. 首跑保持 `DRY_RUN=True` 观察，再翻阶段 2。
+>   3. ⚠️ **未实测**：生产 OSS 账号是否真具备该 bucket 的 `PutObject` 权限。
+> 本单其余未勾选项（六分类状态机等）仍待拍板。
 
 > **背景**：2026-08-03 ultra 评审的 C5/C6 两条，加同日设计模式对标研究
 > （`docs/acl_retention_design_patterns_2026-08-03.md`，在 remote 分支
