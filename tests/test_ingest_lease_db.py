@@ -290,13 +290,20 @@ def test_verify_for_update_blocks_takeover_until_commit(db, lease_on):
     assert _claim_stage2(db, ls, doc)
     _expire_lease(db, doc)   # 租约已到期：接管方随时有权抢——除非被行锁挡住
 
-    hold_s = 0.6
+    # ⚠️ 2026-08-04：本用例原先断言「接管线程至少等了 hold_s*0.8 秒」。那是**墙钟时长**断言，
+    # 在并行负载（xdist 16 worker）下必然脆：`t0` 取在 `_get_real_db_conn()` **之后**，而建连
+    # （连接池/TLS 握手）本身可能耗数百毫秒 ⇒ 子线程真正发出 UPDATE 时主线程已快睡完，
+    # 它只"等"到剩余那点时间 ⇒ 实测 0.197s < 0.48s **误判为"没被锁挡住"**。锁其实一直正常。
+    # 改为断言**顺序**（接管必须在持锁方 commit **之后**才完成）——这才是要守的不变量，
+    # 且与负载无关。建连开销挪到计时窗口之外：子线程建完连接先 set(ready)，主线程等到
+    # ready 再进入窗口，于是"子线程已发出 UPDATE 并被挡住"是可确证的前提而非假设。
     t_b_done = {}
+    ready = threading.Event()
 
     def _blocked_takeover():
-        conn_b = _get_real_db_conn()
+        conn_b = _get_real_db_conn()        # 建连在计时窗口之外
         try:
-            t0 = time.monotonic()
+            ready.set()                     # 已就绪：下一步就是发 UPDATE
             with conn_b.cursor() as cur:
                 cur.execute(
                     "UPDATE document_version SET lease_holder='late-taker-1-cafebabe',"
@@ -306,7 +313,7 @@ def test_verify_for_update_blocks_takeover_until_commit(db, lease_on):
                     (doc, 1))
                 t_b_done["rowcount"] = cur.rowcount
             conn_b.commit()
-            t_b_done["waited"] = time.monotonic() - t0
+            t_b_done["done_at"] = time.monotonic()
         finally:
             conn_b.close()
 
@@ -315,7 +322,8 @@ def test_verify_for_update_blocks_takeover_until_commit(db, lease_on):
         ls.verify_for_update(cur, key)      # FOR UPDATE：行锁到手（租约虽到期仍是我方 epoch）
         t = threading.Thread(target=_blocked_takeover)
         t.start()
-        time.sleep(hold_s)                  # 模拟「验租后-commit 前」的写回窗口
+        assert ready.wait(timeout=10), "接管线程未能建连——环境问题，不是被锁挡住"
+        time.sleep(0.3)                     # 让那条 UPDATE 确实发出并撞上行锁
         cur.execute(
             f"UPDATE document_version SET content_process_status='DONE'"
             f"{ingest_lease.clear_set_sql()}"
@@ -323,9 +331,15 @@ def test_verify_for_update_blocks_takeover_until_commit(db, lease_on):
             (doc, 1) + ls.fence_where_params(key))
         ls.check_fenced_write(cur, key)     # 窗口内不可能被接管 → 必然满额
     db.commit()
+    t_commit_at = time.monotonic()
     t.join(timeout=10)
 
-    assert t_b_done["waited"] >= hold_s * 0.8, "takeover must block on the row lock"
+    # 顺序不变量：接管**只可能**在持锁方 commit 之后完成。若它没被行锁挡住，
+    # 会在 ready 之后毫秒级返回，即**早于** t_commit_at ⇒ 本断言必红。
+    assert "done_at" in t_b_done, "接管线程未完成（10s 内没 join 上）"
+    assert t_b_done["done_at"] >= t_commit_at, (
+        f"接管在持锁方 commit 之前就完成了（done_at 早 "
+        f"{t_commit_at - t_b_done['done_at']:.3f}s）⇒ 行锁没挡住")
     assert t_b_done["rowcount"] == 0, \
         "post-commit takeover must find no expired lease (cleared by terminal write)"
     assert _row(db, doc)[0] == "DONE"
