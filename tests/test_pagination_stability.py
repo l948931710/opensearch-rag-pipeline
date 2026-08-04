@@ -165,3 +165,50 @@ def test_offset_pagination_covers_every_row_exactly_once():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── tiebreaker 方向必须跟随前一排序键（2026-08-04 B3 复核，EXPLAIN 实测）──────────
+
+def test_tiebreaker_direction_follows_the_preceding_key():
+    """🔴 tiebreaker 的 ASC/DESC 必须与它前一个排序键一致 —— 这是**性能**约束，不是风格。
+
+    真库 EXPLAIN 实测（MySQL 8.0.46，qa_conversation 单用户 8000 行，
+    索引 `idx_user_visible_recent (user_id, hidden_at, last_message_at)`）：
+
+        ORDER BY last_message_at DESC, conversation_id DESC
+          → type=range key=idx_user_visible_recent  Backward index scan; Using index   ← 无 filesort
+        ORDER BY last_message_at DESC, conversation_id ASC
+          → type=ref   key=PRIMARY                  **Using filesort**（4000 行）
+
+    机制：InnoDB 二级索引物理上就是 `(索引列…, 主键列…)`，`(user_id, hidden_at,
+    last_message_at, conversation_id)` 恰好覆盖同向的复合排序；方向一混就用不上，
+    退化成主键扫 + 全量 filesort。
+
+    ⚠️ 顺带纠一处我自己的判断：当初写 `d2c8e12` 时的理由是「这些查询本就走 filesort，
+    故加列可忽略」。5 处里 4 处如此，**`/api/conversations` 那处不是** —— 它改前就没有
+    filesort，改后**依然**没有（正因为方向跟随）。结论对，理由曾经是错的。
+    """
+    bad = []
+    for site, clause in _paginated_order_bys():
+        terms = _split_top_level(clause)
+        if len(terms) < 2:
+            continue
+
+        def _dir(t: str) -> str:
+            u = t.upper().split()
+            return "DESC" if "DESC" in u else "ASC"
+
+        # 只看最后一项（tiebreaker）与其紧邻的前一项
+        if _dir(terms[-1]) != _dir(terms[-2]):
+            bad.append(f"{site}: …{terms[-2].strip()} , {terms[-1].strip()}")
+    assert not bad, (
+        "tiebreaker 方向与前一排序键不一致 —— 会让 InnoDB 用不上二级索引的隐含主键序、"
+        "退化成 filesort（真库 EXPLAIN 实测）：\n  " + "\n  ".join(bad))
+
+
+def test_direction_scanner_is_not_vacuous():
+    """守卫上一条不是空转：扫描器确实看到了多项 ORDER BY 的分页点。"""
+    multi = [(s, c) for s, c in _paginated_order_bys() if len(_split_top_level(c)) >= 2]
+    assert len(multi) >= 3, (
+        f"只扫到 {len(multi)} 个多项 ORDER BY 分页点——方向守卫基本没覆盖到东西，"
+        "检查 _paginated_order_bys 的窗口大小/正则是否失效")
