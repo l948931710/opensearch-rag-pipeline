@@ -1336,6 +1336,99 @@ def test_insights_top_docs_owner_axis_stable_keys(monkeypatch):
     assert joined.count(expr) >= 2                 # SELECT 与 GROUP BY 同源
 
 
+# ── /api/kb/feedback-stats 按部门筛选（2026-08-03，codex 两轮共识）───────────────
+def _fb_stats_bypass_cache(monkeypatch):
+    from opensearch_pipeline.routes import kb_console
+    monkeypatch.setattr(kb_console, "_dashboard_cache_get", lambda k: None)
+    monkeypatch.setattr(kb_console, "_dashboard_cache_put", lambda k, v: None)
+
+
+def test_feedback_stats_legacy_key_absent_schema(monkeypatch):
+    """absent：legacy 走旧式 owner_dept IN（不引用 acl_mode/owner_dept_id）；伞形子线随入；
+    分母 answer_total 从 qa_session_log 起查（绝不从反馈表来）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _fb_stats_bypass_cache(monkeypatch)
+    from opensearch_pipeline import api
+    sink = _stub_multi(monkeypatch, [(5,), (2, 1, 3, 1), [], []])
+    resp = api.kb_feedback_stats(owner_key="legacy:production", request=None,
+                                 identity=api.Identity(user_id="dev1"))
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "m.owner_dept IN" in sqls
+    assert "owner_dept_id" not in sqls and "acl_mode" not in sqls
+    assert "FROM" in sqls and "qa_session_log q" in sqls          # 分母独立起查
+    assert any(p and "production_straw" in p for _, p in sink["calls"])   # 伞形展开
+    assert resp.answer_total == 5 and resp.up == 2 and resp.down == 1 and resp.last7 == 1
+
+
+def test_feedback_stats_node_key_absent_400_and_bad_key_400(monkeypatch):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _fb_stats_bypass_cache(monkeypatch)
+    from opensearch_pipeline import api
+    _stub_multi(monkeypatch, [])
+    for bad in ("node:3", "car:1", "node:0", ""):
+        with pytest.raises(Exception) as ei:
+            api.kb_feedback_stats(owner_key=bad, request=None, identity=api.Identity(user_id="dev1"))
+        assert getattr(ei.value, "status_code", None) == 400, bad
+
+
+def test_feedback_stats_node_key_present_descendants(monkeypatch):
+    """present：node key → acl_mode='node' + 后代集 IN（与 _kb_managed_descendants 同源）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _fb_stats_bypass_cache(monkeypatch)
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    import opensearch_pipeline.dept_ancestry as _da
+    import opensearch_pipeline.org_sync as _os
+    for ns in (api, kb_console):
+        monkeypatch.setattr(ns, "_kb_node_capability", lambda cur: "present")
+    monkeypatch.setattr(_os, "load_children_index", lambda: (1, True, {3: [4], 4: []}))
+    monkeypatch.setattr(_da, "resolve_descendant_ids", lambda ch, roots: ({3, 4}, True))
+    sink = _stub_multi(monkeypatch, [(1,), (5,), (2, 1, 3, 1), [], []])   # 首查=dept_dim 在册
+    resp = api.kb_feedback_stats(owner_key="node:3", request=None,
+                                 identity=api.Identity(user_id="dev1"))
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "m.acl_mode='node' AND m.owner_dept_id IN" in sqls
+    assert any(p and 3 in p and 4 in p for _, p in sink["calls"] if isinstance(p, tuple))
+    assert resp.answer_total == 5
+
+
+def test_feedback_stats_node_key_stale_snapshot_409(monkeypatch):
+    """快照 stale ⇒ 409 org_snapshot_stale（服务器故障不扮 400，绝不拿 stale 后代集硬算）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _fb_stats_bypass_cache(monkeypatch)
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    import opensearch_pipeline.org_sync as _os
+    for ns in (api, kb_console):
+        monkeypatch.setattr(ns, "_kb_node_capability", lambda cur: "present")
+    monkeypatch.setattr(_os, "load_children_index", lambda: (1, False, {}))
+    _stub_multi(monkeypatch, [(1,)])
+    with pytest.raises(Exception) as ei:
+        api.kb_feedback_stats(owner_key="node:3", request=None, identity=api.Identity(user_id="dev1"))
+    assert getattr(ei.value, "status_code", None) == 409
+    assert "org_snapshot_stale" in str(getattr(ei.value, "detail", ""))
+
+
+def test_feedback_review_owner_key_intersects_scope(monkeypatch):
+    """dept_admin + owner_key：filter 与 scope AND 交集——只收窄不放宽（两个 IN 子句并存）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
+    _fb_stats_bypass_cache(monkeypatch)
+    from opensearch_pipeline import api
+    sink = _stub_multi(monkeypatch, [[]])
+    api.kb_feedback_review(request=None, owner_key="legacy:production",
+                           identity=api.Identity(user_id="da1"))
+    sql = sink["sql"]
+    assert sql.count("owner_dept IN") >= 2          # scope 一处 + filter 一处
+    params = sink["params"]
+    assert "marketing" in params and "production" in params
+
+
 def test_insights_dept_admin_no_managed_fail_closed(monkeypatch):
     """无授权 dept_admin → 作用域 1=0 空集，绝不静默当全量。"""
     _skip_if_not_sim()
@@ -2293,3 +2386,117 @@ def test_org_tree_flag_fails_safe_to_legacy(monkeypatch):
 
     monkeypatch.setattr("opensearch_pipeline.config.get_config", _boom)
     assert kb_console._node_acl_grant_enabled() is False
+
+
+# ── 附录B：doc-status 漏传 publish_status/chunk_status（2026-08-03）──────────────
+# doc-status 是前端**轮询**的端点（useKb.trackStatus 每 8s 一次，只在徽章 ∈
+# TERMINAL_BADGES 时收手）。它此前是全仓唯一不传这两个字段的真实状态端点，于是
+# _kb_status_badge 的三条终态分支全部不可达。后果两个方向都有：轮询等不到终态，
+# 以及 index_status 残留 'SUCCESS' 的隔离/缺内容件被显示成「已上线」。
+
+def _doc_status(monkeypatch, dv_row, *, doc_status="active", counts=(5, 5, 5), sink=None):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    s = _stub_multi(monkeypatch, [("hr", doc_status, 3), dv_row, counts])
+    if sink is not None:
+        sink["s"] = s
+    from opensearch_pipeline import api
+    return api.kb_doc_status(request=None, doc_id="D1", version=3,
+                             identity=api.Identity(user_id="kb1"))
+
+
+def test_doc_status_selects_the_columns_its_unpacking_needs(monkeypatch):
+    """桩游标按位置喂行，不会因 SELECT 少列而报错——所以必须**单独**钉住列清单。
+
+    少取 publish_status/gate_status 在生产上是 6-元组解包收到 4-元组 ⇒ ValueError ⇒ 500，
+    而纯徽章断言对此完全无感（本条正是补上那个反证空洞）。
+    """
+    sink = {}
+    _doc_status(monkeypatch, ("SUCCESS", "", "SUCCESS", "", "", ""), sink=sink)
+    dv_sql = [c[0] for c in sink["s"]["calls"] if "document_version" in c[0]][0]
+    for col in ("content_process_status", "chunk_status", "index_status",
+                "error_message", "publish_status", "gate_status"):
+        assert col in dv_sql, f"doc-status 的 document_version 查询漏取 {col}：{dv_sql}"
+
+
+# dv_row = (content_process_status, chunk_status, index_status, error_message,
+#           publish_status, gate_status)
+
+def test_doc_status_quarantined_never_shows_online(monkeypatch):
+    """最严重的一支：隔离件的 index_status 可能残留 'SUCCESS' ⇒ 漏传时先命中「已上线」，
+    把已隔离（未脱敏）文档显示成可搜。badge helper 的注释明说绝不能这样。"""
+    r = _doc_status(monkeypatch, ("SUCCESS", "", "SUCCESS", "", "QUARANTINED", ""))
+    assert r.status_badge == "已隔离", f"隔离件显示成了 {r.status_badge}"
+
+
+def test_doc_status_gate_only_quarantine_is_quarantined(monkeypatch):
+    """gate-only 隔离（publish_status 空、gate_status='quarantined'）走
+    _kb_version_quarantined 这个唯一权威 OR 语义——与版本历史同源。"""
+    r = _doc_status(monkeypatch, ("SUCCESS", "", "SUCCESS", "", "", "quarantined"))
+    assert r.status_badge == "已隔离"
+
+
+def test_doc_status_spot_quarantine_is_not_stuck_processing(monkeypatch):
+    """spot 隔离把 index_status 写成 'DELETED' ⇒ 漏传时一路落到默认「处理中」，
+    前端轮询 22 次×8s 后放弃。"""
+    r = _doc_status(monkeypatch, ("QUARANTINED", "", "DELETED", "", "QUARANTINED", ""),
+                    counts=(5, 0, 0))
+    assert r.status_badge == "已隔离"
+
+
+def test_doc_status_empty_chunk_is_terminal(monkeypatch):
+    """chunk_status='EMPTY'（低文本图纸等，78 篇那批）永远不会进索引 —— 必须给终态。"""
+    r = _doc_status(monkeypatch, ("DONE", "EMPTY", "", "", "", ""), counts=(0, 0, 0))
+    assert r.status_badge == "未入索引"
+
+
+def test_doc_status_skipped_publish_is_terminal(monkeypatch):
+    r = _doc_status(monkeypatch, ("DONE", "", "", "", "SKIPPED_PII", ""), counts=(0, 0, 0))
+    assert r.status_badge == "未入索引"
+
+
+def test_doc_status_needs_review_never_shows_online(monkeypatch):
+    """stage-3 毒 chunk 死信**只改 chunk_status**，dv.index_status 仍是 SUCCESS ⇒
+    漏传时该文档显示「已上线」，管理员看不出它缺内容。"""
+    r = _doc_status(monkeypatch, ("SUCCESS", "NEEDS_REVIEW", "SUCCESS", "", "", ""))
+    assert r.status_badge == "未入索引"
+
+
+def test_doc_status_online_path_unchanged(monkeypatch):
+    """对照：正常上线件行为不变。"""
+    r = _doc_status(monkeypatch, ("SUCCESS", "", "SUCCESS", "", "PUBLISHED", ""))
+    assert r.status_badge == "已上线"
+
+
+def test_doc_status_badge_agrees_with_version_history(monkeypatch):
+    """同一行底层数据，doc-status 与 version-history 必须给出**同一个**徽章。
+
+    这条把两个端点锁在一起——它们此前正是因为各传各的字段而漂移。
+    """
+    from opensearch_pipeline import api
+    cases = [
+        ("SUCCESS", "", "SUCCESS", "", "QUARANTINED", ""),
+        ("SUCCESS", "", "SUCCESS", "", "", "quarantined"),
+        ("DONE", "EMPTY", "", "", "", ""),
+        ("SUCCESS", "NEEDS_REVIEW", "SUCCESS", "", "", ""),
+        ("SUCCESS", "", "SUCCESS", "", "PUBLISHED", ""),
+    ]
+    for cps, chs, ixs, err, pubs, gate in cases:
+        ds = _doc_status(monkeypatch, (cps, chs, ixs, err, pubs, gate))
+        _stub_multi(monkeypatch, [("hr", "active"),
+                                  [(3, cps, chs, ixs, pubs, gate, 1, err, "2026-08-03")]])
+        vh = api.kb_version_history(request=None, doc_id="D1",
+                                    identity=api.Identity(user_id="kb1"))
+        assert ds.status_badge == vh.versions[0].status_badge, (
+            f"两端点对同一行漂移：doc-status={ds.status_badge} "
+            f"version-history={vh.versions[0].status_badge}（{cps}/{chs}/{ixs}/{pubs}/{gate}）")
+
+
+def test_new_terminal_badges_are_terminal_in_frontend_poller():
+    """端到端闭合：后端新放出的这两个徽章必须在前端 TERMINAL_BADGES 里，
+    否则轮询照样收不了手 —— 修了后端却没解决用户可见的症状。"""
+    import pathlib
+    src = pathlib.Path("console-app/src/lib/kb.ts").read_text(encoding="utf-8")
+    line = [ln for ln in src.splitlines() if "TERMINAL_BADGES" in ln][0]
+    for badge in ("未入索引", "已隔离"):
+        assert badge in line, f"前端轮询未把「{badge}」当终态：{line}"

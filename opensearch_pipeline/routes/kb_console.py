@@ -10,6 +10,7 @@ api 属性（规则见 routes/__init__.py）。
 """
 
 import os
+import re
 import threading
 import time
 from typing import Dict, List, Literal, Optional
@@ -881,6 +882,7 @@ _KB_FEEDBACK_HANDLED_DONE = ("RESOLVED", "DISMISSED")
 
 @router.get("/api/kb/feedback-review", response_model=KbFeedbackReviewResponse)
 def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool = False,
+                       owner_key: str = "",
                        identity: Optional[Identity] = Depends(current_identity)):
     """差评联动复核队列（只读）：引用了我作用域文档的回答收到 👎 → 逐条列出
     （脱敏提问 + 点踩原因 + 用户补充说明 + 涉及的本部门文档）——「文档质量 → 答案质量」
@@ -906,7 +908,7 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
     _scope_key = ("GLOBAL" if kb.role == ROLE_KB_ADMIN else
                   (tuple(sorted(_managed(kb))),
                    tuple(sorted(getattr(kb, "granted_node_roots", ()) or ()))))
-    cache_key = ("fb_review", _scope_key, win, limit, include_resolved)
+    cache_key = ("fb_review", _scope_key, win, limit, include_resolved, owner_key)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -919,7 +921,12 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
         try:
             with conn.cursor() as cur:
                 _cap = _kb_node_capability(cur)
+                # 可选部门筛选（2026-08-03）：与 scope AND 交集，只收窄不放宽；三态/409 语义见 helper
+                f_clause, f_params = _kb_owner_filter_sql(cur, owner_key, kb) if owner_key else ("", [])
                 scope_clause, scope_params, _deg = _kb_doc_owner_scope_sql(kb, _cap)
+                if _deg and owner_key.startswith("node:"):
+                    raise HTTPException(status_code=409,
+                                        detail="org_snapshot_stale: 管辖范围暂不可得，暂不可按部门筛选")
                 scope_params = list(scope_params)
                 # 平铺 (message, doc) 行，Python 侧按 message 分组保序（GROUP_CONCAT 拼结构太脆）。
                 # LIMIT 300 行 ≈ 数十条差评 × 引用文档数，上限后截 limit 条消息。
@@ -932,9 +939,9 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
                     + " WHERE f.feedback_type='downvote'"
                     "   AND f.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
                     + handled_clause
-                    + (" " + scope_clause if scope_clause else "")
+                    + (" " + scope_clause if scope_clause else "") + f_clause
                     + " ORDER BY f.created_at DESC, f.message_id LIMIT 300",
-                    tuple([win] + scope_params))
+                    tuple([win] + scope_params + list(f_params)))
                 rows = cur.fetchall() or []
         finally:
             conn.close()
@@ -969,6 +976,176 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
             it.docs.append(KbFeedbackDocRef(doc_id=str(doc_id), title=str(title or ""),
                                             owner_dept=str(owner or "")))
     out.items = list(by_msg.values())
+    _dashboard_cache_put(cache_key, out)
+    return out
+
+
+def _kb_owner_filter_sql(cur, owner_key: str, kb):
+    """看板反馈筛选的归属过滤子句（2026-08-03，codex 两轮共识）→ (clause, params)。
+
+    owner_key ∈ {'node:<id>', 'legacy:<code>'}；与调用者 _kb_doc_owner_scope_sql **AND 交集**
+    （只收窄不放宽，无越权面）。三态 capability 纪律与作用域 helper 同源：
+      present → 严格 mode 隔离两腿；absent → legacy 走旧式 owner_dept IN（无 acl_mode 列），
+      node key 400；unknown → 503 诚实 unavailable（不猜）。
+    node 后代展开与 _kb_managed_descendants 同源（load_children_index）；快照 stale/展开失败
+    ⇒ **409 org_snapshot_stale**（服务器故障不扮 400，也绝不拿 stale 后代集硬算——
+    dept_admin 会把「快照故障空集」误读成「该部门零反馈」）。
+    """
+    from opensearch_pipeline.kb_authz import _SANITIZE_RE, expand_managed_owner_depts
+    key = (owner_key or "").strip()
+    cap = _kb_node_capability(cur)
+    if cap == "unknown":
+        raise HTTPException(status_code=503, detail="node-ACL capability 探测失败，暂不可按部门筛选")
+    m = re.match(r"^node:([1-9]\d*)$", key)
+    if m:
+        if cap != "present":
+            raise HTTPException(status_code=400, detail="组织节点筛选需 node-ACL schema（060）就绪")
+        dept_id = int(m.group(1))
+        cur.execute(f"SELECT 1 FROM {_kb_db()}.dept_dim WHERE dept_id=%s AND is_active=1", (dept_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=400, detail=f"部门节点不存在或已停用: {dept_id}")
+        try:
+            from opensearch_pipeline.dept_ancestry import resolve_descendant_ids
+            from opensearch_pipeline.org_sync import load_children_index
+            _rev, fresh, children = load_children_index()
+            if not fresh:
+                raise HTTPException(status_code=409, detail="org_snapshot_stale: 组织快照过期，暂不可按部门筛选")
+            got, ok = resolve_descendant_ids(children, [dept_id])
+            if not ok:
+                raise HTTPException(status_code=409, detail="org_snapshot_stale: 管辖后代展开失败，暂不可按部门筛选")
+        except HTTPException:
+            raise
+        except Exception:   # noqa: BLE001 — OrgSnapshotUnavailable 等
+            raise HTTPException(status_code=409, detail="org_snapshot_stale: 组织快照不可用，暂不可按部门筛选")
+        ids = sorted(got)
+        ph = ",".join(["%s"] * len(ids))
+        return f" AND m.acl_mode='node' AND m.owner_dept_id IN ({ph})", list(ids)
+    code = _SANITIZE_RE.sub("", key[len("legacy:"):]) if key.startswith("legacy:") else ""
+    if not code:
+        raise HTTPException(status_code=400, detail="owner_key 非法（应为 node:<id> 或 legacy:<code>）")
+    owners = expand_managed_owner_depts([code])     # 伞形子线随入（production → production_*）
+    ph = ",".join(["%s"] * len(owners))
+    if cap == "present":
+        return f" AND m.acl_mode='legacy' AND m.owner_dept IN ({ph})", list(owners)
+    return f" AND m.owner_dept IN ({ph})", list(owners)
+
+
+class KbFeedbackDay(BaseModel):
+    day: str = ""
+    up: int = 0
+    down: int = 0
+
+
+class KbDownvoteReason(BaseModel):
+    reason: str = ""                     # 中文原因标签
+    count: int = 0
+
+
+class KbFeedbackStatsResponse(BaseModel):
+    """按部门筛选的反馈聚合（归属=答案实际引用 cited=1 该部门文档，与差评复核/insights 同源；
+    同一 message 引用多部门 ⇒ 各单桶视图都计入，绝不跨桶求和）。"""
+    owner_key: str = ""
+    window_days: int = 30
+    scope_degraded: bool = False
+    answer_total: int = 0        # 命中筛选集的回答数（qa_session_log 独立起查——分母绝不从反馈表来）
+    up: int = 0
+    down: int = 0
+    total: int = 0
+    helpful_rate: float = 0.0
+    last7: int = 0               # 服务端权威口径（scoped 集上 f.created_at>=7d），绝不由 daily 项数推导
+    daily: List[KbFeedbackDay] = Field(default_factory=list)
+    reasons: List[KbDownvoteReason] = Field(default_factory=list)
+
+
+@router.get("/api/kb/feedback-stats", response_model=KbFeedbackStatsResponse)
+def kb_feedback_stats(owner_key: str, request: Request,
+                      identity: Optional[Identity] = Depends(current_identity)):
+    """反馈区按部门筛选的聚合视图。分母（answer_total）从 qa_session_log 起查——
+    若从反馈表起查，分母只剩「已有反馈的回答」，覆盖率必然虚高逼近 100%（codex blocker）。
+    up/down/total/last7/daily/reasons 全部限定在「scoped message 集」（先 DISTINCT 去多文档扇出）。"""
+    _enforce_rate_limit(request, identity, scope="aux")
+    kb = _require_kb_console(identity)
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    from opensearch_pipeline.kb_authz import managed_owner_depts as _managed
+    win = _KB_INSIGHTS_WINDOW_DAYS
+    _scope_key = ("GLOBAL" if kb.role == ROLE_KB_ADMIN else
+                  (tuple(sorted(_managed(kb))),
+                   tuple(sorted(getattr(kb, "granted_node_roots", ()) or ()))))
+    cache_key = ("fb_stats", _scope_key, owner_key, win)
+    cached = _dashboard_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    out = KbFeedbackStatsResponse(owner_key=owner_key, window_days=win)
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        from opensearch_pipeline.qa_facts import qa_docs_join_sql
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                _cap = _kb_node_capability(cur)
+                filter_clause, filter_params = _kb_owner_filter_sql(cur, owner_key, kb)
+                scope_clause, scope_params, _deg = _kb_doc_owner_scope_sql(kb, _cap)
+                out.scope_degraded = bool(_deg)
+                if _deg and owner_key.startswith("node:"):
+                    raise HTTPException(status_code=409,
+                                        detail="org_snapshot_stale: 管辖范围暂不可得，暂不可按部门筛选")
+                scoped = (
+                    f"SELECT DISTINCT q.message_id FROM {_op_db()}.qa_session_log q"
+                    + qa_docs_join_sql(cited=True)
+                    + " WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    + (" " + scope_clause if scope_clause else "") + filter_clause
+                )
+                sp = [win] + list(scope_params) + list(filter_params)
+                cur.execute(f"SELECT COUNT(*) FROM ({scoped}) t", tuple(sp))
+                out.answer_total = int((cur.fetchone() or (0,))[0] or 0)
+                cur.execute(
+                    "SELECT SUM(f.feedback_type='upvote'), SUM(f.feedback_type='downvote'), COUNT(*),"
+                    " SUM(f.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY))"
+                    f" FROM {_op_db()}.user_feedback f"
+                    " WHERE f.feedback_type IN ('upvote','downvote')"
+                    "   AND f.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    f"   AND f.message_id IN ({scoped})",
+                    tuple([win] + sp))
+                r = cur.fetchone() or (0, 0, 0, 0)
+                out.up, out.down = int(r[0] or 0), int(r[1] or 0)
+                out.total = int(r[2] or 0); out.last7 = int(r[3] or 0)
+                out.helpful_rate = round(out.up / out.total, 4) if out.total else 0.0
+                cur.execute(
+                    "SELECT DATE(CONVERT_TZ(f.created_at, 'America/Los_Angeles', 'Asia/Shanghai')),"
+                    " SUM(f.feedback_type='upvote'), SUM(f.feedback_type='downvote')"
+                    f" FROM {_op_db()}.user_feedback f"
+                    " WHERE f.feedback_type IN ('upvote','downvote')"
+                    "   AND f.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    f"   AND f.message_id IN ({scoped})"
+                    " GROUP BY 1 ORDER BY 1",
+                    tuple([win] + sp))
+                out.daily = [KbFeedbackDay(day=str(row[0]), up=int(row[1] or 0), down=int(row[2] or 0))
+                             for row in cur.fetchall()]
+                cur.execute(
+                    f"SELECT f.feedback_reason, COUNT(*) FROM {_op_db()}.user_feedback f"
+                    " WHERE f.feedback_type='downvote'"
+                    "   AND f.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+                    f"   AND f.message_id IN ({scoped})"
+                    " GROUP BY f.feedback_reason",
+                    tuple([win] + sp))
+                rcount: Dict[str, int] = {}
+                for reason, n in cur.fetchall():
+                    n = int(n or 0)
+                    codes = [x.strip() for x in (reason or "").split(",") if x.strip()] or ["__none__"]
+                    for c in codes:
+                        label = "未注明" if c == "__none__" else _KB_DOWNVOTE_REASON_LABELS.get(c, c)
+                        rcount[label] = rcount.get(label, 0) + n
+                out.reasons = sorted(
+                    [KbDownvoteReason(reason=k, count=v) for k, v in rcount.items()],
+                    key=lambda x: x.count, reverse=True)
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = get_request_id()
+        logger.error("kb_feedback_stats 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"反馈筛选查询失败 (trace: {trace_id})")
     _dashboard_cache_put(cache_key, out)
     return out
 
@@ -1235,15 +1412,7 @@ class KbDeptCoverageItem(BaseModel):
     qa_hits_7d: Optional[int] = None
 
 
-class KbFeedbackDay(BaseModel):
-    day: str = ""
-    up: int = 0
-    down: int = 0
-
-
-class KbDownvoteReason(BaseModel):
-    reason: str = ""                     # 中文原因标签
-    count: int = 0
+# KbFeedbackDay/KbDownvoteReason 已前移至 feedback-stats 端点之前（同文件复用）
 
 
 class KbFileType(BaseModel):
@@ -2038,7 +2207,8 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
                     raise HTTPException(status_code=403, detail="无权查看该文档")
                 vno = int(version) if version else cur_ver
                 cur.execute(
-                    "SELECT content_process_status, chunk_status, index_status, error_message "
+                    "SELECT content_process_status, chunk_status, index_status, error_message, "
+                    "publish_status, gate_status "
                     f"FROM {_kb_db()}.document_version WHERE doc_id=%s AND version_no=%s LIMIT 1",
                     (doc_id, vno),
                 )
@@ -2058,13 +2228,28 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
         logger.error("kb_doc_status 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"文档状态查询失败 (trace: {trace_id})")
 
-    cps, chs, ixs, err = (dv or ("", "", "", ""))
+    cps, chs, ixs, err, pubs, gate = (dv or ("", "", "", "", "", ""))
     active = int(active or 0)
+    # doc-status 是**前端轮询**的那个端点（useKb.trackStatus 每 8s 一次，只在徽章 ∈
+    # TERMINAL_BADGES 时收手）。此前它是全仓唯一**不传** publish_status/chunk_status 的
+    # 真实状态端点（my-docs:340 / browse:445 / version-history:2175 / contribution:692 都传），
+    # 于是 _kb_status_badge 的三条终态分支在这里**全部不可达**：
+    #   · publish_status='QUARANTINED' → 「已隔离」
+    #   · chunk_status='EMPTY' / publish_status='SKIPPED_*' → 「未入索引」（78 篇 EMPTY 那批）
+    #   · chunk_status='NEEDS_REVIEW' → 「未入索引」（stage-3 毒 chunk 死信只改 chunk_status）
+    # 后果**两个方向都有**，且不止"卡在处理中"：
+    #   · spot 隔离件（index_status='DELETED'）落到默认「处理中」⇒ 轮询 22 次×8s 后放弃；
+    #   · 而隔离/NEEDS_REVIEW 件的 index_status 若残留 'SUCCESS'，会先命中「已上线」分支
+    #     ⇒ **把已隔离/缺内容的文档显示成"已上线"**（badge helper 的注释明说绝不能这样：
+    #     "会被误读为可搜/已脱敏"）。
+    # gate-only 隔离同样要走 _kb_version_quarantined（唯一权威 OR 语义），与版本历史一致。
+    _is_q = _kb_version_quarantined(pubs, gate)
     return KbDocStatusResponse(
         doc_id=doc_id, version_no=vno, owner_dept=owner_dept,
         content_process_status=cps or "", chunk_status=chs or "", index_status=ixs or "",
         chunk_total=int(total or 0), chunk_active=active, chunk_indexed=int(indexed or 0),
-        status_badge=_kb_status_badge(cps, ixs, doc_status, active),
+        status_badge=("已隔离" if _is_q else _kb_status_badge(
+            cps, ixs, doc_status, active, publish_status=pubs, chunk_status=chs)),
         error_message=err or "",
     )
 
