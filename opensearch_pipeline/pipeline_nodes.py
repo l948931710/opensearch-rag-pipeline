@@ -6436,9 +6436,20 @@ def node_write_chunk_meta(ctx: dict):
                     "image_content_override", "funnel_policy")}
                 # P1-9：funnel_policy 优先取 **canonical 里 Stage-1 写下的那个**；
                 # 取不到才回落当前进程 env（老 canonical 没有该键）。
-                _canon_policy = doc.get("funnel_policy")
-                if _canon_policy is not None:
-                    _provenance["funnel_policy"] = _canon_policy
+                # ⚠️ 必须**逐 (doc_id, version_no)**：本批 valid_chunks 跨多篇文档（stage-2 一次
+                # 认领 ≤100 篇），而 _provenance 是**批级共用**对象。此处原先读的是 6235 行 for
+                # 循环**泄漏出来的 `doc`**（= 批内最后一篇 canonical），等于给整批 chunk 盖同一个
+                # 策略标签 —— 事后拿 funnel_policy 盘点「谁还欠一次 C 重灌」会漏掉真正欠账的文档
+                # （**假阴**：旧策略产出的图集被标成 c1，账面显示已完成、永久缺图）。
+                # copy-on-write：只在值不同时新建 dict，且 "" 也必须走新建 —— 绝不原地改
+                # _provenance，否则第一篇就把批级基准污染掉，变成第二次同型泄漏。
+                _prov_by_dv = {}
+                for _cdoc in canonicals:
+                    _cp = _cdoc.get("funnel_policy")
+                    if _cp is None or _cp == _provenance.get("funnel_policy"):
+                        continue   # 缺键 ⇒ 回落批级（当前进程 env）；同值 ⇒ 共用批级对象
+                    _prov_by_dv[(_cdoc.get("doc_id"), _cdoc.get("version_no"))] = {
+                        **_provenance, "funnel_policy": _cp}
                 _chunk_set_hashes = _compute_chunk_set_hashes(valid_chunks)
 
                 insert_rows = []
@@ -6449,7 +6460,8 @@ def node_write_chunk_meta(ctx: dict):
                     # 序列化 extra dict → JSON（图片 chunk 的 source_image/visual_summary/oss_key）
                     # + 合并 L3 provenance + chunk_set_hash（构造新 dict，不就地改 chunk.extra）。
                     _extra_for_json = dict(chunk.extra or {})
-                    _extra_for_json["_provenance"] = _provenance
+                    _extra_for_json["_provenance"] = _prov_by_dv.get(
+                        (chunk.doc_id, chunk.version_no), _provenance)
                     _extra_for_json["_chunk_set_hash"] = _chunk_set_hashes.get(
                         (chunk.doc_id, chunk.version_no))
                     extra_json_val = _json.dumps(_extra_for_json, ensure_ascii=False)

@@ -372,6 +372,16 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                             "vlm_degraded_count": content_json.get("vlm_degraded_count", 0),
                             # 批次6：部分内容丢失留痕（OCR 部分页/中途异常）→ 同一 NEEDS_REVIEW 通道
                             "partial_loss_notes": content_json.get("partial_loss_notes", []) or [],
+                            # 漏斗策略必须跨 stage 边界回读（审查 P1-9 的另一半）：stage-1 把
+                            # funnel_policy 写进了 canonical JSON（pipeline_nodes 的 canonical 组装
+                            # 处），但本白名单此前**没收这个键** —— 生产是 stage-1/stage-2 两个独立
+                            # 进程，于是 node_write_chunk_meta 那侧的 `doc.get("funnel_policy")` 恒为
+                            # None，整批 chunk 一律盖上 **stage-2 当时进程 env** 的标签，P1-9 在生产
+                            # 主路径上完全失效。后果与循环变量泄漏同向：拿 funnel_policy 盘点「谁还欠
+                            # 一次 C 重灌」时把旧策略产出的图集标成已完成（假阴），欠账文档永久缺图。
+                            # 缺键 ⇒ None ⇒ 消费侧 `is not None` 的回落语义不变（老 canonical 照旧
+                            # 用当前 env），故对存量无行为改变。
+                            "funnel_policy": content_json.get("funnel_policy"),
                             "filename": content_json.get("filename") or title,
                             "canonical_status": "DONE",
                             "canonical_key": canonical_json_key,
