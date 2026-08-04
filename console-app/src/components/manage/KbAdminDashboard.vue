@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   Database, CheckCircle2, Archive, Clock,
   ThumbsUp, ThumbsDown, Percent, Quote, MessageSquare, Ban, AlertTriangle,
@@ -15,6 +15,8 @@ import StatCard from './StatCard.vue'
 import BarList from './BarList.vue'
 import ColumnChart from './ColumnChart.vue'
 import OrgCoverageTable from './OrgCoverageTable.vue'
+import OrgTreeSelect from './OrgTreeSelect.vue'
+import type { PickedNode } from './OrgTreePicker.vue'
 import VitalsList, { type VitalItem } from './VitalsList.vue'
 import FeedbackTrend from './FeedbackTrend.vue'
 import MiniTrend from './MiniTrend.vue'
@@ -32,7 +34,7 @@ const ownerText = (key: string) => resolveOwnerBucket(key, undefined, snapById.v
 // 知识库管理员「概览看板」= 全库视角（对齐 Atlas 设计分区）。资产/状态取 /api/kb/stats、待审批
 // /pending-approvals；运行健康+治理风险+部门覆盖取 /api/kb/governance；知识效果取 /api/kb/insights。
 // 全部真实口径，无对应数据则如实显空 —— 绝不造数。
-const { kbStats, approvals, kbGovernance, kbInsights, feedbackReview, loadStats, loadGovernance, loadInsights, loadErrors } = useKb()
+const { kbStats, approvals, kbGovernance, kbInsights, feedbackReview, loadStats, loadGovernance, loadInsights, loadErrors, fbStats, loadFeedbackStats } = useKb()
 
 // 「待你处理」置顶条（P2）：差评复核是看板里唯一的行动区，却沉在页尾 ~2900px 深——
 // 有未处理差评时在首屏给一枚计数 chip，点击平滑定位；清零即隐，与文档管理 tab 的待办条同语言。
@@ -138,8 +140,33 @@ const topDocItems = computed(() =>
 const gapItems = computed(() =>
   (kbInsights.value?.gap_queries || []).map((g) => ({ label: g.query, sub: `平均相关度 ${g.avg_top.toFixed(2)}`, value: g.count })))
 
+// ── 反馈区按部门筛选（2026-08-03 Sam 需求，codex 两轮共识）────────────────────
+// 归属口径=答案实际引用（cited=1）该部门文档；选择颗粒度随 OrgTreeSelect 默认止于二级。
+// 置顶「差评未处理」chip 保持全库收件箱计数（行动区语义），筛选只作用于本区视图。
+const fbFilterNode = ref<PickedNode[]>([])
+const fbOwnerKey = computed(() => (fbFilterNode.value[0] ? `node:${fbFilterNode.value[0].dept_id}` : ''))
+const fbFilterName = computed(() => {
+  const id = fbFilterNode.value[0]?.dept_id
+  return id ? (snapById.value.get(id)?.name ?? `#${id}`) : ''
+})
+watch(fbOwnerKey, (k) => { void loadFeedbackStats(k) })
+const fbFiltered = computed(() => !!fbOwnerKey.value && !!fbStats.value)
+function clearFbFilter() { fbFilterNode.value = [] }
+
 // ── 用户反馈与回答质量 ──
 const feedbackCards = computed<Card[]>(() => {
+  // 筛选态：数据源切 /api/kb/feedback-stats（分母 answer_total 同为筛选口径，绝不混窗）
+  if (fbFiltered.value) {
+    const st = fbStats.value!
+    const coverage = st.answer_total ? st.total / st.answer_total : undefined
+    const hint = `筛选：${fbFilterName.value} · 近 ${st.window_days} 天`
+    return [
+      { label: '点赞', value: fmtN(st.up), icon: ThumbsUp, tone: 'text-st-live', hint },
+      { label: '点踩', value: fmtN(st.down), icon: ThumbsDown, tone: 'text-st-fail', hint },
+      { label: '正反馈率', value: pct(st.total ? st.helpful_rate : undefined), icon: Percent, tone: 'text-accent-text', hint: '赞 /(赞+踩)' },
+      { label: '反馈覆盖率', value: pct(coverage), icon: MessageSquare, tone: 'text-foreground', hint: `反馈数 / 命中该部门文档的回答数` },
+    ]
+  }
   const g = kbGovernance.value
   // 覆盖率 = 反馈数 / 回答数，两者【同为近 window_days 天】口径（#10 修复：此前分子全量、分母 30 天
   // 混窗，覆盖率可 >100% 且无意义）。
@@ -281,26 +308,41 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
     <!-- 用户反馈与回答质量（卡 + 趋势|原因 收在同一个框里） -->
     <section v-if="kbGovernance" id="kb-dash-feedback" :class="SECTION" class="scroll-mt-4">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>用户反馈与回答质量</header>
+      <!-- 按部门筛选（止于二级；归属=答案实际引用该部门文档；chip 计数恒全库不随筛选） -->
+      <div class="mb-3 flex flex-wrap items-center gap-2" data-testid="fb-filter">
+        <span class="text-[12px] text-muted-foreground">按部门筛选</span>
+        <div class="w-64"><OrgTreeSelect v-model="fbFilterNode" mode="owner" placeholder="全部部门" /></div>
+        <template v-if="fbOwnerKey">
+          <span class="rounded-full border border-accent-strong bg-accent-soft px-2.5 py-0.5 text-[11.5px] font-medium text-accent-text">
+            筛选：{{ fbFilterName }}</span>
+          <button type="button" class="text-[11.5px] text-muted-foreground underline transition hover:text-foreground"
+                  @click="clearFbFilter">清除</button>
+        </template>
+      </div>
+      <p v-if="loadErrors['feedbackStats']" class="mb-3 rounded-lg border border-st-busy/40 bg-st-busy/10 px-3 py-2 text-[12px] text-st-busy"
+         data-testid="fb-filter-error">
+        {{ loadErrors['feedbackStats'] }}
+      </p>
       <div :class="GRID" class="mb-3">
         <StatCard v-for="s in feedbackCards" :key="s.label" v-bind="s" />
       </div>
       <div :class="SPLIT">
         <div class="p-[15px]">
           <p :class="SUBHEAD">反馈趋势</p>
-          <FeedbackTrend bare :days="kbGovernance.feedback_daily" :last7="kbGovernance.feedback_last7" :total="kbGovernance.feedback_total" />
+          <FeedbackTrend bare :days="fbFiltered ? fbStats!.daily : kbGovernance.feedback_daily" :last7="fbFiltered ? fbStats!.last7 : kbGovernance.feedback_last7" :total="fbFiltered ? fbStats!.total : kbGovernance.feedback_total" />
         </div>
         <div class="p-[15px]">
           <div class="mb-2 flex items-baseline justify-between gap-2">
             <span class="text-[12.5px] font-medium text-muted-foreground">点踩原因分布</span>
-            <span class="font-mono text-[11px] tabular-nums text-faint">共 {{ fmtN(kbGovernance.feedback_down) }} 条</span>
+            <span class="font-mono text-[11px] tabular-nums text-faint">共 {{ fmtN(fbFiltered ? fbStats!.down : kbGovernance.feedback_down) }} 条</span>
           </div>
-          <ColumnChart :items="downvoteItems" show-share :share-base="kbGovernance.feedback_down" color="var(--st-fail)" unit=" 次" empty="近期无点踩反馈。" />
+          <ColumnChart :items="fbFiltered ? fbStats!.reasons.map((r) => ({ label: r.reason, value: r.count })) : downvoteItems" show-share :share-base="fbFiltered ? fbStats!.down : kbGovernance.feedback_down" color="var(--st-fail)" unit=" 次" empty="近期无点踩反馈。" />
           <p v-if="downvoteItems.length" class="mt-1 text-[11px] text-faint">占比 = 该原因 / 点踩总数；点踩可多选，故合计可超 100%。</p>
         </div>
       </div>
       <!-- 差评复核：逐条被点踩回答 + 涉及文档（全库；与上方聚合互补——这里能落到具体该修哪篇） -->
       <p :class="SUBHEAD" class="mt-4">差评复核 · 逐条（引用了库内文档）</p>
-      <FeedbackReviewList />
+      <FeedbackReviewList :owner-key="fbOwnerKey" />
       <!-- 入库复审任务：spot_checker 权限抽查等安全网登记（P2-33 消费端，kb_admin 专属） -->
       <p :class="SUBHEAD" class="mt-4">入库复审 · 安全网登记的人工任务</p>
       <ReviewTaskQueue />

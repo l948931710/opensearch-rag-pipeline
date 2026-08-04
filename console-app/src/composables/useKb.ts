@@ -208,6 +208,18 @@ const visLoading = ref(false)
 const visErr = ref('')
 // 差评联动复核（看板卡片）：引用了我作用域文档的回答收到 👎。null=尚未加载（显占位不显 0）。
 const feedbackReview = ref<FeedbackReviewItem[] | null>(null)
+// ── 反馈区按部门筛选（2026-08-03，codex 两轮共识）─────────────────────────────
+// 全库收件箱（chip 专用，永不带 owner_key）与区内筛选视图**分离**——否则筛选会把
+// 「差评未处理」置顶 chip 也变成部门计数（行动区语义必须全库）。
+const feedbackReviewView = ref<FeedbackReviewItem[] | null>(null)
+export interface KbFeedbackStats {
+  owner_key: string; window_days: number; scope_degraded: boolean
+  answer_total: number; up: number; down: number; total: number; helpful_rate: number
+  last7: number; daily: KbFeedbackDay[]; reasons: KbDownvoteReason[]
+}
+const fbStats = ref<KbFeedbackStats | null>(null)
+let fbViewSeq = 0
+let fbStatsSeq = 0
 const showResolvedFeedback = ref(false)   // 「显示已处理」切换：默认只看未处置（收件箱语义）
 const feedbackResolveBusy = ref<Set<string>>(new Set())   // 处置在途（按 message_id）
 // 入库复审任务队列（盲区审计 P2-33：review_task 补消费端，kb_admin 专属）。
@@ -1258,6 +1270,49 @@ async function loadFeedbackReview() {
   }
 }
 
+/** 区内筛选视图 loader（kb_admin 看板专用；DeptDashboard 恒不调）。无 key ⇒ 镜像全库
+ *  收件箱（零额外请求）；有 key ⇒ 带 owner_key 拉取，seq 复核防乱序覆盖。 */
+async function loadFeedbackReviewView(ownerKey: string) {
+  const mySeq = ++fbViewSeq
+  if (!ownerKey) {
+    await loadFeedbackReview()
+    if (mySeq === fbViewSeq) feedbackReviewView.value = feedbackReview.value
+    return
+  }
+  clearLoadError('feedbackReviewView')
+  feedbackReviewView.value = null            // 进加载态——绝不把上一 scope 的行挂在新筛选标签下（ux-review D1/D3）
+  try {
+    const qs = `?owner_key=${encodeURIComponent(ownerKey)}${showResolvedFeedback.value ? '&include_resolved=true' : ''}`
+    const r = await apiJson<{ items: FeedbackReviewItem[] }>(`/api/kb/feedback-review${qs}`, { auth: true })
+    if (mySeq !== fbViewSeq) return
+    feedbackReviewView.value = r.items || []
+  } catch (e) {
+    if (mySeq !== fbViewSeq) return
+    // 404=端点未上线兜底空；真错误保留 null ⇒ 组件显式错误占位——不回退全库/旧 scope 数据
+    if (!noteLoadError('feedbackReviewView', e)) feedbackReviewView.value = []
+  }
+}
+
+/** 反馈聚合筛选视图（/api/kb/feedback-stats）。409=org_snapshot_stale ⇒ 显式错误、
+ *  绝不显示成「该部门零反馈」；清筛选（''）⇒ 回全库口径（governance 数据，零请求）。 */
+async function loadFeedbackStats(ownerKey: string) {
+  const mySeq = ++fbStatsSeq
+  if (!ownerKey) { fbStats.value = null; clearLoadError('feedbackStats'); return }
+  clearLoadError('feedbackStats')
+  try {
+    const r = await apiJson<KbFeedbackStats>(
+      `/api/kb/feedback-stats?owner_key=${encodeURIComponent(ownerKey)}`, { auth: true })
+    if (mySeq !== fbStatsSeq) return
+    fbStats.value = r
+  } catch (e: any) {
+    if (mySeq !== fbStatsSeq) return
+    fbStats.value = null
+    loadErrors.value['feedbackStats'] = e?.status === 409
+      ? '组织快照过期，暂不可按部门筛选——可清除筛选查看全库口径'
+      : (e?.detail || '部门反馈聚合加载失败')
+  }
+}
+
 /** 切换「显示已处理」并重载。 */
 function toggleShowResolvedFeedback() {
   showResolvedFeedback.value = !showResolvedFeedback.value
@@ -1277,13 +1332,18 @@ async function resolveFeedback(messageId: string, action: FeedbackResolveAction)
     else {
       await apiJson('/api/kb/feedback-review/resolve', { method: 'POST', auth: true, body: JSON.stringify({ message_id: messageId, action }) })
     }
-    const list = feedbackReview.value || []
-    if (done && !showResolvedFeedback.value) {
-      feedbackReview.value = list.filter((x) => x.message_id !== messageId)   // 收件箱：处置即移出
-    } else {
-      feedbackReview.value = list.map((x) => x.message_id === messageId
-        ? { ...x, handled: done, handled_status: action === 'resolve' ? 'RESOLVED' : action === 'dismiss' ? 'DISMISSED' : 'PENDING' } : x)
+    // 处置成功同步**双状态**（全库收件箱 + 部门筛选视图,2026-08-03）——两者可能各持一份列表
+    const applyTo = (target: typeof feedbackReview) => {
+      const list = target.value || []
+      if (done && !showResolvedFeedback.value) {
+        target.value = list.filter((x) => x.message_id !== messageId)   // 收件箱：处置即移出
+      } else {
+        target.value = list.map((x) => x.message_id === messageId
+          ? { ...x, handled: done, handled_status: action === 'resolve' ? 'RESOLVED' : action === 'dismiss' ? 'DISMISSED' : 'PENDING' } : x)
+      }
     }
+    applyTo(feedbackReview)
+    if (feedbackReviewView.value) applyTo(feedbackReviewView)
     return true
   } catch (e: any) { void notice({ title: '处置失败', message: uploadErrText(e), danger: true }); return false }
   finally { const n = new Set(feedbackResolveBusy.value); n.delete(messageId); feedbackResolveBusy.value = n }
@@ -1696,6 +1756,7 @@ export function useKb() {
     nodeCandidates, loadNodeCandidates, decideNodeCandidate,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     feedbackReview, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
+    feedbackReviewView, loadFeedbackReviewView, fbStats, loadFeedbackStats,
     reviewTasks, loadReviewTasks, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, accessNoteOf, loadMyAccessRequests,

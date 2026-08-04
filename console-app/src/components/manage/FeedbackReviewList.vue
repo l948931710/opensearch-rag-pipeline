@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ThumbsDown, Check, Ban, RotateCcw, CheckCircle2, MessageSquareText, AlertTriangle, RotateCw, ArrowDownWideNarrow } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
@@ -11,15 +11,38 @@ import QueuePager from './QueuePager.vue'
 // 点踩原因 + 用户补充说明 + 涉及文档，并可一键处置（已修复/忽略/重开）。这是「文档质量 →
 // 答案质量」最直接的改进线索：看清用户嫌哪儿不对 → 修文档或去知识贡献补充 → 标记闭环。
 // 头部语义（设计稿 2026-07-19 §1）：红头卡（st-fail 7% 底 + st-fail 计数 + 卡边框 st-fail 混合）。
+// ownerKey 视图模式（2026-08-03 部门筛选）：prop 缺省 = 全库收件箱（DeptDashboard 原语义
+// 零变化）；kb_admin 看板传 ownerKey（'' = 全库镜像）→ 改读筛选视图状态，加载/重试/
+// 「显示已处理」切换全部显式带 key——chip 的全库计数与本列表自此互不串扰（codex blocker）。
+const props = defineProps<{ ownerKey?: string }>()
 const {
   feedbackReview, loadFeedbackReview, loadErrors,
+  feedbackReviewView, loadFeedbackReviewView,
   showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
 } = useKb()
+const viewMode = computed(() => props.ownerKey !== undefined)
+const rows = computed(() => (viewMode.value ? feedbackReviewView.value : feedbackReview.value))
+const errKey = computed(() => (viewMode.value && props.ownerKey ? 'feedbackReviewView' : 'feedbackReview'))
+function reload() {
+  return viewMode.value ? loadFeedbackReviewView(props.ownerKey || '') : loadFeedbackReview()
+}
+let fbWatchFirst = true
+watch([() => props.ownerKey, showResolvedFeedback], () => {
+  if (!viewMode.value) return
+  // 首次且无筛选：全库数据由 ManageView 预载，镜像即可——再拉一次是重复请求（ux-review D4）
+  if (fbWatchFirst && !props.ownerKey) {
+    fbWatchFirst = false
+    feedbackReviewView.value = feedbackReview.value
+    return
+  }
+  fbWatchFirst = false
+  void reload()
+}, { immediate: true })
 
 // 显式降级（staging 2026-07-11 P1 教训）：接口真错误时绝不渲染「已清空/无差评」快乐空态——
 // 无数据可显 → 错误占位卡（含重试）；有旧数据 → 顶部错误条 + 保留旧列表。
-const loadFailed = computed(() => !!loadErrors.value['feedbackReview'])
-const hasRows = computed(() => !!feedbackReview.value?.length)
+const loadFailed = computed(() => !!loadErrors.value[errKey.value])
+const hasRows = computed(() => !!rows.value?.length)
 function busy(id: string) { return feedbackResolveBusy.value.has(id) }
 
 // ── 时间范围下拉（设计稿 §2/§4：近 7/30/90 天/全部，默认近 30 天；按反馈时间 created_at 前端过滤）──
@@ -35,12 +58,12 @@ function tsOf(it: FeedbackReviewItem): number | null {
   return Number.isFinite(t) ? t : null
 }
 const ranged = computed(() => {
-  const rows = feedbackReview.value || []
+  const list = rows.value || []
   const days = RANGES.find((r) => r.key === rangeKey.value)?.days ?? null
-  if (days === null) return rows
+  if (days === null) return list
   const cutoff = Date.now() - days * 86400000
   // 缺失/坏时间戳的行不因过滤而消失（graceful degradation：宁多显勿静默丢差评）
-  return rows.filter((it) => { const t = tsOf(it); return t === null || t >= cutoff })
+  return list.filter((it) => { const t = tsOf(it); return t === null || t >= cutoff })
 })
 function onRangeChange() { pageReq.value = 1 }
 
@@ -84,7 +107,7 @@ function scrollWhenReady(id: string, deadlineMs = 1500) {
 <template>
   <div>
     <!-- 刷新失败但有旧数据：顶部错误条（自带重试），旧列表照常保留在下方 -->
-    <LoadError v-if="hasRows" class="mb-2.5" :message="loadErrors['feedbackReview']" @retry="loadFeedbackReview()" />
+    <LoadError v-if="hasRows" class="mb-2.5" :message="loadErrors[errKey]" @retry="reload()" />
     <!-- 加载失败且无数据可显：显式错误占位卡——差评可能存在但当前不可见，绝不伪装成「无差评」 -->
     <div
       v-if="loadFailed && !hasRows" role="alert" data-testid="feedback-review-error"
@@ -100,10 +123,10 @@ function scrollWhenReady(id: string, deadlineMs = 1500) {
       <button
         type="button"
         class="mt-2.5 inline-flex items-center gap-1 rounded-md border border-st-fail/40 px-2.5 py-1 text-[11.5px] font-medium text-st-fail transition hover:bg-st-fail/10"
-        @click="loadFeedbackReview()"
+        @click="reload()"
       ><RotateCw :size="12" :stroke-width="1.75" /> 重试</button>
     </div>
-    <div v-else-if="feedbackReview === null" class="rounded-[14px] border border-dashed border-border bg-card/60 p-5 text-[12.5px] text-muted-foreground">
+    <div v-else-if="rows === null" class="rounded-[14px] border border-dashed border-border bg-card/60 p-5 text-[12.5px] text-muted-foreground">
       差评复核拉取中…
     </div>
     <!-- 红头卡（qcard-fail）：st-fail 30% 混合边框 + 头/计数/工具条一体 -->
@@ -133,9 +156,10 @@ function scrollWhenReady(id: string, deadlineMs = 1500) {
         <span class="hidden text-xs text-muted-foreground lg:inline">用户对答案的差评，定位到文档修复</span>
       </div>
 
-      <!-- 空态：真无数据沿用原文案；仅被时间范围滤空时如实说明（可放宽） -->
-      <div v-if="!feedbackReview.length" class="px-4 py-5 text-[12.5px] text-muted-foreground">
-        {{ showResolvedFeedback ? '近期无「引用本部门文档且被点踩」的回答 —— 保持。' : '未处理的差评已清空 —— 干得漂亮。' }}
+      <!-- 空态：真无数据沿用原文案；部门筛选空 ≠ 时间范围滤空，各说各话（ux-review D2） -->
+      <div v-if="!rows.length" class="px-4 py-5 text-[12.5px] text-muted-foreground">
+        {{ props.ownerKey ? '该部门近期无「被引用且点踩」的回答 —— 可清除筛选查看全库。'
+          : (showResolvedFeedback ? '近期无「引用本部门文档且被点踩」的回答 —— 保持。' : '未处理的差评已清空 —— 干得漂亮。') }}
       </div>
       <div v-else-if="!sorted.length" class="px-4 py-5 text-[12.5px] text-muted-foreground">
         当前时间范围内无记录 —— 可切换时间范围查看更早的差评。

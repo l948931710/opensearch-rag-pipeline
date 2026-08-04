@@ -184,3 +184,34 @@ test.describe('硬门 — 看板组织覆盖（2026-08-03 重设计）', () => {
     await assertNoHorizontalScroll(page);
   });
 });
+
+test.describe('硬门 — 反馈按部门筛选（2026-08-03）', () => {
+  test('选部门 ⇒ 卡片切筛选口径；清除回全库；颗粒度默认止二级', async ({ page }) => {
+    await mockNodeMode(page, { role: 'kb_admin', managedRoots: [] });
+    await page.goto(MANAGE_ROUTE);
+    const fb = page.getByTestId('fb-filter');
+    await expect(fb).toBeVisible();
+    await expect(page.getByText('96').first()).toBeVisible();          // 全库点赞（governance）
+    await fb.locator('button[aria-expanded]').click();
+    await expect(fb.locator('.op-tree').getByText('注塑一车间')).toHaveCount(0);  // 止二级
+    await fb.locator('input[aria-label="注塑事业部，子树 300 人"]').check();
+    await expect(fb.getByText('筛选：注塑事业部')).toBeVisible();
+    await expect(page.getByText('33').first()).toBeVisible();          // 筛选口径点赞（feedback-stats）
+    // D2 回归：部门筛选空列表给专属文案（不误导去切时间范围），且不渲染全库旧行
+    await expect(page.getByText('该部门近期无「被引用且点踩」的回答')).toBeVisible();
+    await page.getByRole('button', { name: '清除' }).click();
+    await expect(fb.getByText('筛选：注塑事业部')).toHaveCount(0);
+    await expect(page.getByText('96').first()).toBeVisible();
+  });
+
+  test('快照过期 409 ⇒ 显式降级提示，不显示成「该部门零反馈」', async ({ page }) => {
+    await mockNodeMode(page, { role: 'kb_admin', managedRoots: [], fbStats409: true });
+    await page.goto(MANAGE_ROUTE);
+    const fb = page.getByTestId('fb-filter');
+    await fb.locator('button[aria-expanded]').click();
+    await fb.locator('input[aria-label="注塑事业部，子树 300 人"]').check();
+    await expect(page.getByTestId('fb-filter-error')).toBeVisible();
+    await expect(page.getByTestId('fb-filter-error')).toContainText('组织快照过期');
+    await expect(page.getByText('96').first()).toBeVisible();          // 回落全库口径而非伪 0
+  });
+});

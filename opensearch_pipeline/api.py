@@ -3107,6 +3107,7 @@ KbFeedbackDocRef = _routes_kb_console.KbFeedbackDocRef
 KbFeedbackReviewItem = _routes_kb_console.KbFeedbackReviewItem
 KbFeedbackReviewResponse = _routes_kb_console.KbFeedbackReviewResponse
 kb_feedback_review = _routes_kb_console.kb_feedback_review
+kb_feedback_stats = _routes_kb_console.kb_feedback_stats
 KbFeedbackResolveRequest = _routes_kb_console.KbFeedbackResolveRequest
 kb_feedback_resolve = _routes_kb_console.kb_feedback_resolve
 KbReviewTaskItem = _routes_kb_console.KbReviewTaskItem

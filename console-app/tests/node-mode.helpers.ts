@@ -73,6 +73,8 @@ export interface NodeModeOpts {
   orgTreeNull?: boolean;
   /** 台账文档行（默认一行 node 文档，供 DocMetaModal 入口） */
   docs?: Record<string, unknown>[];
+  /** feedback-stats 返回 409 org_snapshot_stale（筛选降级路径） */
+  fbStats409?: boolean;
 }
 
 export const NODE_DOC = {
@@ -127,6 +129,19 @@ export async function mockNodeMode(page: Page, opts: NodeModeOpts = {}) {
       ...(opts.managedRoots !== undefined ? { my_managed_node_roots: opts.managedRoots } : {}),
     }),
   }));
+  await page.route('**/api/kb/feedback-stats**', (r) => {
+    if (opts.fbStats409) {
+      return r.fulfill({ status: 409, contentType: 'application/json',
+        body: JSON.stringify({ detail: 'org_snapshot_stale: 组织快照过期，暂不可按部门筛选' }) });
+    }
+    const key = new URL(r.request().url()).searchParams.get('owner_key') || '';
+    return r.fulfill({ contentType: 'application/json', body: JSON.stringify({
+      owner_key: key, window_days: 30, scope_degraded: false,
+      answer_total: 145, up: 33, down: 4, total: 37, helpful_rate: 0.8919, last7: 9,
+      daily: [{ day: '2026-08-01', up: 5, down: 1 }, { day: '2026-08-02', up: 4, down: 0 }],
+      reasons: [{ reason: '答非所问', count: 3 }],
+    }) });
+  });
   await page.route('**/api/kb/governance**', (r) => r.fulfill({
     contentType: 'application/json', body: JSON.stringify(GOVERNANCE_MOCK),
   }));
