@@ -110,8 +110,18 @@ const TYPE_LABEL: Record<string, string> = {
       </div>
     </div>
     <!-- P2-11：后端 limit=20 此前静默截断——复审任务是安全网承诺，第 21 条以后
-         在界面上根本不存在。与审核队列/GapList 同款加载更多。 -->
-    <div v-if="reviewTasksHasMore" class="mt-2 text-center">
+         在界面上根本不存在。与审核队列/GapList 同款加载更多。
+         ⚠️ **只在「未处置」视图给翻页**：include_closed 分支的排序首键是
+         `(open_pred) DESC` —— 一个**可变谓词**。处置会让该行跨组跳到队尾，服务端前缀
+         收缩 1，而本视图下 resolveReviewTask 只标 closed、**不从本地移除** ⇒ offset
+         (=本地条数) 不跟着收缩 ⇒ **每处置 1 条，下一页就漏 1 条**（真库实测：处置 T12/T11
+         后第 2 页从 T08,T07 跳到 T06 起）。默认视图没有这个问题——处置即本地移除，
+         offset 与服务端前缀同步收缩，实测处置 0~4 条第 2 页恒为 T05..T08。
+         已处置视图暂不翻页，但**如实说明被截断**，绝不静默丢行。 -->
+    <div v-if="reviewTasksHasMore && showClosedReviewTasks" class="mt-2 text-center text-[11.5px] text-faint">
+      仅显示最近若干条。「显示已处置」视图暂不支持翻页——请取消勾选后再翻页查看未处置任务。
+    </div>
+    <div v-else-if="reviewTasksHasMore" class="mt-2 text-center">
       <button
         type="button" data-testid="review-task-load-more"
         class="rounded-lg border border-border px-4 py-1.5 text-[12.5px] font-medium text-foreground transition hover:border-border-strong"
