@@ -24,11 +24,22 @@ def _lock_doc(cursor, doc_id: str) -> bool:
     """F3 逐文档串行化原语：document_meta 行 FOR UPDATE。
 
     锁序纪律（本文件 + cost_breaker + stage-2 duplicate-skip 已归一）：任何同事务
-    触碰 ≥2 张 {document_meta, chunk_meta, document_version} 的写方，必须【先】取本锁，
+    触碰 ≥2 张 {document_meta, chunk_meta, document_version} 的写方，应当【先】取本锁，
     此后 chunk_meta 先于 document_version。console 端点（restore/retire/visibility）
-    天然 meta-first（内部 dv→chunk 顺序被 meta 锁串行化掩护）；stage-3 是唯一不取
-    meta 锁的写方（chunk→dv），与本纪律的 post-meta 顺序兼容——这不是全仓全序声明，
-    只覆盖此处列名的写方族。返回 False = document_meta 行不存在。"""
+    天然 meta-first（内部 dv→chunk 顺序被 meta 锁串行化掩护）。
+    **这不是全仓全序声明**，只覆盖此处列名的写方族。返回 False = document_meta 行不存在。
+
+    ⚠️ **2026-08-03 订正（原文有事实错误，且已误导过评审）**：
+    此处原写「stage-3 是**唯一**不取 meta 锁的写方（chunk→dv）」。**「唯一」不成立** ——
+    `access_grants.py` 全文 **0 处 `FOR UPDATE`**（可 grep 复核），其中至少两个写方
+    同事务触碰 ≥2 张表却不取本锁：
+      · `materialize_doc_allowed_depts` —— 读 document_meta、写 chunk_meta；
+      · `pre_drain_meta_projection` —— 多表 `UPDATE chunk_meta cm JOIN document_meta dm`。
+    这两者的实际取锁顺序**由执行计划提供，而非由结构保证**（dm 走 const 查找时先取 S 锁）：
+    一旦谓词从单 doc 放宽成 doc 集合、或 dm 查找不再是 const，顺序会**静默翻转且没有任何
+    测试会红**。故：读这段注释**不能**推断"除 stage-3 外都已 meta-first"；要判断某写方的
+    锁序，**必须回去读它自己的 SQL**。（本条订正源于 2026-08-03 对 C3′ B3 的锁序专题，
+    三个独立分析对同一段代码给出过不同结论——静态读码判不出执行计划给的锁序。）"""
     cursor.execute("SELECT doc_id FROM document_meta WHERE doc_id = %s FOR UPDATE", (doc_id,))
     return cursor.fetchone() is not None
 
@@ -443,7 +454,8 @@ def reconcile_stranded_versions() -> dict:
     行（含范围/间隙锁，封同 doc 幻影插入）并在 Python 侧重验完整候选事实（当前版本
     仍是最新 active、≥1 INDEXED 且 0 非 INDEXED、旧版本仍有 active chunk、未隔离、
     PROCESSING 陈旧判据以 SQL NOW() 重施），全部成立才执行不可逆 HA3 删除。版本收尾
-    按锁内观测态分派（对 stage-3 这一唯一不取 meta 锁的写方 CAS 兜底）：
+    按锁内观测态分派（对 stage-3 这类不取 meta 锁的写方 CAS 兜底；⚠️「唯一」的说法已于
+    2026-08-03 订正，见 _lock_doc docstring —— access_grants 里还有两个同类写方）：
       · SUCCESS → 已终态，无需写（同值 UPDATE 的 changed-rows=0 不可判赢输，故不写）；
       · FAILED/NOT_INDEXED → 精确观测态 CAS → SUCCESS；
       · 陈旧 PROCESSING → (index_status='PROCESSING' AND updated_at=观测值) 时间戳绑定

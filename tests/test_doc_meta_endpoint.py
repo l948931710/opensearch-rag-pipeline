@@ -277,3 +277,96 @@ def test_pre_drain_syncs_category_marks_dirty_and_claims(monkeypatch):
     # category 从 document_meta 同步进 chunk_meta（stage-3 载荷读 cm 列）+ NOT_INDEXED 标脏
     assert sum(1 for s in sqls if "cm.category_l1 = dm.category_l1" in s and "NOT_INDEXED" in s) == 2
     assert sum(1 for s in sqls if "attempts = attempts + 1" in s) == 2
+
+
+# ── pre_drain_meta_projection：claims 必须在 commit 成功后才对外（2026-08-03）──────
+# 原实现在循环里直接写 out["claims"]，而 conn.commit() 在循环**外**：整批任一环节让
+# commit 失败 ⇒ 外层 except 捕获、函数**照常返回非空 claims**，而 chunk 的 NOT_INDEXED
+# 标脏已随事务回滚 ⇒ 调用方按 claims 做 CAS 标 processed_at ⇒ 那次改标题/分类的编辑
+# **永久丢失，且账面显示已处理**。
+
+class _PdCur:
+    def __init__(self, conn):
+        self.conn = conn
+        self.rowcount = 1
+        self._r = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        self.conn.sql.append(s)
+        self._r = list(self.conn.outbox) if "FROM" in s and "outbox" in s and s.startswith("SELECT") else []
+
+    def fetchall(self):
+        return self._r
+
+    def fetchone(self):
+        return self._r[0] if self._r else None
+
+
+class _PdConn:
+    def __init__(self, outbox, commit_fails=False):
+        self.outbox = outbox
+        self.commit_fails = commit_fails
+        self.sql = []
+        self.rolled_back = False
+
+    def cursor(self):
+        return _PdCur(self)
+
+    def commit(self):
+        if self.commit_fails:
+            raise RuntimeError("commit boom（磁盘满/连接断/锁超时）")
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def close(self):
+        pass
+
+
+def _run_pre_drain(monkeypatch, conn):
+    from opensearch_pipeline import access_grants
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    return access_grants.pre_drain_meta_projection(limit=10)
+
+
+def test_pre_drain_claims_are_empty_when_commit_fails(monkeypatch):
+    """★ commit 失败 ⇒ claims 必须为空：标脏已回滚，绝不能让调用方把 outbox 收成已处理。"""
+    conn = _PdConn([(1, "D1", 3), (2, "D2", 5)], commit_fails=True)
+    out = _run_pre_drain(monkeypatch, conn)
+    assert out["claims"] == [], "commit 失败却返回了 claims ⇒ 编辑会被永久丢弃且账面显示已处理"
+    assert out["marked"] == 0, "marked 同理：行已回滚，不该计数"
+    assert out["errors"], "失败必须留痕"
+    assert conn.rolled_back, "失败路径应显式 rollback"
+
+
+def test_pre_drain_claims_returned_on_success(monkeypatch):
+    """对照：commit 成功时照常返回 claims（幂等收尾语义不变）。"""
+    conn = _PdConn([(1, "D1", 3), (2, "D2", 5)])
+    out = _run_pre_drain(monkeypatch, conn)
+    assert out["claims"] == [(1, "D1", 3), (2, "D2", 5)]
+    assert out["marked"] == 2
+    assert not out["errors"]
+
+
+def test_lock_order_docstring_no_longer_claims_stage3_is_unique(monkeypatch):
+    """纪律 docstring 不得再声称「stage-3 是唯一不取 meta 锁的写方」。
+
+    该说法已被证伪：access_grants.py 全文 0 处 FOR UPDATE，其中 materialize_doc_allowed_depts
+    与 pre_drain_meta_projection 都同事务触碰 ≥2 张表却不取 meta 锁。
+    这条错误声明在 2026-08-03 的 C3′ B3 锁序分析里**真的误导过评审**，故用测试钉死。
+    """
+    import pathlib
+    src = pathlib.Path("opensearch_pipeline/spot_checker.py").read_text(encoding="utf-8")
+    assert "唯一不取\nmeta 锁的写方" not in src.replace("    ", "")
+    assert "是**唯一**不取 meta 锁的写方" not in src or "「唯一」不成立" in src
+    ag = pathlib.Path("opensearch_pipeline/access_grants.py").read_text(encoding="utf-8")
+    assert "FOR UPDATE" not in ag, (
+        "access_grants 出现了 FOR UPDATE —— 订正说明里的事实前提已变，请同步更新 "
+        "spot_checker._lock_doc 的 docstring")

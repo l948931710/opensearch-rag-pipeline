@@ -765,6 +765,15 @@ def pre_drain_meta_projection(limit: int = 200) -> dict:
             except Exception:   # noqa: BLE001 — 1146 表不存在 = 061 未 apply
                 out["skipped"] = True
                 return out
+            # 🔴 claims/marked 必须**在 commit 成功之后**才对外可见（2026-08-03）。
+            # 原实现在循环里直接写 out["claims"]，而 conn.commit() 在循环**外**：整批任一
+            # 环节让 commit 失败 ⇒ 外层 except 捕获、函数**照常返回非空 claims**，而 chunk 的
+            # NOT_INDEXED 标脏已随事务回滚。调用方（dataworks_orchestrator →
+            # complete_meta_projection）按 claims 做 (id,generation) CAS 标 processed_at
+            # ⇒ **那次改标题/分类的编辑永久丢失，且账面显示已处理**。
+            # 先攒本地、commit 成功再对外——不改事务粒度（锁释放时机/重试粒度保持现状）。
+            _pending_claims = []
+            _pending_marked = 0
             for rid, doc_id, gen in rows:
                 try:
                     cur.execute(
@@ -774,11 +783,11 @@ def pre_drain_meta_projection(limit: int = 200) -> dict:
                         f"    cm.index_status = '{ChunkIndexStatus.NOT_INDEXED}' "
                         "WHERE cm.doc_id = %s AND cm.is_active = 1",
                         (doc_id,))
-                    out["marked"] += cur.rowcount
+                    _pending_marked += cur.rowcount
                     cur.execute(
                         f"UPDATE {_kb_db()}.kb_doc_meta_projection_outbox "
                         "SET attempts = attempts + 1, updated_at = NOW() WHERE id = %s", (rid,))
-                    out["claims"].append((int(rid), doc_id, int(gen or 0)))
+                    _pending_claims.append((int(rid), doc_id, int(gen or 0)))
                 except Exception as e:   # noqa: BLE001 — 单行失败不拖垮整轮
                     out["errors"].append(f"{doc_id}: {e}")
                     try:
@@ -789,7 +798,15 @@ def pre_drain_meta_projection(limit: int = 200) -> dict:
                     except Exception:   # noqa: BLE001
                         pass
         conn.commit()
+        # commit 成功才认账：失败时 claims 保持空 ⇒ 调用方不收尾 ⇒ 下轮重投影
+        # （幂等：category 同步与标脏都可重放），正是本函数 docstring 承诺的语义。
+        out["claims"] = _pending_claims
+        out["marked"] = _pending_marked
     except Exception as e:   # noqa: BLE001
+        try:
+            conn.rollback()
+        except Exception:   # noqa: BLE001
+            pass
         out["errors"].append(str(e))
     finally:
         conn.close()
