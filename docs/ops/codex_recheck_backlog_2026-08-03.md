@@ -54,11 +54,16 @@ codex 完成了缺陷核查与修法建议，**但没看到实现 diff**。两�
 本条其实在额度用尽**之前**，但也没单独过评审。风险：**已部署的定时任务可能开始变红**——
 那是本意（此前是假绿），但 Sam 应先知道再让它触发。
 
-### B7 🟠 `a4f6e37` P2-11 分页（我的贡献 / 复审任务）
-- **决定本身要复核**：我给 review-tasks 新加了一个 **OFFSET** 分页端点，而同一批的 `d2c8e12`
-  刚刚论证过 OFFSET 对活数据有窗口平移竞态、keyset 才是正解。选 OFFSET 的理由是"与控制台
-  既有 has_more+offset 范式一致"（loadMoreDocs / contributions），但这是**把技术债对齐**，
-  不是消除它。是否该借这次直接上 keyset？
+### B7 🟡 `a4f6e37`+`b8e11b4` P2-11 分页（我的贡献 / 复审任务）——**已自行量化，降级**
+原记「OFFSET vs keyset 不确定」。**已用真库量清楚，不再是开放问题**：
+- **默认视图零漏，且是精确自洽**：`ORDER BY created_at ASC` + 处置即**本地移除** +
+  offset 传 `.length` ⇒ 本地条数与服务端前缀同步收缩。实测处置 0~4 条第 2 页恒为 T05..T08。
+  ⚠️ 这条正确性**依赖前端契约**（offset=本地条数、处置即移除），不是 OFFSET 本身的性质
+  —— 谁改了 `resolveReviewTask` 的本地移除，或把 offset 改成"累计已加载数"，就会破。
+- **`include_closed` 视图每处置 1 条漏 1 条**（首排序键 `(open_pred) DESC` 是可变谓词，
+  处置让行跨组跳走而本地不移除）。`b8e11b4` 已把该分支的翻页收掉、改为如实说明截断。
+- **仍待裁决（降为设计题）**：是否把 include_closed 也做对——改排序去掉 open-first 分组，
+  或对该分支上 keyset。属 UX + 设计变更，该走 ui-iterate + codex。
 - 三个已踩过的坑已修并有测试（ORDER BY 补 `t.task_id`、`offset` 进 cache key、`&` 拼接），
   但请复核 `_dashboard_cache` 与分页的整体交互——缓存 TTL 内翻页看到的是不同时刻的快照。
 
