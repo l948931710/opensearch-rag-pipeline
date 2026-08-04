@@ -195,6 +195,9 @@ approved 跨部门授权 0**；`RAG_ALLOWED_DEPTS_ACL` env 未设 ⇒ 默认 **F
 
 ### ⛔ B3 · stage-3 的「先读 ACL、后抢锁」TOCTOU —— **改管线，不是改 materializer**
 
+> 🔴 **2026-08-03/04 两轮多代理分析后的结论：暂缓，等 codex（08-07）。理由不是"难"，
+> 是"地形没测准"。** 详见本节末尾「两轮分析纪要」。
+
 stage-3 先把 chunk 读进内存（`FROM chunk_meta cm`）并在 `:603-650` **重解析** allowed_depts
 （那段刻意不信 chunk_meta 投影、直读权威授权表），而抢 `PROCESSING` 是 `dag.run(ctx)`（`:663`）
 里的首节点 `node_acquire_index_lock` ⇒ **即使 materializer 锁了并提交，已读到旧 ACL 的
@@ -202,7 +205,46 @@ stage-3 仍会把旧值推回 HA3**。按 `version_no` 排序**解决不了**。
 （行号为 2026-08-03 e6ca2f4 之后的当前值——该文件当日因 C9/B′ 加过 capability 探测，
 原稿的 `:472/:627` 已漂移，勿按旧号定位。）
 **修法**：stage-3 改 **claim-before-read**，或抢锁后重读重算 ACL 再进 embedding/push。
-另：materializer 不应继续硬编码 2h（`access_grants.py:387`），应复用 `ingest_lease.takeover_where_sql()`。
+另：materializer 不应继续硬编码 2h（`access_grants.py` 约 :432），应复用 `ingest_lease.takeover_where_sql()`。
+
+#### 两轮分析纪要（2026-08-03/04，共 22 个 agent）
+
+**根因被更正（第一轮，已独立核实）**：不是「读得太早」，而是**脏标记被无条件抹掉** ——
+materializer 写新 ACL + `index_status='NOT_INDEXED'`（`access_grants.py:496/547`）+ bump epoch；
+随后 `node_update_index_status` 的 `UPDATE chunk_meta SET index_status='INDEXED'
+WHERE chunk_id IN (…)`（`pipeline_nodes.py:8699-8740`）**零 CAS**，把脏标擦掉
+⇒ RDS 判 clean、HA3 留旧 ACL = **永久分叉**。
+且 `drain_acl_projection_outbox` 在 `allowed_depts_acl` 为假时直接 return skipped
+（`:632-634`，**默认关**），而 `node_grants_save` 调 materialize **无 flag 包裹**
+（`routes/kb_access.py:285-289`）⇒ 现网姿态下这类变更**没有任何重试通道**。
+⇒ 「抢锁后重读 ACL」（我方第一直觉）只缩窗口，**不解决**这条。
+
+**对抗验证（第一轮）**：并发轴 ✅ 攻不破 · 不变量轴 ✅ 攻不破（且判定是**加强**了
+「先索引后停用」）· **测试计划轴 ❌ 被证伪**（simulate 短路 / 新真库模块不在 CI 清单
+⇒ 只 collect 不 run / 最承重的「dm 必须是第一把行锁」零覆盖）。
+
+**🔴 为什么暂缓（第二轮的决定性发现）**：
+1. **三个独立锁序分析对同一段代码给出不同结论**（2 判无倒置 / 1 判有倒置）。
+2. 更要命的是其中一份指出：`access_grants` 那两个写方的 dm-first
+   **是执行计划提供的、不是结构保证的** —— 谓词一旦从单 doc 放宽成 doc 集合、
+   或 dm 查找不再是 const，取锁顺序会**静默翻转且没有任何测试会红**。
+   ⇒ **静态读码判不出这类锁序**，多派 agent 也不行；需要真库并发实证。
+3. 实测否掉了一个看似优雅的解法：把栅栏写进 `UPDATE … WHERE` 做条件写
+   —— 会把驱动表翻成 `chunk_meta`、锁序倒置、产生 1213，**牺牲者是控制台端点**。
+
+**⚠️ 方法论缺陷（我方，需在 08-07 重跑前修）**：第二轮的工作流 `args` 传的是文件指针而
+脚本当内容用，导致**第一轮方案与 21 条 must_fix 根本没传进第二轮**（agent 在其 E0 里
+主动点破）。故第二轮产出是**重写**而非修订，**第一轮那 21 条 must_fix 至今未被逐条回应**。
+交 codex 时须把两轮原始产出一并给它，勿只给第二轮。
+
+**已从 B3 拆出、独立修掉的副产物**（`8de19a7`）：
+`pre_drain_meta_projection` 的 claims 早于 commit（会永久丢改标题/分类的编辑）；
+`spot_checker._lock_doc` 失实的锁序纪律声明（其「stage-3 是唯一不取 meta 锁的写方」
+已被证伪，且**确实误导过本会话对 C9/B′ 的锁序论证**）。
+
+**仍未做的相邻项**：`pre_drain` 把 ≤200 篇 doc 的 dm(S)+cm(X) 锁攒在**一个**事务里
+（阻塞窗口比 B3 新增的还大），建议改逐 doc 提交、与 `drain_acl_projection_outbox` 对齐 ——
+属独立优化，不随 B3 走。
 
 ### 已达成共识、实施时直接采用的设计点
 
