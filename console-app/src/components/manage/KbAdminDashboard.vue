@@ -7,6 +7,7 @@ import {
 import { onMounted } from 'vue'
 import { useKb } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
+import { SECTION, ZONE_HEAD, ZONE_TICK, SUBHEAD, GRID, SPLIT } from '@/lib/section'
 import { fetchOrgSnapshot } from '@/composables/useOrgSnapshot'
 import { resolveOwnerBucket } from '@/lib/orgTree'
 import type { OrgNode } from '@/composables/useOrgSnapshot'
@@ -182,16 +183,7 @@ const feedbackCards = computed<Card[]>(() => {
 const downvoteItems = computed(() =>
   (kbGovernance.value?.downvote_reasons || []).map((r) => ({ label: r.reason, value: r.count })))
 
-// 每个主分区 = 一个有边框的「区域面板」（暖底 bg-panel + 描边），白色指标卡浮于其上（卡上区的标准看板分层）。
-const SECTION = 'rounded-2xl border border-border bg-panel/60 p-4 sm:p-5'
-// 区域标题：绿色竖条 + 区名 + 下方细分隔线（替代原 uppercase「眉标」，更像真标题而非装饰）。
-const ZONE_HEAD = 'mb-4 flex items-center gap-2 border-b border-border/70 pb-3 text-[13px] font-semibold tracking-tight text-foreground'
-const ZONE_TICK = 'h-3.5 w-1 shrink-0 rounded-full bg-accent-strong'
-const SUBHEAD = 'mb-2 text-[12.5px] font-medium text-muted-foreground'
-const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
-// 成对子项收进「一个框、两半、中间竖线分隔」的共享面板（对齐设计：趋势|原因、最常用|未答好）。
-// 嵌在区域面板里 → 用纯白 bg-surface 与暖底面板拉开层次。
-const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface divide-y divide-border sm:grid-cols-2 sm:divide-y-0 sm:divide-x'
+// 分区视觉常量已抽到 @/lib/section（此前三个看板各写一遍，SUBHEAD 已因此漂移过）。
 </script>
 
 <template>
@@ -238,7 +230,10 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       <div :class="GRID">
         <StatCard v-for="s in assetCards" :key="s.label" v-bind="s" :loading="statsLoading" />
       </div>
-      <p :class="SUBHEAD" class="ml-0.5 mt-4">状态分布</p>
+      <!-- ml-0.5 已移除（2026-08-04）：本处曾是全应用唯一一个在调用点给 SUBHEAD 加 2px 左边距的
+           实例，而 DeptDashboard 是把同样的 2px 烤进了它自己的常量——同一偏移两条互不知情的路径。
+           抽取共享常量时统一取多数（17:3）的无偏移版，20 个 SUBHEAD 实例自此同一基准。 -->
+      <p :class="SUBHEAD" class="mt-4">状态分布</p>
       <StatusDistBar :by-badge="kbStats?.by_badge || {}" />
       <template v-if="kbGovernance">
         <div class="mt-4 grid gap-x-10 lg:grid-cols-2">

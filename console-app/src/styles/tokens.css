@@ -45,6 +45,32 @@
   --font-body: "Hanken Grotesk",-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
   --font-code: "JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
   --radius: 0.7rem;
+
+  /* ── 动效 scale（2026-08-04）─────────────────────────────────────────────
+     此前 7 个无名时长值散在本文件各处，新代码没有可挑选的集合、只能再发明一个。
+     本轮只做「命名 + 就地替换已【精确匹配】的值」——**刻意不做任何数值合并**：
+     硬门用严格相等比对 computed style，合并会把断言弱化成「差 ≤Nms」。未匹配的
+     三个值（.doc-actions/.conv-del 的 .13s、.kb-grow 的 .55s、.vb-fade 的 .34s）
+     保留原值 + 就地 TODO 标明该并到哪个 token，留给动它们的那一轮顺手收编。
+
+     ⚠️⚠️ 缓动**刻意不做 token**，只给唯一那条自定义曲线留名。三条曲线同名不同值：
+        CSS 原生 `ease`     = cubic-bezier(.25, .1, .25, 1)   ← 本文件的 transition 全用它
+        CSS 原生 `ease-out` = cubic-bezier(0, 0, .58, 1)      ← .kb-in / .vb-fade 用它
+        Tailwind `ease-out` = cubic-bezier(0, 0, .2,  1)      ← Sidebar.vue:58 用它（**不同曲线**）
+     曾试过定义 `--ease-out: ease-out` 求「命名统一」，结果是一个真回归：Tailwind v4 的
+     `ease-out` 工具类编译成对 `--ease-out` 变量的引用，而其默认 @theme
+     把该变量定义为 cubic-bezier(0,0,.2,1)——在 :root 里同名声明会**覆盖 Tailwind 的主题变量**，
+     侧栏展开曲线被静默改掉（硬门 G2 抓到）。`--ease-*` 是 Tailwind 的保留命名空间，别进去。
+     而 `ease` / `ease-out` 本身已是最清楚的名字，包一层只增风险不增可读性，故规则里直接写字面量。 */
+  --dur-fast:   140ms;   /* 状态与悬停反馈：.kb-card / .dropzone / .kb-trend-bar */
+  --dur-reveal: 500ms;   /* 自我绘制入场：.kb-rise / .kb-in（另有 .kb-rise-top 也吃它，但那条
+                            与已清除的 .kb-seg 一样是**孤儿规则**——全 src grep 零消费方，无 DOM
+                            实例可测，硬门覆盖不到；本轮不顺手删，登记为独立跟进项） */
+  /* 本 scale 只收**已有消费方**的档位。曾一并定义过 --dur-base:160ms 作为「位移与尺寸」档，
+     但它唯一的出处 .kb-seg 已作为孤儿规则清除 —— 一个既无消费方、值也不再有来源的 token，
+     等于把「下一轮大概会用 160ms」这个猜测固化进公共命名空间。需要它的那一轮自己定义。 */
+  --curve-emphasis: cubic-bezier(.22, 1, .36, 1);   /* 图表入场那条 spring-ish，此前只有字面量没有名字。
+                                                       刻意不叫 --ease-emphasis：见上，别碰 Tailwind 命名空间。 */
 }
 
 /* ── ② semantic（shadcn 约定名 → Atlas primitive）── */
@@ -197,6 +223,8 @@ body {
   vertical-align: -0.16em;
   border-radius: 1.5px;
   background: var(--accent-text);
+  /* 1.05s 有意不进时长 scale：scale 描述的是「一次性过渡/入场」的节奏，而这是无限循环的
+     节拍器，两者语义不同档，收进同一组 token 反而误导。故不列 TODO。 */
   animation: caret-blink 1.05s steps(1) infinite;
 }
 @keyframes caret-blink { 0%, 52% { opacity: .9; } 52.01%, 100% { opacity: 0; } }
@@ -206,6 +234,10 @@ body {
 }
 
 /* content_blocks 定稿：图片块淡入就位（文本保持不变，避免流式文字重渲闪烁）——平滑"打字→图文定稿"交接。 */
+/* TODO(动效收敛): .34s 无对应 token（介于 --dur-base 与 --dur-reveal 之间）。缓动已收编；
+   时长留原值待动 AnswerBlocks 的轮次定夺。注意下方 :211 有本类专属的 reduced-motion 覆盖
+   （直接 animation:none，与全局那种「压 duration 但保留 animation-name」是两套机制），
+   改本行的 shorthand 时不会自动同步到那个 @media 块。 */
 .vb-fade { animation: vb-fade .34s ease-out both; }
 @keyframes vb-fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .vb-fade { animation: none; } }
@@ -240,13 +272,16 @@ body {
 /* 行操作可见性：默认半透明常显（静态浏览/截图/新用户可感知入口），hover/focus 升满。
    原 opacity:0 纯 hover-reveal 有两个盲区——桌面新用户不知道要悬停；768–1024px 触屏
    （hover:none）既无悬停又不命中 ≤680px 卡片态媒体查询，操作与「审批中」等状态恒不可见。 */
+/* TODO(动效收敛): .13s 与 --dur-fast(140ms) 差 10ms。本行的 opacity 值另有 WCAG 1.4.11
+   问题（静止态实测 1.90:1 < 3:1），两者一并留给处理命中区/对比度的那一轮，避免此处
+   为了 10ms 去弱化硬门的严格相等断言。 */
 .doc-actions { opacity: .45; transition: opacity .13s; }
 .led-row:hover .doc-actions, .led-row:focus-within .doc-actions { opacity: 1; }
 .doc-actions[data-open="1"] { opacity: 1; }   /* 「更多操作」菜单展开中恒亮（不依赖 hover/focus） */
 @media (hover: none) { .doc-actions { opacity: 1; } }
 
 /* 会话历史行：hover 显删除 + 当前会话高亮（Atlas） */
-.conv-del { opacity: 0; transition: opacity .13s; }
+.conv-del { opacity: 0; transition: opacity .13s; }   /* TODO(动效收敛): 同 .doc-actions 的 .13s，理由见上 */
 .conv-row:hover .conv-del, .conv-row:focus-within .conv-del { opacity: 1; }
 [data-active-item="1"] { background: var(--accent-soft) !important; color: var(--accent-text) !important; font-weight: 600; }
 @media (hover: none) { .conv-del { opacity: 1; } }
@@ -274,9 +309,9 @@ body {
 }
 
 /* ── Atlas 仪表盘卡片 + 拖拽上传 ── */
-.kb-card { transition: border-color .14s ease, transform .14s ease; }
+.kb-card { transition: border-color var(--dur-fast) ease, transform var(--dur-fast) ease; }
 .kb-card:hover { border-color: var(--border-strong); transform: translateY(-1px); }
-.dropzone { transition: border-color .14s ease, background .14s ease; }
+.dropzone { transition: border-color var(--dur-fast) ease, background var(--dur-fast) ease; }
 .dropzone[data-drag="1"] { border-color: var(--accent) !important; background: var(--accent-soft) !important; }
 
 /* ── 看板图表「自我绘制」入场（趋势竖起 / 分布横展 / 环图淡入）——
@@ -285,11 +320,15 @@ body {
 @keyframes kb-rise { from { transform: scaleY(0); } }
 @keyframes kb-grow { from { transform: scaleX(0); } }
 @keyframes kb-in   { from { opacity: 0; transform: scale(.96); } }
-.kb-rise     { animation: kb-rise .5s cubic-bezier(.22,1,.36,1) both; transform-origin: bottom; }
-.kb-rise-top { animation: kb-rise .5s cubic-bezier(.22,1,.36,1) both; transform-origin: top; }
-.kb-grow     { animation: kb-grow .55s cubic-bezier(.22,1,.36,1) both; transform-origin: left; }
-.kb-in       { animation: kb-in .5s ease-out both; }
+.kb-rise     { animation: kb-rise var(--dur-reveal) var(--curve-emphasis) both; transform-origin: bottom; }
+.kb-rise-top { animation: kb-rise var(--dur-reveal) var(--curve-emphasis) both; transform-origin: top; }
+/* TODO(动效收敛): .55s 是本文件唯一的该值，与 --dur-reveal(500ms) 差 50ms。合并会让硬门断言
+   从「严格相等」退化成「差 ≤50ms」，故本轮保留原值；动 BarList 的轮次顺手收编。 */
+.kb-grow     { animation: kb-grow .55s var(--curve-emphasis) both; transform-origin: left; }
+.kb-in       { animation: kb-in var(--dur-reveal) ease-out both; }
 /* 趋势条 hover 提亮 + 分段图 hover 聚焦（图例↔切片联动由组件控 data-dim） */
-.kb-trend-bar { transition: filter .14s ease, opacity .14s ease; }
+.kb-trend-bar { transition: filter var(--dur-fast) ease, opacity var(--dur-fast) ease; }
 .kb-trend-col:hover .kb-trend-bar { filter: brightness(1.08) saturate(1.05); }
-.kb-seg { transition: stroke-width .16s ease, opacity .16s ease; }
+/* 已清除 .kb-seg（2026-08-04）：stroke-width 是 SVG 专属，属 2026-08-03 fdc2648 删掉的
+   DonutChart 遗留；全仓 grep 零消费方（有规则、无 DOM），与悬空的 .kb-cards（有 DOM、无规则）
+   恰是一对镜像死代码，本轮一并清掉。 */

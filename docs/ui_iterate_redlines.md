@@ -36,3 +36,11 @@
 - **本体工作台空页仍返回游标**(2026-07-14 δ-1):cursor 编码在管辖精判之前,dept_admin 可能收到空页但仍有游标——「继续加载」语义,非终止,非 bug。
 - **贡献页 loadGaps 回首页重置翻页态**(2026-07-14 批次α):有意。
 - **browse.spec 断言 aria-label「退役下线/恢复上线」勿改**(2026-07-04)。
+- **缓动刻意不做 token,`--ease-*` 是 Tailwind 保留命名空间**(2026-08-04 动效 token 化轮):
+  tokens.css 只给唯一那条自定义曲线留名(`--curve-emphasis`),`ease` / `ease-out` 在规则里
+  直接写字面量。**不是遗漏,是踩过的坑**——Tailwind v4 的 `ease-out` 工具类编译成对
+  `--ease-out` 变量的引用(其默认 @theme 值 `cubic-bezier(0,0,.2,1)`),在 `:root` 同名声明
+  会覆盖 Tailwind 主题变量,把 Sidebar 展开曲线静默换成另一条,而静态截图完全看不出来。
+  当前在用的三条同名不同值曲线:CSS 原生 `ease` = `cubic-bezier(.25,.1,.25,1)`、CSS 原生
+  `ease-out` = `cubic-bezier(0,0,.58,1)`、Tailwind `ease-out` = `cubic-bezier(0,0,.2,1)`。
+  守卫在 `tests/motion-tokens-zero-visual-change.spec.ts` 的 G2,**勿删勿放宽**。

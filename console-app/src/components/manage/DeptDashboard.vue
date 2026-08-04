@@ -4,6 +4,7 @@ import { Database, CheckCircle2, Loader, Clock, Percent, UserCheck, Quote } from
 import { onMounted, ref } from 'vue'
 import { useKb } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
+import { SECTION, ZONE_HEAD, ZONE_TICK, SUBHEAD, GRID, USAGE_GRID } from '@/lib/section'
 import { fetchOrgSnapshot, type OrgNode } from '@/composables/useOrgSnapshot'
 import { resolveOwnerBucket } from '@/lib/orgTree'
 import StatusDistBar from './StatusDistBar.vue'
@@ -64,13 +65,8 @@ const gapItems = computed(() =>
   (kbInsights.value?.gap_queries || []).map((g) => ({ label: g.query, sub: `平均相关度 ${g.avg_top.toFixed(2)}`, value: g.count })))
 
 // 与 KbAdminDashboard 同一分区视觉语言（P2 角色间一致性）：区域面板（暖底+描边）+
-// 绿竖条真标题——此前本看板还停在旧 uppercase 眉标，两角色切换视觉断层。
-const SECTION = 'rounded-2xl border border-border bg-panel/60 p-4 sm:p-5'
-const ZONE_HEAD = 'mb-4 flex items-center gap-2 border-b border-border/70 pb-3 text-[13px] font-semibold tracking-tight text-foreground'
-const ZONE_TICK = 'h-3.5 w-1 shrink-0 rounded-full bg-accent-strong'
-const SUBHEAD = 'mb-2 ml-0.5 text-[12.5px] font-medium text-muted-foreground'
-const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
-const USAGE_GRID = 'kb-cards grid grid-cols-1 gap-3 sm:grid-cols-3'   // 使用成效合并为 3 卡后独立网格
+// 绿竖条真标题。常量已抽到 @/lib/section——本文件原先的 SUBHEAD 多带一个 ml-0.5，
+// 是三处复制里唯一的漂移（详见 section.ts 的 SUBHEAD 注释）。
 </script>
 
 <template>

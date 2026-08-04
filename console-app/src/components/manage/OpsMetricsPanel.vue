@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import { Activity, Coins, Gauge, RefreshCw, Users } from '@lucide/vue'
 import { useKb } from '@/composables/useKb'
 import { admissionReasonLabel, deptLabel } from '@/lib/kb'
+import { SECTION, ZONE_HEAD, ZONE_TICK, SUBHEAD, GRID, SPLIT } from '@/lib/section'
 import LoadError from './LoadError.vue'
 import StatCard from './StatCard.vue'
 import BarList from './BarList.vue'
@@ -25,12 +26,7 @@ function fmtTok(n?: number | null): string {
 }
 const ms2s = (ms?: number | null) => (ms ? (ms / 1000).toFixed(1) + 's' : '—')
 
-const SECTION = 'rounded-2xl border border-border bg-panel/60 p-4 sm:p-5'
-const ZONE_HEAD = 'mb-4 flex items-center gap-2 border-b border-border/70 pb-3 text-[13px] font-semibold tracking-tight text-foreground'
-const ZONE_TICK = 'h-3.5 w-1 shrink-0 rounded-full bg-accent-strong'
-const SUBHEAD = 'mb-2 text-[12.5px] font-medium text-muted-foreground'
-const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
-const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface divide-y divide-border sm:grid-cols-2 sm:divide-y-0 sm:divide-x'
+// 分区视觉常量已抽到 @/lib/section（此前三个看板各写一遍）。
 
 // ── D1 LLM 用量 ──
 const llmErrRate = computed(() => {
