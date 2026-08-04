@@ -17,12 +17,14 @@ import re
 import pytest
 
 # 各表的唯一键列（ORDER BY 里出现任一即构成全序）。
+# ⚠️ message_id 已移除（2026-08-04 独立核验 B3）：qa_session_log 只有普通 idx_message_id，
+# 唯一键全是复合键——把它当全序列会让未来的分页点静默漏保。
 UNIQUE_COLS = {
     "id",                # AUTO_INCREMENT PK
     "doc_id",            # document_meta.uk_doc_id
     "contribution_id",   # kb_contribution.uk_contribution_id
     "conversation_id",   # qa_conversation PK 的后半（查询已按 user_id 收窄）
-    "chunk_id", "message_id", "feedback_id", "task_id", "job_id",
+    "chunk_id", "feedback_id", "task_id", "job_id",
 }
 
 
@@ -50,20 +52,26 @@ def _bare_col(term: str) -> str:
 
 
 def _paginated_order_bys():
-    """扫出所有 `OFFSET %s` 分页点，回其 ORDER BY 子句。"""
+    """扫出所有 `OFFSET %s` 分页点，回其窗口内**每一个** ORDER BY 子句。
+
+    2026-08-04 独立核验（B3 变异 C）：旧版只 `rfind` 最近一个 ORDER BY —— 分支构造的
+    `order = "ORDER BY …DESC…" if x else "ORDER BY …ASC…"` 只有靠后那臂被查，前一臂的
+    方向/全序可整体改坏而全绿。现改为窗口内全量枚举、逐臂检查（宁可保守多查：窗口内
+    偶发混入邻近查询的 ORDER BY 时守卫会红并点名，作者看一眼即可，好过静默漏保）。"""
     found = []
     for path in sorted(pathlib.Path("opensearch_pipeline").rglob("*.py")):
         src = path.read_text(encoding="utf-8")
         for m in re.finditer(r"OFFSET\s+%s", src):
             window = src[max(0, m.start() - 900):m.start()]
-            i = window.upper().rfind("ORDER BY")
-            if i < 0:
-                continue                     # 无 ORDER BY 的分页另属问题，不在本条范围
-            clause = window[i + len("ORDER BY"):]
-            # 截到 LIMIT 为止；去掉 Python 字符串拼接的引号/换行噪音
-            clause = re.split(r"\bLIMIT\b", clause, flags=re.I)[0]
-            clause = clause.replace('"', " ").replace("'", " ").replace("\n", " ")
-            found.append((f"{path}:{src[:m.start()].count(chr(10)) + 1}", clause.strip()))
+            starts = [mm.start() for mm in re.finditer(r"ORDER BY", window, flags=re.I)]
+            site = f"{path}:{src[:m.start()].count(chr(10)) + 1}"
+            for j, i in enumerate(starts):
+                end = starts[j + 1] if j + 1 < len(starts) else len(window)
+                clause = window[i + len("ORDER BY"):end]
+                # 截到 LIMIT 为止；去掉 Python 字符串拼接的引号/换行噪音
+                clause = re.split(r"\bLIMIT\b", clause, flags=re.I)[0]
+                clause = clause.replace('"', " ").replace("'", " ").replace("\n", " ")
+                found.append((site, clause.strip()))
     return found
 
 

@@ -175,3 +175,13 @@ def test_kb_gaps_no_result_binds_gap_window_and_cap(monkeypatch):
     assert params[0] == ctr._GAP_WINDOW_DAYS == 365
     assert params[-1] == ctr._GAP_CANDIDATE_CAP == 2000
     assert (params[0], params[-1]) != (ctr._CONTRIB_WINDOW_DAYS, ctr._CONTRIB_CANDIDATE_CAP)
+
+
+def test_kb_gaps_final_sort_has_hash_tiebreaker():
+    """(-asks, days) 非全序（2026-08-04 独立核验 B3）：同热度同龄缺口次序逐跑可漂，
+    Python 切片分页跨缓存 TTL 会漏/重。hash 兜底 tiebreaker 必须在场。
+    源级钉扎（能抓删除；等价改写需人工复核——与本仓其他 grep 式守卫同边界）。"""
+    import pathlib
+    src = pathlib.Path("opensearch_pipeline/routes/contribution.py").read_text(encoding="utf-8")
+    assert 'open_gaps.sort(key=lambda g: (-g["asks"], g["days"], g.get("hash") or ""))' in src, \
+        "kb_gaps 终排序丢了 hash tiebreaker——切片分页回到非确定序"

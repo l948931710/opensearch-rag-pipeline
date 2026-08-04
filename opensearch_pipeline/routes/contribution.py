@@ -1592,7 +1592,10 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
     if group_map:
         from opensearch_pipeline.qa_gap_groups import merge_semantic_gaps
         open_gaps = merge_semantic_gaps(open_gaps, group_map)
-    open_gaps.sort(key=lambda g: (-g["asks"], g["days"]))
+    # hash 兜底 tiebreaker（2026-08-04 独立核验 B3）：(-asks, days) 非全序——同热度同龄的
+    # 缺口相对次序逐跑可漂，Python 切片分页（offset 参数）跨缓存 TTL 会漏/重。console
+    # 现只发单页（limit=30 无 offset），此为 API 层潜伏面的封口，非现网 bug。
+    open_gaps.sort(key=lambda g: (-g["asks"], g["days"], g.get("hash") or ""))
     summary.unanswered = len(open_gaps)
     if fails == 0:   # 降级结果（部分子查询失败）不缓存——下一请求重试取全量
         _gaps_cache_put(cache_key, (open_gaps, summary))
