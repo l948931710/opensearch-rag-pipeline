@@ -368,6 +368,7 @@ export interface DismissedGap {
   dismissed_by_name: string; dismissed_at: string
 }
 const dismissedGaps = ref<DismissedGap[]>([])
+const dismissedGapsTruncated = ref(false)   // P3-3：后端硬 LIMIT 100 截断标记
 // （分支侧 P0-D 身份指纹判废随大合并收敛；main 无运行期身份切换，指纹恒等。）
 async function loadDismissed() {
   const s = useSession()
@@ -376,10 +377,14 @@ async function loadDismissed() {
     return
   }
   try {
-    const r = await apiJson<{ items: DismissedGap[] }>('/api/kb/gaps/dismissed', { auth: true })
+    const r = await apiJson<{ items: DismissedGap[]; truncated?: boolean }>('/api/kb/gaps/dismissed', { auth: true })
     dismissedGaps.value = r.items || []
+    // P3-3：后端硬 LIMIT 100。本端点是「撤销忽略」的**唯一入口** ⇒ 截断=更早的忽略撤不回来，
+    // 必须如实告知（此前完全静默）。
+    dismissedGapsTruncated.value = !!r.truncated
   } catch (e) {
-    dismissedGaps.value = []; noteLoadError('dismissed', e)   // 404=老后端静默（noteLoadError 内建）
+    dismissedGaps.value = []; dismissedGapsTruncated.value = false
+    noteLoadError('dismissed', e)   // 404=老后端静默（noteLoadError 内建）
   }
 }
 // 从折叠区恢复：restore 成功 → 移出折叠区 + 重拉缺口列表（该缺口回到「待回答」——
@@ -410,7 +415,7 @@ export function useContribute() {
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
     loadGaps, toggleGapContext, loadMine, loadPending, loadHeroes,
     openModal, closeModal, submitContribution, acceptContribution, rejectContribution, retryContribution,
-    dismissGap, restoreGap, dismissedGaps, loadDismissed, restoreDismissed,
+    dismissGap, restoreGap, dismissedGaps, dismissedGapsTruncated, loadDismissed, restoreDismissed,
   }
 }
 

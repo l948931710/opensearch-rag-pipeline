@@ -5,10 +5,11 @@ import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type PendingItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
 import QueuePager from './QueuePager.vue'
+import TruncationNotice from '@/components/manage/TruncationNotice.vue'
 import { useDialog } from '@/composables/useDialog'
 
 // 待审批队列：仅 kb_admin 可见（后端 /pending-approvals 也会 403 兜底）。Atlas 式：带橙头的卡 + 行。
-const { approvals, isBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors, openDocPreview } = useKb()
+const { approvals, truncatedQueues, isBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors, openDocPreview } = useKb()
 const { promptText } = useDialog()
 const rowKey = (d: PendingItem) => `appr:${d.doc_id}/${d.version_no}`
 
@@ -88,6 +89,8 @@ async function onReject(d: PendingItem) {
       </div>
       <!-- 翻页脚（单页自隐） -->
       <QueuePager :total="sorted.length" :page="page" :per-page="PER_PAGE" @update:page="pageReq = $event" />
+      <!-- P3-3：后端硬 LIMIT 100 的截断此前完全静默 —— 队列超上限时被截掉的条目永远没人处理。 -->
+      <TruncationNotice class="px-[18px] pb-3" :when="truncatedQueues.approvals" :cap="100" label="待审批" hint="先处理完当前批再刷新" />
     </div>
   </section>
 </template>

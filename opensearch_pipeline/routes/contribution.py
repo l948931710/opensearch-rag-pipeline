@@ -1752,6 +1752,9 @@ class KbGapDismissedItem(BaseModel):
 
 class KbGapDismissedResponse(BaseModel):
     items: List[KbGapDismissedItem] = Field(default_factory=list)
+    # P3-3（2026-08-04）：硬 LIMIT 100，此前截断不外露 —— 已忽略缺口超过 100 条时，
+    # 更早的忽略无法在 UI 里寻回（本端点是 restore 的**唯一入口**）⇒ 撤销路径实际断掉。
+    truncated: bool = False
 
 
 @router.get("/api/kb/gaps/dismissed", response_model=KbGapDismissedResponse)
@@ -1770,13 +1773,16 @@ def kb_gaps_dismissed(request: Request,
         logger.error("kb_gaps_dismissed 连接失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"查询失败 (trace: {trace_id})")
     items: List[KbGapDismissedItem] = []
+    _truncated = False   # P3-3：与 items 同初始化——fail-open 降级路径下也要有确定值
     try:
         with conn.cursor() as cur:
             cur.execute(
                 f"SELECT question_hash, question_preview, reason, dismissed_by_name, updated_at"
                 f" FROM {_op_db()}.qa_gap_dismissal WHERE revoked_at IS NULL"
-                " ORDER BY updated_at DESC LIMIT 100")
-            for h, prev, reason, by_name, at in cur.fetchall() or []:
+                " ORDER BY updated_at DESC LIMIT 101")   # 100+1 探针行（P3-3）
+            _rows = cur.fetchall() or []
+            _truncated = len(_rows) > 100
+            for h, prev, reason, by_name, at in _rows[:100]:
                 items.append(KbGapDismissedItem(
                     question_hash=h or "", question_preview=prev or "", reason=reason or "",
                     dismissed_by_name=by_name or "",
@@ -1785,7 +1791,7 @@ def kb_gaps_dismissed(request: Request,
         logger.info("kb_gaps_dismissed 查询失败（空列表，non-fatal）: %s", e)
     finally:
         conn.close()
-    return KbGapDismissedResponse(items=items)
+    return KbGapDismissedResponse(items=items, truncated=_truncated)
 
 
 @router.post("/api/kb/gaps/dismiss", response_model=KbGapDismissResponse)

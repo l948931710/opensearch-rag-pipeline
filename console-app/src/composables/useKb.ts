@@ -1,4 +1,4 @@
-import { computed, effectScope, nextTick, ref, watch } from 'vue'
+import { computed, effectScope, nextTick, reactive, ref, watch } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
@@ -209,6 +209,10 @@ const visErr = ref('')
 // 差评联动复核（看板卡片）：引用了我作用域文档的回答收到 👎。null=尚未加载（显占位不显 0）。
 const feedbackReview = ref<FeedbackReviewItem[] | null>(null)
 const feedbackReviewTruncated = ref(false)   // B8：后端两层截断任一命中即 true（如实告知，不做分页）
+// P3-3（2026-08-04）：硬 LIMIT 队列的截断标记。后端 `LIMIT N+1` 取探针行，多出来即置位。
+// 键 = 队列名；无键 = 该队列本轮没截断。与 B8 同族：**先让截断不再静默**，不做真分页
+// —— 真分页需要稳定排序键（`DATETIME` 只到秒，OFFSET 翻页会漏/重）+ 前端翻页，属设计变更。
+const truncatedQueues = reactive<Record<string, boolean>>({})
 // ── 反馈区按部门筛选（2026-08-03，codex 两轮共识）─────────────────────────────
 // 全库收件箱（chip 专用，永不带 owner_key）与区内筛选视图**分离**——否则筛选会把
 // 「差评未处理」置顶 chip 也变成部门计数（行动区语义必须全库）。
@@ -645,7 +649,8 @@ function accessNoteOf(docId: string): string { return myAccessReqs.value.get(doc
 // 申请人侧权威态：拉我的申请 + 派生同步态。后端未上线 / 无申请 → 静默空（不报错、不打扰）。
 async function loadMyAccessRequests() {
   try {
-    const r = await apiJson<{ items: MyAccessRequestItem[] }>('/api/kb/my-access-requests', { auth: true })
+    const r = await apiJson<{ items: MyAccessRequestItem[]; truncated?: boolean }>('/api/kb/my-access-requests', { auth: true })
+    truncatedQueues.myAccessRequests = !!r.truncated
     const m = new Map<string, { status: string; sync_state: string; note: string }>()
     // 后端按 created_at DESC（最新在前）返回；每 doc 保留【最新】一行——拒后重申/撤销后重申会留多行，
     // 若 last-write-wins（直接 m.set）会让最旧行覆盖最新 → 误显「申请授权」。首见即最新 → 不覆盖。
@@ -895,8 +900,9 @@ async function loadApprovals(force = false) {
   lastLoadedAt['approvals'] = Date.now()
   clearLoadError('approvals')
   try {
-    const r = await apiJson<{ items: PendingItem[] }>('/api/kb/pending-approvals', { auth: true })
+    const r = await apiJson<{ items: PendingItem[]; truncated?: boolean }>('/api/kb/pending-approvals', { auth: true })
     approvals.value = r.items || []
+    truncatedQueues.approvals = !!r.truncated
   } catch (e) { lastLoadedAt['approvals'] = 0; approvals.value = []; noteLoadError('approvals', e) }
   // kb_admin 的待办队列源=上传审批（授权申请已划归 dept_admin），拉取过即视为队列就绪
   finally { queuesSettled.value = true }
@@ -1164,8 +1170,9 @@ async function loadAccessRequests(force = false) {
   lastLoadedAt['accessRequests'] = Date.now()
   clearLoadError('accessRequests')
   try {
-    const r = await apiJson<{ items: AccessRequestItem[] }>('/api/kb/access-requests', { auth: true })
+    const r = await apiJson<{ items: AccessRequestItem[]; truncated?: boolean }>('/api/kb/access-requests', { auth: true })
     accessRequests.value = r.items || []
+    truncatedQueues.accessRequests = !!r.truncated
   } catch (e) { lastLoadedAt['accessRequests'] = 0; accessRequests.value = []; noteLoadError('accessRequests', e) }   // 404（未上线）静默；5xx 显错
   finally { queuesSettled.value = true }
 }
@@ -1210,9 +1217,10 @@ async function loadAccessGrants() {
   }
   clearLoadError('accessGrants')
   try {
-    const r = await apiJson<{ items: AccessGrantItem[] }>('/api/kb/access-grants', { auth: true })
+    const r = await apiJson<{ items: AccessGrantItem[]; truncated?: boolean }>('/api/kb/access-grants', { auth: true })
     if (seq !== grantsSeq) return          // 竞态守卫：仅最新结果落地
     accessGrants.value = r.items || []
+    truncatedQueues.accessGrants = !!r.truncated
   } catch (e) { if (seq === grantsSeq) { accessGrants.value = []; noteLoadError('accessGrants', e) } }   // 404（未上线）静默；5xx 显错
 }
 
@@ -1656,9 +1664,10 @@ async function loadNodeCandidates() {
   const s = useSession()
   if (s.role !== 'kb_admin') { nodeCandidates.value = []; return }
   try {
-    const r = await apiJson<{ items: NodeCandidate[] }>('/api/kb/admin-node-candidates', { auth: true })
+    const r = await apiJson<{ items: NodeCandidate[]; truncated?: boolean }>('/api/kb/admin-node-candidates', { auth: true })
     nodeCandidates.value = r.items || []
-  } catch { nodeCandidates.value = [] }
+    truncatedQueues.nodeCandidates = !!r.truncated
+  } catch { nodeCandidates.value = []; truncatedQueues.nodeCandidates = false }
 }
 
 /** 确认/驳回候选。409 = 快照已翻或候选失效——刷新队列并把后端文案回给调用方。 */
@@ -1781,7 +1790,7 @@ export function useKb() {
     docMetaCtx, openDocMeta, closeDocMeta,
     nodeCandidates, loadNodeCandidates, decideNodeCandidate,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
-    feedbackReview, feedbackReviewTruncated, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
+    feedbackReview, feedbackReviewTruncated, truncatedQueues, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
     feedbackReviewView, loadFeedbackReviewView, fbStats, loadFeedbackStats,
     reviewTasks, loadReviewTasks, reviewTasksHasMore, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,

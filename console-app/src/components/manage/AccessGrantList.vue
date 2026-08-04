@@ -5,11 +5,12 @@ import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessGrantItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
 import QueuePager from './QueuePager.vue'
+import TruncationNotice from '@/components/manage/TruncationNotice.vue'
 import { useDialog } from '@/composables/useDialog'
 
 // 已授权清单（审批人侧）：本部门文档现行有效（approved 存量）的跨部门检索授权，可撤销（approved→revoked）。
 // 与「授权申请」（pending 待审批）区分：此处是已放行的存量，活跃态调（st-live）。空时整块不渲染。
-const { accessGrants, isBusy, revokeAccess, loadAccessGrants, loadErrors } = useKb()
+const { accessGrants, truncatedQueues, isBusy, revokeAccess, loadAccessGrants, loadErrors } = useKb()
 const { promptText } = useDialog()
 
 // requester_depts 为逗号分隔组码（多部门管理员可一次授予多组）→ 逐个 deptLabel 再拼。
@@ -117,6 +118,8 @@ async function onRevoke(g: AccessGrantItem) {
       </div>
       <!-- 翻页脚（单页自隐） -->
       <QueuePager :total="sorted.length" :page="page" :per-page="PER_PAGE" @update:page="pageReq = $event" />
+      <!-- P3-3：后端硬 LIMIT 200 的截断此前完全静默 —— 队列超上限时被截掉的条目永远没人处理。 -->
+      <TruncationNotice class="px-[18px] pb-3" :when="truncatedQueues.accessGrants" :cap="200" label="已授权" hint="撤销时可能有遗漏，请留意" />
     </div>
   </section>
 </template>

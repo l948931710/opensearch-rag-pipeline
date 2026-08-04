@@ -3542,6 +3542,10 @@ class KbPendingItem(BaseModel):
 
 class KbPendingResponse(BaseModel):
     items: List[KbPendingItem] = Field(default_factory=list)
+    # P3-3（2026-08-04）：本端点是**硬 LIMIT 队列**，此前截断完全不外露 —— 队列超过上限时
+    # 管理员看到的「待处理就这些」只是前 N 条，**且无从知道** ⇒ 被截掉的申请永远没人处理。
+    # 与 B8（差评复核）同族：先让截断不再静默；真分页是另一回事（需稳定排序键，另议）。
+    truncated: bool = False
 
 
 @router.get("/api/kb/pending-approvals", response_model=KbPendingResponse)
@@ -3564,8 +3568,8 @@ def kb_pending_approvals(request: Request,
                     JOIN {_kb_db()}.document_meta m ON m.doc_id = v.doc_id
                     WHERE v.content_process_status = 'PENDING_APPROVAL'
                     ORDER BY v.received_at DESC
-                    LIMIT 100
-                    """
+                    LIMIT 101
+                    """   # 101 = 上限 100 + 1 探针行：多出来那行只用来判断"还有更多"
                 )
                 rows = cur.fetchall()
         finally:
@@ -3574,6 +3578,8 @@ def kb_pending_approvals(request: Request,
         trace_id = get_request_id()
         logger.error("kb_pending_approvals 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"待审批队列查询失败 (trace: {trace_id})")
+    _truncated = len(rows) > 100
+    rows = rows[:100]
     items = [
         KbPendingItem(
             doc_id=r[0] or "", version_no=int(r[1] or 1), title=r[2] or "",
@@ -3583,7 +3589,7 @@ def kb_pending_approvals(request: Request,
         )
         for r in rows
     ]
-    return KbPendingResponse(items=items)
+    return KbPendingResponse(items=items, truncated=_truncated)
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -5,6 +5,7 @@ import { deptLabel } from '@/lib/kb'
 import { useKb, type AdminItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
 import OrgTreePicker, { type PickedNode } from './OrgTreePicker.vue'
+import TruncationNotice from '@/components/manage/TruncationNotice.vue'
 import { useDialog } from '@/composables/useDialog'
 
 // Phase F 成员/角色管理（kb_admin 专属）：维护部门管理员 + 其可管理 owner_dept（写授权）。
@@ -12,7 +13,7 @@ import { useDialog } from '@/composables/useDialog'
 // 阶段 B：双轴——legacy 组码 + node 管辖根（manual；auto 由组织同步派生，中心级/超规模/换根
 // 进下方候选队列待确认）。覆盖语义按轴隔离：不动节点选择器 = 不动节点轴。
 const { adminGrants, grantableDepts, isBusy, grantDeptAdmin, revokeAdminGrant, loadAdminGrants, loadErrors,
-        nodeAclGrant, nodeCandidates, loadNodeCandidates, decideNodeCandidate } = useKb()
+        nodeAclGrant, nodeCandidates, truncatedQueues, loadNodeCandidates, decideNodeCandidate } = useKb()
 const { confirm } = useDialog()
 
 const formUser = ref('')
@@ -210,6 +211,8 @@ async function onRevokeDept(a: AdminItem, d: string) {
         <button type="button" class="rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong"
                 @click="onDecide(c.id, 'reject')">驳回</button>
       </div>
+      <!-- P3-3：后端硬 LIMIT 200 的截断此前完全静默 —— 被截掉的候选永远不被裁决。 -->
+      <TruncationNotice class="px-[18px] pb-3" :when="truncatedQueues.nodeCandidates" :cap="200" label="待裁决候选" hint="先处理完当前批再刷新" />
     </div>
   </section>
 </template>

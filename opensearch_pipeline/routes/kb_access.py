@@ -82,6 +82,10 @@ class KbAccessRequestItem(BaseModel):
 
 class KbAccessRequestListResponse(BaseModel):
     items: List[KbAccessRequestItem] = Field(default_factory=list)
+    # P3-3（2026-08-04）：本端点是**硬 LIMIT 队列**，此前截断完全不外露 —— 队列超过上限时
+    # 使用者看到的「就这些」只是前 N 条，**且无从知道**。与 B8（差评复核）同族：
+    # 先让截断不再静默；真分页是另一回事（需稳定排序键 + 前端翻页，另议）。
+    truncated: bool = False
 
 
 class KbAccessGrantItem(BaseModel):
@@ -99,6 +103,10 @@ class KbAccessGrantItem(BaseModel):
 
 class KbAccessGrantListResponse(BaseModel):
     items: List[KbAccessGrantItem] = Field(default_factory=list)
+    # P3-3（2026-08-04）：本端点是**硬 LIMIT 队列**，此前截断完全不外露 —— 队列超过上限时
+    # 使用者看到的「就这些」只是前 N 条，**且无从知道**。与 B8（差评复核）同族：
+    # 先让截断不再静默；真分页是另一回事（需稳定排序键 + 前端翻页，另议）。
+    truncated: bool = False
 
 
 class KbAccessGrantCreate(BaseModel):
@@ -377,6 +385,9 @@ class MyAccessRequestItem(BaseModel):
 
 class MyAccessRequestListResponse(BaseModel):
     items: List[MyAccessRequestItem] = Field(default_factory=list)
+    # P3-3（2026-08-04）：硬 LIMIT 100，此前截断不外露。申请人提交超过 100 条时，
+    # 更早的申请会静默消失在「我的申请」里 —— 同 B8 家族，先让截断不再静默。
+    truncated: bool = False
 
 
 @router.post("/api/kb/access-requests", response_model=KbAccessRequestSubmitResponse)
@@ -493,7 +504,7 @@ def kb_access_requests_list(request: Request,
                     JOIN {_kb_db()}.document_meta m ON m.doc_id = r.doc_id
                     WHERE r.status='pending' {clause}
                     ORDER BY r.created_at DESC
-                    LIMIT 100
+                    LIMIT 101   -- 100+1 探针行（P3-3）
                     """,
                     tuple(params),
                 )
@@ -504,6 +515,8 @@ def kb_access_requests_list(request: Request,
         trace_id = get_request_id()
         logger.error("kb_access_requests_list 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"授权申请队列查询失败 (trace: {trace_id})")
+    _truncated = len(rows) > 100
+    rows = rows[:100]
     items = [
         KbAccessRequestItem(
             id=str(r[0]), doc_id=r[1] or "", doc_title=r[2] or "", owner_dept=r[3] or "",
@@ -513,7 +526,7 @@ def kb_access_requests_list(request: Request,
         )
         for r in rows
     ]
-    return KbAccessRequestListResponse(items=items)
+    return KbAccessRequestListResponse(items=items, truncated=_truncated)
 
 
 @router.get("/api/kb/access-grants", response_model=KbAccessGrantListResponse)
@@ -550,7 +563,7 @@ def kb_access_grants_list(request: Request,
                     JOIN {_kb_db()}.document_meta m ON m.doc_id = r.doc_id
                     WHERE r.status='approved' {clause}
                     ORDER BY r.decided_at DESC
-                    LIMIT 200
+                    LIMIT 201   -- 200+1 探针行（P3-3）
                     """,
                     tuple(params),
                 )
@@ -561,6 +574,8 @@ def kb_access_grants_list(request: Request,
         trace_id = get_request_id()
         logger.error("kb_access_grants_list 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"已授权清单查询失败 (trace: {trace_id})")
+    _truncated = len(rows) > 200
+    rows = rows[:200]
     items = [
         KbAccessGrantItem(
             id=str(r[0]), doc_id=r[1] or "", doc_title=r[2] or "", owner_dept=r[3] or "",
@@ -570,7 +585,7 @@ def kb_access_grants_list(request: Request,
         )
         for r in rows
     ]
-    return KbAccessGrantListResponse(items=items)
+    return KbAccessGrantListResponse(items=items, truncated=_truncated)
 
 
 @router.post("/api/kb/access-grants", response_model=KbAccessGrantCreateResponse)
@@ -1049,6 +1064,7 @@ def kb_my_access_requests(request: Request,
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     items: List[MyAccessRequestItem] = []
+    _truncated = False   # P3-3：与 items 同初始化——早退/降级路径下也要有确定值
     try:
         from opensearch_pipeline.db import _get_db_conn
         from opensearch_pipeline.access_grants import current_allowed_for_doc
@@ -1063,11 +1079,13 @@ def kb_my_access_requests(request: Request,
                     LEFT JOIN {_kb_db()}.document_meta m ON m.doc_id = r.doc_id
                     WHERE r.requester_id = %s
                     ORDER BY r.created_at DESC
-                    LIMIT 100
+                    LIMIT 101   -- 100+1 探针行（P3-3）
                     """,
                     (kb.user_id,),
                 )
                 rows = cur.fetchall()
+                _truncated = len(rows) > 100      # P3-3：探针行命中 ⇒ 还有更早的申请
+                rows = rows[:100]
                 # ── E#40 批量预取：approved 行的 (doc_id, current_version) 去重对 ──
                 import json as _json
                 pairs: List[tuple] = []
@@ -1169,7 +1187,7 @@ def kb_my_access_requests(request: Request,
         trace_id = get_request_id()
         logger.error("kb_my_access_requests 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"我的授权申请查询失败 (trace: {trace_id})")
-    return MyAccessRequestListResponse(items=items)
+    return MyAccessRequestListResponse(items=items, truncated=_truncated)
 
 
 def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
@@ -1586,6 +1604,10 @@ class KbNodeCandidateItem(BaseModel):
 
 class KbNodeCandidateListResponse(BaseModel):
     items: List[KbNodeCandidateItem] = Field(default_factory=list)
+    # P3-3（2026-08-04）：本端点是**硬 LIMIT 队列**，此前截断完全不外露 —— 队列超过上限时
+    # 使用者看到的「就这些」只是前 N 条，**且无从知道**。与 B8（差评复核）同族：
+    # 先让截断不再静默；真分页是另一回事（需稳定排序键 + 前端翻页，另议）。
+    truncated: bool = False
 
 
 class KbNodeCandidateDecideRequest(BaseModel):
@@ -1606,6 +1628,7 @@ def kb_node_candidates_list(request: Request,
     _enforce_rate_limit(request, identity, scope="aux")
     _require_kb_admin(identity)
     items: List[KbNodeCandidateItem] = []
+    _truncated = False   # P3-3：与 items 同初始化——早退/降级路径下也要有确定值
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
@@ -1617,8 +1640,10 @@ def kb_node_candidates_list(request: Request,
                     f"FROM {_kb_db()}.dept_admin_node_candidate c "
                     f"LEFT JOIN {_kb_db()}.dept_dim d ON d.dept_id = c.proposed_dept_id "
                     f"LEFT JOIN {_kb_db()}.user_role u ON u.user_id = c.user_id AND u.is_active=1 "
-                    "WHERE c.status='pending' ORDER BY c.created_at ASC LIMIT 200")
-                for r in cur.fetchall():
+                    "WHERE c.status='pending' ORDER BY c.created_at ASC LIMIT 201")   # 200+1 探针行（P3-3）
+                _rows = cur.fetchall()
+                _truncated = len(_rows) > 200
+                for r in _rows[:200]:
                     items.append(KbNodeCandidateItem(
                         id=int(r[0]), user_id=r[1] or "", user_name=r[2] or "",
                         dept_id=int(r[3] or 0), dept_name=r[4] or str(r[3] or ""),
@@ -1630,7 +1655,7 @@ def kb_node_candidates_list(request: Request,
         trace_id = get_request_id()
         logger.error("kb_node_candidates_list 查询失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"候选队列查询失败 (trace: {trace_id})")
-    return KbNodeCandidateListResponse(items=items)
+    return KbNodeCandidateListResponse(items=items, truncated=_truncated)
 
 
 def _candidate_risk(cur, dept_id: int) -> Optional[str]:

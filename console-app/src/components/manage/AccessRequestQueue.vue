@@ -5,12 +5,13 @@ import { deptLabel, permLabel } from '@/lib/kb'
 import { useKb, type AccessRequestItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
 import QueuePager from './QueuePager.vue'
+import TruncationNotice from '@/components/manage/TruncationNotice.vue'
 import { useDialog } from '@/composables/useDialog'
 
 // 授权申请队列（审批人侧，Phase C）：其他部门申请检索本部门文档 → 由文档所属部门管理员审批。
 // 头部语义（设计稿 2026-07-19 §1）：「待处理=琥珀」统一 → 与待审批队列同款橙头（st-busy），
 // 与「已授权」（st-live 存量）区分。数据空时整块不渲染（无后端 = 自然隐藏，不造占位噪声）。
-const { accessRequests, isBusy, approveAccess, rejectAccess, loadAccessRequests, loadErrors } = useKb()
+const { accessRequests, truncatedQueues, isBusy, approveAccess, rejectAccess, loadAccessRequests, loadErrors } = useKb()
 const { promptText } = useDialog()
 
 // ── 前端分页 + 时间排序（设计稿 §2：队列 2 条/页；按申请时间 created_at，默认新→旧）──
@@ -84,6 +85,8 @@ async function onReject(d: AccessRequestItem) {
       </div>
       <!-- 翻页脚（单页自隐） -->
       <QueuePager :total="sorted.length" :page="page" :per-page="PER_PAGE" @update:page="pageReq = $event" />
+      <!-- P3-3：后端硬 LIMIT 100 的截断此前完全静默 —— 队列超上限时被截掉的条目永远没人处理。 -->
+      <TruncationNotice class="px-[18px] pb-3" :when="truncatedQueues.accessRequests" :cap="100" label="授权申请" hint="先处理完当前批再刷新" />
     </div>
   </section>
 </template>

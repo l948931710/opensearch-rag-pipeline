@@ -5,6 +5,7 @@ import { deptLabel, fmtTs, fmtWindowDays, gapKindLabel } from '@/lib/kb'
 import { useContribute, type GapItem } from '@/composables/useContribute'
 import { useDialog } from '@/composables/useDialog'
 import LoadError from '@/components/manage/LoadError.vue'
+import TruncationNotice from '@/components/manage/TruncationNotice.vue'
 
 // 「待回答」= 高频无人回答排行 Top 30（批次ε-4）：后端按询问次数降序，前端只取前 30、
 // 不翻页；全集规模在卡头徽标（=summary.unanswered，与统计卡同口径）与截断尾注如实披露。
@@ -15,7 +16,7 @@ import LoadError from '@/components/manage/LoadError.vue'
 // → 弹窗不用 danger 红色态（区别于撤销授权类终态动作），原因可空、记录台账。
 const { gaps, gapsSummary, loadingGaps, loadErrors, gapsWindowDays, loadGaps, toggleGapContext,
         openModal, canManage, isBusy, dismissGap, restoreGap,
-        dismissedGaps, loadDismissed, restoreDismissed } = useContribute()
+        dismissedGaps, dismissedGapsTruncated, loadDismissed, restoreDismissed } = useContribute()
 const { promptText } = useDialog()
 
 // 「已忽略」折叠区（2026-07-15 拍板补齐）：刷新后撤销的唯一 UI 入口（行内「撤销」只覆盖
@@ -184,6 +185,8 @@ async function onDismiss(g: GapItem) {
           >恢复</button>
         </div>
         <p v-if="!dismissedGaps.length && !loadErrors['dismissed']" class="px-[18px] pb-3 pt-1 text-[11.5px] text-faint">没有被忽略的缺口。</p>
+        <!-- P3-3：后端硬 LIMIT 100。本区是「撤销忽略」的**唯一入口** ⇒ 截断=更早的忽略撤不回来。 -->
+        <TruncationNotice class="px-[18px] pb-3" :when="dismissedGapsTruncated" :cap="100" label="已忽略缺口" hint="更早的忽略暂时无法在此撤销" />
       </div>
     </div>
   </section>
