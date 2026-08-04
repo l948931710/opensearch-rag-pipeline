@@ -307,7 +307,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
                     WHERE 1=1 {clause} {search_clause} {owner_clause} {filter_clause}
-                    ORDER BY (m.status='active') DESC, m.updated_at DESC
+                    ORDER BY (m.status='active') DESC, m.updated_at DESC, m.doc_id DESC
                     LIMIT %s OFFSET %s
                     """,
                     (*params, *search_params, *owner_params, *filter_params, limit + 1, offset),
@@ -408,7 +408,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                     WHERE m.status='active'
                       AND m.permission_level IN ('public','dept_internal')
                       {owner_clause} {search_clause} {filter_clause}
-                    ORDER BY m.owner_dept ASC, m.updated_at DESC
+                    ORDER BY m.owner_dept ASC, m.updated_at DESC, m.doc_id DESC
                     LIMIT %s OFFSET %s
                     """,
                     (*owner_params, *search_params, *filter_params, limit + 1, offset),

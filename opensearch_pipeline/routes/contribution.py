@@ -716,7 +716,7 @@ def kb_contributions_mine(request: Request, limit: int = 20, offset: int = 0,
         with conn.cursor() as cur:
             cur.execute(
                 f"SELECT {_CONTRIB_COLS} FROM {_op_db()}.kb_contribution WHERE author_id=%s"
-                " ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                " ORDER BY created_at DESC, contribution_id DESC LIMIT %s OFFSET %s",
                 (identity.user_id, limit + 1, offset))
             rows = cur.fetchall() or []
             items = [_contrib_item(r) for r in rows[:limit]]
@@ -828,7 +828,7 @@ def kb_contributions_pending(request: Request, limit: int = 20, offset: int = 0,
             cur.execute(
                 f"SELECT {_CONTRIB_COLS} FROM {_op_db()}.kb_contribution"
                 " WHERE review_status='pending' " + scope_clause
-                + " ORDER BY created_at ASC LIMIT %s OFFSET %s",
+                + " ORDER BY created_at ASC, contribution_id ASC LIMIT %s OFFSET %s",
                 tuple(scope_params + [limit + 1, offset]))
             rows = cur.fetchall() or []
             items = [_contrib_item(r) for r in rows[:limit]]

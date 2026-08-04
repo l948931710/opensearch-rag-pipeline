@@ -2211,7 +2211,7 @@ def list_conversations(request: Request, limit: int = 30, offset: int = 0,
                     SELECT conversation_id, title, last_message_at
                     FROM {_op_db()}.qa_conversation
                     WHERE user_id=%s AND hidden_at IS NULL
-                    ORDER BY last_message_at DESC
+                    ORDER BY last_message_at DESC, conversation_id DESC
                     LIMIT %s OFFSET %s
                     """,
                     (identity.user_id, limit + 1, offset),
