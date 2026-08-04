@@ -171,7 +171,7 @@ function onModel(v: PickedNode[]) { emit('update:modelValue', v) }
           <span class="shrink-0 text-[10.5px]" :class="zeroStaff(p) || missingInSnap(p.dept_id) ? '' : 'text-faint'">
             {{ missingInSnap(p.dept_id) ? '⚠️ 不在快照' : (p.subtree ? '含下级' : '仅本级') }}
           </span>
-          <button type="button" class="grid size-4 shrink-0 place-items-center rounded-full transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
+          <button type="button" class="hit grid size-4 shrink-0 place-items-center rounded-full transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50" style="--hit-w:24px"
                   :aria-label="`移除 ${nameOf(p.dept_id)}`" :disabled="disabled"
                   @click="removeChip(p.dept_id)"><X :size="10" :stroke-width="2.25" /></button>
         </span>

@@ -160,7 +160,7 @@ async function onRevokeDept(a: AdminItem, d: string) {
           <div class="mt-1 flex flex-wrap gap-1.5">
             <span v-for="d in a.managed_owner_depts" :key="d" class="inline-flex items-center gap-1 rounded-md bg-panel px-2 py-0.5 text-[11.5px] text-muted-foreground">
               {{ deptLabel(d) }}
-              <button type="button" class="text-faint transition hover:text-st-busy disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="onRevokeDept(a, d)"><Loader2 v-if="isBusy(`member:${a.user_id}`)" :size="11" :stroke-width="2.5" class="animate-spin" /><X v-else :size="11" :stroke-width="2.5" /></button>
+              <button type="button" class="hit text-faint transition hover:text-st-busy disabled:opacity-50" style="--hit-w:24px" :disabled="isBusy(`member:${a.user_id}`)" @click="onRevokeDept(a, d)"><Loader2 v-if="isBusy(`member:${a.user_id}`)" :size="11" :stroke-width="2.5" class="animate-spin" /><X v-else :size="11" :stroke-width="2.5" /></button>
             </span>
             <span
               v-for="n in (a.managed_node_roots || [])" :key="'n' + n.dept_id"
@@ -168,7 +168,7 @@ async function onRevokeDept(a: AdminItem, d: string) {
               :title="n.source === 'auto' ? '组织同步自动派生' : '手动指定'"
             >
               <GitBranch :size="10" :stroke-width="2" />{{ n.name }}<span v-if="n.source === 'auto'" class="text-[10px] opacity-70">auto</span>
-              <button type="button" class="text-faint transition hover:text-st-busy disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="revokeAdminGrant(a.user_id, '', n.dept_id)"><Loader2 v-if="isBusy(`member:${a.user_id}`)" :size="11" :stroke-width="2.5" class="animate-spin" /><X v-else :size="11" :stroke-width="2.5" /></button>
+              <button type="button" class="hit text-faint transition hover:text-st-busy disabled:opacity-50" style="--hit-w:24px" :disabled="isBusy(`member:${a.user_id}`)" @click="revokeAdminGrant(a.user_id, '', n.dept_id)"><Loader2 v-if="isBusy(`member:${a.user_id}`)" :size="11" :stroke-width="2.5" class="animate-spin" /><X v-else :size="11" :stroke-width="2.5" /></button>
             </span>
             <span v-if="!a.managed_owner_depts.length && !(a.managed_node_roots || []).length" class="text-[11.5px] text-faint">（无可管理部门）</span>
           </div>

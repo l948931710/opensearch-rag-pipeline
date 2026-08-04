@@ -356,7 +356,7 @@ async function onRestore(d: DocItem) {
           <button
             type="button" role="checkbox" :aria-checked="allVisibleSelected"
             :disabled="!selectableVisible.length"
-            class="grid size-4 shrink-0 place-items-center rounded border transition disabled:opacity-30"
+            class="hit grid size-4 shrink-0 place-items-center rounded border transition disabled:opacity-30"
             :class="allVisibleSelected ? 'border-accent-strong bg-accent-strong text-primary-foreground' : 'border-border-strong bg-surface hover:border-ring'"
             aria-label="全选可见文档" title="全选可见文档" @click="toggleSelectAllVisible"
           ><Check v-if="allVisibleSelected" :size="11" :stroke-width="3" /></button>
@@ -389,7 +389,7 @@ async function onRestore(d: DocItem) {
           <button
             v-if="d.can_manage !== false"
             type="button" role="checkbox" :aria-checked="isSelected(d.doc_id)"
-            class="mt-0.5 grid size-4 shrink-0 place-items-center rounded border transition"
+            class="hit mt-0.5 grid size-4 shrink-0 place-items-center rounded border transition"
             :class="isSelected(d.doc_id) ? 'border-accent-strong bg-accent-strong text-primary-foreground' : 'border-border-strong bg-surface hover:border-ring'"
             :aria-label="`选择：${d.title || d.doc_id}`" @click="toggleSelect(d.doc_id)"
           ><Check v-if="isSelected(d.doc_id)" :size="11" :stroke-width="3" /></button>
@@ -422,19 +422,19 @@ async function onRestore(d: DocItem) {
           <template v-if="d.can_manage !== false">
             <button
               type="button" aria-label="版本历史"
-              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
+              class="hit grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
               title="版本历史" @click="openHistory(d)"
             ><History :size="14" :stroke-width="1.75" /></button>
             <button
               type="button" data-testid="doc-preview" aria-label="下载原始文件"
-              class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
+              class="hit grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
               title="下载原始文件" @click="openDocPreview(d.doc_id)"
             ><Download :size="14" :stroke-width="1.75" /></button>
             <div class="relative" data-act-menu="row">
               <button
                 type="button" data-testid="doc-more" aria-label="更多操作" aria-haspopup="menu"
                 :aria-expanded="menuDocId === d.doc_id"
-                class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
+                class="hit grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
                 title="更多操作" @click="toggleMenu(d.doc_id)"
               ><Loader2 v-if="retireRowId === d.doc_id" :size="14" :stroke-width="1.75" class="animate-spin" /><Settings v-else :size="14" :stroke-width="1.75" /></button>
               <!-- 弹层（设计稿 .menu-pop/.mi）：≤680px 卡片态锚点靠左 → 改左对齐防溢出屏幕左缘 -->

@@ -267,16 +267,46 @@ body {
 .led-row:last-child { border-radius: 0 0 11px 11px; }
 .led-sort { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; user-select: none; }
 .led-sort:hover { color: var(--text); }
-.led-actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
+/* gap 2→10px：视觉尺寸不变（三按钮恒 28×28），只把相邻中心距从 30 拉到 38px。
+   列宽验算（审计 LIVE 实测，非纸面推算）：3×28 + 2×10 = 104 ≤ 110，余 6px；
+   1440/1280/1024 三视口下 scrollWidth === clientWidth，无溢出。
+   配合 .hit 的 32×40 命中区，相邻命中区两两留 6px 死区（不重叠）——误点落空 ≠ 误触发。 */
+.led-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; --hit-w: 32px; --hit-h: 40px; }
+
+/* ── 命中区扩张（WCAG 2.5.5/2.5.8）────────────────────────────────────────────
+   契约：**视觉尺寸零变化**，只用绝对定位 ::before 把可点区域撑到 --hit-w / --hit-h。
+   为什么只能这样：操作列硬编码 110px（余量实测 6px）、1024px 有 assertNoHorizontalScroll，
+   任何改盒模型的手法（padding / 加宽 / 负 margin）都要重算列宽并重跑三视口；abspos 脱离
+   文档流，不参与 grid track，是唯一可证明零布局影响的手法。
+   max(100%, …) 保证命中区永不小于控件自身，一个类覆盖 11/16/28px 各种场景。
+   ⚠️ 仅用于自身未定位的控件（本类置 relative）；祖先有 overflow:hidden 会裁切，新位点先确认。 */
+.hit { position: relative; }
+.hit::before {
+  content: ""; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width:  max(100%, var(--hit-w, 32px));
+  height: max(100%, var(--hit-h, var(--hit-w, 32px)));
+}
+/* 台账勾选框：审计实测 16×16，且表头那个到排序按钮**只有 8px** —— 尺寸与间距双重不达标，
+   没有任何 Spacing 例外可套。方案原本没把它列进来（只盯着操作列），但它才是本文件里真正
+   不合规的那个，且是批量退役/改可见范围的入口，每页最多 50 行重复获取。
+   行内取 44px 高（行高 61.75px，相邻行命中区仍相距 17.75px）；表头封顶 32px——44 会与
+   首行的命中区叠上。横向 32px：±8px 停在标题左缘前，不吃相邻列。 */
+.led-row .led-cell-main [role="checkbox"] { --hit-w: 32px; --hit-h: 44px; }
+.led-head [role="checkbox"]               { --hit-w: 32px; --hit-h: 32px; }
 /* 操作列 110px 内不强制 nowrap：外部门行「已驳回 · 重新申请」徽标两行显示优于溢出压住更新列；
    「更多操作」弹层的菜单项各自带 whitespace-nowrap（弹层按内容撑开，不受本列宽限制）。 */
 /* 行操作可见性：默认半透明常显（静态浏览/截图/新用户可感知入口），hover/focus 升满。
    原 opacity:0 纯 hover-reveal 有两个盲区——桌面新用户不知道要悬停；768–1024px 触屏
    （hover:none）既无悬停又不命中 ≤680px 卡片态媒体查询，操作与「审批中」等状态恒不可见。 */
-/* TODO(动效收敛): .13s 与 --dur-fast(140ms) 差 10ms。本行的 opacity 值另有 WCAG 1.4.11
-   问题（静止态实测 1.90:1 < 3:1），两者一并留给处理命中区/对比度的那一轮，避免此处
-   为了 10ms 去弱化硬门的严格相等断言。 */
-.doc-actions { opacity: .45; transition: opacity .13s; }
+/* WCAG 1.4.11（本轮修）：静止态 .45 实测 **亮 1.895:1 / 暗 2.244:1**，均 < 3:1，而这些
+   图标是该操作唯一的视觉可供性。改 .75 ⇒ 亮 3.205:1 / 暗 3.871:1，双主题都过且留 ~7% 余量；
+   与 hover 的 1.0 仍差 25%，「休眠 vs 激活」两级语义不被抹平（hover 另有 bg-panel 加持）。
+   不改成 color: var(--faint)：那会让外部门行「申请授权」按钮的**边框**保持满强度，破坏
+   「整组休眠」的一致性——opacity 是对的机制，只是数值定错了。
+   ⚠️ TODO(动效收敛) 里那半——把 .13s 收编进 --dur-fast(140ms)——**本轮刻意不做**：
+   motion-tokens-zero-visual-change.spec.ts:132 严格断言 transitionDuration === '0.13s'，
+   为 10ms 去弱化一道硬门不值当。该 TODO 保留给专门的动效收敛轮。 */
+.doc-actions { opacity: .75; transition: opacity .13s; }
 .led-row:hover .doc-actions, .led-row:focus-within .doc-actions { opacity: 1; }
 .doc-actions[data-open="1"] { opacity: 1; }   /* 「更多操作」菜单展开中恒亮（不依赖 hover/focus） */
 @media (hover: none) { .doc-actions { opacity: 1; } }

@@ -131,7 +131,7 @@ const wowBadge = (n: number | null | undefined) =>
               :class="r.depth ? 'bg-panel/40' : ''">
             <td class="px-3.5 py-2" :class="r.depth ? 'pl-9' : ''">
               <button v-if="r.children.length" type="button"
-                      class="mr-1 inline-flex size-4 items-center justify-center rounded text-muted-foreground transition hover:text-foreground"
+                      class="hit mr-1 inline-flex size-4 items-center justify-center rounded text-muted-foreground transition hover:text-foreground" style="--hit-w:24px;--hit-h:32px"
                       :aria-expanded="openSet.has(r.key)"
                       :aria-label="`${openSet.has(r.key) ? '收起' : '展开'} ${r.label} 的下级部门`"
                       @click="toggleOpen(r.key)">
