@@ -119,7 +119,7 @@ const TYPE_LABEL: Record<string, string> = {
          offset 与服务端前缀同步收缩，实测处置 0~4 条第 2 页恒为 T05..T08。
          已处置视图暂不翻页，但**如实说明被截断**，绝不静默丢行。 -->
     <div v-if="reviewTasksHasMore && showClosedReviewTasks" class="mt-2 text-center text-[11.5px] text-faint">
-      仅显示最近若干条。「显示已处置」视图暂不支持翻页——请取消勾选后再翻页查看未处置任务。
+      仅显示最近若干条。「显示已处理」视图暂不支持翻页——请取消勾选后再翻页查看未处理任务。
     </div>
     <div v-else-if="reviewTasksHasMore" class="mt-2 text-center">
       <button

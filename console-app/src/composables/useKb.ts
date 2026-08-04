@@ -2,6 +2,7 @@ import { computed, effectScope, nextTick, reactive, ref, watch } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
+import { useToast } from '@/composables/useToast'
 import type { OrgSnapshot } from '@/composables/useOrgSnapshot'
 import {
   GROUP_LABEL, MAX_UPLOAD_MB, TERMINAL_BADGES, deptLabel, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
@@ -12,6 +13,9 @@ import {
 
 // 失败/结果类提示统一走应用内告知框（useDialog 单例状态挂模块作用域，此处直接取用；不再用原生 alert）。
 const { notice } = useDialog()
+// 成功类回执走 toast，**绝不复用 notice()**：useDialog 是模块级单槽（_supersede），一个后台请求
+// 返回就能把用户正盯着的破坏性确认框顶掉并让它 resolve 成 false（用户以为自己点了取消）。
+const { toast, clearToasts } = useToast()
 
 export interface DocItem {
   doc_id: string; title: string; original_filename: string; owner_dept: string
@@ -1363,6 +1367,12 @@ async function resolveFeedback(messageId: string, action: FeedbackResolveAction)
     }
     applyTo(feedbackReview)
     if (feedbackReviewView.value) applyTo(feedbackReviewView)
+    // 收件箱语义下该行处置即移出，用户唯一的反馈就是「那一行没了」——与「我点错了」「网络没生效」
+    // 「本来就没有」三种情况肉眼不可区分；处理完最后一条时空态还与「从来没有过」共用同一句文案。
+    // 故成功侧必须留一条可读屏播报的回执，并顺带告知恢复路径（把消失变成可逆）。
+    toast(action === 'reopen' ? '已重开这条差评'
+      : action === 'dismiss' ? '已忽略（可在「显示已处理」中重开）'
+      : '已标记为已处理（可在「显示已处理」中重开）')
     return true
   } catch (e: any) { void notice({ title: '处置失败', message: uploadErrText(e), danger: true }); return false }
   finally { const n = new Set(feedbackResolveBusy.value); n.delete(messageId); feedbackResolveBusy.value = n }
@@ -1434,6 +1444,13 @@ async function resolveReviewTask(taskId: string, action: EscalationResolveAction
       reviewTasks.value = list.map((x) => x.task_id === taskId
         ? { ...x, closed: done, status: action === 'resolve' ? 'RESOLVED' : action === 'dismiss' ? 'DISMISSED' : 'PENDING' } : x)
     }
+    // 同 resolveFeedback：处置成功即移出列表，成功侧此前零回执。
+    // ⚠️ 括号里的控件名必须与 ReviewTaskQueue.vue:49 的按钮标签**逐字一致**（「显示已处理」）。
+    // 初版这里写的是「显示已处置」——全仓没有任何控件叫这个名字，等于把「无信息」变成「错误指路」，
+    // 而恰恰这条当时没被硬门断言覆盖（G1 有、G2 无）才漏出去。硬门 G2 已补上对称断言。
+    toast(action === 'reopen' ? '已重开该复审任务'
+      : action === 'dismiss' ? '已按误报忽略（可在「显示已处理」中重开）'
+      : '已标记为已处理（可在「显示已处理」中重开）')
     return true
   } catch (e: any) { void notice({ title: '处置失败', message: uploadErrText(e), danger: true }); return false }
   finally { const n = new Set(reviewTaskResolveBusy.value); n.delete(taskId); reviewTaskResolveBusy.value = n }
@@ -1716,7 +1733,12 @@ async function revokeAdminGrant(userId: string, ownerDept = '', nodeRoot = 0): P
         return
       }
       await apiJson('/api/kb/admin-grants/revoke', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, owner_dept: ownerDept, node_root: nodeRoot }) })
+      // 注意这里是「权威重拉」而非本地 splice（正确性上是对的），所以 UI 落定要等两次串行往返
+      // （实测 ~960ms）；toast 挂在重拉之后，保证播报时列表已是最终状态。
+      // dev-preview 分支走上面的本地 splice 且提前 return——刻意不合并两条路径：
+      // __tests__/member-role-manager.spec.ts:84-96 断言的正是那条本地 splice 的即时性。
       await loadAdminGrants()
+      toast(ownerDept || nodeRoot ? '已撤销该部门的管理权限' : '已撤销全部管理权限')
     } catch (e: any) { void notice({ title: '撤销失败', message: uploadErrText(e), danger: true }) }
   })
 }
@@ -1817,6 +1839,7 @@ export function __resetKb() {
   for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）
   if (qTimer) { clearTimeout(qTimer); qTimer = null }
   if (filterTimer) { clearTimeout(filterTimer); filterTimer = null }
+  clearToasts()   // 安全项：队列是模块级的，不清会让 A 的「已撤销管理权限」飘到 B 的界面上
 }
 
 /** 仅供测试：注入选中文件（绕过 input）。 */

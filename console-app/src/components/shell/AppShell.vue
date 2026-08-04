@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import Sidebar from './Sidebar.vue'
 import ErrorBoundary from './ErrorBoundary.vue'
 import ConfirmDialog from '@/components/manage/ConfirmDialog.vue'
+import ToastHost from '@/components/shell/ToastHost.vue'
 import { useAsk } from '@/composables/useAsk'
 
 // 应用外壳：左图标轨 + 右内容区。router-view 只在外壳内（= ready 之后）渲染，
@@ -54,6 +55,10 @@ const resetSignal = computed(() => route.path + '::' + activeId.value)
     <!-- 全局 确认/输入/告知 框（useDialog 单例）：挂外壳层、ErrorBoundary 外——
          所有路由视图（管理台/贡献/问答）共用一份，贡献页审核失败等 notice 也有处渲染。 -->
     <ConfirmDialog />
+    <!-- 全局 toast（useToast 单例）：与 ConfirmDialog 同挂外壳层、ErrorBoundary 外——视图崩了
+         也要还有一条能发出反馈的通道。刻意与 useDialog **完全独立**：后者是模块级单槽
+         （_supersede），成功提示若走 notice() 会把用户正盯着的破坏性确认框顶掉并 resolve 成 false。 -->
+    <ToastHost />
   </div>
 </template>
 

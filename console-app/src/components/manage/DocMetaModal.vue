@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { X, Loader2 } from '@lucide/vue'
 import { apiJson } from '@/lib/api'
 import { deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
+import { useToast } from '@/composables/useToast'
 import OrgTreeSelect from './OrgTreeSelect.vue'
 import type { PickedNode } from './OrgTreePicker.vue'
 
@@ -16,6 +17,16 @@ import type { PickedNode } from './OrgTreePicker.vue'
  * chunk 正文里嵌的旧标题不变——文案里如实说明。
  */
 const { docMetaCtx, closeDocMeta, loadDocs, isKbAdmin, isDeptAdmin, nodeAclGrant } = useKb()
+const { toast } = useToast()
+
+// Esc 关闭：本弹窗此前是 6 个模态里**唯一**没有 Esc 的，键盘用户在这里按 Esc 毫无反应。
+// 监听必须挂 window——模板上的 @keydown 只在焦点落于弹窗内时收得到（ConfirmDialog 的既有教训）。
+// 保存中不响应：避免请求在途时关窗，让用户以为没提交。
+function onKey(e: KeyboardEvent) {
+  if (e.key === 'Escape' && docMetaCtx.value && !saving.value) closeDocMeta()
+}
+onMounted(() => window.addEventListener('keydown', onKey))
+onUnmounted(() => window.removeEventListener('keydown', onKey))
 
 const meta = ref<any | null>(null)
 const loading = ref(false)
@@ -72,12 +83,20 @@ async function save() {
   saving.value = true
   try {
     const r = await apiJson<any>('/api/kb/doc-meta', { method: 'POST', auth: true, body: JSON.stringify(body) })
+    // 「没有变更」这条**留在弹窗里**（下面不 closeDocMeta），本来就读得到，不动。
     if (!r.changed?.length) { savedNote.value = '没有变更'; return }
-    savedNote.value = `已保存（${r.changed.join('、')}）`
+    // 成功这条此前是死信：赋值后同一 tick 就 closeDocMeta()，实测 savedNote 从未出现在 DOM 里，
+    // 而「标题/分类要下轮索引重推才在检索侧生效」是本弹窗**唯一**解释检索延迟的语义说明——
+    // 它一直没送达用户，正是「我改了标题怎么搜还是旧的」这类困惑的来源。改走 toast：
+    // 关窗与回执不再互斥，且失败路径（saveErr）仍留在弹窗内不变。
+    let note = `已保存（${r.changed.join('、')}）`
     if (r.changed.includes('title') || r.changed.includes('category')) {
-      savedNote.value += '；标题/分类将在下轮索引重推后于检索侧生效（正文内旧标题字样不变）'
+      // 「正文内旧标题字样不变」不能省：它解释了为什么按旧标题仍能搜到，
+      // 与本文件头部第 18 行注释承诺的「文案里如实说明」对应，删掉会让注释与代码漂移。
+      note += '；标题/分类将在下轮索引重推后于检索侧生效（正文内旧标题字样不变）'
     }
     closeDocMeta()
+    toast(note)
     void loadDocs()
   } catch (e: any) {
     saveErr.value = e?.detail || (e?.status === 409 ? '文档信息已被他人修改，请关闭后重试' : '保存失败')
