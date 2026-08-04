@@ -68,6 +68,67 @@ def live_db(monkeypatch):
     return cfg
 
 
+class _FakeOssPage:
+    def __init__(self, objs):
+        self.object_list = objs
+        self.is_truncated = False
+        self.next_marker = ""
+
+
+class _FakeOssObj:
+    def __init__(self, key):
+        self.key = key
+
+
+class _FakeBucket:
+    """极简 OSS 桩：key → gzip-JSONL 字节。"""
+    def __init__(self, objects=None):
+        self.objects = dict(objects or {})
+        self.puts, self.deletes = {}, []
+
+    def list_objects(self, prefix="", marker="", max_keys=1000):
+        return _FakeOssPage([_FakeOssObj(k) for k in sorted(self.objects) if k.startswith(prefix)])
+
+    def get_object(self, key):
+        data = self.objects[key]
+
+        class _R:
+            def read(self_inner):
+                return data
+        return _R()
+
+    def put_object(self, key, data, headers=None):
+        self.puts[key] = data
+        self.objects[key] = data
+
+    def delete_object(self, key):
+        self.deletes.append(key)
+        self.objects.pop(key, None)
+
+
+def _gz_jsonl(rows):
+    import gzip
+    import io
+    import json
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        for r in rows:
+            gz.write((json.dumps(r, ensure_ascii=False) + "\n").encode("utf-8"))
+    return buf.getvalue()
+
+
+@pytest.fixture
+def oss_archive(monkeypatch):
+    """C5=方案A 后：purge_subject 必然要查冷归档面。默认给一个**空桶**。
+
+    ⚠️ 不给桶不是"跳过"——是 raise（fail-closed）：查不到归档就不许声称擦除完成。
+    要测归档清理的用例覆盖本 fixture 的返回值即可。
+    """
+    bkt = _FakeBucket()
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (bkt, False))
+    return bkt
+
+
 def test_simulate_mode_skips():
     rep = retention.purge_subject("u1")
     assert rep.get("skipped") == "simulate" and rep["ok"]
@@ -78,14 +139,21 @@ def test_empty_user_id_rejected():
         retention.purge_subject("   ")
 
 
-def test_dry_run_counts_without_deleting(monkeypatch, live_db):
+def test_dry_run_counts_without_deleting(monkeypatch, live_db, oss_archive):
     conn = _Conn(affected=42)
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     rep = retention.purge_subject("u1")
     assert rep["ok"] and rep["dry_run"]
+    # C5=方案A 后多出 `oss_archive` 一面：RDS 行删干净 ≠ 主体数据清干净，
+    # qa_session_log 的到期行早已 gzip-JSONL 落进 OSS，报告必须**分面如实**。
     assert set(rep["tables"]) == {"qa_retrieved_doc", "user_feedback", "escalation_ticket",
-                                  "qa_conversation", "qa_session_log"}
-    assert all(t["affected"] == 42 and t["dry_run"] for t in rep["tables"].values())
+                                  "qa_conversation", "qa_session_log", "oss_archive"}
+    # RDS 五张表同源（桩 conn 恒回 42）；归档面是**另一层数据源**（本例空桶=0），
+    # 不能把它硬凑成 42——那是编数字。分面断言。
+    _rds = {k: v for k, v in rep["tables"].items() if k != "oss_archive"}
+    assert all(t["affected"] == 42 and t["dry_run"] for t in _rds.values())
+    _arch = rep["tables"]["oss_archive"]
+    assert _arch["ok"] and _arch["dry_run"] and _arch["affected"] == 0
     assert conn.acts == 0 and conn.commits == 0, "dry-run 绝不 DELETE、绝不 commit"
 
 
@@ -95,7 +163,7 @@ def test_commit_requires_enable_flag(monkeypatch, live_db):
         retention.purge_subject("u1", commit=True)
 
 
-def test_commit_deletes_fact_rows_before_session_log(monkeypatch, live_db):
+def test_commit_deletes_fact_rows_before_session_log(monkeypatch, live_db, oss_archive):
     monkeypatch.setenv("RAG_SUBJECT_PURGE_ENABLE", "true")
     conn = _Conn(affected=3, act_rowcounts=[3, 0, 0, 0, 3])
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
@@ -114,7 +182,7 @@ def test_commit_deletes_fact_rows_before_session_log(monkeypatch, live_db):
     assert "message_id IN" in deletes[idx_fact]
 
 
-def test_optional_table_1146_is_skipped_not_failed(monkeypatch, live_db):
+def test_optional_table_1146_is_skipped_not_failed(monkeypatch, live_db, oss_archive):
     monkeypatch.setenv("RAG_SUBJECT_PURGE_ENABLE", "true")
     conn = _Conn(affected=1, act_rowcounts=[1, 1, 1, 1],
                  raise_1146_on="qa_retrieved_doc")
@@ -125,7 +193,7 @@ def test_optional_table_1146_is_skipped_not_failed(monkeypatch, live_db):
     assert rep["tables"]["qa_session_log"]["ok"]
 
 
-def test_non_optional_table_error_fails_report(monkeypatch, live_db):
+def test_non_optional_table_error_fails_report(monkeypatch, live_db, oss_archive):
     monkeypatch.setenv("RAG_SUBJECT_PURGE_ENABLE", "true")
     conn = _Conn(affected=1, act_rowcounts=[1, 1, 1, 1],
                  raise_1146_on="user_feedback")
@@ -135,7 +203,7 @@ def test_non_optional_table_error_fails_report(monkeypatch, live_db):
     assert rep["tables"]["user_feedback"].get("error")
 
 
-def test_cli_purge_user_dry_run(monkeypatch, live_db, capsys):
+def test_cli_purge_user_dry_run(monkeypatch, live_db, capsys, oss_archive):
     conn = _Conn(affected=7)
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     assert retention.main(["--purge-user", "u1"]) == 0
@@ -146,3 +214,83 @@ def test_cli_purge_user_dry_run(monkeypatch, live_db, capsys):
 def test_cli_purge_user_commit_without_enable_exits_3(monkeypatch, live_db):
     monkeypatch.delenv("RAG_SUBJECT_PURGE_ENABLE", raising=False)
     assert retention.main(["--purge-user", "u1", "--commit"]) == 3
+
+
+# ── C5=方案A 的必然后果：主体擦除必须覆盖 OSS 冷归档面（PIPL 被删除权）────────────
+
+_PFX = "archive/retention/qa_session_log/"
+
+
+def test_archive_rows_of_subject_are_removed_others_kept(monkeypatch, live_db):
+    """只抹该主体的行，同一对象里别人的行必须原样保留。"""
+    import gzip
+    import io
+    import json
+    bkt = _FakeBucket({_PFX + "R1/batch-0000.jsonl.gz": _gz_jsonl(
+        [{"id": 1, "user_id": "u1", "q": "a"},
+         {"id": 2, "user_id": "u2", "q": "b"},
+         {"id": 3, "user_id": "u1", "q": "c"}])})
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (bkt, False))
+    rep = retention._purge_archives_for_subject("u1", commit=True)
+    assert rep["ok"] and rep["rows_removed"] == 2 and rep["objects_rewritten"] == 1
+    key = _PFX + "R1/batch-0000.jsonl.gz"
+    with gzip.GzipFile(fileobj=io.BytesIO(bkt.puts[key]), mode="rb") as gz:
+        left = [json.loads(x) for x in gz.read().decode("utf-8").splitlines() if x.strip()]
+    assert [r["user_id"] for r in left] == ["u2"], "他人数据被误删"
+
+
+def test_archive_object_fully_owned_by_subject_is_deleted(monkeypatch, live_db):
+    """整对象都属该主体 ⇒ 删对象，不留空 gz。"""
+    bkt = _FakeBucket({_PFX + "R1/b.jsonl.gz": _gz_jsonl([{"id": 1, "user_id": "u1"}])})
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (bkt, False))
+    rep = retention._purge_archives_for_subject("u1", commit=True)
+    assert rep["objects_deleted"] == 1 and rep["objects_rewritten"] == 0
+    assert bkt.deletes == [_PFX + "R1/b.jsonl.gz"]
+
+
+def test_archive_dry_run_counts_but_never_writes(monkeypatch, live_db):
+    bkt = _FakeBucket({_PFX + "R1/b.jsonl.gz": _gz_jsonl([{"id": 1, "user_id": "u1"}])})
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (bkt, False))
+    rep = retention._purge_archives_for_subject("u1", commit=False)
+    assert rep["rows_removed"] == 1 and rep["dry_run"]
+    assert bkt.puts == {} and bkt.deletes == [], "dry-run 绝不写不删"
+
+
+def test_archive_unavailable_fails_closed_not_silently_ok(monkeypatch, live_db):
+    """OSS 不可达 ⇒ 整体判否。**绝不**「查不到就当没有」——那正是把「归档里还留着」
+    谎报成「已擦除」的路径。"""
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (None, True))
+    conn = _Conn(affected=0)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    rep = retention.purge_subject("u1")
+    assert rep["ok"] is False, "OSS 不可达却报了擦除成功"
+    assert "error" in rep["tables"]["oss_archive"]
+
+
+def test_archive_scope_matches_rds_scope_only(monkeypatch, live_db):
+    """覆盖面必须与 RDS 侧逐字一致：只清 qa_session_log 归档，**不动** kb_audit_log
+    （操作者审计，不在 _purge_jobs 范围内）。两侧口径不一致就是新缺口。"""
+    bkt = _FakeBucket({
+        _PFX + "R1/b.jsonl.gz": _gz_jsonl([{"id": 1, "user_id": "u1"}]),
+        "archive/retention/kb_audit_log/R1/b.jsonl.gz": _gz_jsonl([{"id": 9, "user_id": "u1"}]),
+    })
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (bkt, False))
+    rep = retention._purge_archives_for_subject("u1", commit=True)
+    assert rep["objects_scanned"] == 1, "扫描面超出了 qa_session_log"
+    assert "archive/retention/kb_audit_log/R1/b.jsonl.gz" in bkt.objects
+
+
+def test_archive_malformed_line_is_kept_not_dropped(monkeypatch, live_db):
+    """坏行（非 JSON）原样保留——解析失败绝不当成"可以丢"。"""
+    import gzip
+    import io
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        gz.write(b'{"id":1,"user_id":"u1"}\n not-json \n{"id":2,"user_id":"u2"}\n')
+    bkt = _FakeBucket({_PFX + "R1/b.jsonl.gz": buf.getvalue()})
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (bkt, False))
+    rep = retention._purge_archives_for_subject("u1", commit=True)
+    assert rep["rows_removed"] == 1
+    with gzip.GzipFile(fileobj=io.BytesIO(bkt.puts[_PFX + "R1/b.jsonl.gz"]), mode="rb") as gz:
+        left = [x for x in gz.read().decode("utf-8").splitlines() if x.strip()]
+    assert any("not-json" in x for x in left), "坏行被静默丢弃"

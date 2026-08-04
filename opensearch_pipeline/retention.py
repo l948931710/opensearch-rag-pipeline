@@ -403,6 +403,95 @@ def _purge_jobs(user_id: str) -> List[dict]:
     ]
 
 
+def _purge_archives_for_subject(user_id: str, *, commit: bool = False) -> dict:
+    """把该数据主体的行从 **OSS 冷归档**里抹掉（PIPL「被删除权」的归档面）。
+
+    ── 为什么必须有这个函数 ────────────────────────────────────────────────
+    C5 选了方案 A（打通删前冷归档）之后，`qa_session_log` 的到期行不再是直删，而是先
+    gzip-JSONL 落到 OSS。`purge_subject` 原本只清 5 张 RDS 表 ⇒ 主体请求擦除后，
+    **归档副本里仍然完整保留着他的问答记录**，而且账面会报「擦除完成」。
+    选 A 就必须同批补上这一面，否则等于用一个合规缺口换另一个。
+
+    ── 覆盖面（与 RDS 侧**逐字一致**，不多不少）──────────────────────────
+    `_ARCHIVE_TABLES` 有两张表，这里**只清 qa_session_log**：
+      · `qa_session_log` —— 带 `user_id`，且在 `_purge_jobs` 覆盖内 ⇒ 清；
+      · `kb_audit_log`   —— 操作者审计（operator_id），**不在** `_purge_jobs` 范围内，
+        RDS 侧本来就不删 ⇒ 这里也不动。两侧口径若不一致，又是一个新缺口。
+    归档行是 `SELECT *` 落盘的，`user_id` 列在，主体可定位。
+
+    ── 语义 ────────────────────────────────────────────────────────────────
+    · **fail-closed**：OSS 不可达 ⇒ raise。绝不「查不到就当没有」——那正是会把
+      「归档里还留着」谎报成「已擦除」的路径。
+    · 重写用**同 key 覆盖写**（不带 forbid-overwrite）：put 是原子替换，不留对象消失的窗口；
+      与 `_archive_batch` 的写入姿态**有意不同**，那里禁覆盖是防撞 key，这里覆盖是本意。
+    · 整个对象的行都属于该主体 ⇒ 直接删对象（不留空 gz）。
+    · dry-run 默认：只统计，不写不删。
+    """
+    import gzip
+    import io
+    import json as _json
+
+    from opensearch_pipeline.clients import _get_oss_bucket
+    bucket, is_sim = _get_oss_bucket()
+    if is_sim or bucket is None:
+        raise RuntimeError(
+            "[purge_subject] OSS 不可达（simulate/占位凭据/缺 oss2）——无法确认冷归档中是否"
+            "仍留有该主体数据，拒绝声称擦除完成。（若本环境从未开启归档，"
+            "请显式确认后再跑，或设 RAG_RETENTION_ARCHIVE=false 的环境本就无归档对象。）")
+
+    prefix = f"archive/retention/{_ARCHIVE_TABLES['qa_rows']}/"
+    # `affected` 与各 RDS 表报告**同名同义**（本次命中的行数）——报告形状统一，
+    # 下游（CLI 汇总/看板）才能把 6 个面一视同仁地消费，不必给归档面开特例分支。
+    rep = {"prefix": prefix, "objects_scanned": 0, "objects_rewritten": 0,
+           "objects_deleted": 0, "rows_removed": 0, "affected": 0,
+           "dry_run": not commit, "ok": False}
+    marker = ""
+    while True:
+        page = bucket.list_objects(prefix=prefix, marker=marker, max_keys=1000)
+        for obj in getattr(page, "object_list", []) or []:
+            key = obj.key
+            if not key.endswith(".jsonl.gz"):
+                continue
+            rep["objects_scanned"] += 1
+            raw = bucket.get_object(key).read()
+            keep, removed = [], 0
+            with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as gz:
+                for line in gz.read().decode("utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        if str((_json.loads(line) or {}).get("user_id", "")) == str(user_id):
+                            removed += 1
+                            continue
+                    except Exception:      # noqa: BLE001 — 坏行原样保留，绝不因解析失败丢数据
+                        pass
+                    keep.append(line)
+            if not removed:
+                continue
+            rep["rows_removed"] += removed
+            rep["affected"] = rep["rows_removed"]
+            if not commit:
+                continue
+            if keep:
+                buf = io.BytesIO()
+                with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+                    gz.write(("\n".join(keep) + "\n").encode("utf-8"))
+                bucket.put_object(key, buf.getvalue())      # 同 key 原子覆盖
+                rep["objects_rewritten"] += 1
+            else:
+                bucket.delete_object(key)                    # 整对象都属该主体
+                rep["objects_deleted"] += 1
+        if not getattr(page, "is_truncated", False):
+            break
+        marker = getattr(page, "next_marker", "") or ""
+    rep["ok"] = True
+    print(f"[purge_subject] oss_archive: 扫 {rep['objects_scanned']} 个对象，"
+          f"命中 {rep['rows_removed']} 行"
+          + ("（dry-run，未改动）" if not commit
+             else f"，重写 {rep['objects_rewritten']} / 删除 {rep['objects_deleted']}"))
+    return rep
+
+
 def purge_subject(user_id: str, *, commit: bool = False, batch: int = DEFAULT_BATCH,
                   max_batches: int = MAX_BATCHES_PER_JOB) -> Dict[str, dict]:
     """按 user_id 硬删 fuling_operation 内该数据主体的全部个人数据行（dry-run 默认）。
@@ -514,6 +603,19 @@ def purge_subject(user_id: str, *, commit: bool = False, batch: int = DEFAULT_BA
                 rep["error"] = str(e)
                 result["ok"] = False
                 print(f"[purge_subject] {table}: ✗ {e}")
+
+    # ── OSS 冷归档面（C5=方案A 的必然后果）────────────────────────────────────
+    # RDS 行删干净 ≠ 主体数据清干净：qa_session_log 的到期行早已 gzip-JSONL 落进 OSS。
+    # 归档面失败**必须**把整体判否——否则会出现「5 张表全绿、账面报擦除完成，而归档里
+    # 原封不动」这种最坏形态（正是 C5 选 A 引入、必须同批堵上的 PIPL 缺口）。
+    # 归档在 RDS **之后**清：顺序不影响正确性（user_id 是稳定定位键，两面各自幂等），
+    # 但报告必须分面如实，绝不用一个总 ok 掩盖半边。
+    try:
+        result["tables"]["oss_archive"] = _purge_archives_for_subject(user_id, commit=commit)
+    except Exception as e:      # noqa: BLE001 — 与各表同款：记错、判否、不半途 raise
+        result["tables"]["oss_archive"] = {"ok": False, "error": str(e)}
+        result["ok"] = False
+        print(f"[purge_subject] oss_archive: ✗ {e}")
     return result
 
 

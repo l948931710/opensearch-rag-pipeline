@@ -337,9 +337,25 @@ class _PurgeCursor:
         return []
 
 
+class _EmptyOssPage:
+    object_list: list = []
+    is_truncated = False
+    next_marker = ""
+
+
+class _EmptyBucket:
+    """空归档桶：本文件的 purge 用例测的是 **RDS 锚点顺序**，不是归档面。"""
+    def list_objects(self, **kw):
+        return _EmptyOssPage()
+
+
 def _purge(monkeypatch, live_db, conn, **kw):
     monkeypatch.setenv("RAG_SUBJECT_PURGE_ENABLE", "true")
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    # C5=方案A 起，purge_subject 必查冷归档面；不给桶 = fail-closed raise（见
+    # _purge_archives_for_subject）。这里给空桶，让本文件的用例专注 RDS 锚点纪律。
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket",
+                        lambda *a, **k: (_EmptyBucket(), False))
     monkeypatch.setattr("opensearch_pipeline.env_guard.assert_destructive_write_allowed",
                         lambda *a, **k: None)
     return retention.purge_subject("U1", commit=True, **kw)
