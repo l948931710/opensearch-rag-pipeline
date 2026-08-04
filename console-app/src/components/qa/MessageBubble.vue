@@ -8,7 +8,7 @@ import ThinkingDisclosure from './ThinkingDisclosure.vue'
 
 // 一条消息：用户气泡 / AI 多态（思考过程披露条 · 加载骨架 · 错误重试 · 无结果卡 · 正常答案）。
 const props = defineProps<{ message: ChatMessage }>()
-const { retry, fillInput } = useAsk()
+const { retry, fillInput, asking } = useAsk()
 const m = props.message
 
 // 等待态来源预览的档位点颜色（与 SourceList 同口径）。
@@ -62,7 +62,9 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
       <div class="text-[15px] text-foreground">{{ m.errorText }}</div>
       <button
         type="button"
-        class="mt-2 flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground"
+        class="mt-2 flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent disabled:hover:text-muted-foreground"
+        :disabled="asking"
+        :title="asking ? '正在回答上一个问题，稍候再重试' : ''"
         @click="retry(m)"
       >
         <RotateCw :size="14" :stroke-width="1.75" /> 重试
@@ -131,7 +133,9 @@ const DOT: Record<string, string> = { high: 'bg-st-live', mid: 'bg-st-busy', low
       <button
         v-if="m.question"
         type="button"
-        class="mt-2 flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground"
+        class="mt-2 flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent disabled:hover:text-muted-foreground"
+        :disabled="asking"
+        :title="asking ? '正在回答上一个问题，稍候再重试' : ''"
         @click="retry(m)"
       >
         <RotateCw :size="14" :stroke-width="1.75" /> 重试

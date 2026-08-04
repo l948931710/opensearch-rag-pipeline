@@ -403,3 +403,64 @@ describe('useAsk.ask — 深度思考过程帧（reasoning，披露条）', () =
     expect(ai.html).not.toContain('应查年假制度')                  // 思考不混入答案
   })
 })
+
+// ── 附录B：retry() 在另一路流式在途时会「删卡但不重发」（2026-08-03）──────────────
+describe('useAsk.retry — 忙时绝不吞掉错误卡', () => {
+  /** 造一张错误卡：HTTP 非 2xx，SSE 未开始。 */
+  async function seedErrorCard() {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResp({ detail: 'boom' }, { ok: false, status: 500 })))
+    const api = useAsk()
+    await api.ask('年假几天')
+    await waitFor(() => !api.asking.value)
+    const card = api.messages.value.find((m) => m.role === 'ai' && m.error)
+    expect(card, '前置条件：必须先有一张错误卡').toBeTruthy()
+    return { api, card: card! }
+  }
+
+  it('流式在途时点重试 → 错误卡必须还在，且问句没丢', async () => {
+    const { api, card } = await seedErrorCard()
+
+    // 另起一问并让它停在流式中（reader 永不 done）
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, status: 200,
+      body: { getReader: () => ({ read: () => new Promise(() => {}), cancel() {} }) },
+      text: async () => '',
+    }))
+    void api.ask('另一个问题')
+    await waitFor(() => api.asking.value)
+    expect(api.asking.value).toBe(true)
+    const before = api.messages.value.length   // ← 必须在第二问入列**之后**取基线
+
+    api.retry(card)
+
+    // 修复前：卡被 splice（且 schedulePersist 落盘），ask() 又因 asking 立刻 return
+    // ⇒ 长度 -1、问句永久丢失。修复后必须原样保留。
+    expect(api.messages.value).toContain(card)
+    expect(api.messages.value.length).toBe(before)
+    api.stop()
+  })
+
+  it('空闲时点重试 → 照常移除错误卡并重发（原行为不受影响）', async () => {
+    const { api, card } = await seedErrorCard()
+    const q = card.question
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(streamResp([
+      frame({ type: 'chunk', content: '好' }), frame({ type: 'done', model: 'q', usage: {} }), DONE,
+    ])))
+    api.retry(card)
+    await waitFor(() => !api.asking.value && !api.messages.value.includes(card))
+    expect(api.messages.value).not.toContain(card)
+    const fresh = api.messages.value[api.messages.value.length - 1]
+    expect(fresh.role).toBe('ai')
+    expect(fresh.question).toBe(q)
+    expect(fresh.error).toBeFalsy()
+  })
+
+  it('无问句的卡片点重试 → 不删不发（删了就再也重发不了）', async () => {
+    const { api, card } = await seedErrorCard()
+    card.question = ''
+    const before = api.messages.value.length
+    api.retry(card)
+    expect(api.messages.value).toContain(card)
+    expect(api.messages.value.length).toBe(before)
+  })
+})

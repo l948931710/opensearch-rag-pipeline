@@ -69,3 +69,54 @@ describe('useDialog', () => {
     await p
   })
 })
+
+// ── 附录B：_resolve 是模块级单槽，被顶掉的 Promise 此前永久悬挂（2026-08-03）──────
+describe('useDialog 并发弹窗：绝不留悬挂 Promise', () => {
+  it('第二个 confirm 顶掉第一个 → 前者按「取消」了结，不再永久 pending', async () => {
+    const { confirm, onConfirm } = useDialog()
+    let firstSettled: boolean | null = null
+    const p1 = confirm({ message: '第一个' }).then((v) => { firstSettled = v; return v })
+    const p2 = confirm({ message: '第二个' })       // 覆盖 _resolve
+    await Promise.resolve(); await Promise.resolve()
+    expect(firstSettled).toBe(false)                 // ← 修复前这里恒为 null（永不 resolve）
+    expect(await p1).toBe(false)
+    onConfirm()
+    expect(await p2).toBe(true)                      // 后者仍正常工作
+  })
+
+  it('被顶掉的确认框绝不返回 true —— 危险操作不得凭空「被确认」', async () => {
+    const { confirm, notice, onConfirm } = useDialog()
+    const danger = confirm({ message: '确定退役该文档？', danger: true })
+    notice({ message: '后台任务失败' })              // 无关弹窗顶掉它
+    onConfirm()                                       // 用户点的是 notice 的「知道了」
+    expect(await danger).toBe(false)
+  })
+
+  it('promptText 被顶掉 → null（取消语义），不是空串', async () => {
+    const { promptText, confirm, onConfirm } = useDialog()
+    const p = promptText({ message: '填写理由' })
+    confirm({ message: '别的' })
+    onConfirm()
+    expect(await p).toBeNull()
+  })
+
+  it('notice 被顶掉 → 照常 resolve（void），调用方 await 不挂死', async () => {
+    const { notice, confirm, onCancel } = useDialog()
+    let done = false
+    const p = notice({ message: '提示' }).then(() => { done = true })
+    confirm({ message: '别的' })
+    await Promise.resolve(); await Promise.resolve()
+    expect(done).toBe(true)
+    onCancel()
+    await p
+  })
+
+  it('顶掉旧框不会把新框关掉（state.open 归新框所有）', async () => {
+    const { confirm, dialog, onConfirm } = useDialog()
+    void confirm({ message: '旧' })
+    const p2 = confirm({ message: '新' })
+    expect(dialog.value.open).toBe(true)
+    expect(dialog.value.message).toBe('新')
+    onConfirm(); await p2
+  })
+})

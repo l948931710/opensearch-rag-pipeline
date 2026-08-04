@@ -469,6 +469,11 @@ function stop(): void {
 }
 
 function retry(m: ChatMessage): void {
+  // ⚠️ 先判「能不能重发」，再动列表。ask() 的第一行就是 `if (!text || asking.value) return`：
+  // 另一路流式在途时它直接返回，而错误卡此时**已经被 splice 掉、并且 schedulePersist()
+  // 已把删除落进本地历史** ⇒ 用户点了「重试」，卡片消失、问题没重发，问句就此永久丢失。
+  // 触发面很浅：Q1 报错后接着问 Q2，Q2 流式期间点 Q1 那张卡的重试即中招。
+  if (!(m.question || '').trim() || asking.value) return
   const idx = messages.value.indexOf(m)
   if (idx >= 0) { messages.value.splice(idx, 1); schedulePersist() }   // 原位移除错误卡，保留用户问句重发
   void ask(m.question, true)
