@@ -146,6 +146,10 @@ quarantine），但**无 `content_process_status` 守卫**；而 raw_key 的权�
 > 若 Sam 对 c 选 (i)（放宽也立即），则三行统一为「可见范围是**文档级意图**，恒立即生效」——
 > 实现更简单、心智更一致，但要接受"放宽即刻扩大暴露面"。**这是产品决定，不是工程决定。**
 
+> 🟢 **Sam 2026-08-04 拍板：R1 纳入 CAS**（set-visibility 也要 `expected_acl_revision`，
+> 不匹配返 409）。与 doc-meta 编辑端点口径统一。
+> ⚠️ 前端需同传该字段（API 小契约变更）；并发时会多出 409，需 UI 文案引导「刷新后重试」。
+
 ## 5. R1 · `acl_revision` CAS 域
 
 **事实**：doc-meta 编辑端点**要求** `expected_acl_revision`（`kb_console.py:3289/3401/3430`，

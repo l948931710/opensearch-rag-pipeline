@@ -3,6 +3,14 @@
 > 状态：**待 Sam 拍板**。代码侧本日已落**探测器**（`d1a5ace`），本单是**栅栏**，未动一行代码。
 > 同族：仓库已登记的开放缺口「cross-cloud split-brain on irreversible HA3 deletes（RDS↔HA3 无 2PC）」。
 
+> 🟢 **Sam 2026-08-04 拍板：立项做栅栏协议**（不停在探测器）。
+> ⇒ §4 的 A 选「现在立项」。**B/C/D/E 四项仍待勾**，它们决定实施形态：
+> B intent 落新表还是 `document_version` 加列（涉 schema 063+）· C 隔离粒度
+> `(doc_id, version_no)` 还是整个 `doc_id`（并发升版的另一类 TOCTOU 取决于此）·
+> D 既有 `PENDING_DELETE` 无前态谓词（会踩 console 恢复）单独修还是并入 ·
+> E 是否接受 fetch 权威读的额外 HA3 往返成本。
+> ⚠️ 本项与 C3′ B3 同属「跨 stage 协议变更」，且都需真库并发实证 —— 建议**同批**交 codex。
+
 ## 1. 为什么还需要一单
 
 `d1a5ace` 关掉的是**陈旧快照**和**能被 PK 集合看见的并发重切**。三个洞按设计留着，

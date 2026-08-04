@@ -7,6 +7,16 @@
 
 ---
 
+> 🟢 **Sam 2026-08-04 拍板：方案 E（版本号绑定）**。
+> 前置已解除（生产 OSS 已开 versioning）。实施要点：register 保存
+> `raw_version_id + etag + file_size`；`doc-preview` 按保存的 `versionId` 签 GET；
+> stage-1 在**真实 GET** 上带 `params={"versionId": expected}` 并核返回身份/大小。
+> 🔴 **仍须先确认**：生命周期规则是否会删历史版本 —— 若会，`VERSION_ID` 绑定的对象会在
+> 保留期后消失，需配套保留策略（否则 fail-closed 会把老文档全部卡死）。
+> 🔴 `content_binding_mode`（LEGACY_UNBOUND / VERSION_ID / FROZEN_KEY）三态契约**必须写死**，
+> 只靠 `raw_version_id IS NULL` 区分不了「存量」与「新写失败」。
+> 方案 F 未采纳 ⇒ 其 register 幂等 BLOCKER 随之**不阻塞本项**。
+
 ## 1. 缺陷（已核验）
 
 - `UPLOAD_TOKEN_TTL = 30*60` —— **upload token 与签名 PUT URL 共用这 30 分钟**（`kb_upload.py:23`）。
