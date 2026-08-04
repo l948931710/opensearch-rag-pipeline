@@ -92,6 +92,29 @@ UI 该显示什么（能"加载更多"才给按钮，否则给一句"结果已�
    根因（跨测试模块互踩 / 模块级状态未隔离）始终没查。它正在稀释 `make test` 的信号价值——
    现在每次全量红都要先花一轮排除 flake。
 
+## C-bis. 2026-08-04 自查（**不替代 codex**，但把"没人看过"降级为"我逐条查过并留了证据"）
+
+Sam 要求「验证到 100% 确认为止」。逐条实测结论：
+
+| 条 | 判定 | 证据 |
+|---|---|---|
+| **B1** | 🔴 **我错了，已修** | 我偏离 codex 的 fail-closed 建议，理由是「HA3 是否回填 version_no 无法验证」——**那条理由错的，证据一直在仓里**：`docs/ha3_stg_table_spec.md` 是生产表实时导出、含 `version_no INT64`；`stitch_neighbor_chunks` 自 `16eb40b` 起就拿它建 WHERE（不回该字段的话邻居拼接会静默全空）。改回 fail-closed（`f9e59ea`）。**顺带查出独立既存 bug**：本地 OS 回退路径读侧漏取 version_no ⇒ 该路径邻居拼接自 2026-06-28 起一直静默全空 |
+| **B2** | ✅ 问一成立；问二有隐雷已拆 | 真库**全交叉积 20160 组 0 不一致**（`5566f1f`）。但 gate 轴此前只在 doc-status/版本历史的 `_is_q` 外挂里，SQL 镜像只看 publish ⇒ gate-only 隔离在列表侧会显「已上线」。**当前不可达**（三个 gate_status 写方里两个 quarantined 都与 publish 同 UPDATE），已两侧补齐 |
+| **B3** | ✅ 结论对、理由曾错 | EXPLAIN 实测 5/5 零计划影响（`858f515`）。但 `/api/conversations` **改前就没走 filesort**（"本就 filesort"在那处不成立）。**新发现**：tiebreaker 方向承重 —— 逆向 ASC 会从 Backward index scan 掉成 PRIMARY + filesort。已加守卫 |
+| **B4** | ✅ 无问题 | **全量审 19 个调用点**（7 promptText + 9 confirm + notice）：取消值一律落到中止分支。加守卫（`922c9f1`/`f32e255`）。retry 语义属产品取舍，留 Sam |
+| **B5** | ✅ 不改 | 断言全是安全性质；唯一"精确形状"那条**必须保留** —— `/api/kb/approve` 无 `response_model`，它是唯一形状契约 |
+| **B6** | ✅ 属实且已在跑；**顺带查出 C1 同族漏修** | launchd `com.fuling.ops-monitor` 上次退出码正是 3（根因 DNS，被正确归 error 而非 drift）。但**告警标题层**没跟上：探针失败顶着「parity drift」+critical 发。三处已修 + AST 守卫（`9cd9436`） |
+| **B7** | ✅ 逐端点核过 | `_dashboard_cache` 7 个使用者里**只有 review-tasks 带 offset**；后果已写进调用点 + 守卫（`de119a1`） |
+| **P3-1~4** | ✅ 守卫重跑反证仍咬 | 逐条把修复改坏 ⇒ 对应测试红；还原 ⇒ 绿 |
+
+🔴 **需要 Sam 知道的现网状态**：ops-monitor 日志里 **24 条 CRITICAL 全部被抑制**
+（`RAG_OPS_ALERT_WEBHOOK` 未配）。其中的 RDS↔HA3 drift 很可能是语料真空期的预期结果，
+但**重灌开始前必须配好 webhook**，否则重灌期的真 drift 同样静默。
+
+⚠️ 自查**不等于**外部评审：本次找到的 3 处真问题（B1 的错误依据、B2 的 gate 隐雷、
+B6 的告警标题）都是**我自己写的代码**里的，同一个人复查同一批代码有系统性盲区。
+08-07 仍须送 codex。
+
 ## D. 状态
 
 - 附录B「值得优先自查的 7 条」——**全部完成**（其余 43 条正文没给，在工作流原始输出里，
