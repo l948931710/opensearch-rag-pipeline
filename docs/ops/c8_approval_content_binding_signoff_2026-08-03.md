@@ -56,7 +56,7 @@ register 时对象 = B，登记 ETag(B)
 |---|---|---|
 | 待拍板 | register 保存 `raw_version_id + etag + file_size`；`doc-preview` 按保存的 `versionId` 签 GET；scanner 携带保存的内容身份；stage-1 在**真实 GET** 上带 `params={"versionId": expected}` 并核返回身份/大小 | ☐ |
 | 为何首选 | 重 PUT 会产生**新 version**，不影响已固化的那个 ⇒ 这才是真正的"内容冻结"，同时闭合预览与摄取两处 | |
-| 🔴 前置（未核实） | **生产 bucket 是否已开 versioning（Enabled/Suspended/未启用）** —— 若未启用，**不得为 C8 直接无评估开启**：versioning 是 **bucket 级姿态**，会改变覆盖/删除/生命周期与存储成本，不是代码 flag | ☐ |
+| ✅ 前置**已核实**（Sam 2026-08-04 告知） | **生产 OSS 已开 version control** ⇒ 原「不得为 C8 直接无评估开启 versioning」的阻塞**解除**（bucket 级姿态已是既成事实，不需为本项再做开关决策）。⚠️ 仍需确认的是**姿态细节**：Enabled 还是 Suspended、以及生命周期规则是否会删历史版本（若会，`raw_version_id` 绑定的对象可能在保留期后消失，`VERSION_ID` 模式需配套保留策略）| ✅ |
 | SDK 可行性 | 仓库钉 OSS SDK **2.19.1**（`requirements-dataworks-py37.txt:17`），HEAD/GET 结果带 `versionid`，GET 与签名 URL 均接受 `params`。⚠️ 但当前 `head_object()` 包装器**把 version-id 丢掉**，只返回 size/content_type/etag（`oss_url.py:187-193`）—— 需先补 | |
 | 🔴 **binding mode + fail-closed 契约（必须写死）** | 只靠 `raw_version_id IS NULL` **无法区分"存量"与"新写失败"** ⇒ 加显式 `content_binding_mode`：<br>`LEGACY_UNBOUND`（存量，允许兼容读）/ `VERSION_ID` / `FROZEN_KEY`。<br>**`binding_mode=VERSION_ID` ⇒ `raw_version_id` 必须非空；缺失或返回身份不符 ⇒ register/预览/审批/摄取全部 fail-closed，不得回退 ETag 或 legacy** | ☐ |
 | 为何必须 | 生产若处于 Suspended、包装器漏字段或配置漂移，实施者可能把 NULL 当 legacy 兼容继续放行 ⇒ **V 静默退化回未绑定状态** | |
