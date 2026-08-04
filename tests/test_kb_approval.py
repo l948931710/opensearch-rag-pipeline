@@ -306,3 +306,33 @@ def test_review_tasks_cache_key_includes_offset(monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_review_tasks_is_the_only_paginated_dashboard_cache_user():
+    """🔴 B7 复核（2026-08-04）：`_dashboard_cache` 只准有一个带 offset 的使用者。
+
+    缓存 × OFFSET 分页会把「他人并发处置导致下一页漏行」的窗口从网络往返放大到
+    ≤TTL（默认 60s）。今天只有 `/api/kb/review-tasks` 处在这个组合里，且其后果已在
+    调用点写明并有前端契约兜底（自己处置时本地与服务端前缀同步收缩，真库实测 0 漏）。
+
+    这条守卫防的是**再加第二个** —— 那时就得逐个重新论证，而不是默认沿用本端点的结论。
+    """
+    import pathlib
+    import re
+    src = pathlib.Path("opensearch_pipeline/routes/kb_console.py").read_text(encoding="utf-8")
+    lines = src.splitlines()
+    marks = [(i, m.group(2)) for i, ln in enumerate(lines)
+             if (m := re.search(r'@router\.(get|post)\("([^"]+)"', ln))]
+    paginated = []
+    for i, ln in enumerate(lines):
+        if "_dashboard_cache_get(" not in ln or "def " in ln:
+            continue
+        before = [p for p in marks if p[0] < i]
+        if not before:
+            continue
+        ep = max(before, key=lambda x: x[0])
+        if "offset" in "\n".join(lines[ep[0]:i]):
+            paginated.append(ep[1])
+    assert paginated == ["/api/kb/review-tasks"], (
+        f"带 offset 的 _dashboard_cache 使用者变成了 {paginated} —— "
+        "新加的那个必须单独论证「缓存 TTL 内翻页看到跨时刻快照」的后果，不能沿用 review-tasks 的结论")

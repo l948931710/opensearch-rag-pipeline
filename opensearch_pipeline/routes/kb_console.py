@@ -1300,6 +1300,18 @@ def kb_review_tasks(request: Request, limit: int = 20, offset: int = 0,
     offset = max(0, min(int(offset or 0), _KB_MAX_OFFSET))
     # ⚠️ offset 必须进 cache key —— 漏了它，第 2 页会命中第 1 页的缓存条目，
     # 「加载更多」表现为把同一页重复追加（越点越多重复项）。
+    #
+    # 📌 缓存 × 分页的已知交互（B7 复核 2026-08-04 逐端点核过）：本端点是
+    # `_dashboard_cache` 的 7 个使用者里**唯一带 offset 的**（stats / insights /
+    # feedback-review / feedback-stats / governance / ops-metrics 都不分页）。
+    # 后果：第 1 页可能来自最多 `RAG_KB_DASHBOARD_CACHE_TTL`（默认 60s）前的快照，
+    # 而第 2 页因 key 不同必然是**新鲜查询** ⇒ 期间被**他人**处置掉的任务会让服务端
+    # 前缀收缩，而本地列表没同步收缩 ⇒ 下一页漏一条。
+    # · 自己处置**不受影响**：resolveReviewTask 本地移除 + offset 取本地条数，
+    #   与服务端前缀同步收缩（真库实测 0 漏，见 `review-task-pagination.spec.ts`）。
+    # · 该漏行是 OFFSET 分页对并发变更的固有性质，缓存只是把窗口从"网络往返"
+    #   放大到"≤TTL"。彻底解法是 keyset 分页（B7 记为未解决，属设计变更）。
+    # · 临时收窄：`RAG_KB_DASHBOARD_CACHE_TTL=0` 关缓存即把窗口收回往返级。
     cache_key = ("review_tasks", limit, offset, include_closed)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
