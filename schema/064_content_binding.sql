@@ -6,7 +6,7 @@
 --    经 scripts/apply_migration.py，台账 checksum=3b26d12f…，applied_at 11:27:05）。
 --    apply 后核实：3070 行存量全部 content_binding_mode='LEGACY_UNBOUND'、raw_version_id 全 NULL
 --    ⇒ **行为逐字节不变**（绑定要等 RAG_CONTENT_BINDING 打开才生效）。
--- ⚠️ staging **未 apply**（本次只做生产，Sam 指定）。
+-- ✅ **staging 亦于 2026-08-04 11:48:02 apply**（566 行全 LEGACY_UNBOUND、raw_version_id 全 NULL）。
 --
 -- ── 缺陷 ─────────────────────────────────────────────────────────────────────
 -- 签名 PUT URL 与 upload token 共用 30 分钟 TTL，且**预签名 URL 服务端无法逐个撤销**

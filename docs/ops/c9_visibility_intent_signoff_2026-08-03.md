@@ -1,5 +1,12 @@
 # C9 可见范围意图持久化 + R1 acl_revision CAS 域 拍板单（2026-08-03）
 
+> ✅ **schema/063 已于 2026-08-04 apply 生产 + staging**（Sam 授权 PROD-RW:2026-08-04，
+> 经 scripts/apply_migration.py；prod 11:45:23 / stg 11:47:58）。
+> apply 后核实：prod 3070 行 / stg 566 行的 `permission_override` **全 NULL** ⇒ 行为逐字节不变。
+> ⚠️ 但**读写两侧的 capability 探测从此为真**（此前是降级跳过）——即：管理员经 set-visibility
+> 显式声明的可见范围，从这一刻起不再被 stage-2 按 raw_key 路径覆盖回写。**C9 的行为变更由此生效**，
+> 与 C8 不同（C8 还压着 `RAG_CONTENT_BINDING` 这道 flag）。
+
 > **背景**：2026-08-03 ultra 评审 **C9** —— `kb_set_visibility` 改的可见范围会被 stage-2
 > 按 raw_key 路径**覆盖回写**；连带 **R1** —— set-visibility 在 `acl_revision` CAS 并发域之外。
 > 两者都动 set-visibility，合为一单。codex 第一批（4 轮）已给出 B′ 完整协议规格。

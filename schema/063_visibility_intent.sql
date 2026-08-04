@@ -2,6 +2,11 @@
 -- 库：fuling_knowledge（document_version 的归属库，见 schema/README.md 矩阵）
 -- 拍板：docs/ops/c9_visibility_intent_signoff_2026-08-03.md（Sam 2026-08-03 选 B′）
 --
+-- ✅ **2026-08-04 已 apply 生产 + staging**（Sam 当日授权 PROD-RW:2026-08-04；
+--    经 scripts/apply_migration.py；prod 11:45:23 / stg 11:47:58）。
+--    apply 后核实：prod 3070 行 / stg 566 行的 permission_override **全 NULL**
+--    ⇒ **行为逐字节不变**（NULL=无意图，stage-2 沿用 raw_key 路径解析）。
+--
 -- ── 为什么需要这一列 ───────────────────────────────────────────────────────────
 -- `kb_set_visibility` 改的可见范围会被 stage-2 **按 raw_key 路径覆盖回写**：
 -- raw_key 的权限段才是 stage-2 的权威（resolve_permission_level 路径解析），
@@ -23,9 +28,16 @@
 -- ── 兼容性 ───────────────────────────────────────────────────────────────────
 -- 纯加列、可空、无默认语义变化；未 apply 的环境走 capability 探测降级（先部署后 apply 安全，
 -- 与 048/049/050/062 同款纪律）。
-ALTER TABLE document_version
-    ADD COLUMN permission_override VARCHAR(32) DEFAULT NULL
-        COMMENT 'C9/B′：管理员显式声明的可见范围意图（canonical 值）；NULL=无意图，走 raw_key 路径解析';
+-- 幂等守卫（与 060/062/064 同款 PREPARE 形态）：裸 `ADD COLUMN` 重跑会 ERROR 1060，
+-- 而 apply_migration 的台账在 checksum 一致时是**放行重跑**的 ⇒ 必须自带幂等。
+-- MySQL 8 的 `ALTER TABLE ... ADD COLUMN` 不支持 `IF NOT EXISTS`，故走 information_schema 判定。
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'document_version'
+            AND COLUMN_NAME = 'permission_override');
+SET @ddl = IF(@c = 0,
+    "ALTER TABLE document_version ADD COLUMN permission_override VARCHAR(32) DEFAULT NULL COMMENT 'C9/B-prime：管理员显式声明的可见范围意图（canonical 值）；NULL=无意图，走 raw_key 路径解析'",
+    'SELECT 1');
+PREPARE s FROM @ddl; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- ── 台账（F-35 纪律：schema 文件 + schema_migrations 一行，缺一即事故预备役）──
 -- ⚠️ **不要手写 INSERT**（与 062 同款纪律）：`schema_migrations` 的 PK 是 `filename`、
