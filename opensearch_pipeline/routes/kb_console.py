@@ -802,11 +802,16 @@ def kb_insights(request: Request, identity: Optional[Identity] = Depends(current
                 out.helped_users = int(r2[1] or 0)
             except Exception as e:
                 fails += 1; logger.warning("kb_insights cited/helped 失败: %s", e)
-            # 3) 最常被检索的文档（COUNT(DISTINCT message_id) 去扇出，与其它计数同一纪律）
+            # 3) 最常被检索的文档（COUNT(DISTINCT message_id) 去扇出，与其它计数同一纪律）。
+            #    归属轴与 governance dept_coverage 同稳定键口径（阶段 B）：node 文档回 node:<id>，
+            #    半迁移双 NULL / 空串归 'unknown'——capability present 才引用 owner_dept_id（旧
+            #    schema 无该列），SELECT/GROUP BY 必须同一表达式。
             try:
+                _own_t = ("COALESCE(NULLIF(m.owner_dept, ''), CONCAT('node:', m.owner_dept_id), 'unknown')"
+                          if _cap == "present" else "COALESCE(NULLIF(m.owner_dept, ''), 'unknown')")
                 cur.execute(
-                    "SELECT m.title, m.owner_dept, COUNT(DISTINCT q.message_id)" + base
-                    + " GROUP BY m.doc_id, m.title, m.owner_dept"
+                    f"SELECT m.title, {_own_t}, COUNT(DISTINCT q.message_id)" + base
+                    + f" GROUP BY m.doc_id, m.title, {_own_t}"
                     " ORDER BY COUNT(DISTINCT q.message_id) DESC LIMIT 8", args)
                 out.top_docs = [KbTopDocItem(title=row[0] or "", owner_dept=row[1] or "", hits=int(row[2] or 0))
                                 for row in cur.fetchall()]

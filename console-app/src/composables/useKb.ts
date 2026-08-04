@@ -1,7 +1,8 @@
-import { computed, nextTick, ref } from 'vue'
+import { computed, effectScope, nextTick, ref, watch } from 'vue'
 import { apiJson, ApiError } from '@/lib/api'
 import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
+import type { OrgSnapshot } from '@/composables/useOrgSnapshot'
 import {
   GROUP_LABEL, MAX_UPLOAD_MB, TERMINAL_BADGES, deptLabel, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
 } from '@/lib/kb'
@@ -78,7 +79,7 @@ export interface KbInsights {
   top_docs: KbTopDoc[]; gap_queries: KbGapQuery[]
 }
 export interface KbEmbedRun { bizdate: string; embedded: number; failed: number; fail_rate: number }
-export interface KbDeptCoverage { owner_dept: string; docs: number; new_month: number; qa_hits: number; no_answer_rate: number; pii_docs: number; wow_net?: number | null; wow_total?: number | null; qa_wow_net?: number | null; qa_wow?: number | null; qa_hits_7d?: number | null }
+export interface KbDeptCoverage { owner_dept: string; owner_label?: string; docs: number; new_month: number; qa_hits: number; no_answer_rate: number; pii_docs: number; wow_net?: number | null; wow_total?: number | null; qa_wow_net?: number | null; qa_wow?: number | null; qa_hits_7d?: number | null }
 export interface KbFeedbackDay { day: string; up: number; down: number }
 export interface KbDownvoteReason { reason: string; count: number }
 export interface KbFileType { ftype: string; count: number }
@@ -192,6 +193,10 @@ const newOwnerNode = ref<{ dept_id: number; subtree: boolean }[]>([])
 // ⚠️ 关时上传必须继续走 legacy 组码：GRANT 关时 can_read_doc 对 node 文档无条件 DENY，
 // 此刻写 node 授权 = 新文档对所有人不可见（连归属部门自己都看不到）。
 const nodeAclGrant = ref(false)
+// 归属自动预填的「每身份一次」标记（记 userId）：切 tab 重挂不重播（尊重用户清空），
+// 身份切换 / __resetKb 后对新身份重新生效。⚠️ 不用裸模块 boolean——那不随 reset 复位
+// （codex v3 blocker）。
+const autoSeedDoneFor = ref('')
 // 主动共享弹窗（owner 侧）：把自己部门的 dept_internal 文档直接放行给指定部门（POST /api/kb/access-grants）。
 const shareCtx = ref<DocItem | null>(null)
 const docMetaCtx = ref<DocItem | null>(null)   // 阶段 B「编辑信息」弹窗（doc-meta 端点 UI 面）
@@ -237,6 +242,79 @@ let docsSeq = 0
 let trackSeq = 0
 let qTimer: ReturnType<typeof setTimeout> | null = null
 let trackTimer: ReturnType<typeof setTimeout> | null = null   // 当前轮询定时器句柄（可取消）
+
+// ── 身份切换防线（codex v4 共识）───────────────────────────────────────────
+// 上传表单是模块级 refs：A 免登失效→容器重登换成 B（reauth 的 syncHistoryForUser 同款
+// 场景）后，A 的归属/可见集/已选文件绝不能被 B 继承误交。服务端 register 有 upload_token
+// uid 门兜底（kb_console 403「与当前用户不符」）；这里管的是**前端草稿与 UI 不被污染**。
+
+/** 清空上传草稿（生产可调；__resetKb 复用）。含 File 真身、file input 之外的全部草稿态；
+ *  DOM input 的清理在 UploadCard 里 watch principalEpoch 走既有 clearFiles 路径。 */
+function resetUploadDraft() {
+  newTitle.value = ''; newOwner.value = ''; newOwnerNode.value = []; newPerm.value = 'dept_internal'
+  newShareDepts.value = []; newShareNodes.value = []; verCtx.value = null
+  selectedFiles = []; selectedNames.value = []; uploadQueue.value = []
+  dupWarn.value = ''; contentDupMsg.value = ''; uploadMsg.value = ''; uploadErr.value = ''
+  uploadOk.value = false
+  autoSeedDoneFor.value = ''
+  trackSeq++                                        // 作废进行中的状态轮询
+  if (trackTimer) { clearTimeout(trackTimer); trackTimer = null }
+}
+
+/** principal 变化时（当前 epoch ≠ 捕获值）为真——上传链各异步边界据此静默终止，
+ *  不把旧身份的进度/结果回写新身份 UI。 */
+function principalChangedSince(epoch0: number): boolean {
+  return useSession().principalEpoch !== epoch0
+}
+
+// 每个 session store 实例只注册一次身份 watcher。⚠️ 不能用裸模块 boolean：Vitest 逐 case
+// 重建 Pinia，boolean 置位后新 store 不再被监听（codex v4 major）。detached effectScope：
+// watcher 不随首个调用组件的卸载被回收。
+const _watchedSessions = new WeakSet<object>()
+function ensurePrincipalWatch(session: ReturnType<typeof useSession>) {
+  if (_watchedSessions.has(session as unknown as object)) return
+  _watchedSessions.add(session as unknown as object)
+  let lastUid = session.identity?.userId ?? ''
+  effectScope(true).run(() => {
+    watch(() => session.identity?.userId ?? '', (uid) => {
+      // A→B 直换、或 A→登出→B：清 A 的草稿。同用户 401 续签（uid 不变/短暂为空后复原）保留草稿。
+      if (uid && lastUid && uid !== lastUid) resetUploadDraft()
+      if (uid) lastUid = uid
+    })
+  })
+}
+
+/** 归属自动预填（Sam 拍板：dept_admin 单管辖根 ⇒ 预填并锁定展示、可点「更改」）。
+ *  node 口径仅在 snap.status==='fresh' 且恰一根且根在快照中且表单为空且非升版时播种；
+ *  legacy 口径 = 唯一上传目标预选。每身份一次（autoSeedDoneFor），不覆盖用户已选/已清。 */
+function maybeAutoSeedOwner(snap?: OrgSnapshot) {
+  const session = useSession()
+  const uid = session.identity?.userId ?? ''
+  if (!uid || autoSeedDoneFor.value === uid || verCtx.value) return
+  if (session.role !== 'dept_admin') return
+  if (nodeAclGrant.value) {
+    if (!snap || snap.status !== 'fresh') return          // stale/unavailable：不播种不锁定（B2）
+    const roots = snap.my_managed_node_roots
+    if (!roots || roots.length !== 1) return              // null=旧后端 unknown；多根不自动（B3）
+    const root = roots[0]
+    const rootNode = snap.nodes.find((n) => n.dept_id === root)
+    if (!rootNode || rootNode.depth > 2) return   // 颗粒度止于二级：深层唯一根不自动锁定（codex blocker）
+    if (newOwnerNode.value.length) return
+    newOwnerNode.value = [{ dept_id: root, subtree: true }]
+    autoSeedDoneFor.value = uid
+  } else {
+    const t = uploadTargetDeptsOf(session)
+    if (t.length !== 1 || newOwner.value) return
+    newOwner.value = t[0]
+    autoSeedDoneFor.value = uid
+  }
+}
+
+/** 上传目标选项（模块级取值：与 useKb().uploadTargetDepts computed 同口径）。 */
+function uploadTargetDeptsOf(session: ReturnType<typeof useSession>): string[] {
+  const u = session.identity?.uploadTargetDepts
+  return u && u.length ? u : (session.identity?.managedOwnerDepts ?? [])
+}
 
 // 各分区加载错误（key→提示文案）。诚实区分：404（端点未上线，Phase C/D 可选）→ 静默兜底空；
 // 5xx/网络/其他 → 置错误条，组件显「加载失败 + 重试」，不再把服务端故障伪装成「无数据」。
@@ -853,7 +931,9 @@ async function onFileSelected(list: FileList | null) {
     const core = fileCore(selectedFiles[0].name)
     if (core.length >= 2) {
       try {
+        const epoch0 = useSession().principalEpoch
         const r = await apiJson<MyDocsResp>(`/api/kb/my-docs?limit=10&q=${encodeURIComponent(core)}`, { auth: true })
+        if (principalChangedSince(epoch0)) return   // 旧身份的查重结果不写新身份 UI
         const hit = (r.items || []).find((d) => d.status_badge !== '已退役')
         if (hit) dupWarn.value = `已有相似文档《${hit.title || hit.original_filename || hit.doc_id}》v${hit.current_version_no}（${hit.status_badge}）。如是同一文档，建议改为「升版」。`
       } catch { /* 软提示，失败忽略 */ }
@@ -863,16 +943,17 @@ async function onFileSelected(list: FileList | null) {
 
 function trackStatus(docId: string, versionNo: number) {
   const mySeq = ++trackSeq
+  const epoch0 = useSession().principalEpoch       // 身份切换即作废（不往新身份 UI 回写轮询结果）
   if (trackTimer) clearTimeout(trackTimer)
   let tries = 0
   let fails = 0                                     // 连续轮询失败计：区分「处理慢」与「状态检查接口出错」
   const MAX = 22
   const poll = async () => {
-    if (mySeq !== trackSeq) return                 // 被新上传/操作作废
+    if (mySeq !== trackSeq || principalChangedSince(epoch0)) return   // 被新上传/操作/换身份作废
     tries++
     try {
       const s = await apiJson<DocStatusResp>(`/api/kb/doc-status?doc_id=${encodeURIComponent(docId)}&version=${versionNo}`, { auth: true })
-      if (mySeq !== trackSeq) return               // await 期间被作废
+      if (mySeq !== trackSeq || principalChangedSince(epoch0)) return   // await 期间被作废
       fails = 0                                     // 成功 → 清失败计
       patchRow(docId, s.status_badge)
       if (TERMINAL_BADGES.includes(s.status_badge)) {
@@ -896,6 +977,8 @@ async function uploadSingle(file: File) {
   if (file.size <= 0) { uploadErr.value = '所选文件为空。'; return }
   if (file.size > maxUploadBytes.value) { uploadErr.value = `文件 ${(file.size / 1048576).toFixed(1)}MB，超过上限 ${maxUploadMb.value}MB，请压缩或拆分。`; return }
   trackSeq++                                        // 作废上一轮轮询
+  // 身份代际：链上任一 await 期间换人 ⇒ 静默终止，不回写 UI（服务端 register uid 门兜底真拦截）
+  const epoch0 = useSession().principalEpoch
   uploadBusy.value = true
   try {
     const isVer = !!verCtx.value
@@ -912,10 +995,15 @@ async function uploadSingle(file: File) {
         : { action: 'new', filename: file.name, owner_dept: newOwner.value, permission_level: shared ? 'dept_internal' : newPerm.value, title: newTitle.value || undefined }
     uploadMsg.value = '申请上传地址…'
     const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify(body) })
+    if (principalChangedSince(epoch0)) return
     uploadMsg.value = '上传文件到 OSS… 0%'
-    await putWithProgress(u.put_url, file, (pct) => { uploadMsg.value = `上传文件到 OSS… ${pct}%` }, u.content_type)
+    await putWithProgress(u.put_url, file, (pct) => {
+      if (!principalChangedSince(epoch0)) uploadMsg.value = `上传文件到 OSS… ${pct}%`
+    }, u.content_type)
+    if (principalChangedSince(epoch0)) return       // 换人后不再 register（token uid 也必被后端 403）
     uploadMsg.value = '登记…'
     const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
+    if (principalChangedSince(epoch0)) return
     uploadOk.value = true
     let shareNote = ''
     if (nodeMode && newShareNodes.value.length) {
@@ -928,6 +1016,7 @@ async function uploadSingle(file: File) {
           shareNote = shareResultNote(await createGrants(r.doc_id, [...newShareDepts.value]))
         }
       } catch { shareNote = '；共享设置失败，可稍后在台账点「共享」重试' }
+      if (principalChangedSince(epoch0)) return
     }
     uploadMsg.value = `已提交：${r.title || file.name} v${r.version_no}（${r.status_badge}${r.requires_kb_admin_approval ? '，待审批' : ''}）${shareNote}`
     contentDupMsg.value = buildDupMsg(r.content_dups, r.content_dups_other)
@@ -935,7 +1024,10 @@ async function uploadSingle(file: File) {
     if (isVer) exitVersionMode()
     void loadDocs(); void loadApprovals(true)   // force：刚上传可能新增待审批单，穿透 staleness 门
     if (!r.requires_kb_admin_approval) trackStatus(r.doc_id, r.version_no)   // 待审批不轮询
-  } catch (e: any) { uploadErr.value = uploadErrText(e); uploadMsg.value = '' } finally { uploadBusy.value = false }
+  } catch (e: any) {
+    if (principalChangedSince(epoch0)) return       // 旧身份的失败不写新身份 UI
+    uploadErr.value = uploadErrText(e); uploadMsg.value = ''
+  } finally { uploadBusy.value = false }
 }
 
 // 批量上传并发度（E#35）。跨文件小并发池：每文件内部 upload-url → OSS PUT → register 三步顺序不变，
@@ -947,6 +1039,7 @@ const BATCH_CONCURRENCY = 2
 async function uploadBatch(files: File[]) {
   uploadErr.value = ''; uploadOk.value = false; contentDupMsg.value = ''; uploadMsg.value = ''
   trackSeq++
+  const epoch0 = useSession().principalEpoch        // 身份代际（与 uploadSingle 同款防线）
   const rows: QueueRow[] = files.map((f) => ({ name: f.name, status: '排队', pct: 0, msg: '' }))
   uploadQueue.value = rows
   uploadBusy.value = true
@@ -962,24 +1055,38 @@ async function uploadBatch(files: File[]) {
       const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify(bNodeMode
         ? { action: 'new', filename: f.name, owner_dept: '', permission_level: shared ? 'dept_internal' : newPerm.value, owner_dept_id: newOwnerNode.value[0].dept_id, visible_nodes: [...newShareNodes.value] }
         : { action: 'new', filename: f.name, owner_dept: newOwner.value, permission_level: shared ? 'dept_internal' : newPerm.value }) })
-      await putWithProgress(u.put_url, f, (pct) => { row.pct = pct; row.msg = `${pct}%` }, u.content_type)
+      if (principalChangedSince(epoch0)) return
+      await putWithProgress(u.put_url, f, (pct) => {
+        if (!principalChangedSince(epoch0)) { row.pct = pct; row.msg = `${pct}%` }
+      }, u.content_type)
+      if (principalChangedSince(epoch0)) return     // 换人后不再 register（token uid 后端必 403）
       row.status = '登记中'; row.msg = ''
       const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
+      if (principalChangedSince(epoch0)) return
       row.status = '已提交'; row.msg = `v${r.version_no}（${r.status_badge}）`
       if (shared && newShareDepts.value.length) {
         // refresh:false：并发 worker 逐文件刷清单会互相覆盖+烧 aux 限流，批末统一拉一次
         try { row.msg += shareResultNote(await createGrants(r.doc_id, [...newShareDepts.value], '', { refresh: false })).replace(/^，/, ' · ') }
-        catch { row.msg += ' · 共享失败可稍后重试' }
+        catch { if (!principalChangedSince(epoch0)) row.msg += ' · 共享失败可稍后重试' }
       }
       const dm = buildDupMsg(r.content_dups, r.content_dups_other); if (dm) row.dupMsg = dm
       okN++
-    } catch (e: any) { row.status = '失败'; row.msg = uploadErrText(e); badN++ }
+    } catch (e: any) {
+      if (principalChangedSince(epoch0)) return     // 旧身份的失败不写新身份 UI
+      row.status = '失败'; row.msg = uploadErrText(e); badN++
+    }
   }
   // 小并发池：worker 共享游标领任务，按队列顺序开工（uploadOne 自吞异常，Promise.all 不会中途 reject）。
   let cursor = 0
-  const worker = async () => { for (;;) { const i = cursor++; if (i >= files.length) return; await uploadOne(i) } }
+  const worker = async () => {
+    for (;;) {
+      if (principalChangedSince(epoch0)) return     // 换身份：整批停止领新任务
+      const i = cursor++; if (i >= files.length) return; await uploadOne(i)
+    }
+  }
   await Promise.all(Array.from({ length: Math.min(BATCH_CONCURRENCY, files.length) }, () => worker()))
   uploadBusy.value = false
+  if (principalChangedSince(epoch0)) return         // 批末汇总不写新身份 UI
   uploadMsg.value = `${okN} 成功${badN ? `，${badN} 失败/跳过` : ''}`
   void loadDocs(); void loadApprovals(true)   // force：批量里可能有待审批单
   if (shared && okN) void loadAccessGrants()  // 批末一次权威刷新（逐文件已抑制）
@@ -1551,6 +1658,7 @@ async function restore(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
 
 export function useKb() {
   const session = useSession()
+  ensurePrincipalWatch(session)   // 身份切换 ⇒ 清上传草稿（每 store 实例注册一次）
   const ownerDepts = computed(() => session.identity?.managedOwnerDepts ?? [])
   // 上传目标选项(含生产子线);toIdentity 已做旧后端回退,此处仅兜底空值。
   const uploadTargetDepts = computed(() => {
@@ -1592,6 +1700,7 @@ export function useKb() {
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, accessNoteOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
+    maybeAutoSeedOwner, resetUploadDraft, autoSeedDoneFor,
     approve, reject, retire, restore,
   }
 }
@@ -1602,17 +1711,15 @@ export function __resetKb() {
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   selectedIds.value = new Set(); bulkBusy.value = false; bulkMsg.value = ''
-  newTitle.value = ''; newOwner.value = ''; newOwnerNode.value = []; newPerm.value = 'dept_internal'; newShareDepts.value = []; newShareNodes.value = []; verCtx.value = null
+  resetUploadDraft()                                // 上传草稿域（含 selectedFiles/autoSeedDoneFor/轮询作废）
   shareCtx.value = null; shareBusy.value = false
-  uploadBusy.value = false; uploadMsg.value = ''; uploadErr.value = ''; uploadOk.value = false
-  dupWarn.value = ''; contentDupMsg.value = ''; uploadQueue.value = []; selectedNames.value = []
+  uploadBusy.value = false
   inflight.value = new Set(); retireBusy.value = false
   feedbackReview.value = null; showResolvedFeedback.value = false; feedbackResolveBusy.value = new Set()
   reviewTasks.value = null; showClosedReviewTasks.value = false; reviewTaskResolveBusy.value = new Set()
-  selectedFiles = []; docsOffset = 0; docsPage.value = 1; docsSeq = 0; trackSeq = 0
+  docsOffset = 0; docsPage.value = 1; docsSeq = 0; trackSeq = 0
   for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）
   if (qTimer) { clearTimeout(qTimer); qTimer = null }
-  if (trackTimer) { clearTimeout(trackTimer); trackTimer = null }
   if (filterTimer) { clearTimeout(filterTimer); filterTimer = null }
 }
 

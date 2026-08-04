@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { Database, CheckCircle2, Loader, Clock, Percent, UserCheck, Quote } from '@lucide/vue'
+import { onMounted, ref } from 'vue'
 import { useKb } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
+import { fetchOrgSnapshot, type OrgNode } from '@/composables/useOrgSnapshot'
+import { resolveOwnerBucket } from '@/lib/orgTree'
 import StatusDistBar from './StatusDistBar.vue'
 import StatCard from './StatCard.vue'
 import BarList from './BarList.vue'
@@ -48,8 +51,15 @@ const usageCards = computed<Card[]>(() => {
     { label: '被引用', value: i?.cited ?? 0, icon: Quote, tone: 'text-foreground', hint: '本部门文档进入最终回答的提问数' },
   ]
 })
+// 归属键 kind-aware 解析（node:<id> 桶不再裸键上屏；快照缓存命中零额外请求）
+const snapById = ref<Map<number, OrgNode>>(new Map())
+onMounted(async () => {
+  try { snapById.value = new Map((await fetchOrgSnapshot()).nodes.map((n) => [n.dept_id, n])) } catch { /* 兜底 deptLabel */ }
+})
 const topDocItems = computed(() =>
-  (kbInsights.value?.top_docs || []).map((d) => ({ label: d.title, sub: deptLabel(d.owner_dept), value: d.hits })))
+  (kbInsights.value?.top_docs || []).map((d) => ({
+    label: d.title, sub: resolveOwnerBucket(d.owner_dept, undefined, snapById.value, deptLabel).label, value: d.hits,
+  })))
 const gapItems = computed(() =>
   (kbInsights.value?.gap_queries || []).map((g) => ({ label: g.query, sub: `平均相关度 ${g.avg_top.toFixed(2)}`, value: g.count })))
 

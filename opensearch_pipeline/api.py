@@ -2609,6 +2609,11 @@ class KbOrgTreeResponse(BaseModel):
     my_role: str = "employee"
     my_managed_owner_depts: List[str] = Field(default_factory=list)
     my_grantable_owner_depts: List[str] = Field(default_factory=list)
+    # 阶段 B 管理轴：调用者自己的 node 管辖根（dept_admin_node_grant auto+manual 有效行）。
+    # 前端据此做归属自动预填/管辖子树过滤；⚠️ 旧前端忽略即可，新前端对**缺字段**必须按
+    # unknown（≠空授权）处理——放这里而不进 whoami/Identity，是为了避开「两条免登路径
+    # 字段必须同源」的 footgun（81a25d1 教训）。
+    my_managed_node_roots: List[int] = Field(default_factory=list)
     org_tree: Optional[Dict[str, Any]] = Field(default=None, description="org 快照（缺失则 null）")
     # 2026-08-01：节点授权是否**已对读侧生效**（= RAG_NODE_ACL_GRANT）。
     # ⚠️ 上传侧必须据此选授权口径,不能只看"控件写好了"：GRANT 关时 `can_read_doc` 对 node

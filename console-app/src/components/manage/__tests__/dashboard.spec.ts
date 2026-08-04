@@ -7,7 +7,6 @@ import KbAdminDashboard from '@/components/manage/KbAdminDashboard.vue'
 import DeptDashboard from '@/components/manage/DeptDashboard.vue'
 import StatusDistBar from '@/components/manage/StatusDistBar.vue'
 import BarList from '@/components/manage/BarList.vue'
-import DonutChart from '@/components/manage/DonutChart.vue'
 import FeedbackTrend from '@/components/manage/FeedbackTrend.vue'
 import { useKb, __resetKb, type KbInsights, type KbGovernance } from '@/composables/useKb'
 
@@ -58,7 +57,7 @@ describe('KbAdminDashboard — 全库真实口径，无造数', () => {
   it('治理数据未到 → 资产卡渲染 + 如实「加载中」占位（不造数）', () => {
     const w = mountWith(KbAdminDashboard, identity({ role: 'kb_admin' }),
       { stats: { total: 1796, active: 1478, retired: 318, chunks: 27659, new_this_month: 1249, by_badge: { 已上线: 1478, 已退役: 318, 处理中: 12 } } })
-    expect(w.text()).toContain('全库资产概览')
+    expect(w.text()).toContain('全库资产与运行')   // 2026-08-03 重设计：资产+运行合区
     expect(w.text()).toContain('1796')
     expect(w.text()).toContain('318')
     expect(w.text()).toContain('27,659')              // 文档总数下的已索引分块（千分位）
@@ -74,8 +73,8 @@ describe('KbAdminDashboard — 全库真实口径，无造数', () => {
   it('治理 + 洞察就绪 → 运行健康(含治理风险)/部门覆盖与失衡/知识效果/用户反馈 真实数', () => {
     const w = mountWith(KbAdminDashboard, identity({ role: 'kb_admin' }),
       { stats: { total: 1618, active: 1618, retired: 0, chunks: 27659, new_this_month: 1249, by_badge: { 已上线: 1475 } }, gov: GOV, insights: INSIGHTS })
-    // 全库资产概览扩展：各部门文档数分布 + 文件类型分布
-    expect(w.text()).toContain('各部门文档数分布')
+    // 2026-08-03 重设计：三件套并入「组织覆盖」树表；文件类型改内联堆叠条
+    expect(w.text()).toContain('组织覆盖')
     expect(w.text()).toContain('文件类型分布')
     expect(w.text()).toContain('PDF')
     expect(w.text()).toContain('运行健康')
@@ -171,22 +170,6 @@ describe('BarList', () => {
   })
 })
 
-describe('DonutChart — 点踩原因占比环', () => {
-  it('图例标签 + 百分比 + 中心值；切片按值降序', () => {
-    const w = mount(DonutChart, { props: { items: [{ label: '不准确', value: 12 }, { label: '其他', value: 28 }], centerValue: 44, centerLabel: '点踩' } })
-    expect(w.text()).toContain('其他')
-    expect(w.text()).toContain('不准确')
-    expect(w.text()).toContain('44')                 // 中心值
-    expect(w.text()).toContain('70%')                // 28/(28+12) 最大切片排首
-    expect(w.findAll('circle').length).toBe(3)       // 轨道 + 2 切片
-  })
-  it('空 → empty 文案', () => {
-    const w = mount(DonutChart, { props: { items: [], empty: '近期无点踩反馈。' } })
-    expect(w.text()).toContain('近期无点踩反馈。')
-    expect(w.findAll('circle').length).toBe(0)
-  })
-})
-
 describe('FeedbackTrend — 7/30 天切换', () => {
   const days = Array.from({ length: 8 }, (_, i) => ({ day: `2026-06-1${i}`, up: i, down: 1 }))
   it('默认近30天显示 total；切近7天显示 last7', async () => {
@@ -209,7 +192,7 @@ describe('批次δ-2 — 各部门使用量 7/30 天切换', () => {
     ],
   }
 
-  it('默认近 30 天=qa_hits；切近 7 天：标题联动 + 柱值换 qa_hits_7d（块内断言，避开 DeptTable 的 30 天列）', async () => {
+  it('默认近 30 天=qa_hits；切近 7 天：标题联动 + 柱值换 qa_hits_7d（块内断言，锚 OrgCoverageTable 的 dept-usage-block）', async () => {
     const w = mountWith(KbAdminDashboard, identity({ role: 'kb_admin' }), { gov: GOV7 as any, insights: INSIGHTS })
     const block = () => w.find('[data-testid="dept-usage-block"]')
     expect(w.find('[data-testid="dept-usage-title"]').text()).toContain('近 30 天')
@@ -217,7 +200,7 @@ describe('批次δ-2 — 各部门使用量 7/30 天切换', () => {
     await w.find('[data-testid="dept-usage-win-7"]').trigger('click')
     expect(w.find('[data-testid="dept-usage-title"]').text()).toContain('近 7 天')
     expect(block().text()).toContain('97')                        // 7 天口径
-    expect(block().text()).not.toContain('384')                   // 30 天值不再画柱（DeptTable 不受影响）
+    expect(block().text()).not.toContain('384')                   // 30 天使用量不再画柱（无答案率列恒 30 天口径，百分比不受影响）
     expect(block().text()).toContain('▲+22')                      // 周环比徽标两窗口同源保留
   })
 

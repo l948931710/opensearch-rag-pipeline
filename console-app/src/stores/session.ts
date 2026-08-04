@@ -23,15 +23,25 @@ export const useSession = defineStore('session', () => {
   const identity = ref<Identity | null>(null)
   const ready = ref(false)
   const error = ref('')
+  /** 前端专用 principal 代际：仅 userId **真正变化**（含 reset）时递增；同用户 401 续签不动。
+   *  消费方（org 快照缓存、上传链异步边界）据此丢弃跨身份的过期结果——服务端 register 有
+   *  upload_token uid 门兜底，这里只负责不让旧身份的异步回写污染新身份 UI。 */
+  const principalEpoch = ref(0)
 
   const role = computed<Role>(() => identity.value?.role ?? 'employee')
   const canManage = computed(() => !!identity.value?.canManage)
 
   function setToken(t: string) { token.value = t || '' }
-  function setIdentity(i: Identity | null) { identity.value = i }
-  function reset() { token.value = ''; identity.value = null; ready.value = false; error.value = '' }
+  function setIdentity(i: Identity | null) {
+    if ((i?.userId ?? '') !== (identity.value?.userId ?? '')) principalEpoch.value++
+    identity.value = i
+  }
+  function reset() {
+    token.value = ''; identity.value = null; ready.value = false; error.value = ''
+    principalEpoch.value++
+  }
 
-  return { token, identity, ready, error, role, canManage, setToken, setIdentity, reset }
+  return { token, identity, ready, error, principalEpoch, role, canManage, setToken, setIdentity, reset }
 })
 
 /** 后端 /api/auth/dingtalk 或 /api/kb/whoami 的下划线响应 → 前端 Identity（camelCase）。 */

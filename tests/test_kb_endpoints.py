@@ -1309,6 +1309,33 @@ def test_insights_kb_admin_unscoped_global(monkeypatch):
     assert "AND 1=0" not in sqls
 
 
+def test_insights_top_docs_owner_axis_stable_keys(monkeypatch):
+    """★ top_docs 归属轴与 dept_coverage 同稳定键（看板重设计 2026-08-03）：
+    absent=组码 + 'unknown' 兜底（不得引用 owner_dept_id——旧 schema 无该列）；
+    present=node:<id>，且 SELECT/GROUP BY 同一表达式；半迁移空串/双 NULL 归 'unknown'。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    # 同测内两次调用：绕开 60s 看板响应缓存（否则第二次不打 SQL）
+    monkeypatch.setattr(kb_console, "_dashboard_cache_get", lambda k: None)
+    monkeypatch.setattr(kb_console, "_dashboard_cache_put", lambda k, v: None)
+
+    sink = _stub_multi(monkeypatch, [])            # absent（本文件 autouse 默认）
+    api.kb_insights(request=None, identity=api.Identity(user_id="dev1"))
+    sqls = " || ".join(s for s, _ in sink["calls"])
+    assert "COALESCE(NULLIF(m.owner_dept, ''), 'unknown')" in sqls
+    assert "owner_dept_id" not in sqls
+
+    for ns in (api, kb_console):
+        monkeypatch.setattr(ns, "_kb_node_capability", lambda cur: "present")
+    sink2 = _stub_multi(monkeypatch, [])
+    api.kb_insights(request=None, identity=api.Identity(user_id="dev1"))
+    joined = " || ".join(s for s, _ in sink2["calls"])
+    expr = "COALESCE(NULLIF(m.owner_dept, ''), CONCAT('node:', m.owner_dept_id), 'unknown')"
+    assert joined.count(expr) >= 2                 # SELECT 与 GROUP BY 同源
+
+
 def test_insights_dept_admin_no_managed_fail_closed(monkeypatch):
     """无授权 dept_admin → 作用域 1=0 空集，绝不静默当全量。"""
     _skip_if_not_sim()
@@ -2236,6 +2263,23 @@ def test_org_tree_exposes_node_acl_grant_flag(monkeypatch):
                             lambda f=flag: f)
         resp = api.kb_org_tree(request=None, identity=api.Identity(user_id="dev1"))
         assert resp.node_acl_grant is expect
+
+
+def test_org_tree_exposes_my_managed_node_roots(monkeypatch):
+    """★ org-tree 回调用者自己的 node 管辖根（kb.granted_node_roots）——前端归属
+    自动预填/管辖子树过滤的数据源。后端契约：有授权行回排序 int 列表、无行回 []；
+    「缺字段=unknown≠空授权」的三态判定在前端 useOrgSnapshot 做。"""
+    _skip_if_not_sim()
+    from opensearch_pipeline import api
+    monkeypatch.setattr(api, "_load_org_tree_snapshot", lambda: {"nodes": [], "stale": True})
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_NODE_ROOTS", "7,3")
+    resp = api.kb_org_tree(request=None, identity=api.Identity(user_id="mgr1"))
+    assert resp.my_managed_node_roots == [3, 7]
+
+    monkeypatch.delenv("RAG_SIM_MANAGED_NODE_ROOTS")
+    resp2 = api.kb_org_tree(request=None, identity=api.Identity(user_id="mgr1"))
+    assert resp2.my_managed_node_roots == []
 
 
 def test_org_tree_flag_fails_safe_to_legacy(monkeypatch):

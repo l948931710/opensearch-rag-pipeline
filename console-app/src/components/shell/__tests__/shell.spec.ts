@@ -80,7 +80,7 @@ describe('ManageView — 按角色分流', () => {
     expect(w.html()).toContain('title="hr"')
     expect(w.text()).toContain('概览看板')        // 子 tab
     expect(w.text()).toContain('文档管理')        // 子 tab
-    expect(w.text()).toContain('全库资产概览')     // kb_admin 看板（默认 tab）
+    expect(w.text()).toContain('全库资产与运行')   // kb_admin 看板（默认 tab，2026-08-03 重设计合区）
     expect(w.text()).not.toContain('知识库概览')   // 员工专属文案
   })
 

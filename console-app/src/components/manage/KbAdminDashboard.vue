@@ -1,23 +1,33 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import {
-  Database, CheckCircle2, Archive, Clock, GitBranch, Timer, Cpu,
-  ShieldAlert, ShieldCheck, ThumbsUp, ThumbsDown, Percent, Quote, MessageSquare, Ban,
-  Search, AlertTriangle,
+  Database, CheckCircle2, Archive, Clock,
+  ThumbsUp, ThumbsDown, Percent, Quote, MessageSquare, Ban, AlertTriangle,
 } from '@lucide/vue'
-import { useKb, type KbDeptCoverage } from '@/composables/useKb'
+import { onMounted } from 'vue'
+import { useKb } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
+import { fetchOrgSnapshot } from '@/composables/useOrgSnapshot'
+import { resolveOwnerBucket } from '@/lib/orgTree'
+import type { OrgNode } from '@/composables/useOrgSnapshot'
 import StatusDistBar from './StatusDistBar.vue'
 import StatCard from './StatCard.vue'
 import BarList from './BarList.vue'
 import ColumnChart from './ColumnChart.vue'
-import DeptTable from './DeptTable.vue'
+import OrgCoverageTable from './OrgCoverageTable.vue'
+import VitalsList, { type VitalItem } from './VitalsList.vue'
 import FeedbackTrend from './FeedbackTrend.vue'
-import DonutChart from './DonutChart.vue'
 import MiniTrend from './MiniTrend.vue'
 import LoadError from './LoadError.vue'
 import FeedbackReviewList from './FeedbackReviewList.vue'
 import ReviewTaskQueue from './ReviewTaskQueue.vue'
+
+// 归属键 kind-aware 解析（top_docs 副标签用；快照缓存命中零额外请求）
+const snapById = ref<Map<number, OrgNode>>(new Map())
+onMounted(async () => {
+  try { snapById.value = new Map((await fetchOrgSnapshot()).nodes.map((n) => [n.dept_id, n])) } catch { /* 兜底走 owner_label/deptLabel */ }
+})
+const ownerText = (key: string) => resolveOwnerBucket(key, undefined, snapById.value, deptLabel).label
 
 // 知识库管理员「概览看板」= 全库视角（对齐 Atlas 设计分区）。资产/状态取 /api/kb/stats、待审批
 // /pending-approvals；运行健康+治理风险+部门覆盖取 /api/kb/governance；知识效果取 /api/kb/insights。
@@ -64,18 +74,34 @@ const assetCards = computed<Card[]>(() => {
   ]
 })
 
-// ── 全库运行健康：入库成功率 / 数据一致性 / 嵌入失败率 / 问答延迟 p95（检索可用率移入「服务可用性」）──
-const healthCards = computed<Card[]>(() => {
+// ── 运行 vitals（2026-08-03 重设计：9 张同权重卡压成扁平列表；tone 语义逐项照搬原卡,
+//    不发明新阈值——codex 共识）。分组小标题保留「运行健康/服务可用性/治理风险」词面。──
+const vitalsHealth = computed<VitalItem[]>(() => {
   const g = kbGovernance.value
   const maxFail = Math.max(0, ...(g?.embed_runs || []).map((r) => r.fail_rate))
   const ingest = (g && g.docs_active) ? g.docs_in_index / g.docs_active : undefined
   const dual = g?.dual_version_docs ?? 0
   const consistency = (g && g.docs_in_index) ? (g.docs_in_index - dual) / g.docs_in_index : undefined
   return [
-    { label: '入库成功率', value: pct(ingest), icon: CheckCircle2, tone: 'text-st-live', hint: `${g?.docs_in_index ?? 0}/${g?.docs_active ?? 0} 已索引上线` },
-    { label: '数据一致性', value: pct(consistency), icon: GitBranch, tone: dual ? 'text-st-warn' : 'text-st-live', hint: dual ? `${dual} 文档双版本残留` : '无双版本残留' },
-    { label: '嵌入失败率', value: pct(maxFail), icon: Cpu, tone: maxFail > 0 ? 'text-st-warn' : 'text-st-live', hint: '近 8 次入库最差' },
-    { label: '问答延迟 p95', value: ms2s(g?.p95_latency_ms), icon: Timer, tone: 'text-foreground', hint: `p50 ${ms2s(g?.p50_latency_ms)} · 含流式渲染` },
+    { label: '入库成功率', value: pct(ingest), tone: 'text-st-live', hint: `${g?.docs_in_index ?? 0}/${g?.docs_active ?? 0} 已索引上线` },
+    { label: '数据一致性', value: pct(consistency), tone: dual ? 'text-st-warn' : 'text-st-live', hint: dual ? `${dual} 文档双版本残留` : '无双版本残留' },
+    { label: '嵌入失败率', value: pct(maxFail), tone: maxFail > 0 ? 'text-st-warn' : 'text-st-live', hint: '近 8 次入库最差' },
+    { label: '问答延迟 p95', value: ms2s(g?.p95_latency_ms), tone: 'text-foreground', hint: `p50 ${ms2s(g?.p50_latency_ms)} · 含流式渲染` },
+  ]
+})
+const vitalsAvailability = computed<VitalItem[]>(() => {
+  const g = kbGovernance.value
+  return [
+    { label: '问答 API 成功率', value: pct(g?.qa_api_success_rate), tone: 'text-st-live', hint: `近 ${g?.window_days ?? 30} 天 · ${fmtN(g?.qa_total_30d)} 次` },
+    { label: '检索 API 成功率', value: pct(g?.retrieval_api_success_rate), tone: 'text-st-live', hint: '检索正常返回占比' },
+    { label: '近 24h 错误数', value: g?.errors_24h ?? 0, tone: g?.errors_24h ? 'text-st-fail' : 'text-st-live', hint: '失败请求 · DashScope/HA3' },
+  ]
+})
+const vitalsRisk = computed<VitalItem[]>(() => {
+  const g = kbGovernance.value
+  return [
+    { label: 'PII 已脱敏', value: g?.pii_redacted_docs ?? 0, tone: 'text-st-busy', hint: '含敏感信息文档' },
+    { label: 'PII 隔离', value: g?.pii_quarantined_docs ?? 0, tone: g?.pii_quarantined_docs ? 'text-st-warn' : 'text-st-muted', hint: '高风险未入库' },
   ]
 })
 // 近期入库趋势（纵向柱，最新在右）：bizdate 取 MM-DD，值 = 嵌入块数；带失败计数 → 条顶红盖。
@@ -84,43 +110,14 @@ const embedTrend = computed(() =>
     const d = (r.bizdate || '').replace(/\D/g, '')
     return { label: d.length >= 4 ? `${d.slice(-4, -2)}-${d.slice(-2)}` : (r.bizdate || ''), value: r.embedded, failed: r.failed, failRate: r.fail_rate }
   }))
-// ── 服务可用性 ──
-const availabilityCards = computed<Card[]>(() => {
-  const g = kbGovernance.value
-  return [
-    { label: '问答 API 成功率', value: pct(g?.qa_api_success_rate), icon: CheckCircle2, tone: 'text-st-live', hint: `近 ${g?.window_days ?? 30} 天 · ${fmtN(g?.qa_total_30d)} 次` },
-    { label: '检索 API 成功率', value: pct(g?.retrieval_api_success_rate), icon: Search, tone: 'text-st-live', hint: '检索正常返回占比' },
-    { label: '近 24h 错误数', value: g?.errors_24h ?? 0, icon: AlertTriangle, tone: g?.errors_24h ? 'text-st-fail' : 'text-st-live', hint: '失败请求 · DashScope/HA3' },
-  ]
-})
-// ── 全库资产概览扩展：各部门文档数分布（识别偏科）+ 文件类型分布 ──
-const deptDocItems = computed(() =>
-  [...(kbGovernance.value?.dept_coverage || [])].sort((a, c) => c.docs - a.docs)
-    .map((d) => ({ label: deptLabel(d.owner_dept), value: d.docs, delta: d.wow_net ?? null, deltaPct: d.wow_total ?? null })))
-// 各部门使用量（命中提问数）+ 使用量周环比——按当前窗口使用量降序（批次δ-2：7/30 天切换）。
-// ⚠️ 字段窗口语义（别复刻 FeedbackTrend「30=累计」的形状陷阱）：qa_hits 是真·近 30 天
-// （SQL INTERVAL 30 DAY），qa_hits_7d 是真·近 7 天（wow 子查询的 qa7）——两键各自货真价实。
-// 7 天口径缺失（wow 子查询失败 → null=未知）时回落 30 天并在标题如实标注，绝不把 null 画成 0。
-const usageWin = ref<7 | 30>(30)
-const usage7dAvailable = computed(() =>
-  (kbGovernance.value?.dept_coverage || []).some((d) => d.qa_hits_7d != null))
-const usageWinEffective = computed(() => (usageWin.value === 7 && !usage7dAvailable.value ? 30 : usageWin.value))
-const deptUsageItems = computed(() => {
-  const win7 = usageWinEffective.value === 7
-  const val = (d: KbDeptCoverage) => (win7 ? (d.qa_hits_7d ?? 0) : d.qa_hits)
-  return [...(kbGovernance.value?.dept_coverage || [])].sort((a, c) => val(c) - val(a))
-    .map((d) => ({ label: deptLabel(d.owner_dept), value: val(d), delta: d.qa_wow_net ?? null, deltaPct: d.qa_wow ?? null }))
-})
+// ── 文件类型：DonutChart → 内联堆叠条（<1% 段保底可见,占比按真实值不四舍五入到 100）──
 const fileTypeItems = computed(() => (kbGovernance.value?.file_types || []).map((f) => ({ label: f.ftype, value: f.count })))
 const fileTotal = computed(() => (kbGovernance.value?.file_types || []).reduce((s, f) => s + f.count, 0))
-const riskCards = computed<Card[]>(() => {
-  const g = kbGovernance.value
-  // 未答出率移除：与「全库知识效果 · 无答案率」重复（同一 (无结果+拒答)/总 口径）。
-  return [
-    { label: 'PII 已脱敏', value: g?.pii_redacted_docs ?? 0, icon: ShieldCheck, tone: 'text-st-busy', hint: '含敏感信息文档' },
-    { label: 'PII 隔离', value: g?.pii_quarantined_docs ?? 0, icon: ShieldAlert, tone: g?.pii_quarantined_docs ? 'text-st-warn' : 'text-st-muted', hint: '高风险未入库' },
-  ]
-})
+const fileSegments = computed(() => fileTypeItems.value.map((f, i) => ({
+  ...f,
+  sharePct: fileTotal.value ? (f.value / fileTotal.value) * 100 : 0,
+  style: `background: color-mix(in srgb, var(--accent) ${Math.max(14, 52 - i * 13)}%, var(--panel))`,
+})))
 
 // ── 全库知识效果：效果卡（按数据源就绪与否纳入，绝不显伪 0）+ 最常被使用 / 高频未答好 ──
 const effectCards = computed<Card[]>(() => {
@@ -137,7 +134,7 @@ const effectCards = computed<Card[]>(() => {
   return out
 })
 const topDocItems = computed(() =>
-  (kbInsights.value?.top_docs || []).map((d) => ({ label: d.title, sub: deptLabel(d.owner_dept), value: d.hits })))
+  (kbInsights.value?.top_docs || []).map((d) => ({ label: d.title, sub: ownerText(d.owner_dept), value: d.hits })))
 const gapItems = computed(() =>
   (kbInsights.value?.gap_queries || []).map((g) => ({ label: g.query, sub: `平均相关度 ${g.avg_top.toFixed(2)}`, value: g.count })))
 
@@ -165,7 +162,6 @@ const ZONE_HEAD = 'mb-4 flex items-center gap-2 border-b border-border/70 pb-3 t
 const ZONE_TICK = 'h-3.5 w-1 shrink-0 rounded-full bg-accent-strong'
 const SUBHEAD = 'mb-2 text-[12.5px] font-medium text-muted-foreground'
 const GRID = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-4'
-const GRID3 = 'kb-cards grid grid-cols-2 gap-3 sm:grid-cols-3'   // 3 张卡的区（服务可用性 / 治理风险）：N 项 N 格，不留空格
 // 成对子项收进「一个框、两半、中间竖线分隔」的共享面板（对齐设计：趋势|原因、最常用|未答好）。
 // 嵌在区域面板里 → 用纯白 bg-surface 与暖底面板拉开层次。
 const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface divide-y divide-border sm:grid-cols-2 sm:divide-y-0 sm:divide-x'
@@ -207,62 +203,57 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
       ><AlertTriangle :size="12" :stroke-width="1.75" /> 差评复核加载失败 · 数量未知</button>
     </div>
 
-    <!-- 全库资产概览（含状态分布 + 部门覆盖情况） -->
+    <!-- ① 全库资产与运行（2026-08-03 重设计：资产 hero 卡 + 状态分布 + 扁平 vitals + 趋势|文件类型）
+         设计原则：只有决策数字配大卡,运行体征降为安静的 hairline 行——异常靠语义色点浮出。 -->
     <section :class="SECTION">
-      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库资产概览</header>
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库资产与运行</header>
       <LoadError class="mb-3" :message="loadErrors['stats']" @retry="loadStats()" />
       <div :class="GRID">
         <StatCard v-for="s in assetCards" :key="s.label" v-bind="s" :loading="statsLoading" />
       </div>
-      <!-- 各部门文档数分布（偏科）| 文件类型分布 —— 一个框两半 -->
-      <div v-if="kbGovernance" :class="SPLIT" class="mt-4">
-        <div class="p-[15px]">
-          <div class="mb-2 flex items-baseline justify-between gap-2">
-            <span class="text-[12.5px] font-medium text-muted-foreground">各部门文档数分布</span>
-            <span class="text-[11px] text-faint">▲▼ = 本周净变化（篇）</span>
-          </div>
-          <ColumnChart :items="deptDocItems" unit=" 篇" empty="暂无文档。" />
-          <p class="mt-1 text-[11px] text-faint">柱高悬殊 = 知识偏科：少数部门撑起大部分语料。</p>
-        </div>
-        <div class="flex flex-col p-[15px]">
-          <p :class="SUBHEAD">文件类型分布</p>
-          <DonutChart :items="fileTypeItems" :center-value="fmtN(fileTotal)" center-label="篇" class="my-auto" empty="暂无文件。" />
-        </div>
-      </div>
-    </section>
-
-    <!-- 全库运行健康（状态分布 + 健康卡 + 近期入库趋势 + 部门覆盖与失衡 + 治理风险） -->
-    <!-- 状态分布按 kbStats（治理未就绪也显）；其余指标治理就绪才显（无对应数据如实空，不造数）。 -->
-    <section v-if="kbGovernance || kbStats" :class="SECTION">
-      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库运行健康</header>
-      <p :class="SUBHEAD" class="ml-0.5">状态分布</p>
+      <p :class="SUBHEAD" class="ml-0.5 mt-4">状态分布</p>
       <StatusDistBar :by-badge="kbStats?.by_badge || {}" />
       <template v-if="kbGovernance">
-        <div :class="GRID" class="mt-4">
-          <StatCard v-for="s in healthCards" :key="s.label" v-bind="s" />
+        <div class="mt-4 grid gap-x-10 lg:grid-cols-2">
+          <div>
+            <p :class="SUBHEAD">运行健康</p>
+            <VitalsList :items="vitalsHealth" />
+          </div>
+          <div class="mt-4 lg:mt-0">
+            <p :class="SUBHEAD">服务可用性</p>
+            <VitalsList :items="vitalsAvailability" />
+            <p :class="SUBHEAD" class="mt-3">治理风险</p>
+            <VitalsList :items="vitalsRisk" />
+          </div>
         </div>
-        <p :class="SUBHEAD" class="ml-0.5 mt-4">近期入库趋势（嵌入块数）</p>
-        <div class="rounded-2xl border border-border bg-surface p-[15px]">
-          <MiniTrend :items="embedTrend" empty="近期无入库批次记录。" />
-        </div>
-        <p :class="SUBHEAD" class="ml-0.5 mt-5">部门覆盖与失衡</p>
-        <DeptTable :rows="kbGovernance.dept_coverage" />
-        <p class="ml-0.5 mb-1 mt-1.5 text-[11.5px] text-faint">
-          覆盖多≠用得多：对照「已上线 vs 使用量」找出失衡部门；「无答案率」高 = 该部门文档被问到却答不好，「风险」= 含敏感信息文档数。
-        </p>
-        <p :class="SUBHEAD" class="ml-0.5 mt-5">治理风险</p>
-        <div :class="GRID3">
-          <StatCard v-for="s in riskCards" :key="s.label" v-bind="s" />
+        <div class="mt-5 grid gap-x-8 gap-y-4 border-t border-border/70 pt-4 lg:grid-cols-2">
+          <div>
+            <p :class="SUBHEAD">近期入库趋势（嵌入块数）</p>
+            <MiniTrend :items="embedTrend" empty="近期无入库批次记录。" />
+          </div>
+          <div>
+            <div class="mb-2 flex items-baseline justify-between gap-2">
+              <span class="text-[12.5px] font-medium text-muted-foreground">文件类型分布</span>
+              <span class="font-mono text-[11px] tabular-nums text-faint">共 {{ fmtN(fileTotal) }} 篇</span>
+            </div>
+            <div v-if="fileSegments.length" class="flex h-4 w-full overflow-hidden rounded-md" role="img"
+                 :aria-label="`文件类型：${fileSegments.map((f) => `${f.label} ${f.value} 篇`).join('，')}`">
+              <div v-for="f in fileSegments" :key="f.label" :style="`width:${Math.max(f.sharePct, 1.5)}%; ${f.style}`"
+                   :title="`${f.label} · ${f.value} 篇`" />
+            </div>
+            <p v-if="fileSegments.length" class="mt-1.5 text-[11px] text-faint">
+              {{ fileSegments.map((f) => `${f.label} ${f.sharePct < 1 ? '<1' : f.sharePct.toFixed(0)}%`).join(' · ') }}
+            </p>
+            <p v-else class="text-[12px] text-muted-foreground">暂无文件。</p>
+          </div>
         </div>
       </template>
     </section>
 
-    <!-- 服务可用性 -->
+    <!-- ② 组织覆盖（签名区）：归属轴=组织树。中心行卷积可展开;覆盖条+树表合并原三件套。 -->
     <section v-if="kbGovernance" :class="SECTION">
-      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>服务可用性</header>
-      <div :class="GRID3">
-        <StatCard v-for="s in availabilityCards" :key="s.label" v-bind="s" />
-      </div>
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>组织覆盖</header>
+      <OrgCoverageTable :rows="kbGovernance.dept_coverage" />
     </section>
 
     <!-- 全库知识效果 -->
@@ -284,27 +275,6 @@ const SPLIT = 'grid overflow-hidden rounded-2xl border border-border bg-surface 
           </div>
           <BarList bare :items="gapItems" tone="bg-st-warn" unit=" 次" empty="近期无「召回但未答好」的提问。" />
         </div>
-      </div>
-      <!-- 各部门使用量 + 使用量周环比（命中提问数；柱=当前窗口、徽标=本周净变化，两窗口下均为 7 天口径环比） -->
-      <div v-if="deptUsageItems.length" class="mt-3 rounded-2xl border border-border bg-surface p-[15px]" data-testid="dept-usage-block">
-        <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
-          <span class="text-[12.5px] font-medium text-muted-foreground" data-testid="dept-usage-title">各部门使用量（近 {{ usageWinEffective }} 天）</span>
-          <span class="flex items-center gap-2.5">
-            <span class="flex gap-0.5 rounded-lg border border-border bg-panel p-0.5">
-              <button
-                v-for="w in ([7, 30] as const)" :key="w" type="button" :data-testid="`dept-usage-win-${w}`"
-                class="rounded-md px-2.5 py-1 text-[11.5px] font-medium transition"
-                :class="usageWinEffective === w ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
-                :disabled="w === 7 && !usage7dAvailable"
-                :title="w === 7 && !usage7dAvailable ? '7 天口径未知（环比子查询失败），暂不可切' : ''"
-                @click="usageWin = w"
-              >近 {{ w }} 天</button>
-            </span>
-            <span class="text-[11px] text-faint">▲▼ = 本周使用量净变化（次）</span>
-          </span>
-        </div>
-        <ColumnChart :items="deptUsageItems" unit=" 次" :empty="`近 ${usageWinEffective} 天无检索记录。`" />
-        <p class="mt-1 text-[11px] text-faint">使用量 = 命中本部门文档的提问数；对照「各部门文档数」找覆盖多但用得少的部门。</p>
       </div>
     </section>
 

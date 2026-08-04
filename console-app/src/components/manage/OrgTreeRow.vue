@@ -61,13 +61,14 @@ const api = inject('orgPickerApi') as {
 </template>
 
 <style scoped>
-/* 行级样式住在行组件里 —— OrgTreePicker 的 scoped 样式不会穿透到子组件 DOM */
+/* 行级样式住在行组件里 —— OrgTreePicker 的 scoped 样式不会穿透到子组件 DOM。
+   2026-08-03:硬编码十六进制 → tokens.css 语义变量(暗色主题跳色,基线审计 ④) */
 .op-children { list-style: none; margin: 0; padding: 0 0 0 16px; }
 .op-row { display: flex; align-items: center; gap: 4px; padding: 2px 4px; border-radius: 5px; font-size: 12px; }
-.op-row.picked { background: #eef2ff; }
+.op-row.picked { background: var(--accent-soft); }
 .op-caret {
   width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center;
-  border: 0; background: transparent; cursor: pointer; color: var(--muted, #9ca3af);
+  border: 0; background: transparent; cursor: pointer; color: var(--muted);
   transition: transform .15s;
 }
 .op-caret.open { transform: rotate(90deg); }
@@ -76,13 +77,16 @@ const api = inject('orgPickerApi') as {
 .op-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .op-count {
   display: inline-flex; align-items: center; gap: 2px; padding: 0 5px; border-radius: 9px;
-  background: var(--chip, #f3f4f6); color: var(--muted, #6b7280); font-size: 11px; flex: none;
+  background: var(--panel); color: var(--muted); font-size: 11px; flex: none;
 }
 /* 0 人节点 = 授权给它没人能看到 —— 必须显眼 */
-.op-count.zero { background: #fef2f2; color: #b91c1c; font-weight: 600; }
+.op-count.zero {
+  background: color-mix(in srgb, var(--destructive) 12%, transparent);
+  color: var(--destructive); font-weight: 600;
+}
 .op-sub {
   flex: none; padding: 1px 7px; border-radius: 9px; font-size: 11px; cursor: pointer;
-  border: 1px solid var(--border, #e5e7eb); background: #fff; color: var(--muted, #6b7280);
+  border: 1px solid var(--border); background: var(--surface); color: var(--muted);
 }
-.op-sub.on { border-color: #6366f1; background: #eef2ff; color: #4338ca; }
+.op-sub.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-text); }
 </style>

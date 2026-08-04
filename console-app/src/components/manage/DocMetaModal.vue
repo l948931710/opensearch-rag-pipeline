@@ -4,7 +4,8 @@ import { X, Loader2 } from '@lucide/vue'
 import { apiJson } from '@/lib/api'
 import { deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
-import OrgTreePicker, { type PickedNode } from './OrgTreePicker.vue'
+import OrgTreeSelect from './OrgTreeSelect.vue'
+import type { PickedNode } from './OrgTreePicker.vue'
 
 /**
  * 「编辑信息」弹窗（阶段 B doc-meta 端点的 UI 面）：标题 / 分类 / 归属节点 / 可见节点集，
@@ -14,7 +15,7 @@ import OrgTreePicker, { type PickedNode } from './OrgTreePicker.vue'
  * D5（Sam 2026-08-01 拍板）：改标题/分类 = HA3 字段级刷新（下轮 stage-3 重推），
  * chunk 正文里嵌的旧标题不变——文案里如实说明。
  */
-const { docMetaCtx, closeDocMeta, loadDocs, isKbAdmin, nodeAclGrant } = useKb()
+const { docMetaCtx, closeDocMeta, loadDocs, isKbAdmin, isDeptAdmin, nodeAclGrant } = useKb()
 
 const meta = ref<any | null>(null)
 const loading = ref(false)
@@ -135,19 +136,19 @@ async function save() {
         </div>
 
         <template v-if="showNodeEditors">
+          <!-- 折叠式选择器（2026-08-03 改版）：弹窗不再被两棵整树撑到 86vh。
+               归属对 dept_admin 限管辖子树——与后端 D6「改归属须同管源与目标」对齐。 -->
           <div class="mb-3">
             <p class="mb-1.5 text-xs" :class="ownerNode.length ? 'text-muted-foreground' : 'text-st-busy'">
               归属节点（单选）
             </p>
-            <div class="max-h-48 overflow-y-auto rounded-[11px] border border-border bg-surface p-2">
-              <OrgTreePicker v-model="ownerNode" :multiple="false" :disabled="saving" />
-            </div>
+            <OrgTreeSelect v-model="ownerNode" mode="owner" data-testid="meta-owner-select"
+                           :restrict-to-managed="isDeptAdmin" :disabled="saving" />
           </div>
           <div class="mb-3">
             <p class="mb-1.5 text-xs text-muted-foreground">可见范围（多选，整体替换）</p>
-            <div class="max-h-48 overflow-y-auto rounded-[11px] border border-border bg-surface p-2">
-              <OrgTreePicker v-model="visibleNodes" :disabled="saving" />
-            </div>
+            <OrgTreeSelect v-model="visibleNodes" mode="visibility" data-testid="meta-visible-select"
+                           :disabled="saving" />
             <p v-if="ownerNode.length && !visibleNodes.some(p => p.dept_id === ownerNode[0].dept_id)"
                class="mt-1.5 text-[11px] text-st-busy">
               ⚠️ 归属部门不在可见范围内 —— 属主部门自己将看不到这篇文档

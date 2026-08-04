@@ -3,31 +3,90 @@ import { computed, ref, watch } from 'vue'
 import { UploadCloud, FileUp, X } from '@lucide/vue'
 import { UPLOAD_ACCEPT, PERM_LABEL, deptLabel } from '@/lib/kb'
 import { useKb } from '@/composables/useKb'
+import { useSession } from '@/stores/session'
+import { fetchOrgSnapshot, type OrgSnapshot } from '@/composables/useOrgSnapshot'
 import StatusPill from './StatusPill.vue'
-import OrgTreePicker from './OrgTreePicker.vue'
+import OrgTreeSelect from './OrgTreeSelect.vue'
 
 const {
   verCtx, newTitle, newOwner, newOwnerNode, newPerm, newShareDepts, newShareNodes, nodeAclGrant,
-  shareTargets, uploadTargetDepts, selectedNames,
+  shareTargets, uploadTargetDepts, selectedNames, isDeptAdmin, kbConfig,
   dupWarn, uploadBusy, uploadMsg, uploadErr, uploadOk, contentDupMsg, uploadQueue,
-  onFileSelected, doUpload, exitVersionMode, maxUploadMb,
+  onFileSelected, doUpload, exitVersionMode, maxUploadMb, maybeAutoSeedOwner,
 } = useKb()
+const session = useSession()
 
-// 阶段 B：归属节点默认预勾进可见集（Sam 裁决：**只是 UI 的显式默认值**——可取消，取消时
-// 警示"属主部门将看不到"；后端绝不偷偷补回）。换归属时把旧归属的预勾替换为新归属；
-// 用户手动移除后（同一归属内）不再回填。
-let seededOwner = 0
-watch(() => newOwnerNode.value[0]?.dept_id, (oid) => {
+// 阶段 B：归属节点默认预勾进可见集。⚠️ 档位语义（2026-08-03 Sam 拍板）：
+//  · 仅本部门：可见集**恒等于**归属子树（下方 ownerOnlyMode watch 强制同步，选择器不显示）；
+//  · 指定部门：归属仅是**可取消的默认值**（取消时警示"属主部门将看不到"，后端绝不偷偷补回）。
+// 换归属时把旧归属的预勾替换为新归属；用户手动移除后（同一归属内）不再回填。
+// 2026-08-03：旧实现用实例局部 seededOwner 记上一个归属——切 tab 重挂后归零，换归属时
+// 旧预勾清不掉（codex major）。改用 watch 自带的 oldOid，跨重挂载语义正确。
+watch(() => newOwnerNode.value[0]?.dept_id, (oid, oldOid) => {
   if (!oid) return
   const cur = newShareNodes.value
-  const withoutOld = seededOwner ? cur.filter((p) => p.dept_id !== seededOwner) : cur
+  const withoutOld = oldOid ? cur.filter((p) => p.dept_id !== oldOid) : cur
   if (!withoutOld.some((p) => p.dept_id === oid)) {
     newShareNodes.value = [{ dept_id: oid, subtree: true }, ...withoutOld]
   } else {
     newShareNodes.value = withoutOld
   }
-  seededOwner = oid
 })
+
+// 「仅本部门」语义修正（2026-08-03 Sam 拍板 + codex APPROVE）：node 模式下该档不再显示
+// 节点选择器——标签写「仅本部门」却能放行其他节点是阶段 B 遗留错位。可见集由本 watch
+// 恒同步为归属子树；从「指定部门」切回时已加的其他节点**有意丢弃**（这正是选该档的意图）。
+// immediate：上传表单是模块级 refs、watch 是实例级——重挂载也要恢复 owner-only 不变量。
+const ownerOnlyMode = computed(() =>
+  nodeAclGrant.value && !verCtx.value && newPerm.value === 'dept_internal')
+watch([ownerOnlyMode, () => newOwnerNode.value[0]?.dept_id], ([on, oid]) => {
+  if (!on) return
+  newShareNodes.value = oid ? [{ dept_id: oid, subtree: true }] : []
+}, { immediate: true })
+// 只读摘要：名称必显（快照缺节点退 #id），人数仅快照命中时显示（降级规则同 OrgTreeSelect）
+const ownerOnlySnapNode = computed(() => {
+  const oid = newOwnerNode.value[0]?.dept_id
+  return oid ? orgSnap.value?.nodes.find((n) => n.dept_id === oid) ?? null : null
+})
+const ownerOnlyName = computed(() => {
+  const oid = newOwnerNode.value[0]?.dept_id
+  return oid ? ownerOnlySnapNode.value?.name ?? `#${oid}` : ''
+})
+
+// ── 归属自动预填（Sam 拍板：dept_admin 单管辖根 ⇒ 预填并锁定、可点「更改」）──────
+// 快照仅在 node 模式需要；kbConfig 未回前不判定口径（过早按 legacy 播种会烧掉
+// autoSeedDoneFor 的每身份一次额度）。
+const orgSnap = ref<OrgSnapshot | null>(null)
+watch([() => kbConfig.value, nodeAclGrant], async () => {
+  if (!kbConfig.value) return
+  if (nodeAclGrant.value) {
+    try { orgSnap.value = await fetchOrgSnapshot() } catch { /* OrgTreeSelect 内有不可用态+重试 */ }
+    if (orgSnap.value) maybeAutoSeedOwner(orgSnap.value)
+  } else {
+    maybeAutoSeedOwner()
+  }
+}, { immediate: true })
+
+// 单管辖根锁定态：自动预填后归属显示为只读徽章；「更改」解锁为受限选择器（管辖子树内
+// 仍可选车间/班组级归属——后端判定就是后代集）。改后仍受后端 403 保护。
+const unlocked = ref(false)
+const singleRoot = computed(() => {
+  const s = orgSnap.value
+  if (!s || s.status !== 'fresh') return null
+  const roots = s.my_managed_node_roots
+  return roots && roots.length === 1 ? roots[0] : null
+})
+const singleRootName = computed(() => {
+  const id = singleRoot.value
+  return id == null ? '' : (orgSnap.value?.nodes.find((n) => n.dept_id === id)?.name ?? `#${id}`)
+})
+const ownerLocked = computed(() =>
+  !unlocked.value && isDeptAdmin.value && singleRoot.value !== null
+  && newOwnerNode.value.length === 1 && newOwnerNode.value[0].dept_id === singleRoot.value)
+
+// 身份切换：清 file input 的 DOM 残留（模块草稿由 useKb 的 principal watcher 清；
+// 原生 input 不清的话，新用户重选同名文件不触发 change——codex major）。
+watch(() => session.principalEpoch, () => { clearFiles(); unlocked.value = false })
 const ownerNotVisible = computed(() =>
   !!newOwnerNode.value.length
   && (newPerm.value === 'dept_internal' || newPerm.value === 'shared')
@@ -124,12 +183,19 @@ function onDrop(e: DragEvent) {
           <option v-for="o in uploadTargetDepts" :key="o" :value="o">{{ deptLabel(o) }}</option>
         </select>
       </label>
-      <!-- 阶段 B：归属 = 组织节点（级联单选，中心→部门→车间/班组；树深 5 递归可达） -->
+      <!-- 阶段 B：归属 = 组织节点（折叠式选择器；dept_admin 单管辖根自动预填并锁定，可「更改」） -->
       <div v-else class="flex flex-col gap-1 text-xs text-muted-foreground">
         <span :class="newOwnerNode.length ? '' : 'text-st-busy'">归属部门（组织架构，单选）</span>
-        <div class="max-h-56 overflow-y-auto rounded-md border border-input bg-card px-2 py-1.5">
-          <OrgTreePicker v-model="newOwnerNode" :multiple="false" :disabled="uploadBusy" />
+        <div v-if="ownerLocked"
+             class="flex items-center gap-2 rounded-md border border-input bg-card px-2.5 py-1.5">
+          <span class="min-w-0 flex-1 truncate text-sm text-foreground">{{ singleRootName }}
+            <span class="text-[11px] text-faint">（你的管辖部门）</span></span>
+          <button type="button"
+                  class="shrink-0 rounded border border-border px-2 py-0.5 text-[11.5px] text-accent-text transition hover:bg-accent-soft disabled:opacity-50"
+                  :disabled="uploadBusy" @click="unlocked = true">更改</button>
         </div>
+        <OrgTreeSelect v-else v-model="newOwnerNode" mode="owner" data-testid="owner-select"
+                       :restrict-to-managed="isDeptAdmin" :disabled="uploadBusy" />
       </div>
       <label class="flex flex-col gap-1 text-xs text-muted-foreground sm:col-span-2">
         可见范围
@@ -141,15 +207,26 @@ function onDrop(e: DragEvent) {
         </select>
       </label>
 
+      <!-- 仅本部门（node 模式）：可见集恒=归属子树，不给选择器——所见即所得（2026-08-03 拍板） -->
+      <div v-if="ownerOnlyMode" class="sm:col-span-3 text-xs text-muted-foreground">
+        <template v-if="newOwnerNode.length">
+          仅本部门可见：<span class="text-foreground">{{ ownerOnlyName }}</span>（含下级）<template
+            v-if="ownerOnlySnapNode"> · 约 {{ ownerOnlySnapNode.staff_count }} 人可见</template>
+          <span class="text-faint">{{ ' ' }}· 需要放行其他部门请选「指定部门」</span>
+        </template>
+        <template v-else><span class="text-st-busy">请先选择归属部门</span></template>
+      </div>
+
       <!-- 指定部门 · 组织架构口径（节点授权已对读侧生效时才出现）——
            ⚠️ 与下方组码 chips **二选一**：GRANT 关时写 node 授权会让新文档对所有人不可见
            （can_read_doc 无条件 DENY），故此处严格按后端回的 node_acl_grant 切换。 -->
-      <div v-if="nodeAclGrant && !verCtx && (newPerm === 'shared' || newPerm === 'dept_internal')" class="sm:col-span-3">
+      <div v-if="nodeAclGrant && !verCtx && newPerm === 'shared'" class="sm:col-span-3">
         <div class="mb-1.5 text-xs" :class="newShareNodes.length ? 'text-muted-foreground' : 'text-st-busy'">
           可见范围（按组织架构{{ newShareNodes.length ? `，已选 ${newShareNodes.length} 个节点` : '，至少选 1 个' }}）
           <span class="text-faint">· 归属部门已默认加入，可取消</span>
         </div>
-        <OrgTreePicker v-model="newShareNodes" :disabled="uploadBusy" />
+        <OrgTreeSelect v-model="newShareNodes" mode="visibility" data-testid="share-select"
+                       :disabled="uploadBusy" />
         <p v-if="ownerNotVisible" class="mt-1.5 text-[11.5px] text-st-busy">
           ⚠️ 归属部门不在可见范围内 —— 属主部门自己将看不到这篇文档
         </p>
