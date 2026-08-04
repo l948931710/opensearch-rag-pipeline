@@ -152,10 +152,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 <template>
   <div
     v-if="shareCtx"
-    class="fixed inset-0 z-[80] flex items-center justify-center bg-black/40 p-6"
+    class="kb-scrim fixed inset-0 z-[80] flex items-center justify-center bg-black/40 p-6"
     @click="close"
   >
-    <div class="w-[500px] max-w-full overflow-hidden rounded-2xl border border-border bg-card shadow-xl" @click.stop>
+    <div class="kb-pop w-[500px] max-w-full overflow-hidden rounded-2xl border border-border bg-card shadow-xl" @click.stop>
       <!-- 头 -->
       <div class="flex items-start gap-3 border-b border-border px-[22px] py-4">
         <span class="grid size-9 shrink-0 place-items-center rounded-[10px] bg-accent-soft text-accent-text"><Lock :size="17" :stroke-width="1.75" /></span>

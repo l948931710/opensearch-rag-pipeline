@@ -24,10 +24,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 <template>
   <div
     v-if="accessReqDoc"
-    class="fixed inset-0 z-[80] flex items-center justify-center bg-black/40 p-6"
+    class="kb-scrim fixed inset-0 z-[80] flex items-center justify-center bg-black/40 p-6"
     @click="close"
   >
-    <div class="w-[460px] max-w-full overflow-hidden rounded-2xl border border-border bg-card shadow-xl" @click.stop>
+    <div class="kb-pop w-[460px] max-w-full overflow-hidden rounded-2xl border border-border bg-card shadow-xl" @click.stop>
       <div class="p-[22px] pb-0">
         <div class="mb-3 flex items-center gap-2.5">
           <span class="grid size-9 place-items-center rounded-[10px] bg-accent-soft text-accent-text"><Lock :size="18" :stroke-width="1.75" /></span>

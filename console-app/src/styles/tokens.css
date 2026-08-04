@@ -62,13 +62,14 @@
      把该变量定义为 cubic-bezier(0,0,.2,1)——在 :root 里同名声明会**覆盖 Tailwind 的主题变量**，
      侧栏展开曲线被静默改掉（硬门 G2 抓到）。`--ease-*` 是 Tailwind 的保留命名空间，别进去。
      而 `ease` / `ease-out` 本身已是最清楚的名字，包一层只增风险不增可读性，故规则里直接写字面量。 */
-  --dur-fast:   140ms;   /* 状态与悬停反馈：.kb-card / .dropzone / .kb-trend-bar */
+  --dur-fast:   140ms;   /* 状态与悬停反馈：.kb-card / .dropzone / .kb-trend-bar / .kb-scrim */
+  --dur-base:   160ms;   /* 位移与尺寸：.kb-pop / .kb-toast-in（模态与 toast 入场） */
   --dur-reveal: 500ms;   /* 自我绘制入场：.kb-rise / .kb-in（另有 .kb-rise-top 也吃它，但那条
                             与已清除的 .kb-seg 一样是**孤儿规则**——全 src grep 零消费方，无 DOM
                             实例可测，硬门覆盖不到；本轮不顺手删，登记为独立跟进项） */
-  /* 本 scale 只收**已有消费方**的档位。曾一并定义过 --dur-base:160ms 作为「位移与尺寸」档，
-     但它唯一的出处 .kb-seg 已作为孤儿规则清除 —— 一个既无消费方、值也不再有来源的 token，
-     等于把「下一轮大概会用 160ms」这个猜测固化进公共命名空间。需要它的那一轮自己定义。 */
+  /* 本 scale 只收**已有消费方**的档位。--dur-base 曾在上一轮被移除（当时唯一出处 .kb-seg 作为
+     孤儿规则清掉了，留着等于把「下一轮大概会用 160ms」的猜测固化进公共命名空间），2026-08-04
+     模态入场落地时按同一规则重新定义 —— 它现在有 .kb-pop / .kb-toast-in 两个真实消费方。 */
   --curve-emphasis: cubic-bezier(.22, 1, .36, 1);   /* 图表入场那条 spring-ish，此前只有字面量没有名字。
                                                        刻意不叫 --ease-emphasis：见上，别碰 Tailwind 命名空间。 */
 }
@@ -332,3 +333,29 @@ body {
 /* 已清除 .kb-seg（2026-08-04）：stroke-width 是 SVG 专属，属 2026-08-03 fdc2648 删掉的
    DonutChart 遗留；全仓 grep 零消费方（有规则、无 DOM），与悬空的 .kb-cards（有 DOM、无规则）
    恰是一对镜像死代码，本轮一并清掉。 */
+
+/* ── 模态与 toast 入场（2026-08-04）───────────────────────────────────────────
+   两条**不可协商**的约束，都是踩出来的，改之前先读完：
+
+   ①【绝不加 animation-fill-mode】。帧冻结环境（后台/隐藏标签页、离屏预览面板、被遮挡窗口、
+      内嵌 webview）里动画不推进；无 fill-mode 时元素回落到基础样式 = 遮罩可见、面板可见可点。
+      一旦写 both/backwards，就永久停在 from 帧，而 fixed inset-0 遮罩此刻仍拦截全部点击——
+      结果是「什么都看不见且整页点不动」，比 AppShell 那次白屏（还能点侧栏自救）更无出路。
+      注意这与本文件 .kb-in / .vb-fade 用 both 不矛盾：那两个是页面内的装饰性内容块，不拦点击。
+
+   ②【起始帧只动 transform / background-color，绝不碰 opacity】。这是审计对 AppShell.vue:61-69
+      那次事故给的验收条件。严格说事故根因是 Vue <Transition>（靠 rAF 换 class，帧不来就永远停在
+      *-enter-from{opacity:0}），而纯 CSS 关键帧无 JS 依赖、配合①本可安全用 opacity——但收益只是
+      多一层淡入，而代价是把「模态是否会锁死整页」这件事的论证从「两条独立防线」降到「一条」。
+      不值得，故双保险。
+
+   ③ 出场动效**有意不做**：用 <Transition> 做离场，卡住 = 遮罩永驻 DOM 全站不可点；用 closing 态 +
+      setTimeout 则要给 6 个组件各加状态机并接 principalEpoch 竞态。而出场语义本就无歧义（内容没了）。
+
+   prefers-reduced-motion 由本文件 :169-177 的全局规则压成瞬时，此处无需再判。 */
+@keyframes kb-scrim-in { from { background-color: transparent; } }
+@keyframes kb-pop-in   { from { transform: translateY(8px) scale(.985); } }
+@keyframes kb-toast-in { from { transform: translateX(12px); } }
+.kb-scrim    { animation: kb-scrim-in var(--dur-fast) ease; }
+.kb-pop      { animation: kb-pop-in   var(--dur-base) var(--curve-emphasis); }
+.kb-toast-in { animation: kb-toast-in var(--dur-base) var(--curve-emphasis); }

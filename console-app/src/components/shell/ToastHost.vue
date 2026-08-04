@@ -56,7 +56,7 @@ function onAction(id: number, run: () => void) {
     >
       <li
         v-for="t in politeToasts" :key="t.id"
-        class="pointer-events-auto flex max-w-[min(360px,calc(100vw-2rem))] items-start gap-2 rounded-xl border bg-card px-3.5 py-2.5 shadow-lg"
+        class="kb-toast-in pointer-events-auto flex max-w-[min(360px,calc(100vw-2rem))] items-start gap-2 rounded-xl border bg-card px-3.5 py-2.5 shadow-lg"
         :class="TONE_CLASS[t.tone]"
       >
         <component :is="ICON[t.tone]" :size="15" :stroke-width="1.75" class="mt-px shrink-0" />
@@ -81,7 +81,7 @@ function onAction(id: number, run: () => void) {
     >
       <li
         v-for="t in errorToasts" :key="t.id"
-        class="pointer-events-auto flex max-w-[min(360px,calc(100vw-2rem))] items-start gap-2 rounded-xl border border-st-fail/35 bg-st-fail/5 px-3.5 py-2.5 shadow-lg"
+        class="kb-toast-in pointer-events-auto flex max-w-[min(360px,calc(100vw-2rem))] items-start gap-2 rounded-xl border border-st-fail/35 bg-st-fail/5 px-3.5 py-2.5 shadow-lg"
       >
         <AlertTriangle :size="15" :stroke-width="1.75" class="mt-px shrink-0 text-st-fail" />
         <span class="min-w-0 text-[12.5px] text-foreground">{{ t.text }}</span>

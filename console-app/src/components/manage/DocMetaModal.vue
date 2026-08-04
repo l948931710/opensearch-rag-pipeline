@@ -105,9 +105,9 @@ async function save() {
 </script>
 
 <template>
-  <div v-if="docMetaCtx" class="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4"
+  <div v-if="docMetaCtx" class="kb-scrim fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4"
        @click.self="closeDocMeta()">
-    <div class="max-h-[86vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-border bg-card p-5 shadow-xl">
+    <div class="kb-pop max-h-[86vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-border bg-card p-5 shadow-xl">
       <div class="mb-3 flex items-start justify-between gap-3">
         <div>
           <h3 class="text-[15px] font-semibold text-foreground">编辑信息</h3>

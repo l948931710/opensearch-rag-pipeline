@@ -21,10 +21,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 <template>
   <div
     v-if="verHistory"
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
+    class="kb-scrim fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
     @click.self="closeHistory"
   >
-    <div class="flex max-h-[84vh] w-[480px] max-w-full flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl">
+    <div class="kb-pop flex max-h-[84vh] w-[480px] max-w-full flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl">
       <!-- 头 -->
       <div class="flex items-center gap-2.5 border-b border-border px-[22px] py-[18px]">
         <History :size="18" :stroke-width="1.8" class="shrink-0 text-accent-text" />

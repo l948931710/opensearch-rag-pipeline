@@ -33,11 +33,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 <template>
   <div
     v-if="dialog.open"
-    class="fixed inset-0 z-[90] flex items-center justify-center bg-black/40 p-6"
+    class="kb-scrim fixed inset-0 z-[90] flex items-center justify-center bg-black/40 p-6"
     role="dialog" aria-modal="true"
     @click="onCancel"
   >
-    <div class="w-[440px] max-w-full overflow-hidden rounded-2xl border border-border bg-card shadow-xl" @click.stop>
+    <div class="kb-pop w-[440px] max-w-full overflow-hidden rounded-2xl border border-border bg-card shadow-xl" @click.stop>
       <div class="p-[22px] pb-0">
         <div class="mb-2.5 flex items-center gap-2.5">
           <span
