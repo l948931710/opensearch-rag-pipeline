@@ -134,7 +134,7 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
     commit=False 为只读预览（统计 drift，不写）。Returns 统计 dict，**绝不抛**（失败进 errors）。
     flag 关 → 直接返回 skipped（投影路径全程惰性，零写）。
     """
-    result = {"approved": 0, "materialized": 0, "retracted": 0, "unchanged": 0,
+    result = {"approved": 0, "materialized": 0, "retracted": 0, "unchanged": 0, "certified": 0,
               "reset_chunks": 0, "capped": False, "skipped": False, "errors": []}
     if not get_config().rag.allowed_depts_acl:
         result["skipped"] = True
@@ -227,6 +227,13 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
                     status = outcome["status"]
                     if status == "unchanged":
                         result["unchanged"] += 1
+                    elif status == "certified":
+                        # C3′/062：值本就正确、只补盖 epoch 章（不动 index_status、不重推 HA3）。
+                        # ⚠️ **必须单独提交** —— 本函数只在 materialized/retracted 分支 commit，
+                        # 漏掉 certified 会让刚写的 epoch 要么丢、要么被下一篇的 commit 意外带上。
+                        result["certified"] = result.get("certified", 0) + 1
+                        if commit:
+                            conn.commit()
                     elif status in ("materialized", "retracted"):
                         result[status] += 1
                         result["reset_chunks"] += outcome["reset_chunks"]

@@ -275,6 +275,50 @@ def resolve_allowed_depts_one(doc_id: str, cursor) -> List[str]:
     return resolve_allowed_depts([doc_id], cursor).get(doc_id, [])
 
 
+def projection_rows_all_match(cursor, doc_id: str, version_no: int,
+                             want_allowed: List[str], want_owner: str) -> bool:
+    """**逐行**确认该版本全部 active chunk 的 `(owner_dept, allowed_depts)` 都等于期望值。
+
+    C3′/062 certify-only 专用（codex 2026-08-03 BLOCKER）：**不能用
+    `current_allowed_for_doc` 的并集口径来 certify** —— 并集会掩盖逐行不一致。
+    反例：期望 `["finance"]`，一行是 `["finance"]`、另一行是 `NULL`，**并集仍等于期望**，
+    据此盖章就把"一半 chunk 根本没投影"认证成了"已按权威投影"。
+
+    与 diff 口径的分工：
+      · `current_allowed_for_doc`（并集）→ 判**要不要重投影**（少计只会朝重投影自愈，安全）
+      · 本函数（逐行全等）→ 判**能不能盖章**（宁可不盖，绝不误认证）
+    坏 JSON / 任何一行不匹配 ⇒ 直接 False（fail-closed，交由正常 materialize 重投影）。
+    """
+    import json as _json
+    _want = sorted(want_allowed or [])
+    cursor.execute(
+        f"SELECT owner_dept, allowed_depts FROM {_kb_db()}.chunk_meta "
+        "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+        (doc_id, version_no),
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        return False                      # 无 active chunk：没有可认证的对象
+    for owner, ad in rows:
+        if (owner or "") != (want_owner or ""):
+            return False
+        if isinstance(ad, list):
+            got = sorted(ad)
+        elif not ad:
+            got = []
+        else:
+            try:
+                parsed = _json.loads(ad)
+                got = sorted(parsed) if isinstance(parsed, list) else None
+            except (ValueError, TypeError):
+                return False              # 坏 JSON ⇒ 不认证
+            if got is None:
+                return False
+        if got != _want:
+            return False
+    return True
+
+
 def current_allowed_for_doc(cursor, doc_id: str, version_no: int) -> List[str]:
     """该 doc 指定版本 active chunk 现存的 allowed_depts 并集（去重、稳定排序）。
 
@@ -429,6 +473,19 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         # 集合相等而非"首项相等"：混合 owner（部分 chunk 已投影、部分还挂旧 owner）必须判漂移
         _owner_set = _current_owner_set_for_doc(cursor, doc_id, ver)
         if sorted(want) == have and _owner_set == {_owner}:
+            # C3′/062 certify-only（codex PROPOSED CHANGE 3）：值已正确但 epoch 落后/为 NULL 时，
+            # **只盖章、不动 index_status** —— 否则「值对但 acl_epoch IS NULL」的文档永远盖不上章、
+            # 永久 dirty（这是 72c9e22 落码时的缺口：此处在 stamp 之前就 return 了）。
+            # ⚠️ 认证判据必须**逐行全等**，不能用上面 `have` 的并集口径（并集会掩盖
+            #    「一行 ["finance"]、一行 NULL」这种一半没投影的情况）。
+            if _stamp and projection_rows_all_match(cursor, doc_id, ver, want, _owner):
+                cursor.execute(
+                    f"UPDATE {_kb_db()}.chunk_meta SET acl_epoch=%s "
+                    "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+                    (_auth_epoch, doc_id, ver),
+                )
+                if cursor.rowcount:
+                    return {"status": "certified", "reset_chunks": 0, "version_no": ver}
             return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
         status = "materialized" if want else "retracted"
         if not apply:
@@ -467,6 +524,19 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
     have = current_allowed_for_doc(cursor, doc_id, ver)
     _owner_set = _current_owner_set_for_doc(cursor, doc_id, ver)
     if sorted(want) == have and _owner_set == {_owner}:
+        # C3′/062 certify-only（codex PROPOSED CHANGE 3）：值已正确但 epoch 落后/为 NULL 时，
+        # **只盖章、不动 index_status** —— 否则「值对但 acl_epoch IS NULL」的文档永远盖不上章、
+        # 永久 dirty（这是 72c9e22 落码时的缺口：此处在 stamp 之前就 return 了）。
+        # ⚠️ 认证判据必须**逐行全等**，不能用上面 `have` 的并集口径（并集会掩盖
+        #    「一行 ["finance"]、一行 NULL」这种一半没投影的情况）。
+        if _stamp and projection_rows_all_match(cursor, doc_id, ver, want, _owner):
+            cursor.execute(
+                f"UPDATE {_kb_db()}.chunk_meta SET acl_epoch=%s "
+                "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+                (_auth_epoch, doc_id, ver),
+            )
+            if cursor.rowcount:
+                return {"status": "certified", "reset_chunks": 0, "version_no": ver}
         return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
     status = "materialized" if want else "retracted"
     if not apply:
@@ -617,7 +687,8 @@ def drain_acl_projection_outbox(commit: bool = True, limit: int = 200) -> dict:
                         )
                         result["locked"] += 1
                     else:
-                        # unchanged / materialized / retracted / skipped → 投影意图已落实 → 标 done
+                        # unchanged / certified / materialized / retracted / skipped → 投影意图已落实 → 标 done
+                        # （certified = 值本就正确、只补盖 epoch 章；意图同样已落实，刻意归此支）
                         cur.execute(
                             f"UPDATE {_kb_db()}.kb_acl_projection_outbox "
                             "SET done_at=NOW(), last_error=NULL, updated_at=NOW()" + _w, _wp,

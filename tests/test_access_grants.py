@@ -399,3 +399,63 @@ def test_stage2_chunk_insert_stamps_epoch_and_is_capability_aware():
     assert src.index("_proj_ok = False") > 0
     # 姿态 A：RDS 投影不再受 flag 门控
     assert "if valid_chunks:" in src, "allowed_depts 计算仍被 flag 门控（应为姿态 A：始终计算）"
+
+
+# ── C3′/062 B2：certify-only（值对但 epoch 落后 ⇒ 只盖章不重推）────────────────
+def test_projection_rows_all_match_rejects_union_masking():
+    """★ 逐行校验必须拒绝「并集恰好等于期望」的半投影状态。
+
+    codex 反例：期望 ["finance"]，一行 ["finance"]、一行 NULL —— `current_allowed_for_doc`
+    的并集仍等于期望，据此盖章就把「一半 chunk 根本没投影」认证成了「已按权威投影」。
+    """
+    from opensearch_pipeline.access_grants import projection_rows_all_match
+
+    class _Cur:
+        def __init__(self, rows): self.rows = rows
+        def execute(self, sql, params=None): pass
+        def fetchall(self): return self.rows
+
+    # 全等 ⇒ 可认证
+    assert projection_rows_all_match(
+        _Cur([("finance", '["finance"]'), ("finance", '["finance"]')]), "D", 1, ["finance"], "finance")
+    # 并集相等但逐行不等 ⇒ **必须拒绝**
+    assert not projection_rows_all_match(
+        _Cur([("finance", '["finance"]'), ("finance", None)]), "D", 1, ["finance"], "finance")
+    # owner 漂移 ⇒ 拒绝
+    assert not projection_rows_all_match(
+        _Cur([("finance", '["finance"]'), ("production", '["finance"]')]), "D", 1, ["finance"], "finance")
+    # 坏 JSON ⇒ 拒绝（fail-closed）
+    assert not projection_rows_all_match(
+        _Cur([("finance", "{坏的")]), "D", 1, ["finance"], "finance")
+    # 无 active chunk ⇒ 没有可认证对象
+    assert not projection_rows_all_match(_Cur([]), "D", 1, ["finance"], "finance")
+
+
+def test_materialize_has_certify_path_before_returning_unchanged():
+    """★ 值相等时不得直接 return unchanged —— 必须先尝试 certify（只盖章、不动 index_status）。
+
+    这正是 72c9e22 落码时的缺口：两个分支都在 stamp 之前 return，
+    「值对但 acl_epoch IS NULL」的文档永远盖不上章、永久 dirty。
+    """
+    import inspect
+    from opensearch_pipeline import access_grants
+    src = inspect.getsource(access_grants.materialize_doc_allowed_depts)
+    assert src.count('"certified"') == 2, "node 与 legacy 两个分支都必须有 certify 路径"
+    assert "projection_rows_all_match" in src, "certify 未用逐行校验（并集口径会误认证）"
+    # certify 只写 epoch，绝不置 NOT_INDEXED（否则会无谓触发全量重推 HA3）
+    for seg in src.split('"certified"')[:-1]:
+        tail = seg[-400:]
+        assert "SET acl_epoch=%s" in tail, "certify 分支未只写 acl_epoch"
+        assert "NOT_INDEXED" not in tail.split("SET acl_epoch=%s")[-1], \
+            "certify 分支不得置 NOT_INDEXED（值没变就不该重推）"
+
+
+def test_reconcile_commits_certified_status():
+    """★ reconcile 只在 materialized/retracted 时 commit —— 漏掉 certified 会让刚写的 epoch
+    要么丢、要么被下一篇的 commit 意外带上（B1 的事务语义在此露头）。"""
+    import inspect
+    from opensearch_pipeline import allowed_depts_reconcile
+    src = inspect.getsource(allowed_depts_reconcile.reconcile_allowed_depts)
+    assert 'status == "certified"' in src, "reconcile 未识别 certified"
+    seg = src.split('status == "certified"')[1][:400]
+    assert "conn.commit()" in seg, "certified 分支未提交 —— epoch 会丢"

@@ -172,12 +172,13 @@ approved 跨部门授权 0**；`RAG_ALLOWED_DEPTS_ACL` env 未设 ⇒ 默认 **F
 
 ### ⛔ B2 · certify 未闭环 —— **其中一条是第 1 步已落码的潜伏缺口**
 
-- 🔴 **`materialize` 在投影值相等时于 stamp 之前就 `return unchanged`**（node `:431` / legacy `:469`）
-  ⇒ **「值正确但 `acl_epoch IS NULL`」的文档永远盖不上章、永久 dirty**。
-  **这是 commit `72c9e22` 里的既有缺口**；今天不咬人（生产零 active chunk），**开 sweep 前必须先修**。
-- 🔴 `current_allowed_for_doc` 用 `vals = set()` **取并集**（`:290`）⇒ 期望 `["finance"]` 时
-  一行 `["finance"]` + 一行 `NULL` 并集仍相等 —— **并集掩盖逐行不一致**。
-  **正确 certify 必须逐 active chunk 验证规范化后的 `(owner_dept, allowed_depts)`。**
+- ✅ **已修（2026-08-03，同会话）**：`materialize` 值相等时不再直接 `return unchanged`，而是先走
+  **certify-only**（只写 `acl_epoch`、**不动 `index_status`**、不重推 HA3），两个分支都有；
+  `reconcile` 增加 `certified` 提交分支（漏掉它 epoch 会丢或被下一篇 commit 意外带上）；
+  outbox drain 的 else 支已覆盖 `certified`（投影意图确实已落实，刻意归此支）。
+- ✅ **已修**：新增 `projection_rows_all_match()` **逐行**校验替代并集口径作为**认证判据**。
+  分工写死：`current_allowed_for_doc`（并集）判**要不要重投影**（少计只朝重投影自愈，安全）；
+  新 helper（逐行全等）判**能不能盖章**（宁可不盖，绝不误认证）。坏 JSON/任一行不符 ⇒ 拒绝。
 - reconcile 候选仍是旧来源，**没有 `acl_epoch IS NULL/<` 这一路**（`allowed_depts_reconcile.py:203`）
 - legacy 预筛仍 current-only（`:74`）⇒「current 干净、旧 active 版 dirty」会被提前判 unchanged
 - 缺 `chunk.acl_epoch > dm.acl_epoch` 的**不变量破坏阻断告警**
