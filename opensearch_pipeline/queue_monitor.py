@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,8 @@ def run_queue_aging_check(*, alert: bool = True) -> Dict[str, Any]:
             "   AND (handled_status IS NULL OR handled_status NOT IN ('RESOLVED','DISMISSED'))"),
     }
     queues: Dict[str, Any] = {}
+
+    probe_errors: List[str] = []
     breaches = []
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -93,15 +95,24 @@ def run_queue_aging_check(*, alert: bool = True) -> Dict[str, Any]:
                         if backlog > backlog_max:
                             breaches.append({"queue": name, "kind": "backlog",
                                              "backlog": backlog, "max": backlog_max})
-                    except Exception as e:  # noqa: BLE001 — 单队列失败诚实记 error，不拖垮其余
+                    except Exception as e:  # noqa: BLE001 — 单队列失败不拖垮其余，但必须冒到顶层
                         queues[name] = {"error": str(e)}
+                        probe_errors.append(f"{name}: {type(e).__name__}: {e}")
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001
         logger.exception("queue_aging: 连接失败")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    report = {"ok": not breaches, "queues": queues, "breaches": breaches}
+    # ⚠️ **探针失败必须进顶层 `errors`**（附录B，2026-08-03 核实的假绿）：此前每个失败只写进
+    # `queues[name]["error"]`，而 `ok` 只看 `breaches` ⇒ 探针 SQL 挂掉时 breaches 空、ok=True、
+    # 顶层无 error 键 ⇒ `ops_monitor._job_exit` 落到 `return 0 if ok` ⇒ **exit 0 全绿**。
+    # 极端情况下所有探针都失败（如 schema 变更打挂全部 SQL），监控什么都没测却报健康。
+    # 探针坏掉是 **error(exit 3)**，不是 drift(exit 2) —— 两者必须可辨。
+    report = {"ok": (not breaches) and (not probe_errors),
+              "queues": queues, "breaches": breaches}
+    if probe_errors:
+        report["errors"] = probe_errors
     if alert and breaches:
         try:
             from opensearch_pipeline.alerting import send_ops_alert
@@ -157,6 +168,8 @@ def run_ingest_funnel_check(*, alert: bool = True) -> Dict[str, Any]:
             f"   AND dv.content_process_status IN ('NEEDS_REVIEW','FAILED')"),
     }
     buckets: Dict[str, Any] = {}
+
+    probe_errors: List[str] = []
     problems = []
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -169,15 +182,20 @@ def run_ingest_funnel_check(*, alert: bool = True) -> Dict[str, Any]:
                         buckets[name] = {"count": int(cnt), "worst_hours": int(worst or 0)}
                         if int(cnt) > 0:
                             problems.append(name)
-                    except Exception as e:  # noqa: BLE001
+                    except Exception as e:  # noqa: BLE001 — 同 queue_aging：必须冒到顶层
                         buckets[name] = {"error": str(e)}
+                        probe_errors.append(f"{name}: {type(e).__name__}: {e}")
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001
         logger.exception("ingest_funnel: 连接失败")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    report = {"ok": not problems, "buckets": buckets, "problems": problems}
+    # 同 queue_aging：探针失败进顶层 errors（否则 ok=True + 无 error 键 ⇒ exit 0 假绿）
+    report = {"ok": (not problems) and (not probe_errors),
+              "buckets": buckets, "problems": problems}
+    if probe_errors:
+        report["errors"] = probe_errors
     if alert and problems:
         try:
             from opensearch_pipeline.alerting import send_ops_alert
