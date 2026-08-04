@@ -176,3 +176,36 @@ def test_read_triplet_missing_doc_none(monkeypatch):
     from opensearch_pipeline import api
     monkeypatch.setattr(api, "_kb_node_capability", lambda cur: "present")
     assert api._kb_read_doc_triplet(_Cur(None), "nope") is None
+
+
+# ── 条件列存在性一律按 capability 判定，不用 len(row)（2026-08-04）───────────────
+
+def test_no_length_heuristic_for_conditional_acl_columns():
+    """★ 禁止用 `len(r) > N` 探测 `_mc`（acl_mode / owner_dept_id）这两列是否存在。
+
+    那是**长度启发式**：只要给同一条 SELECT **追加任何新列**（哪怕加在末位），判据就恒真
+    ⇒ 新列被当成 `acl_mode` 读、`owner_dept_id` 读到错值 —— 而这是 **ACL 判定轴**，
+    错了**不报错、只错权限**。
+    2026-08-04 落 R1 时差点踩上：想给 my-docs 加 `m.acl_revision`，`len(r) > 13` 会立刻恒真。
+    """
+    import pathlib
+    import re
+    src = pathlib.Path("opensearch_pipeline/routes/kb_console.py").read_text(encoding="utf-8")
+    bad = []
+    for m in re.finditer(r"len\(r\)\s*>\s*\d+", src):
+        line_no = src[:m.start()].count("\n") + 1
+        line = src.splitlines()[line_no - 1].strip()
+        bad.append(f"{line_no}: {line[:100]}")
+    assert not bad, (
+        "条件列存在性又用回了长度启发式（加尾列即静默错位）：\n  " + "\n  ".join(bad))
+
+
+def test_conditional_acl_columns_are_read_by_capability():
+    """正向：三处 `_mode, _oid` 解包都必须按 capability 分派。"""
+    import pathlib
+    src = pathlib.Path("opensearch_pipeline/routes/kb_console.py").read_text(encoding="utf-8")
+    sites = [ln for ln in src.splitlines() if "_mode, _oid = ((r[" in ln]
+    assert len(sites) == 3, f"预期 3 处行级解包，实得 {len(sites)}"
+    for ln in sites:
+        assert '== "present"' in ln, f"未按 capability 判定：{ln.strip()[:100]}"
+

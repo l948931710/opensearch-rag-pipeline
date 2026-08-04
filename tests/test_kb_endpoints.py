@@ -2547,3 +2547,59 @@ def test_feedback_review_no_truncation_when_within_limits(monkeypatch):
     out = _feedback_review(monkeypatch, [_fb_row(f"m{i}") for i in range(3)])
     assert out.truncated_messages is False and out.truncated_scan is False
     assert len(out.items) == 3
+
+
+def test_appending_a_column_no_longer_corrupts_acl_mode(monkeypatch):
+    """★★ 行为级证明：给 my-docs 的行**追加一列**后，`acl_mode` 不得被污染。
+
+    这正是 2026-08-04 落 R1 时差点造成的形态：capability='absent'（行里**没有**
+    acl_mode/owner_dept_id），但因为追加了 `m.acl_revision`，`len(r) > 13` 恒真
+    ⇒ 把那个整数当成 `acl_mode` 读 ⇒ 文档被判成 node 模式（或落进 `_kb_node_names` 查询）。
+    **ACL 判定轴错了不报错、只错权限**，所以必须有行为级守卫，不能只靠源码扫描。
+    """
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "absent")
+    seen_node_ids = []
+    monkeypatch.setattr(kb_console, "_kb_node_names",
+                        lambda cur, ids: seen_node_ids.extend(ids) or {})
+    monkeypatch.setattr(kb_console, "_kb_usage_enrich", lambda cur, ids: {})
+    monkeypatch.setattr(kb_console, "_kb_badge_counts", lambda *a, **k: {})
+    # 13 个基础列 + **1 个追加列**（模拟 m.acl_revision），capability=absent ⇒ 无 _mc
+    row = ("D1", "标题", "f.pdf", "hr", "dept_internal", 1, "active", "2026-08-04",
+           "DONE", "SUCCESS", "PUBLISHED", "", "", 77)
+    _stub_multi(monkeypatch, [[row]])
+    resp = api.kb_my_docs(request=None, identity=api.Identity(user_id="kb1"))
+    assert resp.items, "用例前提：应返回一行"
+    assert seen_node_ids == [], (
+        f"追加列被当成 owner_dept_id 送进了节点名查询：{seen_node_ids} —— ACL 判定轴已被污染")
+    assert resp.items[0].owner_dept == "hr"
+
+
+def test_appending_two_columns_does_not_silently_flip_acl_mode(monkeypatch):
+    """★★ 比上一条更可怕的一格：**追加两列**时旧写法不会崩，会**静默**把它们读成
+    `acl_mode` / `owner_dept_id`。
+
+    追加一列 ⇒ `r[14]` 越界 ⇒ IndexError（至少会响）；
+    追加**两列** ⇒ `r[13]`/`r[14]` 都在 ⇒ 无异常、文档被判成 node 模式、
+    那个整数被当作 `owner_dept_id` 送进节点名查询 —— **不报错、只错权限**。
+    """
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "absent")
+    seen_node_ids = []
+    monkeypatch.setattr(kb_console, "_kb_node_names",
+                        lambda cur, ids: seen_node_ids.extend(ids) or {})
+    monkeypatch.setattr(kb_console, "_kb_usage_enrich", lambda cur, ids: {})
+    monkeypatch.setattr(kb_console, "_kb_badge_counts", lambda *a, **k: {})
+    row = ("D1", "标题", "f.pdf", "hr", "dept_internal", 1, "active", "2026-08-04",
+           "DONE", "SUCCESS", "PUBLISHED", "", "", 77, 88)      # 追加**两**列
+    _stub_multi(monkeypatch, [[row]])
+    resp = api.kb_my_docs(request=None, identity=api.Identity(user_id="kb1"))
+    assert seen_node_ids == [], (
+        f"追加的两列被静默当成 acl_mode/owner_dept_id：{seen_node_ids}")
+    assert resp.items[0].owner_dept == "hr", "归属轴被污染"

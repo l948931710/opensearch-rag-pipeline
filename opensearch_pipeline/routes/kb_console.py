@@ -25,6 +25,13 @@ from opensearch_pipeline.request_context import get_request_id
 
 # api 驻留共享件（模型/助手/依赖）。from-import 拷贝绑定在这里是安全的：
 # 这些名字均不在 tests 的 api monkeypatch 清单内（见 routes/__init__.py）。
+# ⚠️ **条件列的存在性判定一律用 capability，不用 `len(row)`**（2026-08-04）。
+# `_mc = ", acl_mode, owner_dept_id" if cap == "present" else ""` 这类条件列的消费点，
+# 曾用 `if len(r) > N` 探测「这行带没带那两列」。那是**长度启发式**：
+# 只要给同一条 SELECT **追加任何新列**（哪怕加在末位），判据就恒真 ⇒ 新列会被当成
+# `acl_mode` 读、`owner_dept_id` 读到越界或错值 —— 而这是**ACL 判定轴**，错了不报错、只错权限。
+# 2026-08-04 落 R1 时差点踩上（想给 my-docs 加 `m.acl_revision`）。六处已全部改成
+# `cap == "present"`；`tests/test_kb_doc_scope.py` 有守卫防回潮。
 from opensearch_pipeline.api import (
     Identity,
     KbDocItem,
@@ -315,7 +322,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
                 node_names = _kb_node_names(
-                    cur, [r[14] for r in rows[:limit] if len(r) > 14 and r[14]])
+                    cur, [r[14] for r in rows[:limit] if cap == "present" and r[14]])
         finally:
             conn.close()
     except HTTPException:
@@ -329,7 +336,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     items = []
     for r in rows[:limit]:
         (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks, cpe) = r[:13]
-        _mode, _oid = ((r[13] or "legacy"), r[14]) if len(r) > 13 else ("legacy", None)
+        _mode, _oid = ((r[13] or "legacy"), r[14]) if cap == "present" else ("legacy", None)
         _okey, _olabel = _kb_owner_dto(_mode, owner or "", _oid, node_names)
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
@@ -416,7 +423,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
                 node_names = _kb_node_names(
-                    cur, [r[13] for r in rows[:limit] if len(r) > 13 and r[13]])
+                    cur, [r[13] for r in rows[:limit] if _bcap == "present" and r[13]])
         finally:
             conn.close()
     except HTTPException:
@@ -434,7 +441,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
     items = []
     for r in rows[:limit]:
         (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r[:12]
-        _mode, _oid = ((r[12] or "legacy"), r[13]) if len(r) > 12 else ("legacy", None)
+        _mode, _oid = ((r[12] or "legacy"), r[13]) if _bcap == "present" else ("legacy", None)
         _okey, _olabel = _kb_owner_dto(_mode, owner or "", _oid, node_names)
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
@@ -534,7 +541,7 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
                 )
                 rows = cur.fetchall()
                 _stats_node_names = _kb_node_names(
-                    cur, [r[5] for r in rows if len(r) > 5 and r[5]])
+                    cur, [r[5] for r in rows if cap == "present" and r[5]])
                 # 当前已索引分块总数（设计「全库已索引 chunk」口径）；取数失败仅置 0，不拖垮主统计。
                 # kb_admin（无作用域 clause）走无 JOIN 的原查询：JOIN 会把没有 document_meta 行的
                 # 孤儿分块从全库口径里悄悄减掉，那是治理端的信号、不该由统计端替它抹平。
@@ -577,7 +584,7 @@ def kb_stats(request: Request, identity: Optional[Identity] = Depends(current_id
     node_facets: Dict[str, str] = {}     # key(node:<id>) → label
     for r in rows:
         status, badge, owner, n = r[0], r[1], r[2], r[3]
-        _mode, _oid = ((r[4] or "legacy"), r[5]) if len(r) > 4 else ("legacy", None)
+        _mode, _oid = ((r[4] or "legacy"), r[5]) if cap == "present" else ("legacy", None)
         n = int(n or 0)
         total += n
         # 语义与旧 Python 逐行分桶逐字节一致：active 判定 (status or 'active')=='active'；
