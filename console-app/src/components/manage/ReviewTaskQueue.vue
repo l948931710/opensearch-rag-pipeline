@@ -12,6 +12,7 @@ import LoadError from './LoadError.vue'
 const {
   reviewTasks, loadReviewTasks, loadErrors,
   showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
+  reviewTasksHasMore,
 } = useKb()
 const { promptText } = useDialog()
 
@@ -107,6 +108,15 @@ const TYPE_LABEL: Record<string, string> = {
           </template>
         </div>
       </div>
+    </div>
+    <!-- P2-11：后端 limit=20 此前静默截断——复审任务是安全网承诺，第 21 条以后
+         在界面上根本不存在。与审核队列/GapList 同款加载更多。 -->
+    <div v-if="reviewTasksHasMore" class="mt-2 text-center">
+      <button
+        type="button" data-testid="review-task-load-more"
+        class="rounded-lg border border-border px-4 py-1.5 text-[12.5px] font-medium text-foreground transition hover:border-border-strong"
+        @click="loadReviewTasks((reviewTasks || []).length)"
+      >加载更多</button>
     </div>
     <p class="ml-0.5 mt-2 text-[11.5px] text-faint">
       管线安全网登记的人工复审（权限抽查不一致等）——先用「谁能看到 / 调整可见范围 / 退役」核实并整改文档，再回来标记已处理。

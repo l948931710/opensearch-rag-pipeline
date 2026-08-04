@@ -93,6 +93,7 @@ const gapsWindowDays = ref(30)
 const myContribs = ref<ContributionItem[]>([])
 const pendingContribs = ref<ContributionItem[]>([])
 const pendingHasMore = ref(false)   // 批次ε-1：>50 条时后端 has_more 此前被静默丢弃（假满员）
+const mineHasMore = ref(false)      // P2-11：同款——loadMine 也丢过 has_more（>50 条的贡献者看不到旧稿）
 const heroes = ref<HeroItem[]>([])
 const deptHeroes = ref<DeptScoreItem[]>([])       // 部门榜（同分按一级部门求和）
 const myDeptHeroes = ref<HeroItem[]>([])          // 本部门个人榜
@@ -198,14 +199,20 @@ async function toggleGapContext(g: GapItem) {
   finally { g.ctxLoading = false }
 }
 
-async function loadMine() {
+async function loadMine(offset = 0) {
   const s = useSession()
-  if (import.meta.env.DEV && s.token === 'dev-preview') { myContribs.value = _previewMine(); return }
+  if (import.meta.env.DEV && s.token === 'dev-preview') { myContribs.value = _previewMine(); mineHasMore.value = false; return }
   clearLoadError('mine')
   try {
-    const r = await apiJson<ContribListResp>('/api/kb/contributions/mine?limit=50', { auth: true })
-    myContribs.value = r.items || []
-  } catch (e) { myContribs.value = []; noteLoadError('mine', e) }
+    // P2-11：后端一直返回 has_more（contribution.py:741），此前被丢弃 ⇒ 贡献 >50 条的人
+    // 只能看到最新 50 条、旧稿无从翻到，且界面看起来像「就这些」（与 pending 的 ε-1 同型）。
+    const r = await apiJson<ContribListResp>(`/api/kb/contributions/mine?limit=50&offset=${offset}`, { auth: true })
+    myContribs.value = offset ? [...myContribs.value, ...(r.items || [])] : (r.items || [])
+    mineHasMore.value = !!r.has_more
+  } catch (e) {
+    if (!offset) myContribs.value = []
+    noteLoadError('mine', e)
+  }
 }
 
 async function loadPending(offset = 0) {
@@ -390,7 +397,7 @@ export function useContribute() {
   // 待你审核的贡献数（红点/角标单一来源）。
   const reviewCount = computed(() => pendingContribs.value.length)
   return {
-    gaps, gapsSummary, gapsWindowDays, myContribs, pendingContribs, pendingHasMore, heroes, loadingGaps, loadErrors, isBusy,
+    gaps, gapsSummary, gapsWindowDays, myContribs, pendingContribs, pendingHasMore, mineHasMore, heroes, loadingGaps, loadErrors, isBusy,
     deptHeroes, myDeptHeroes, myDeptName,
     modalOpen, formQuestion, formContent, formDept, formWarning, submitBusy, submitErr, submitOk,
     CONTRIB_DEPT_OPTS, canManage, reviewCount,

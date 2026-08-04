@@ -1240,6 +1240,7 @@ class KbReviewTaskItem(BaseModel):
 
 class KbReviewTasksResponse(BaseModel):
     items: List[KbReviewTaskItem] = Field(default_factory=list)
+    has_more: bool = False        # P2-11：此前只回 items，前端无从知道被 limit 截了
 
 
 _KB_REVIEW_DONE = ("RESOLVED", "DISMISSED")
@@ -1268,24 +1269,30 @@ def _monitor_dead(age_h, expected: bool) -> bool:
 
 
 @router.get("/api/kb/review-tasks", response_model=KbReviewTasksResponse)
-def kb_review_tasks(request: Request, limit: int = 20, include_closed: bool = False,
+def kb_review_tasks(request: Request, limit: int = 20, offset: int = 0,
+                    include_closed: bool = False,
                     identity: Optional[Identity] = Depends(current_identity)):
     """入库复审任务队列（只读，kb_admin）。默认只列 PENDING、不设时间窗、按龄升序
     （安全网任务是承诺不是日志）；include_closed=True 连已处置一并返回（近 90 天）。"""
     _enforce_rate_limit(request, identity, scope="aux")
     _require_kb_admin(identity)
     limit = max(1, min(limit, 50))
-    cache_key = ("review_tasks", limit, include_closed)
+    offset = max(0, min(int(offset or 0), _KB_MAX_OFFSET))
+    # ⚠️ offset 必须进 cache key —— 漏了它，第 2 页会命中第 1 页的缓存条目，
+    # 「加载更多」表现为把同一页重复追加（越点越多重复项）。
+    cache_key = ("review_tasks", limit, offset, include_closed)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
     open_pred = f"(t.review_status IS NULL OR t.review_status NOT IN ({sql_in_list(_KB_REVIEW_DONE)}))"
     if include_closed:
         where = f"(({open_pred}) OR t.created_at >= DATE_SUB(NOW(), INTERVAL 90 DAY))"
-        order = "ORDER BY (" + open_pred + ") DESC, t.created_at DESC"
+        # tiebreaker 见 d2c8e12：created_at 是 DATETIME（秒），批量入库的任务成片同秒，
+        # 没有唯一列时 OFFSET 翻页会漏行/重行。task_id 有 uk_task_id 唯一键。
+        order = "ORDER BY (" + open_pred + ") DESC, t.created_at DESC, t.task_id DESC"
     else:
         where = open_pred
-        order = "ORDER BY t.created_at ASC"
+        order = "ORDER BY t.created_at ASC, t.task_id ASC"
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
@@ -1298,7 +1305,7 @@ def kb_review_tasks(request: Request, limit: int = 20, include_closed: bool = Fa
                     " t.created_at, DATEDIFF(NOW(), t.created_at)"
                     f" FROM {_kb_db()}.review_task t"
                     f" LEFT JOIN {_kb_db()}.document_meta m ON m.doc_id = t.doc_id"
-                    f" WHERE {where} {order} LIMIT %s", (limit,))
+                    f" WHERE {where} {order} LIMIT %s OFFSET %s", (limit + 1, offset))
                 rows = cur.fetchall() or []
         finally:
             conn.close()
@@ -1312,7 +1319,9 @@ def kb_review_tasks(request: Request, limit: int = 20, include_closed: bool = Fa
         logger.warning("kb_review_tasks 查询失败（空列表，non-fatal）[trace=%s]: %s", trace_id, e)
         return KbReviewTasksResponse()
     out = KbReviewTasksResponse()
-    for (tid, doc_id, title, ver, rtype, reason, owner, sperm, st, rname, created, age) in rows:
+    # 多取一条判 has_more（与 my-docs / contributions 同款），本页只渲染 limit 条。
+    out.has_more = len(rows) > limit
+    for (tid, doc_id, title, ver, rtype, reason, owner, sperm, st, rname, created, age) in rows[:limit]:
         st = str(st or "PENDING").upper() or "PENDING"
         out.items.append(KbReviewTaskItem(
             task_id=str(tid), doc_id=str(doc_id or ""), title=str(title or ""),

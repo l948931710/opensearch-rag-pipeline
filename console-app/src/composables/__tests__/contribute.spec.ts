@@ -697,3 +697,45 @@ describe('GapList — phrasings chip 与上下文展开', () => {
     expect(w.find('[data-testid="gap-ctx-panel"]').text()).toContain('无会话上文')
   })
 })
+
+// ── P2-11：loadMine 此前丢弃 has_more（>50 条的贡献者看不到旧稿）────────────────
+describe('useContribute.loadMine 分页', () => {
+  it('消费 has_more；offset>0 追加而非替换；offset=0 回首页替换', async () => {
+    const calls: string[] = []
+    const page = (ids: string[], has_more: boolean) => ({
+      items: ids.map((id) => ({ contribution_id: id, question: id, state: 'pending', created_at: '' })),
+      has_more,
+    })
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      calls.push(String(url))
+      const off = /offset=(\d+)/.exec(String(url))?.[1] ?? '0'
+      return { ok: true, status: 200, json: async () => (off === '0' ? page(['a', 'b'], true) : page(['c'], false)) }
+    }))
+    const c = useContribute()
+    await c.loadMine()
+    expect(c.myContribs.value.map((x) => x.contribution_id)).toEqual(['a', 'b'])
+    expect(c.mineHasMore.value).toBe(true)
+    expect(calls[0]).toContain('offset=0')
+
+    await c.loadMine(c.myContribs.value.length)
+    expect(c.myContribs.value.map((x) => x.contribution_id)).toEqual(['a', 'b', 'c'])
+    expect(c.mineHasMore.value).toBe(false)
+    expect(calls[1]).toContain('offset=2')
+
+    await c.loadMine()   // 回首页 → 替换
+    expect(c.myContribs.value.map((x) => x.contribution_id)).toEqual(['a', 'b'])
+  })
+
+  it('翻页失败不清空已加载的前几页（只有首屏失败才清空）', async () => {
+    let n = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      n += 1
+      if (n === 1) return { ok: true, status: 200, json: async () => ({ items: [{ contribution_id: 'a', question: 'a', state: 'pending', created_at: '' }], has_more: true }) }
+      return { ok: false, status: 500, json: async () => ({}), text: async () => 'boom' }
+    }))
+    const c = useContribute()
+    await c.loadMine()
+    await c.loadMine(1)
+    expect(c.myContribs.value.map((x) => x.contribution_id)).toEqual(['a'])
+  })
+})

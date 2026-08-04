@@ -648,3 +648,39 @@ describe('useKb.approve/reject — 审批后定向更新（#82）', () => {
     expect(calls.filter((c) => c === '/api/kb/access-requests')).toHaveLength(0)   // 队列 GET 未发生
   })
 })
+
+// ── P2-11：review-tasks 此前只回 items，limit=20 静默截断（安全网承诺被截掉不留痕）──
+describe('useKb.loadReviewTasks 分页', () => {
+  it('消费 has_more；offset>0 追加；offset=0 替换；include_closed 与 offset 共存', async () => {
+    const s = useSession(); s.setToken('T'); s.setIdentity({ userId: 'k', role: 'kb_admin', canManage: true } as never)
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(String(url))
+      const off = /offset=(\d+)/.exec(String(url))?.[1] ?? '0'
+      return { ok: true, status: 200, json: async () => (
+        off === '0'
+          ? { items: [{ task_id: 't1' }, { task_id: 't2' }], has_more: true }
+          : { items: [{ task_id: 't3' }], has_more: false }) }
+    }))
+    const kb = useKb()
+    await kb.loadReviewTasks()
+    expect((kb.reviewTasks.value || []).map((x) => x.task_id)).toEqual(['t1', 't2'])
+    expect(kb.reviewTasksHasMore.value).toBe(true)
+
+    await kb.loadReviewTasks((kb.reviewTasks.value || []).length)
+    expect((kb.reviewTasks.value || []).map((x) => x.task_id)).toEqual(['t1', 't2', 't3'])
+    expect(kb.reviewTasksHasMore.value).toBe(false)
+    expect(new URL(urls[1], 'http://x').searchParams.get('offset')).toBe('2')
+
+    await kb.loadReviewTasks()
+    expect((kb.reviewTasks.value || []).map((x) => x.task_id)).toEqual(['t1', 't2'])
+    // include_closed 开关不得把 offset 挤掉。⚠️ 必须**解析** query 而非 toContain——
+    // 误用 '?' 拼接会得到 `?offset=2?include_closed=true`，两个子串都还"含"在里面，
+    // toContain 断言会全绿放行一个坏掉的 URL（这条反证曾真的没打红）。
+    kb.toggleShowClosedReviewTasks()
+    await kb.loadReviewTasks(2)
+    const q = new URL(urls[urls.length - 1], 'http://x').searchParams
+    expect(q.get('offset')).toBe('2')
+    expect(q.get('include_closed')).toBe('true')
+  })
+})

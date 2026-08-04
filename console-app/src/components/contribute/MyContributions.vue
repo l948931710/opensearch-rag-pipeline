@@ -10,7 +10,7 @@ import ContribBadge from './ContribBadge.vue'
 // 批次ε-2：行可展开看原稿（此前 content 完全不渲染，被驳回后原稿不可见=只能凭记忆重打）；
 // 被驳回行「修改重交」带旧稿重开表单（新 contribution_id 重提，原驳回记录保留审计）；
 // failed 行透出失败原因（ingestion_error，老后端缺字段→兜底句）。
-const { myContribs, loadErrors, isBusy, canManage, loadMine, retryContribution, openModal } = useContribute()
+const { myContribs, mineHasMore, loadErrors, isBusy, canManage, loadMine, retryContribution, openModal } = useContribute()
 
 const expanded = ref<Record<string, boolean>>({})
 function toggleExpand(id: string) { expanded.value = { ...expanded.value, [id]: !expanded.value[id] } }
@@ -134,6 +134,14 @@ function reopen(c: ContributionItem) {
         >{{ c.content }}</div>
       </div>
       <p v-if="!myContribs.length" class="px-[18px] py-8 text-center text-[12.5px] text-muted-foreground">还没有贡献，去「待回答」挑一个问题回答吧。</p>
+      <!-- P2-11：>50 条时后端 has_more 此前被丢弃（假满员）——与审核队列/GapList 同款 -->
+      <div v-if="mineHasMore" class="border-t border-border p-3 text-center">
+        <button
+          type="button" data-testid="mycontrib-load-more"
+          class="rounded-lg border border-border px-4 py-1.5 text-[12.5px] font-medium text-foreground transition hover:border-border-strong"
+          @click="loadMine(myContribs.length)"
+        >加载更多</button>
+      </div>
     </div>
   </section>
 </template>

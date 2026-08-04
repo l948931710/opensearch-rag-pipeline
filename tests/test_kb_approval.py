@@ -212,5 +212,97 @@ def test_reject_defaults_reason_when_absent(monkeypatch, audit):
     assert _updates(conn)[0][1][0] == "rejected"
 
 
+
+
+# ── P2-11：review-tasks 分页（此前只回 items，limit=20 静默截断）──────────────
+
+def _review_tasks(monkeypatch, n_rows, *, limit=20, offset=0, include_closed=False):
+    """桩：SELECT review_task 回 n_rows 行（端点多取一条判 has_more）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline.routes import kb_console
+
+    seen = {}
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def execute(self, sql, params=None):
+            seen["sql"] = " ".join(sql.split())
+            seen["params"] = params
+
+        def fetchall(self):
+            return [(f"T{i}", "D1", "标题", 1, "spot_check_mismatch", "r", "hr",
+                     "restricted", "PENDING", "", "2026-08-03", 3) for i in range(n_rows)]
+
+        def fetchone(self): return None
+
+    class _Cn:
+        def cursor(self): return _C()
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _Cn())
+    monkeypatch.setattr(kb_console, "_dashboard_cache_get", lambda k: None)
+    monkeypatch.setattr(kb_console, "_dashboard_cache_put", lambda k, v: None)
+    from opensearch_pipeline import api
+    out = api.kb_review_tasks(request=None, limit=limit, offset=offset,
+                              include_closed=include_closed,
+                              identity=api.Identity(user_id="kb1"))
+    return out, seen
+
+
+def test_review_tasks_reports_has_more_and_trims_the_probe_row(monkeypatch):
+    """多取一条判 has_more，但**不得**把那条渲染出去（否则每页多一条、翻页错位）。"""
+    out, seen = _review_tasks(monkeypatch, 21, limit=20)
+    assert out.has_more is True
+    assert len(out.items) == 20, "探测行必须被裁掉"
+    assert "LIMIT %s OFFSET %s" in seen["sql"]
+    assert seen["params"] == (21, 0), "取 limit+1 条"
+
+
+def test_review_tasks_last_page_has_no_more(monkeypatch):
+    out, _ = _review_tasks(monkeypatch, 20, limit=20)
+    assert out.has_more is False and len(out.items) == 20
+
+
+def test_review_tasks_order_by_has_unique_tiebreaker(monkeypatch):
+    """新增 OFFSET 分页不得重演 d2c8e12：created_at 是秒精度，必须带 task_id。"""
+    _, seen_open = _review_tasks(monkeypatch, 1, include_closed=False)
+    _, seen_closed = _review_tasks(monkeypatch, 1, include_closed=True)
+    for tag, seen in (("open", seen_open), ("closed", seen_closed)):
+        order = seen["sql"].split("ORDER BY")[1].split("LIMIT")[0]
+        assert "t.task_id" in order, f"{tag} 分支 ORDER BY 缺唯一 tiebreaker：{order}"
+
+
+def test_review_tasks_cache_key_includes_offset(monkeypatch):
+    """offset 必须进 cache key —— 漏了它第 2 页会命中第 1 页缓存（加载更多变成重复追加）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline.routes import kb_console
+    keys = []
+    monkeypatch.setattr(kb_console, "_dashboard_cache_get", lambda k: keys.append(k) or None)
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): pass
+        def fetchall(self): return []
+        def fetchone(self): return None
+
+    class _Cn:
+        def cursor(self): return _C()
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _Cn())
+    monkeypatch.setattr(kb_console, "_dashboard_cache_put", lambda k, v: None)
+    from opensearch_pipeline import api
+    api.kb_review_tasks(request=None, offset=0, identity=api.Identity(user_id="kb1"))
+    api.kb_review_tasks(request=None, offset=20, identity=api.Identity(user_id="kb1"))
+    assert keys[0] != keys[1], f"两页 cache key 相同 ⇒ 第 2 页会吃第 1 页缓存：{keys}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

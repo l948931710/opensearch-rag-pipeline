@@ -224,6 +224,7 @@ const showResolvedFeedback = ref(false)   // 「显示已处理」切换：默�
 const feedbackResolveBusy = ref<Set<string>>(new Set())   // 处置在途（按 message_id）
 // 入库复审任务队列（盲区审计 P2-33：review_task 补消费端，kb_admin 专属）。
 const reviewTasks = ref<ReviewTaskItem[] | null>(null)
+const reviewTasksHasMore = ref(false)   // P2-11：后端 limit=20 此前静默截断，前端无从知道还有
 const showClosedReviewTasks = ref(false)
 const reviewTaskResolveBusy = ref<Set<string>>(new Set())
 // 共享目标可选项 = 10 个用户面 ACL 组码（与后端 sanitize 白名单同源；生产子线是 owner 粒度、非读者组）。
@@ -1362,7 +1363,7 @@ export interface ReviewTaskItem {
 }
 
 /** 拉入库复审任务队列（kb_admin 专属）：默认只列 PENDING（不设时间窗、老单先出）。 */
-async function loadReviewTasks() {
+async function loadReviewTasks(offset = 0) {
   const s = useSession()
   if (s.role !== 'kb_admin') { reviewTasks.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -1373,13 +1374,18 @@ async function loadReviewTasks() {
         created_at: '2026-06-25 08:10', age_days: 9, status: 'PENDING', closed: false, reviewer_name: '' },
     ]
     reviewTasks.value = showClosedReviewTasks.value ? all : all.filter((x) => !x.closed)
+    reviewTasksHasMore.value = false
     return
   }
   clearLoadError('reviewTasks')
   try {
-    const qs = showClosedReviewTasks.value ? '?include_closed=true' : ''
-    const r = await apiJson<{ items: ReviewTaskItem[] }>(`/api/kb/review-tasks${qs}`, { auth: true })
-    reviewTasks.value = r.items || []
+    // P2-11：后端 limit 默认 20 且此前不回 has_more —— 复审任务是「安全网承诺」，
+    // 静默截断意味着第 21 条以后的隐患在界面上根本不存在。offset>0=追加，0=回首页替换。
+    const qs = showClosedReviewTasks.value ? '&include_closed=true' : ''
+    const r = await apiJson<{ items: ReviewTaskItem[]; has_more?: boolean }>(
+      `/api/kb/review-tasks?offset=${offset}${qs}`, { auth: true })
+    reviewTasks.value = offset ? [...(reviewTasks.value || []), ...(r.items || [])] : (r.items || [])
+    reviewTasksHasMore.value = !!r.has_more
   } catch (e) { reviewTasks.value = reviewTasks.value ?? []; noteLoadError('reviewTasks', e) }
 }
 
@@ -1757,7 +1763,7 @@ export function useKb() {
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     feedbackReview, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
     feedbackReviewView, loadFeedbackReviewView, fbStats, loadFeedbackStats,
-    reviewTasks, loadReviewTasks, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
+    reviewTasks, loadReviewTasks, reviewTasksHasMore, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, accessNoteOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
