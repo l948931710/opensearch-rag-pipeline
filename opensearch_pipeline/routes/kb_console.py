@@ -2459,6 +2459,13 @@ class KbSetVisibilityRequest(BaseModel):
     doc_id: str
     permission_level: str            # dept_internal / public / restricted（受 sanitize）
     reason: Optional[str] = None
+    # R1（Sam 2026-08-04 拍板「纳入 CAS」）：与 doc-meta 编辑端点同一并发域。
+    # ⚠️ 现阶段**可选**而非必填：本端点有多个既有调用方（DocTable 行级 / ShareDocModal /
+    # 批量改可见范围 / 批量退役间接路径），一步改必填会全线 400。
+    # 姿态：**带了就强制 CAS（不匹配 409）**；没带则按现状放行，但**无论如何都 bump**
+    # —— 这样 doc-meta 侧的 CAS 立刻能感知到可见范围变更（原本完全感知不到）。
+    # 🔴 待办：全部调用方确认送该字段后，翻成缺失即 400（与 doc-meta 端点齐平）。
+    expected_acl_revision: Optional[int] = None
 
 
 class KbSetVisibilityResponse(BaseModel):
@@ -3380,7 +3387,7 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
             with conn.cursor() as cur:
                 _cap = _kb_node_capability(cur)
                 _mc = ", acl_mode, owner_dept_id" if _cap == "present" else ""
-                cur.execute(f"SELECT owner_dept, permission_level, status, current_version_no{_mc} "
+                cur.execute(f"SELECT owner_dept, permission_level, status, current_version_no{_mc}, acl_revision "
                             f"FROM {_kb_db()}.document_meta WHERE doc_id=%s FOR UPDATE", (req.doc_id,))
                 row = cur.fetchone()
                 if not row:
@@ -3390,6 +3397,18 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                 _mode, _oid = ((row[4] or "legacy"), row[5]) if _cap == "present" else ("legacy", None)
                 if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权修改该文档（owner_dept 不在管理范围）")
+                # R1：CAS 校验必须在**授权判定之后** —— 否则无权用户带个陈旧版本号会拿到 409
+                # 而不是 403（既泄露"这篇存在且刚被改过"，也把安全检查次序打乱）。
+                # acl_revision **追加在 SELECT 末位** ⇒ 既有位置索引 0..5 逐字不变（与 loader 的
+                # `_pov_col`/`_epoch_col` 同款纪律：插中间会静默移位、造成比原 bug 更坏的错配）。
+                # 老桩/老行形态可能没有这一列（长度不足）⇒ 视为 0，不因缺列打成 500。
+                _cur_rev = int((row[6 if _cap == "present" else 4] or 0)
+                               if len(row) > (6 if _cap == "present" else 4) else 0)
+                if (req.expected_acl_revision is not None
+                        and int(req.expected_acl_revision) != _cur_rev):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"文档信息已被他人修改（当前版本 {_cur_rev}），请刷新后重试")
                 # public 涉及全公司可见 → 收窄/放宽均需 kb_admin（与 retire/restore/上传同款不对称）
                 if (target == "public" or cur_perm == "public") and kb.role != ROLE_KB_ADMIN:
                     raise HTTPException(status_code=403, detail="涉及全公司公开的可见范围变更需知识库管理员操作")
@@ -3414,7 +3433,10 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                     raise HTTPException(status_code=409, detail=_vg)
 
                 # 1) 基础级别：document_meta（声明意图）
-                cur.execute(f"UPDATE {_kb_db()}.document_meta SET permission_level=%s, updated_at=NOW() "
+                # R1：**恒 bump** —— 可见范围变更此前完全不进 acl_revision 并发域，
+                # doc-meta 侧的 CAS 因此对它毫无感知（两个管理员同时改，后写者静默赢）。
+                cur.execute(f"UPDATE {_kb_db()}.document_meta "
+                            "SET permission_level=%s, acl_revision=acl_revision+1, updated_at=NOW() "
                             "WHERE doc_id=%s", (target, req.doc_id))
                 # 1b) 版本级意图：让 stage-2 的 raw_key 解析不再覆盖回去（063；未 apply 则降级跳过）。
                 # 写到该文档**全部 active 版本**：stage-2 认领哪一版都得带上同一意图，且幂等。

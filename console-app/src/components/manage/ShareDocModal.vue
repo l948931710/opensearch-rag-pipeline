@@ -111,7 +111,9 @@ async function onPickLevel(key: string) {
   })
   if (!okGo) return
   err.value = ''; visBusy.value = key
-  const e = await setVisibility(d as DocItem, key, '权限弹窗调整')
+  // R1：本弹窗开启即拉 doc-meta，手上有权威 acl_revision ⇒ 送上做 CAS（零额外请求）。
+  const e = await setVisibility(d as DocItem, key, '权限弹窗调整',
+                                { expectedAclRevision: docMeta.value?.acl_revision ?? null })
   visBusy.value = ''
   if (e) { err.value = e; return }
   // 成功：受限 = 已离开检索，直接关闭（列表会刷新）；其余留在弹窗以便继续调共享。

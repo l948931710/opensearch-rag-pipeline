@@ -1572,21 +1572,31 @@ async function saveNodeGrants(
  * N 篇 = N+1 次全量列表拉取，烧 aux 限流且批中列表反复重置分页/闪动）。
  * 返回 null=成功；string=错误文案。 */
 async function setVisibility(d: DocItem, level: string, reason = '',
-                             opts: { reload?: boolean } = {}): Promise<string | null> {
+                             opts: { reload?: boolean; expectedAclRevision?: number | null } = {},
+                             ): Promise<string | null> {
   return withInflight(`vis:${d.doc_id}`, async () => {
     try {
       const s = useSession()
       if (import.meta.env.DEV && s.token === 'dev-preview') { d.permission_level = level; return null }
       await apiJson('/api/kb/set-visibility', {
         method: 'POST', auth: true,
-        body: JSON.stringify({ doc_id: d.doc_id, permission_level: level, ...(reason ? { reason } : {}) }),
+        // R1（Sam 2026-08-04）：带上 expected_acl_revision ⇒ 后端强制 CAS，并发改动返 409。
+        // ⚠️ 只有**手上确实有**该版本号的调用方才传（ShareDocModal 开弹窗即拉 doc-meta）；
+        // 批量路径暂不传 —— 后端对"没带"按现状放行，但**无论如何都 bump**，
+        // 所以 doc-meta 侧的 CAS 立刻能感知到可见范围变更（原本完全感知不到）。
+        body: JSON.stringify({
+          doc_id: d.doc_id, permission_level: level, ...(reason ? { reason } : {}),
+          ...(opts.expectedAclRevision != null ? { expected_acl_revision: opts.expectedAclRevision } : {}),
+        }),
       })
       d.permission_level = level                     // 乐观即时反映
       if (opts.reload !== false) void loadDocs()     // 权威纠正（restricted→可能掉出列表/改徽章）
       return null
     } catch (e: any) {
+      // 409 现在有两种成因：非在线状态（旧）/ acl_revision CAS 落空（R1，新）。
+      // 后端 detail 已分别写明，原样透出即可，别再套死"该文档非在线状态"。
       return e && e.status === 403 ? (e.detail || '无权修改该文档可见范围')
-        : e && e.status === 409 ? (e.detail || '该文档非在线状态') : uploadErrText(e)
+        : e && e.status === 409 ? (e.detail || '该文档状态已变化，请刷新后重试') : uploadErrText(e)
     }
   }) as Promise<string | null>
 }

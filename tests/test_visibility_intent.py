@@ -89,8 +89,10 @@ def _sqls(conn, prefix):
     return [(s, p) for s, p in conn.calls if s.startswith(prefix)]
 
 
-def _meta(perm="dept_internal", status="active", ver=2):
-    return ("hr", perm, status, ver)
+def _meta(perm="dept_internal", status="active", ver=2, rev=7):
+    # R1：SELECT 末位追加了 acl_revision（capability=absent ⇒ 索引 4）。
+    # 追加在末位是硬约束——既有索引 0..3 逐字不变。
+    return ("hr", perm, status, ver, rev)
 
 
 # ── 互斥闸：正在入库/推索引 ⇒ 409（且必须是可重试语义）────────────────────────
@@ -180,3 +182,109 @@ def test_widening_without_pending_version_applies_immediately(monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── R1（Sam 2026-08-04 拍板「纳入 CAS」）───────────────────────────────────────
+
+def test_stale_acl_revision_rejected_with_409(monkeypatch):
+    """★ 带了 expected_acl_revision 且与库中不符 ⇒ 409，且**409 之前不得有任何写**。"""
+    _skip_if_not_sim()
+    conn = _Conn(meta_row=_meta(rev=9))
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "absent")
+    with pytest.raises(Exception) as ei:
+        api.kb_set_visibility(
+            api.KbSetVisibilityRequest(doc_id="D1", permission_level="public",
+                                       expected_acl_revision=3),   # 陈旧
+            request=None, identity=api.Identity(user_id="kb1"))
+    assert getattr(ei.value, "status_code", None) == 409
+    assert "9" in str(getattr(ei.value, "detail", "")), "409 文案应带当前版本号供前端提示"
+    assert not _sqls(conn, "UPDATE"), "CAS 落空前不得有任何写"
+
+
+def test_matching_acl_revision_passes(monkeypatch):
+    """对照：版本号匹配 ⇒ 照常放行。"""
+    _skip_if_not_sim()
+    conn = _Conn(meta_row=_meta(rev=9))
+    _call_with_rev = None
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "absent")
+    api.kb_set_visibility(
+        api.KbSetVisibilityRequest(doc_id="D1", permission_level="public",
+                                   expected_acl_revision=9),
+        request=None, identity=api.Identity(user_id="kb1"))
+    assert _sqls(conn, "UPDATE"), "版本号匹配却没放行"
+
+
+def test_omitted_revision_still_bumps(monkeypatch):
+    """★ 没带 CAS 字段（批量路径）⇒ 按现状放行，但**必须仍然 bump**。
+
+    不 bump 的话，doc-meta 侧的 CAS 对可见范围变更**完全感知不到** —— 那正是 R1 要修的。
+    """
+    _skip_if_not_sim()
+    conn = _Conn(meta_row=_meta(rev=9))
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "absent")
+    api.kb_set_visibility(
+        api.KbSetVisibilityRequest(doc_id="D1", permission_level="public"),   # 不带
+        request=None, identity=api.Identity(user_id="kb1"))
+    meta_ups = [s for s, _ in conn.calls
+                if s.startswith("UPDATE") and "document_meta SET permission_level" in s]
+    assert meta_ups and "acl_revision=acl_revision+1" in meta_ups[0], (
+        "可见范围变更未 bump acl_revision ⇒ doc-meta 的 CAS 感知不到它")
+
+
+def test_acl_revision_index_is_capability_aware(monkeypatch):
+    """★ capability='present' 时 SELECT 多出 acl_mode/owner_dept_id 两列
+    ⇒ acl_revision 落在索引 **6** 而非 4。索引写死会静默读错列（读到 owner_dept_id）。
+
+    ⚠️ 本仓这类「条件列 + 位置索引」已出过多次错位；此处显式覆盖 present 分支，
+    否则只测 absent 会让「索引写死 4」这个回归完全隐形（反证实测过：确实不打红）。
+    """
+    _skip_if_not_sim()
+    # present 形态：(owner, perm, status, ver, acl_mode, owner_dept_id, acl_revision)
+    conn = _Conn(meta_row=("hr", "dept_internal", "active", 2, "legacy", None, 11))
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "present")
+    with pytest.raises(Exception) as ei:
+        api.kb_set_visibility(
+            api.KbSetVisibilityRequest(doc_id="D1", permission_level="public",
+                                       expected_acl_revision=3),
+            request=None, identity=api.Identity(user_id="kb1"))
+    assert getattr(ei.value, "status_code", None) == 409
+    assert "11" in str(getattr(ei.value, "detail", "")), (
+        "present 分支读到的不是 acl_revision（很可能读成了 owner_dept_id）")
+
+
+def test_authz_is_checked_before_cas(monkeypatch):
+    """★ 无权用户即使带陈旧版本号，也必须得 **403 而非 409**。
+
+    CAS 若排在授权之前，会泄露「这篇存在且刚被人改过」，并且把安全检查次序打乱。
+    （本条源于一次真实回归：我把 CAS 放到了 `_kb_can_manage_doc` 之前，被既有用例抓出。）
+    """
+    _skip_if_not_sim()
+    conn = _Conn(meta_row=_meta(rev=9))
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
+    monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")   # 与文档 owner "hr" 不符
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "absent")
+    with pytest.raises(Exception) as ei:
+        api.kb_set_visibility(
+            api.KbSetVisibilityRequest(doc_id="D1", permission_level="dept_internal",
+                                       expected_acl_revision=3),   # 陈旧，但不该轮到它说话
+            request=None, identity=api.Identity(user_id="da1"))
+    assert getattr(ei.value, "status_code", None) == 403, "CAS 抢在了授权之前"
