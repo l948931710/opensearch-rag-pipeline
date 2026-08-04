@@ -404,7 +404,7 @@ describe('useKb 主动共享（多部门可见度）', () => {
   it('setVisibility 403 → 返回文案、不改本地级别', async () => {
     const d2: DocItem = { ...doc, doc_id: 'D9', permission_level: 'dept_internal' }
     vi.stubGlobal('fetch', routeFetch({
-      setVis: jsonResp({ detail: '涉及全公司公开的可见范围变更需知识库管理员操作' }, { ok: false, status: 403 }),
+      setVis: jsonResp({ detail: '仅知识库管理员可变更全公司公开的可见范围' }, { ok: false, status: 403 }),
     }))
     const kb = useKb()
     setIdentity('dept_admin', ['marketing'])
@@ -520,7 +520,7 @@ describe('useKb.retire', () => {
 
   it('403（公开文档需 kb_admin）→ 返回失败 + detail', async () => {
     const d: DocItem = { doc_id: 'd2', title: 'pub', original_filename: '', owner_dept: 'hr', permission_level: 'public', current_version_no: 1, status: 'active', status_badge: '已上线', updated_at: '' }
-    vi.stubGlobal('fetch', routeFetch({ retire: jsonResp({ detail: '公开文档需知识库管理员退役' }, { ok: false, status: 403 }) }))
+    vi.stubGlobal('fetch', routeFetch({ retire: jsonResp({ detail: '仅知识库管理员可退役公开文档' }, { ok: false, status: 403 }) }))
     const kb = useKb()
     const r = await kb.retire(d)
     expect(r.ok).toBe(false)

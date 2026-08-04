@@ -2803,13 +2803,34 @@ def _require_kb_console(identity: Optional[Identity]):
     return kb
 
 
-def _require_kb_admin(identity: Optional[Identity]):
-    """强制：调用者必须是【知识库管理员 kb_admin】（成员/角色管理 = kb_admin 专属，dept_admin 不可）。"""
-    kb = _require_kb_console(identity)
+def _assert_kb_admin_role(kb, action: str):
+    """★「非 kb_admin ⇒ 403」的**唯一实现**（P3 设计债，2026-08-04 收敛）。
+
+    此前 `_require_kb_admin` 的文案写死成「管理成员/角色」，于是审批 / 驳回 / 审批队列 /
+    迁回组码等场景**各自重写了同一个判定**只为换句话 —— 多套实现 = 某一套漂移就是越权，
+    且审计时要逐处看。加 `action` 参数后判定收敛到这一处，文案仍贴合各自语境。
+
+    入口鉴权请用 `_require_kb_admin(identity, action)`；本函数收**已解析好的 kb**，
+    供**事务内**的子动作门使用（`_require_kb_admin` 会再查一次身份库，不能在开着的
+    事务里调）。
+
+    🔴 **不要**把「非 kb_admin 则收窄作用域」那类分支改用这两个函数：
+    `kb_access.py` 的授权申请/存量授权列表、`kb_console.py` 的差评越权守卫，
+    它们的 `if kb.role != ROLE_KB_ADMIN` 是**作用域收窄**（限定到 managed 部门），
+    **不是拒绝** —— 改过去会把「只看本部门」变成「403」，是功能性回归。
+    """
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
     if kb.role != ROLE_KB_ADMIN:
-        raise HTTPException(status_code=403, detail="仅知识库管理员可管理成员/角色")
+        raise HTTPException(status_code=403, detail=f"仅知识库管理员可{action}")
     return kb
+
+
+def _require_kb_admin(identity: Optional[Identity], action: str = "管理成员/角色"):
+    """入口鉴权：调用者必须是【知识库管理员 kb_admin】（dept_admin 不可）。
+
+    判定本身在 `_assert_kb_admin_role`（见其 docstring 的收敛说明与红线）。
+    """
+    return _assert_kb_admin_role(_require_kb_console(identity), action)
 
 
 def _kb_owner_scope_sql(kb, col: str = "owner_dept"):

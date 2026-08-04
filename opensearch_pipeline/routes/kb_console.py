@@ -56,6 +56,7 @@ from opensearch_pipeline.api import (
     _kb_read_doc_triplet,
     _kb_status_badge,
     _load_org_tree_snapshot,
+    _assert_kb_admin_role,
     _require_kb_admin,
     _require_kb_console,
     current_identity,
@@ -3002,13 +3003,11 @@ def kb_approve(req: KbApprovalRequest, request: Request,
                identity: Optional[Identity] = Depends(current_identity)):
     """kb_admin 审批放行：PENDING_APPROVAL → NOT_STARTED（下一批入库）。仅 kb_admin。"""
     _enforce_rate_limit(request, identity, scope="aux")
-    kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    kb = _require_kb_admin(identity, "审批")
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
     from opensearch_pipeline.audit_log import write_audit
     from opensearch_pipeline.config import get_config
-    if kb.role != ROLE_KB_ADMIN:
-        raise HTTPException(status_code=403, detail="仅知识库管理员可审批")
+
     if not req.doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
     assert_metadata_write_allowed("kb_approve", get_config().rds.host, kind="rds")
@@ -3051,13 +3050,11 @@ def kb_reject(req: KbApprovalRequest, request: Request,
               identity: Optional[Identity] = Depends(current_identity)):
     """kb_admin 驳回：PENDING_APPROVAL → REJECTED（永不入库）。仅 kb_admin。"""
     _enforce_rate_limit(request, identity, scope="aux")
-    kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    kb = _require_kb_admin(identity, "驳回")
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
     from opensearch_pipeline.audit_log import write_audit
     from opensearch_pipeline.config import get_config
-    if kb.role != ROLE_KB_ADMIN:
-        raise HTTPException(status_code=403, detail="仅知识库管理员可驳回")
+
     if not req.doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
     assert_metadata_write_allowed("kb_reject", get_config().rds.host, kind="rds")
@@ -3101,7 +3098,6 @@ def kb_retire(req: KbRetireRequest, request: Request,
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
     from opensearch_pipeline.audit_log import write_audit
     from opensearch_pipeline.config import get_config
@@ -3130,8 +3126,9 @@ def kb_retire(req: KbRetireRequest, request: Request,
                 # 授权：先作用域，再"公开需 kb_admin"（与上传同款不对称——公开影响全公司）
                 if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权退役该文档（owner_dept 不在管理范围）")
-                if perm == "public" and kb.role != ROLE_KB_ADMIN:
-                    raise HTTPException(status_code=403, detail="公开文档需知识库管理员退役")
+                # 公开=全公司可见 ⇒ 与上传同款不对称授权。事务内 ⇒ 用纯判定 _assert_kb_admin_role。
+                if perm == "public":
+                    _assert_kb_admin_role(kb, "退役公开文档")
                 if str(status).lower() != "active":
                     conn.commit()       # 幂等：已退役/非活跃 → 直接回既有态
                     return KbRetireResponse(doc_id=req.doc_id, retired=False, already=True,
@@ -3209,7 +3206,6 @@ def kb_restore(req: KbRetireRequest, request: Request,
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
     from opensearch_pipeline.audit_log import write_audit
     if not req.doc_id:
@@ -3236,8 +3232,9 @@ def kb_restore(req: KbRetireRequest, request: Request,
                 # 授权：与退役同款不对称——作用域 + 公开文档需 kb_admin
                 if not _kb_can_manage_doc(kb, _mode, owner_dept, _oid):
                     raise HTTPException(status_code=403, detail="无权恢复该文档（owner_dept 不在管理范围）")
-                if perm == "public" and kb.role != ROLE_KB_ADMIN:
-                    raise HTTPException(status_code=403, detail="公开文档需知识库管理员恢复")
+                # 公开=全公司可见 ⇒ 与上传同款不对称授权。事务内 ⇒ 用纯判定 _assert_kb_admin_role。
+                if perm == "public":
+                    _assert_kb_admin_role(kb, "恢复公开文档")
                 if str(status).lower() == "active":
                     conn.commit()       # 幂等：已在线 → 直接回既有态
                     return KbRestoreResponse(doc_id=req.doc_id, restored=False, already=True,
@@ -3372,7 +3369,6 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
     from opensearch_pipeline.audit_log import write_audit
     if not req.doc_id:
@@ -3416,9 +3412,10 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                     raise HTTPException(
                         status_code=409,
                         detail=f"文档信息已被他人修改（当前版本 {_cur_rev}），请刷新后重试")
-                # public 涉及全公司可见 → 收窄/放宽均需 kb_admin（与 retire/restore/上传同款不对称）
-                if (target == "public" or cur_perm == "public") and kb.role != ROLE_KB_ADMIN:
-                    raise HTTPException(status_code=403, detail="涉及全公司公开的可见范围变更需知识库管理员操作")
+                # public 涉及全公司可见 → 收窄/放宽均需 kb_admin（与 retire/restore/上传同款不对称）。
+                # 事务内 ⇒ 用 _assert_kb_admin_role（纯判定），不用会重查身份库的 _require_kb_admin。
+                if target == "public" or cur_perm == "public":
+                    _assert_kb_admin_role(kb, "变更全公司公开的可见范围")
                 if str(status).lower() != "active":
                     raise HTTPException(status_code=409, detail="该文档非在线状态，请先恢复上线后再改可见范围")
                 # 隔离文档（status 仍 'active'、级别被隔离流程收紧为 restricted）绝不能经本端点
@@ -3552,10 +3549,8 @@ def kb_pending_approvals(request: Request,
                          identity: Optional[Identity] = Depends(current_identity)):
     """kb_admin 待审批队列：列出 content_process_status='PENDING_APPROVAL' 的版本。仅 kb_admin。只读。"""
     _enforce_rate_limit(request, identity, scope="aux")
-    kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
-    if kb.role != ROLE_KB_ADMIN:
-        raise HTTPException(status_code=403, detail="仅知识库管理员可查看审批队列")
+    _require_kb_admin(identity, "查看审批队列")   # 仅鉴权，本端点不再用到 kb
+
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
@@ -3736,7 +3731,7 @@ def kb_doc_meta_save(req: KbDocMetaSaveRequest, request: Request,
     )
     from opensearch_pipeline.audit_log import write_audit
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
-    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, sanitize_owner_dept
+    from opensearch_pipeline.kb_authz import sanitize_owner_dept
 
     if not req.doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
@@ -3779,8 +3774,10 @@ def kb_doc_meta_save(req: KbDocMetaSaveRequest, request: Request,
                 if target_mode == "legacy":
                     if cur_mode != "node":
                         raise HTTPException(status_code=400, detail="该文档已是组码授权模式")
-                    if kb.role != ROLE_KB_ADMIN:
-                        raise HTTPException(status_code=403, detail="迁回组码模式仅限知识库管理员")
+                    # 事务内的子动作门：本端点 dept_admin 可进，但「迁回组码」只准 kb_admin。
+                    # 用 _assert_kb_admin_role（收已解析的 kb）而非 _require_kb_admin——
+                    # 后者会再查一次身份库，不能在开着的事务里调。
+                    _assert_kb_admin_role(kb, "将文档迁回组码模式")
                     legacy_owner = sanitize_owner_dept(req.legacy_owner_dept or "")
                     if not legacy_owner:
                         raise HTTPException(status_code=400,

@@ -232,3 +232,49 @@ def test_upload_target_depts_production_sublines():
     # 双拼写/未批准值仍非法(白名单外 fail-closed)
     bad = ka.authorize_upload(prod_admin, "production_papercup", "dept_internal")
     assert not bad.allowed and bad.reason == "invalid_owner_dept"
+
+
+# ── P3：「必须是 kb_admin」只准有一个实现（2026-08-04）──────────────────────────
+
+def test_kb_admin_rejection_has_exactly_one_implementation():
+    """★ 全仓只允许 `_require_kb_admin` 这一处把「非 kb_admin」判成 403。
+
+    此前它的文案写死成「管理成员/角色」，于是审批/驳回/审批队列各自**重新实现了同一个判定**
+    只为换句话 ⇒ 多套实现 = 某一套漂移就是越权，且审计要逐处看。
+    加 `action` 参数后判定收敛到一处，文案仍贴合语境。
+    """
+    import pathlib
+    hits = []
+    for f in ["opensearch_pipeline/api.py", "opensearch_pipeline/routes/kb_console.py",
+              "opensearch_pipeline/routes/kb_access.py"]:
+        src = pathlib.Path(f).read_text(encoding="utf-8")
+        lines = src.splitlines()
+        for i, ln in enumerate(lines):
+            if "kb.role != ROLE_KB_ADMIN" not in ln:
+                continue
+            # 只统计**拒绝式**（紧随其后 raise 403），作用域收窄那类不算
+            nxt = " ".join(lines[i + 1:i + 3])
+            if "status_code=403" in nxt:
+                hits.append(f"{f}:{i + 1}")
+    assert len(hits) == 1 and hits[0].startswith("opensearch_pipeline/api.py:"), (
+        "「非 kb_admin ⇒ 403」出现了多处实现（应只在 _require_kb_admin 内）：" + str(hits))
+
+
+def test_scope_narrowing_sites_are_not_converted_to_rejection():
+    """🔴 反向守卫：「非 kb_admin 则**收窄作用域**」的分支**绝不能**改成 `_require_kb_admin`。
+
+    `kb_access` 的授权申请/存量授权列表、`kb_console` 的差评越权守卫，都是
+    「kb_admin 看全量、dept_admin 只看本部门」——改成拒绝会把「只看本部门」变成 403，
+    即**功能性回归**（dept_admin 再也进不去那些页面）。
+    """
+    import pathlib
+    keep = 0
+    for f in ["opensearch_pipeline/routes/kb_console.py", "opensearch_pipeline/routes/kb_access.py"]:
+        src = pathlib.Path(f).read_text(encoding="utf-8")
+        lines = src.splitlines()
+        for i, ln in enumerate(lines):
+            if "kb.role != ROLE_KB_ADMIN" in ln and "status_code=403" not in " ".join(lines[i + 1:i + 3]):
+                keep += 1
+    assert keep >= 3, (
+        f"作用域收窄分支只剩 {keep} 处（原有 3 处：kb_access 两处授权列表 + kb_console 差评守卫）"
+        "——是不是被误统一成拒绝式了？")
