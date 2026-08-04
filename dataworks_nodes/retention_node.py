@@ -20,8 +20,12 @@ DataWorks PyODPS 3 节点 — log_retention：日志/审计表留存（F-36）
 退出码：0=ok；2=守卫拦下（rollup 死掉时 qa_rows 被拒——先修 rollup）；3=作业失败。
 
 凭据：本文件【不含明文密钥】。控制台粘贴时从【清理stage3】节点顶部原样复制
-RAG_* 赋值贴到「凭据」标记处（仅需 RDS 三件套 + DASHSCOPE key 过 config 守卫；
-不碰 OSS/HA3）。
+RAG_* 赋值贴到「凭据」标记处。
+🔴 C5=方案A（Sam 2026-08-03）后**凭据清单变了**：除 RDS 三件套 + DASHSCOPE key，
+   还需 **OSS 四件套**（endpoint / bucket / AK / SK）——删前冷归档要真写 OSS。
+   缺任一项 ⇒ retention.py 的 preflight **启动即失败**（不再等阶段 2 第一批才爆）。
+   ⚠️ 未实测：生产 OSS 账号是否真具备该 bucket 的 PutObject 权限——首跑请先用
+   DRY_RUN=True 观察，再翻阶段 2。
 """
 import os
 import sys
@@ -29,13 +33,14 @@ import subprocess
 import zipfile
 
 # ═══════════════════════════════════════════════════════════════
-# 0. 安装依赖（PyODPS 3.7 pod 无 pymysql/dbutils；纯 RDS 作业，不装 oss2/ha3）
+# 0. 安装依赖（PyODPS 3.7 pod 无 pymysql/dbutils）
+#    C5=方案A（Sam 2026-08-03 拍板）：**加装 oss2** 打通删前冷归档；ha3 仍不装。
 # ═══════════════════════════════════════════════════════════════
 # py3.7 serverless 执行器钉真兼容版（批次9 同族清扫，同 stage3_node 分支法）
 if sys.version_info >= (3, 8):
-    DEPS = ["PyMySQL", "DBUtils", "requests"]
+    DEPS = ["PyMySQL", "DBUtils", "requests", "oss2"]
 else:
-    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.2", "requests==2.31.0"]
+    DEPS = ["PyMySQL==1.1.1", "DBUtils==3.1.2", "requests==2.31.0", "oss2==2.19.1"]
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", *DEPS, "-t", "/tmp/pydeps", "-q"
 ])
@@ -55,14 +60,16 @@ os.environ["RAG_ENVIRONMENT"] = "production"
 # 2026-07-21 stage3 实地踩过;另一条路 RAG_ALLOW_LEGACY_OPEN_PROD=ack:<当日> 午夜过期,不适合调度任务。
 os.environ["RAG_REQUIRE_AUTH"] = "true"
 os.environ["RAG_ACL_FAIL_CLOSED"] = "true"
-# retention 是纯 RDS 作业，不碰检索后端/OSS。显式声明这两路走 mock：
-#   ① 短路 config 的 production 完整性守卫 R5（config.py:501「production 必须有检索后端，
-#      否则 EnvironmentMismatchError」）——2026-07-02 首跑即撞它；
-#   ② 免配 HA3/OSS 凭据（本节点不需要）。
+# 检索后端走 mock：短路 config 的 production 完整性守卫 R5（config.py:501「production 必须有
+# 检索后端，否则 EnvironmentMismatchError」）——2026-07-02 首跑即撞它。retention 不碰 HA3。
 # RDS 仍真实：simulate_db 不设 → 继承 RAG_SIMULATE=false → 真连生产 RDS；retention.py 的
 # `if cfg.simulate or cfg.simulate_db: skip` 也不会误跳（两者均 false）。
 os.environ["RAG_SIMULATE_OPENSEARCH"] = "true"
-os.environ["RAG_SIMULATE_OSS"] = "true"
+# 🔴 C5=方案A：**不得**再设 RAG_SIMULATE_OSS=true。
+# 它此前把 OSS 钉成 simulate ⇒ `_get_oss_bucket()` 回 (None, True) ⇒ 删前冷归档从未真正
+# 发生；而 RAG_RETENTION_ARCHIVE 默认 true，于是阶段 2 真删时会在第一批 raise。
+# 现在 retention.py 的 preflight 会在**启动即**拒绝「archive=true 但 OSS 不可用」，
+# 所以下面的 OSS 凭据必须真配（见「凭据」段），否则节点起不来——这是有意的 fail-closed。
 
 # 阶段开关：阶段1 = True（dry-run 只报数）；阶段2 = False + 打开 RAG_RETENTION_ENABLE
 DRY_RUN = True

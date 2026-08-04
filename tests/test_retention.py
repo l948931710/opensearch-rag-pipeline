@@ -91,12 +91,33 @@ def live_db(monkeypatch):
     return cfg
 
 
+@pytest.fixture
+def oss_available(monkeypatch):
+    """C5 preflight 起效后：真正测「归档」的用例必须声明 OSS 可用。
+
+    preflight 里是 `from opensearch_pipeline.clients import _get_oss_bucket`（函数内惰性
+    import），所以要打 clients 模块上的名字。
+    """
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket",
+                        lambda *a, **k: (object(), False))
+
+
+@pytest.fixture
+def no_archive(monkeypatch):
+    """不关心归档的用例：显式选 RAG_RETENTION_ARCHIVE=false。
+
+    ⚠️ 这是 C5 拍板单写死的**唯一**非生产出口——不设「跳过 preflight 但保留 archive=true」
+    的通用旁路，否则 preflight 形同虚设。测试也走同一条路，不开后门。
+    """
+    monkeypatch.setenv("RAG_RETENTION_ARCHIVE", "false")
+
+
 def test_simulate_mode_skips():
     rep = retention.run_retention()
     assert all(r.get("skipped") == "simulate" for r in rep.values())
 
 
-def test_dry_run_counts_without_acting(monkeypatch, live_db):
+def test_dry_run_counts_without_acting(monkeypatch, live_db, no_archive):
     conn = _ScriptedConn(affected=1234)
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     rep = retention.run_retention(only=["audit"])
@@ -120,7 +141,7 @@ def test_commit_batches_until_drained(monkeypatch, live_db):
     assert conn.commits == 2, "每批一个短事务提交"
 
 
-def test_qa_rows_blocked_when_rollup_empty(monkeypatch, live_db):
+def test_qa_rows_blocked_when_rollup_empty(monkeypatch, live_db, no_archive):
     monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
     conn = _ScriptedConn(affected=100, rollup_state=(0, None))
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
@@ -129,7 +150,7 @@ def test_qa_rows_blocked_when_rollup_empty(monkeypatch, live_db):
     assert conn.acts == 0, "rollup 从未跑过时绝不删原始 qa 行"
 
 
-def test_qa_rows_blocked_when_rollup_stale(monkeypatch, live_db):
+def test_qa_rows_blocked_when_rollup_stale(monkeypatch, live_db, no_archive):
     monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
     conn = _ScriptedConn(affected=100, rollup_state=(50, datetime.date(2026, 1, 1)),
                          rollup_lag_days=30)
@@ -151,7 +172,7 @@ def test_qa_rows_proceeds_when_rollup_fresh(monkeypatch, live_db):
 # ── P3-18：删前冷归档（qa_rows / audit 默认走 select→归档→按 id 删）──
 
 
-def test_archive_before_delete_uploads_then_deletes_by_id(monkeypatch, live_db):
+def test_archive_before_delete_uploads_then_deletes_by_id(monkeypatch, live_db, oss_available):
     monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
     monkeypatch.delenv("RAG_RETENTION_ARCHIVE", raising=False)   # 默认即开
     conn = _ScriptedConn(affected=2, rollup_lag_days=1,
@@ -172,7 +193,7 @@ def test_archive_before_delete_uploads_then_deletes_by_id(monkeypatch, live_db):
     assert delete_sqls and "IN (11,12)" in " ".join(delete_sqls[0].split())
 
 
-def test_archive_failure_blocks_delete(monkeypatch, live_db):
+def test_archive_failure_blocks_delete(monkeypatch, live_db, oss_available):
     """fail-closed：归档上传失败 → 该作业中止，绝不出现「删了但没归档」。"""
     monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
     monkeypatch.delenv("RAG_RETENTION_ARCHIVE", raising=False)
@@ -243,7 +264,7 @@ def test_qa_blobs_uses_update_null_not_delete(monkeypatch, live_db):
         "qa_blobs 是瘦身（置 NULL），绝不是删行"
 
 
-def test_main_exit_codes(monkeypatch, live_db):
+def test_main_exit_codes(monkeypatch, live_db, no_archive):
     # blocked → 2
     monkeypatch.setenv("RAG_RETENTION_ENABLE", "true")
     conn = _ScriptedConn(affected=100, rollup_state=(0, None))
@@ -365,3 +386,69 @@ def test_purge_happy_path_deletes_anchor_last(monkeypatch, live_db):
     assert conn.deleted_tables[0] == "qa_retrieved_doc"
     assert conn.deleted_tables[-1] == "qa_session_log"
     assert out["ok"] is True
+
+
+# ── C5：归档 preflight + 碰撞不可行的 run id（Sam 2026-08-03 拍板 方案 A）────────
+
+def test_preflight_fails_fast_when_archive_on_but_oss_unavailable(monkeypatch, live_db):
+    """archive=true + 含归档作业 + OSS 不可用 ⇒ **启动即失败**。
+
+    此前要等阶段 2 真删的第一批才在 _archive_batch 里爆，且每天重复失败。
+    """
+    monkeypatch.setenv("RAG_RETENTION_ARCHIVE", "true")
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (None, True))
+    with pytest.raises(RuntimeError, match="preflight"):
+        retention.run_retention(only=["qa_rows"])
+
+
+def test_preflight_ignores_non_archive_jobs(monkeypatch, live_db):
+    """只跑非归档作业（6 个里只有 qa_rows/audit 归档）⇒ 缺 OSS **不得**失败。"""
+    monkeypatch.setenv("RAG_RETENTION_ARCHIVE", "true")
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (None, True))
+    conn = _ScriptedConn(affected=0)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    rep = retention.run_retention(only=["findings"])       # 非归档作业
+    assert rep["findings"]["ok"]
+
+
+def test_preflight_requires_positive_window(monkeypatch, live_db):
+    """🔴 codex BLOCKER：`months <= 0` 是**合法 skip**，不得因缺 OSS 打成 FATAL。
+
+    漏掉 window 条件的话，`qa_rows window=0 + 无 OSS` 会从应有的 SKIPPED 变成 preflight
+    RuntimeError —— 与 SKIPPED 的定义直接矛盾。
+    """
+    monkeypatch.setenv("RAG_RETENTION_ARCHIVE", "true")
+    monkeypatch.setenv("RAG_RETENTION_QA_MONTHS", "0")     # 合法 skip
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (None, True))
+    conn = _ScriptedConn(affected=0)
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
+    rep = retention.run_retention(only=["qa_rows"])         # 不得抛
+    assert "qa_rows" in rep
+
+
+def test_preflight_is_after_simulate_shortcircuit():
+    """位置纪律：simulate 仍是纯跳过，preflight 不得把它变成失败。"""
+    rep = retention.run_retention(only=["qa_rows"])         # 默认 simulate
+    assert rep["qa_rows"]["skipped"] == "simulate"
+
+
+def test_archive_run_id_is_collision_proof():
+    """主修复：run id 不再是秒级时间戳——同秒两次必须不同（并发/重入不撞 key）。"""
+    a, b = retention._new_archive_run_id(), retention._new_archive_run_id()
+    assert a != b, "同秒两次生成了相同 run id ⇒ 并发归档会互相覆盖"
+    assert len(a) > len("20260803T100000"), "应带唯一后缀，不只是时间戳"
+
+
+def test_archive_put_forbids_overwrite(monkeypatch, live_db):
+    """纵深防御：写归档对象带 x-oss-forbid-overwrite（撞 key 宁可 raise 也不静默顶掉）。"""
+    seen = {}
+
+    class _Bkt:
+        def put_object(self, key, data, headers=None):
+            seen["key"] = key
+            seen["headers"] = headers or {}
+
+    monkeypatch.setattr("opensearch_pipeline.clients._get_oss_bucket", lambda *a, **k: (_Bkt(), False))
+    retention._archive_batch("qa_rows", [{"id": 1}], ["id"], 0, "RUNID")
+    assert seen["headers"].get("x-oss-forbid-overwrite") == "true"
+    assert "RUNID" in seen["key"]

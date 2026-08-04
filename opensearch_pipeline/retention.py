@@ -63,6 +63,7 @@ CLI：
 import argparse
 import os
 import time
+import uuid
 from typing import Dict, List, Optional
 
 from opensearch_pipeline.config import get_config
@@ -167,9 +168,26 @@ def _archive_enabled() -> bool:
     return os.environ.get("RAG_RETENTION_ARCHIVE", "true").lower() in ("1", "true", "yes")
 
 
+def _new_archive_run_id() -> str:
+    """归档 run id：**时间戳 + UUID**。
+
+    C5 主修复：原先用 `time.strftime("%Y%m%dT%H%M%S")` 单独作 key 段——**秒级粒度**。
+    retention 无全局 lease，调度重入/并发（DataWorks 补数据 + 日常调度同秒起跑）会生成
+    **完全相同的 key**，`put_object` 默认覆盖 ⇒ 前一轮的归档对象被静默顶掉，而对应的
+    RDS 行**已经删了** ⇒ 归档静默丢失、不可恢复。时间戳段保留只为可读/可排序，
+    唯一性完全由 uuid4 承担。
+    """
+    return f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex}"
+
+
 def _archive_batch(job: str, rows, cols: List[str], batch_no: int, run_ts: str) -> str:
     """一批行 → gzip JSONL → OSS 冷归档。返回 OSS key；任何失败 raise（调用方按
-    fail-closed 中止该作业——绝不出现"删了但没归档"）。"""
+    fail-closed 中止该作业——绝不出现"删了但没归档"）。
+
+    run_ts 由 `_new_archive_run_id()` 生成（含 uuid，见其 docstring）。
+    写入带 `x-oss-forbid-overwrite` —— **纵深防御，不是主修复**：即便 key 仍不知怎么撞了，
+    也宁可整批 raise（fail-closed 中止、行不删）也不静默顶掉已有归档。
+    """
     import gzip
     import io
     import json as _json
@@ -187,7 +205,12 @@ def _archive_batch(job: str, rows, cols: List[str], batch_no: int, run_ts: str) 
         for r in rows:
             d = r if isinstance(r, dict) else dict(zip(cols, r))
             gz.write((_json.dumps(d, ensure_ascii=False, default=str) + "\n").encode("utf-8"))
-    bucket.put_object(key, buf.getvalue())
+    # 禁止覆盖：对象已存在 ⇒ OSS 返错 ⇒ 本批 raise ⇒ 调用方 fail-closed 中止该作业。
+    # 老 SDK/兼容端不认该头时退回普通写（能力探测失败不阻断归档主路径）。
+    try:
+        bucket.put_object(key, buf.getvalue(), headers={"x-oss-forbid-overwrite": "true"})
+    except TypeError:      # 极老 oss2 不收 headers kwarg
+        bucket.put_object(key, buf.getvalue())
     return key
 
 
@@ -225,6 +248,29 @@ def run_retention(*, commit: bool = False, only: Optional[List[str]] = None,
 
     windows = _retention_windows()
     jobs = [j for j in _JOB_NAMES if (only is None or j in only)]
+
+    # ── C5 preflight：归档姿态检查（位置必须在 simulate 短路【之后】）────────────────
+    # 不做这一步的话，`archive=true 但 OSS 不可用` 要等到阶段 2 的第一批才在 _archive_batch
+    # 里爆——那时已经跑过一遍事务、且每天重复失败。
+    # 🔴 谓词必须**三条同时成立**才拦（codex BLOCKER）：
+    #   ① 本次选中了归档表（6 个作业里只有 qa_rows / audit 两个）
+    #   ② RAG_RETENTION_ARCHIVE=true
+    #   ③ **该作业 window > 0** —— `months <= 0` 是合法 skip，漏掉这条会把
+    #      「qa_rows window=0 + 无 OSS」从应有的 SKIPPED 打成 FATAL，与 SKIPPED 定义直接矛盾。
+    # ⚠️ 能力边界：只查配置/simulation 姿态/oss2 依赖；**不写对象就不能证明 bucket 存在
+    #    或账号有 PutObject 权限** —— 这不是端到端可写性证明。
+    _archive_required = _archive_enabled() and any(
+        j in _ARCHIVE_TABLES and windows.get(j, 0) > 0 for j in jobs)
+    if _archive_required:
+        from opensearch_pipeline.clients import _get_oss_bucket
+        _bkt, _is_sim = _get_oss_bucket()
+        if _is_sim or _bkt is None:
+            raise RuntimeError(
+                "[retention] preflight 失败：RAG_RETENTION_ARCHIVE=true 且本次含归档作业"
+                f"（{[j for j in jobs if j in _ARCHIVE_TABLES]}），但 OSS 不可用"
+                "（simulate/占位凭据/缺 oss2）。删前冷归档打不通即拒绝启动——"
+                "确无归档需求请显式设 RAG_RETENTION_ARCHIVE=false 并书面接受不可逆直删。")
+
     reports: Dict[str, dict] = {}
 
     from opensearch_pipeline.db import _get_db_conn
@@ -261,7 +307,7 @@ def run_retention(*, commit: bool = False, only: Optional[List[str]] = None,
                 # P3-18：qa_rows/audit 是审计流水——commit 且归档开启时走
                 # select→OSS 归档→按 id 删；归档上传失败 raise 中止该作业（fail-closed）。
                 _arch_on = job in _ARCHIVE_TABLES and _archive_enabled()
-                _run_ts = time.strftime("%Y%m%dT%H%M%S")
+                _run_ts = _new_archive_run_id()   # C5：含 uuid，杜绝并发/重入撞 key
                 deleted = 0
                 for _b in range(max_batches):
                     with conn.cursor() as cur:
