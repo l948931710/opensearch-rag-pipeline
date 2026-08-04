@@ -871,6 +871,14 @@ class KbFeedbackReviewResponse(BaseModel):
     scope: str = "dept"
     window_days: int = _KB_INSIGHTS_WINDOW_DAYS
     items: List[KbFeedbackReviewItem] = Field(default_factory=list)
+    # B8（Sam 2026-08-04 拍板选 c「先让截断不再静默」）：本端点有**两层**截断，
+    # 此前两层都不对外暴露 ⇒ 管理员看到的「差评就这些」可能只是全量的一小部分，**且无从知道**。
+    #   · truncated_messages —— 消息层：凑满 limit 后不再收新 message_id；
+    #   · truncated_scan     —— 扫描层：SQL 硬 `LIMIT 300` 扫原始行，扫满即可能还有更早的差评。
+    # ⚠️ **刻意不做分页**：SQL 的 offset 作用在**原始 join 行**上，与按 message_id **去重聚合后**
+    # 的条目不对齐，直接加 OFFSET 会漏消息/重消息（拍板单 B8 已论证）。真分页属设计变更，另议。
+    truncated_messages: bool = False
+    truncated_scan: bool = False
 
 
 # 管理员对差评的处置态（写入 user_feedback.handled_status）。RESOLVED=已修复/已跟进、
@@ -943,6 +951,8 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
                     + " ORDER BY f.created_at DESC, f.message_id LIMIT 300",
                     tuple([win] + scope_params + list(f_params)))
                 rows = cur.fetchall() or []
+                # 扫满 300 行 ⇒ 可能还有更早的差评没进本次聚合（扫描层截断）
+                _scan_capped = len(rows) >= 300
         finally:
             conn.close()
     except HTTPException:
@@ -959,6 +969,7 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
         it = by_msg.get(mid)
         if it is None:
             if len(by_msg) >= limit:
+                out.truncated_messages = True   # B8：截断必须留痕，不再静默 continue
                 continue
             hs = str(handled_status or "").upper()
             # 跨用户展示：他人原始提问/补充说明无条件 PII 脱敏（与 insights.gap_queries 同一纪律）。
@@ -976,6 +987,7 @@ def kb_feedback_review(request: Request, limit: int = 20, include_resolved: bool
             it.docs.append(KbFeedbackDocRef(doc_id=str(doc_id), title=str(title or ""),
                                             owner_dept=str(owner or "")))
     out.items = list(by_msg.values())
+    out.truncated_scan = _scan_capped
     _dashboard_cache_put(cache_key, out)
     return out
 

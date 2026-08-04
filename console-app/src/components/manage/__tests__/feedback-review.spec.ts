@@ -192,3 +192,30 @@ describe('KbAdminDashboard「待你处理」chip — 区分「0 条」与「加�
     expect(w.find('[data-testid="feedback-load-failed-chip"]').exists()).toBe(false)
   })
 })
+
+
+// ── B8（Sam 2026-08-04 选 c）：截断必须如实告知，且**不给**「加载更多」────────────
+describe('FeedbackReviewList — 截断如实告知（B8）', () => {
+  function mountWithTruncated(truncated: boolean) {
+    const pinia = activePinia(identity())
+    const kb = useKb()
+    kb.feedbackReview.value = [fb('m1')]
+    ;(kb as unknown as { feedbackReviewTruncated: { value: boolean } })
+      .feedbackReviewTruncated.value = truncated
+    return mount(FeedbackReviewList, { global: { plugins: [pinia], stubs } })
+  }
+
+  it('后端报截断 → 显示提示，且**不出现**「加载更多」', () => {
+    const w = mountWithTruncated(true)
+    expect(w.find('[data-testid="feedback-truncated"]').exists()).toBe(true)
+    expect(w.text()).toContain('结果已截断')
+    // ⚠️ 后端 offset 作用在**原始 join 行**上、与按 message_id 去重聚合后的条目不对齐
+    // ⇒ 给「加载更多」会漏消息/重消息。这里的"没有按钮"是**刻意**的，不是遗漏。
+    expect(w.text()).not.toContain('加载更多')
+  })
+
+  it('未截断 → 不显示提示（不制造无谓告警）', () => {
+    const w = mountWithTruncated(false)
+    expect(w.find('[data-testid="feedback-truncated"]').exists()).toBe(false)
+  })
+})

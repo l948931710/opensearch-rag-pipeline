@@ -684,3 +684,32 @@ describe('useKb.loadReviewTasks 分页', () => {
     expect(q.get('include_closed')).toBe('true')
   })
 })
+
+// ── B8：useKb 必须消费后端的两个截断标志（否则组件永远收不到 true）────────────────
+describe('useKb.loadFeedbackReview 截断标志', () => {
+  it.each([
+    ['truncated_messages', { truncated_messages: true }],
+    ['truncated_scan', { truncated_scan: true }],
+  ])('后端报 %s → feedbackReviewTruncated=true', async (_name, extra) => {
+    const s = useSession(); s.setToken('T')
+    s.setIdentity({ userId: 'k', role: 'kb_admin', canManage: true } as never)
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, json: async () => ({ items: [], ...extra }),
+    })))
+    const kb = useKb()
+    await kb.loadFeedbackReview()
+    expect(kb.feedbackReviewTruncated.value).toBe(true)
+  })
+
+  it('两个标志都为假 → false（不制造无谓告警）', async () => {
+    const s = useSession(); s.setToken('T')
+    s.setIdentity({ userId: 'k', role: 'kb_admin', canManage: true } as never)
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ items: [], truncated_messages: false, truncated_scan: false }),
+    })))
+    const kb = useKb()
+    await kb.loadFeedbackReview()
+    expect(kb.feedbackReviewTruncated.value).toBe(false)
+  })
+})

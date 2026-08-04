@@ -208,6 +208,7 @@ const visLoading = ref(false)
 const visErr = ref('')
 // 差评联动复核（看板卡片）：引用了我作用域文档的回答收到 👎。null=尚未加载（显占位不显 0）。
 const feedbackReview = ref<FeedbackReviewItem[] | null>(null)
+const feedbackReviewTruncated = ref(false)   // B8：后端两层截断任一命中即 true（如实告知，不做分页）
 // ── 反馈区按部门筛选（2026-08-03，codex 两轮共识）─────────────────────────────
 // 全库收件箱（chip 专用，永不带 owner_key）与区内筛选视图**分离**——否则筛选会把
 // 「差评未处理」置顶 chip 也变成部门计数（行动区语义必须全库）。
@@ -1262,13 +1263,18 @@ async function loadFeedbackReview() {
         docs: [{ doc_id: 'D4', title: '考勤请假制度', owner_dept: 'hr' }] },
     ]
     feedbackReview.value = showResolvedFeedback.value ? all : all.filter((x) => !x.handled)
+    feedbackReviewTruncated.value = false
     return
   }
   clearLoadError('feedbackReview')
   try {
     const qs = showResolvedFeedback.value ? '?include_resolved=true' : ''
-    const r = await apiJson<{ items: FeedbackReviewItem[] }>(`/api/kb/feedback-review${qs}`, { auth: true })
+    const r = await apiJson<{ items: FeedbackReviewItem[]; truncated_messages?: boolean; truncated_scan?: boolean }>(
+      `/api/kb/feedback-review${qs}`, { auth: true })
     feedbackReview.value = r.items || []
+    // B8（Sam 2026-08-04 选 c）：两层截断任一命中即如实告知。**刻意不给「加载更多」** ——
+    // 后端 SQL 的 offset 作用在原始 join 行上、与去重聚合后的条目不对齐，加了会漏/重消息。
+    feedbackReviewTruncated.value = !!(r.truncated_messages || r.truncated_scan)
   } catch (e) {
     // 仅 404 兜底空；真错误保留 null（首载）/旧值（重载），组件与 chip 据此显式降级而非伪装成空。
     if (!noteLoadError('feedbackReview', e)) feedbackReview.value = feedbackReview.value ?? []
@@ -1765,7 +1771,7 @@ export function useKb() {
     docMetaCtx, openDocMeta, closeDocMeta,
     nodeCandidates, loadNodeCandidates, decideNodeCandidate,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
-    feedbackReview, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
+    feedbackReview, feedbackReviewTruncated, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
     feedbackReviewView, loadFeedbackReviewView, fbStats, loadFeedbackStats,
     reviewTasks, loadReviewTasks, reviewTasksHasMore, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,

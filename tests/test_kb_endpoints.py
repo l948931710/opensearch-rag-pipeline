@@ -2500,3 +2500,50 @@ def test_new_terminal_badges_are_terminal_in_frontend_poller():
     line = [ln for ln in src.splitlines() if "TERMINAL_BADGES" in ln][0]
     for badge in ("未入索引", "已隔离"):
         assert badge in line, f"前端轮询未把「{badge}」当终态：{line}"
+
+
+# ── B8（Sam 2026-08-04 选 c）：差评复核的两层截断必须如实暴露 ────────────────────
+# 此前两层都静默：SQL 硬 LIMIT 300 扫原始行 + 凑满 limit 就不再收新 message_id。
+# ⇒ 管理员看到的「差评就这些」可能只是全量的一小部分，**且无从知道**。
+
+def _fb_row(mid, doc="D1"):
+    # (message_id, created, question, doc_id, title, owner, reason, comment, handled_status)
+    return (mid, "2026-08-01", "问题" + mid, doc, "标题", "hr", "inaccurate", "", "PENDING")
+
+
+def _feedback_review(monkeypatch, rows, limit=20):
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline.routes import kb_console
+    monkeypatch.setattr(kb_console, "_dashboard_cache_get", lambda k: None)
+    monkeypatch.setattr(kb_console, "_dashboard_cache_put", lambda k, v: None)
+    _stub_multi(monkeypatch, [rows])
+    from opensearch_pipeline import api
+    return api.kb_feedback_review(request=None, limit=limit,
+                                  identity=api.Identity(user_id="kb1"))
+
+
+def test_feedback_review_flags_message_layer_truncation(monkeypatch):
+    """★ 消息层：不同 message_id 数超过 limit ⇒ truncated_messages=True。"""
+    out = _feedback_review(monkeypatch, [_fb_row(f"m{i}") for i in range(25)], limit=20)
+    assert len(out.items) == 20
+    assert out.truncated_messages is True, "凑满 limit 后仍静默丢弃新消息"
+
+
+def test_feedback_review_flags_scan_layer_truncation(monkeypatch):
+    """★ 扫描层：SQL 扫满 300 行 ⇒ truncated_scan=True（可能还有更早的差评没进聚合）。
+
+    ⚠️ 这一层与消息层**正交**：即使去重后条目远少于 limit，扫描仍可能被 300 行截断。
+    本例故意让 300 行全属同一 message ⇒ items 只有 1 条、truncated_messages 为 False，
+    但 truncated_scan 必须为 True。
+    """
+    out = _feedback_review(monkeypatch, [_fb_row("same", f"D{i}") for i in range(300)])
+    assert out.truncated_messages is False
+    assert out.truncated_scan is True, "SQL 扫满 300 行却没留痕"
+
+
+def test_feedback_review_no_truncation_when_within_limits(monkeypatch):
+    """对照：未触顶时两个标志都为 False（不制造无谓告警）。"""
+    out = _feedback_review(monkeypatch, [_fb_row(f"m{i}") for i in range(3)])
+    assert out.truncated_messages is False and out.truncated_scan is False
+    assert len(out.items) == 3

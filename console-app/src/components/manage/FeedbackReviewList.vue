@@ -19,6 +19,7 @@ const {
   feedbackReview, loadFeedbackReview, loadErrors,
   feedbackReviewView, loadFeedbackReviewView,
   showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
+  feedbackReviewTruncated,
 } = useKb()
 const viewMode = computed(() => props.ownerKey !== undefined)
 const rows = computed(() => (viewMode.value ? feedbackReviewView.value : feedbackReview.value))
@@ -233,6 +234,15 @@ function scrollWhenReady(id: string, deadlineMs = 1500) {
     <p class="ml-0.5 mt-2 text-[11.5px] text-faint">
       这些回答实际引用了本部门文档却被用户点踩——按原因/补充说明核对文档是否过时/表述不清；改好后点「标记已处理」；确有缺口可
       <RouterLink to="/contribute" class="font-semibold text-accent-text transition hover:underline">去知识贡献补充 →</RouterLink>
+    </p>
+    <!-- B8（Sam 2026-08-04 选 c「先让截断不再静默」）：后端有**两层**截断
+         （SQL 硬 LIMIT 300 扫原始行 + 凑满 limit 就不再收新 message_id），此前两层都不
+         对外暴露 ⇒ 管理员看到的「差评就这些」可能只是全量的一小部分、且无从知道。
+         ⚠️ 这里**刻意不给「加载更多」**：后端 offset 作用在原始 join 行上、与按 message_id
+         去重聚合后的条目不对齐，加了会漏消息/重消息。真分页属设计变更，另议。 -->
+    <p v-if="feedbackReviewTruncated" data-testid="feedback-truncated"
+       class="ml-0.5 mt-2 text-[11.5px] text-st-warn">
+      结果已截断，未显示全部差评 —— 请收窄时间窗或按部门筛选后再查看。
     </p>
   </div>
 </template>
