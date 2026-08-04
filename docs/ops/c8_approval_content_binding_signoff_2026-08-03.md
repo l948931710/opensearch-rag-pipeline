@@ -36,7 +36,7 @@
 > · `_mark_content_mismatch` 终态 · 徽章两侧 + 前端词表 · scan 工具
 >
 > 🔴 **开 flag 前置（仍需 Sam 确认，本会话在 SIM 无法查）**：
-> 1. `schema/064` apply（走 `python scripts/apply_migration.py schema/064_content_binding.sql`）
+> 1. ~~`schema/064` apply~~ ✅ **2026-08-04 已 apply 生产**（PROD-RW:2026-08-04）。staging 未 apply。
 > 2. 生产 OSS versioning 是 **Enabled** 而非 Suspended
 > 3. **生命周期规则不会删历史版本** —— 若会删，被绑定的对象会在保留期后消失，
 >    fail-closed 会把那批文档全部卡死。这一条是本单表头自己列的 🔴，**未解除**。
