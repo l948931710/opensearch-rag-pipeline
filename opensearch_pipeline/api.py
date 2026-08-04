@@ -5,7 +5,7 @@ api.py — RAG 问答 FastAPI 应用
 端点：
   POST /api/ask           非流式问答
   POST /api/ask/stream    SSE 流式问答
-  POST /api/search        纯检索（不调用 LLM）
+  POST /api/search        纯检索（不调用 LLM）—— 已下线，默认 404（RAG_SEARCH_ENDPOINT_ENABLE）
   GET  /api/health        健康检查
 """
 
@@ -896,12 +896,33 @@ def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
     )
 
 
-@app.post("/api/search", response_model=SearchResponse)
+@app.post("/api/search", response_model=SearchResponse, include_in_schema=False)
 def search(req: SearchRequest, request: Request,
            identity: Optional[Identity] = Depends(require_identity)):
-    """纯检索接口 — 只返回相关文档片段，不调用 LLM。"""
+    """纯检索接口 — 只返回相关文档片段，不调用 LLM。**已下线，默认 404**（P3-2，2026-08-04）。
+
+    下线理由不是"没人用"，而是它是一个**已认证但未受治理**的原始检索面：直连
+    `search_chunks` ⇒ 绕过 v2 敏感查询 guard（该 guard 只挂在 `_prefilter_route` 与
+    `dingtalk_bot` 两处）、且不落 `qa_session_log`（检索到了什么无审计）。
+    ACL（server-side dept 过滤）与限频它是有的，缺的是治理与审计。
+    全仓实测零消费方：console / 小程序 / 钉钉 / eval_harness 皆不调用。
+
+    `RAG_SEARCH_ENDPOINT_ENABLE=true` 可开回来 —— 开启时**会跑敏感 guard 前置**，
+    命中即返回空结果集，不会退回成绕过面。审计缺口仍在（本端点不落 qa 日志），
+    若要长期使用请先补审计。
+    """
+    if not get_config().rag.search_endpoint_enable:
+        # 404 而非 403/410：让"已下线"看起来就是"没这个路径"，与 include_in_schema=False 一致。
+        # ⚠️ 不是严格的存在性隐藏 —— `require_identity` 是 Depends，先于函数体执行，
+        # 匿名调用者会先拿到 401（未注册路径则是 404），据此仍可推断本路径存在。
+        # 这里不为此重排依赖：它挡的是"误用/被当成受支持接口"，不是侦察。
+        raise HTTPException(status_code=404, detail="Not Found")
     # 与问答共享限频/日配额（embedding+HA3 也是真金白银），但不计入全局 LLM 熔断
     _enforce_rate_limit(request, identity, scope="ask", count_llm=False)
+    # 敏感 guard 前置：与 /api/ask 同一判定（RAG_SENSITIVE_QUERY_GUARD 关时恒 None）。
+    # 命中 ⇒ 空结果集 —— 用本端点自己的契约表达拒答，而不是塞一段文案。
+    if sensitive_guard_route(req.query) is not None:
+        return SearchResponse(results=[], total=0, latency_ms=0)
     t0 = time.time()
     try:
         # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。

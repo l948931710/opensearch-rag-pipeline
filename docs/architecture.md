@@ -76,7 +76,7 @@ flowchart TB
 
     subgraph SERVE["服务平面 — SAE 在线服务 (workers=1)"]
         direction TB
-        API["api.py (FastAPI)<br/>/api/ask · /api/ask/stream<br/>/api/search · /api/auth/dingtalk<br/>/api/feedback · /api/session/clear"]
+        API["api.py (FastAPI)<br/>/api/ask · /api/ask/stream<br/>/api/auth/dingtalk<br/>/api/feedback · /api/session/clear"]
         BOT["dingtalk_bot.py<br/>Webhook 接收 · 流式卡片<br/>卡片回调(赞/踩)"]
         RL["rate_limiter.py<br/>公网防刷四层准入<br/>限频·匿名IP·深思配额·全局熔断"]
         subgraph CORE["共享服务核心"]
@@ -336,7 +336,7 @@ flowchart LR
 |---|---|---|
 | `/api/health` | GET | 健康检查 |
 | `/api/auth/dingtalk` | POST | 钉钉 authcode → 会话 token（小程序登录） |
-| `/api/search` | POST | 纯检索（无 LLM），返回带分 chunk + 引用上下文 |
+| `/api/search` | POST | ~~纯检索（无 LLM）~~ **已下线（P3-2，2026-08-04）：默认 404**。它是已认证但未受治理的原始检索面（绕过 v2 敏感 guard、不落 qa 日志），零消费方。`RAG_SEARCH_ENDPOINT_ENABLE=true` 可开回，开启时会跑 guard 前置。 |
 | `/api/ask` | POST | 非流式问答：检索 + 生成 → 完整 JSON |
 | `/api/ask/stream` | POST | 流式问答：SSE 推送 token 流 + 引用 |
 | `/api/feedback` | POST | 用户反馈（赞/踩 + 原因）落 `user_feedback` |

@@ -5,6 +5,7 @@ test_rag_api.py — RAG 问答 API 单元测试
 测试检索器、LLM 生成器、FastAPI 端点（mock 外部 API）。
 """
 
+import contextlib
 import json
 from unittest.mock import MagicMock, patch
 
@@ -260,6 +261,24 @@ class TestLLMGenerator:
 # Test: api.py (FastAPI endpoints)
 # ═══════════════════════════════════════════════════════════════
 
+@contextlib.contextmanager
+def _search_endpoint_on():
+    """临时开启 `POST /api/search`（P3-2 起默认 404）。
+
+    改的是**已缓存 config 对象**的属性而非 env —— `config._config` 是进程级缓存、
+    惰性加载后永不失效，`monkeypatch.setenv` 对它无效（见 conftest
+    `_restore_global_config_cache` 的成因说明）。
+    """
+    from opensearch_pipeline.config import get_config
+    rag = get_config().rag
+    old = rag.search_endpoint_enable
+    rag.search_endpoint_enable = True
+    try:
+        yield
+    finally:
+        rag.search_endpoint_enable = old
+
+
 class TestAPI:
     """测试 FastAPI 端点。"""
 
@@ -291,7 +310,8 @@ class TestAPI:
             }
         ]
 
-        resp = client.post("/api/search", json={"query": "住宿申请", "top_k": 5})
+        with _search_endpoint_on():
+            resp = client.post("/api/search", json={"query": "住宿申请", "top_k": 5})
         assert resp.status_code == 200
         data = resp.json()
         assert data["total"] == 1
@@ -387,6 +407,63 @@ class TestAPI:
         """检索异常时应返回 500。"""
         mock_search.side_effect = RuntimeError("连接失败")
 
-        resp = client.post("/api/search", json={"query": "测试"})
+        with _search_endpoint_on():
+            resp = client.post("/api/search", json={"query": "测试"})
         assert resp.status_code == 500
         assert "检索失败" in resp.json()["detail"]
+
+
+# ── P3-2：`POST /api/search` 下线（2026-08-04）─────────────────────────────────
+
+class TestSearchEndpointRetired:
+    """`/api/search` 默认 404，且开回来时不得重新变成"治理绕过面"。
+
+    下线理由不是"没人用"（虽然全仓实测零消费方），而是它是一个**已认证但未受治理**
+    的原始检索面：直连 `search_chunks` ⇒ 绕过 v2 敏感查询 guard（guard 只挂在
+    `_prefilter_route` 与 `dingtalk_bot` 两处）、且不落 `qa_session_log`。
+    """
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from opensearch_pipeline.api import app
+        return TestClient(app)
+
+    def test_default_is_404(self, client):
+        """★ 默认姿态：端点不可达。"""
+        r = client.post("/api/search", json={"query": "住宿申请"})
+        assert r.status_code == 404, f"/api/search 默认应 404，实得 {r.status_code}"
+
+    @patch("opensearch_pipeline.api.search_chunks")
+    def test_disabled_endpoint_does_not_retrieve(self, mock_search, client):
+        """🔴 404 必须发生在**检索之前** —— 否则"下线"只是不返回结果，钱照花、日志照留。"""
+        client.post("/api/search", json={"query": "住宿申请"})
+        mock_search.assert_not_called()
+
+    @patch("opensearch_pipeline.api.search_chunks")
+    def test_enabling_does_not_reopen_the_guard_bypass(self, mock_search, client):
+        """★★ 本类的核心断言：把 flag 开回来，敏感 guard **仍然**拦得住。
+
+        没有这一条，`RAG_SEARCH_ENDPOINT_ENABLE=true` 就等于一键恢复绕过面——
+        而那正是当初下线它的原因。命中 guard ⇒ 空结果集，且**根本不检索**。
+        """
+        mock_search.return_value = [{"chunk_text": "x", "title": "t", "section_title": "",
+                                     "doc_id": "D1", "category_l1": "行政", "score": 0.9}]
+        import opensearch_pipeline.api as api_mod
+        with _search_endpoint_on(), \
+                patch.object(api_mod, "sensitive_guard_route", lambda q: object()):
+            r = client.post("/api/search", json={"query": "帮我查张三的身份证号"})
+        assert r.status_code == 200, "拒答用本端点自己的契约表达（空结果），不是 4xx"
+        assert r.json()["total"] == 0 and r.json()["results"] == []
+        mock_search.assert_not_called(), "命中 guard 后仍去检索了 —— 绕过面没关上"
+
+    @patch("opensearch_pipeline.api.search_chunks")
+    def test_guard_miss_still_searches(self, mock_search, client):
+        """反向：guard 不命中时照常检索（上一条不能靠"永远返回空"来通过）。"""
+        mock_search.return_value = []
+        import opensearch_pipeline.api as api_mod
+        with _search_endpoint_on(), \
+                patch.object(api_mod, "sensitive_guard_route", lambda q: None):
+            r = client.post("/api/search", json={"query": "住宿申请"})
+        assert r.status_code == 200
+        mock_search.assert_called_once()

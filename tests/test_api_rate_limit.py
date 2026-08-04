@@ -146,7 +146,15 @@ def test_global_cap_503_health_unaffected(client):
     assert int(r.headers["Retry-After"]) >= 1
     # 健康检查与纯检索不受 LLM 熔断影响
     assert c.get("/api/health").status_code == 200
-    assert c.post("/api/search", json={"query": "q"}).status_code == 200
+    # /api/search 自 P3-2 起默认 404，这里临时开回来——本用例验的是
+    # 「count_llm=False 的端点不吃 LLM 熔断」，不是端点的可达性。
+    from opensearch_pipeline.config import get_config
+    _rag = get_config().rag
+    _old, _rag.search_endpoint_enable = _rag.search_endpoint_enable, True
+    try:
+        assert c.post("/api/search", json={"query": "q"}).status_code == 200
+    finally:
+        _rag.search_endpoint_enable = _old
 
 
 def test_stream_endpoint_shares_admission(client):
