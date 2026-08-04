@@ -442,20 +442,30 @@ def test_materialize_has_certify_path_before_returning_unchanged():
     src = inspect.getsource(access_grants.materialize_doc_allowed_depts)
     assert src.count('"certified"') == 2, "node 与 legacy 两个分支都必须有 certify 路径"
     assert "projection_rows_all_match" in src, "certify 未用逐行校验（并集口径会误认证）"
-    # certify 只写 epoch，绝不置 NOT_INDEXED（否则会无谓触发全量重推 HA3）
+    # certify 只写 epoch，绝不置 NOT_INDEXED（否则会无谓触发全量重推 HA3）。
+    # ⚠️ 用「回溯到最近一条 cursor.execute」定位，**不用固定字符窗口** ——
+    # 窗口式断言会被中间新增的注释挤爆（2026-08-04 B1 加 `_wrote` 注释时就撞过）。
     for seg in src.split('"certified"')[:-1]:
-        tail = seg[-400:]
-        assert "SET acl_epoch=%s" in tail, "certify 分支未只写 acl_epoch"
-        assert "NOT_INDEXED" not in tail.split("SET acl_epoch=%s")[-1], \
-            "certify 分支不得置 NOT_INDEXED（值没变就不该重推）"
+        stmt = seg[seg.rindex("cursor.execute("):]
+        assert "SET acl_epoch=%s" in stmt, "certify 分支的写语句不是只写 acl_epoch"
+        assert "index_status" not in stmt, "certify 绝不能顺手置 NOT_INDEXED（会触发全量重推）"
 
 
 def test_reconcile_commits_certified_status():
-    """★ reconcile 只在 materialized/retracted 时 commit —— 漏掉 certified 会让刚写的 epoch
-    要么丢、要么被下一篇的 commit 意外带上（B1 的事务语义在此露头）。"""
+    """★ certified 写下的 epoch 必须被提交 —— 丢了它，「值对但 epoch NULL」永远盖不上章。
+
+    ⚠️ 2026-08-04（B1）起，事务了结**不再按 status 分派**，而是按与 status 正交的
+    `wrote` 维度统一分派（certify 的 UPDATE 在 rowcount==0 时会穿透成 status="unchanged"，
+    按 status 分派必然漏掉那一格）。本测试随之改为验证这条**更强**的性质：
+    materialize 对 certified 报 wrote=True，且 reconcile 见 wrote 即 commit。
+    """
     import inspect
-    from opensearch_pipeline import allowed_depts_reconcile
-    src = inspect.getsource(allowed_depts_reconcile.reconcile_allowed_depts)
-    assert 'status == "certified"' in src, "reconcile 未识别 certified"
-    seg = src.split('status == "certified"')[1][:400]
-    assert "conn.commit()" in seg, "certified 分支未提交 —— epoch 会丢"
+    from opensearch_pipeline import access_grants, allowed_depts_reconcile
+    m_src = inspect.getsource(access_grants.materialize_doc_allowed_depts)
+    assert '"certified", "reset_chunks": 0, "version_no": ver, "wrote": True' in m_src, (
+        "certified 未报 wrote=True ⇒ 按 wrote 分派的调用方不会提交，epoch 会丢")
+    r_src = inspect.getsource(allowed_depts_reconcile.reconcile_allowed_depts)
+    assert 'status == "certified"' in r_src, "reconcile 未识别 certified（计数仍需要它）"
+    i = r_src.index('outcome.get("wrote")')
+    seg = r_src[i:i + 300]
+    assert "conn.commit()" in seg, "wrote 分派处未提交 —— certified 的 epoch 会丢"

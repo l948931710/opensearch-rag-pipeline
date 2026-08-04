@@ -297,18 +297,27 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
                     if status == "unchanged":
                         result["unchanged"] += 1
                     elif status == "certified":
-                        # C3′/062：值本就正确、只补盖 epoch 章（不动 index_status、不重推 HA3）。
-                        # ⚠️ **必须单独提交** —— 本函数只在 materialized/retracted 分支 commit，
-                        # 漏掉 certified 会让刚写的 epoch 要么丢、要么被下一篇的 commit 意外带上。
                         result["certified"] = result.get("certified", 0) + 1
-                        if commit:
-                            conn.commit()
                     elif status in ("materialized", "retracted"):
                         result[status] += 1
                         result["reset_chunks"] += outcome["reset_chunks"]
-                        if commit:
-                            conn.commit()                # 逐文档提交（单文档失败不连累其余）
                     # skipped / skipped_locked：current version 正在 stage-3 跑 → 本轮跳过、下轮再对
+
+                    # ── B1（2026-08-04）：**每一篇都必须了结事务**，按 `wrote` 二选一 ──────
+                    # 旧实现只在 certified / materialized / retracted 三支 commit，`unchanged`
+                    # 与 `skipped*` **既不 commit 也不 rollback**。而 `unchanged` 是会**带着写**
+                    # 返回的：certify 的 `UPDATE … SET acl_epoch` 在 rowcount==0（epoch 已相等，
+                    # MySQL 报 changed-rows=0）时**穿透**到 unchanged —— 语句已发出、
+                    # **X 锁已按匹配行取到**（与值是否改变无关），却没有任何人了结这个事务。
+                    # ⇒ 锁一直持到整轮 reconcile 结束（`conn.close()`），期间阻塞 stage-3 与控制台写。
+                    # 而"值已正确且 epoch 已相等"恰恰是**健康系统的常态路径**。
+                    # 判据用 `wrote`（与 status 正交的第二维）而非 status：单靠 status 表达不了
+                    # "报 unchanged 但写过"这种组合。
+                    if commit:
+                        if outcome.get("wrote"):
+                            conn.commit()                # 逐文档提交（单文档失败不连累其余）
+                        else:
+                            conn.rollback()              # 纯读：了结读视图，绝不把它拖给下一篇
                 except Exception as e:                   # noqa: BLE001 — 单文档失败不抛、记 errors
                     result["errors"].append(f"{doc_id}: {e}")
                     try:

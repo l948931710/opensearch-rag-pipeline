@@ -122,7 +122,10 @@ class _Cur:
             self._r = [(self.st.get("owner", {}).get(d, ""),)]
         elif s.startswith("update"):                                # 写
             self.st.setdefault("updates", []).append(p)
-            self.rowcount = 1
+            # B1：`update_rowcount` 让用例能造出 **changed-rows=0** 的 UPDATE ——
+            # 那正是 certify 穿透成 status='unchanged' 却已取 X 锁的真实形态。
+            # 桩恒回 1 的话，这条路径永远测不到（反证会假绿）。
+            self.rowcount = self.st.get("update_rowcount", 1)
             self._r = []
         else:
             self._r = []
@@ -151,7 +154,8 @@ class _Conn:
         self.st["commits"] = self.st.get("commits", 0) + 1
 
     def rollback(self):
-        pass
+        # B1：以前这里是 pass，于是"事务有没有被了结"完全测不出来（回归对测试隐形）。
+        self.st["rollbacks"] = self.st.get("rollbacks", 0) + 1
 
     def close(self):
         pass
@@ -451,3 +455,84 @@ def test_prescreen_catches_null_allowed_depts_version(monkeypatch):
           "owner": {"DN": "hr"}, "chunk_owner": {"DN": "hr"}}
     _run(monkeypatch, st)
     assert "DN" in seen, "NULL allowed_depts 的版本被跳过 ⇒ 未投影却判 unchanged"
+
+
+# ── C3′ B1（2026-08-04）：wrote 与 status 是**正交两维**，事务必须每篇了结 ──────────
+
+def test_materialize_reports_wrote_orthogonally_to_status():
+    """★ 活 bug 的根：certify 的 UPDATE 在 rowcount==0 时**穿透**成 status='unchanged'。
+
+    MySQL 对**匹配到的行**取 X 锁，与值是否改变无关 ⇒ 报 unchanged 却持着锁。
+    单靠 status 表达不了「报 unchanged 但写过」，故必须有第二维 `wrote`。
+    """
+    import inspect
+    from opensearch_pipeline import access_grants
+    src = inspect.getsource(access_grants.materialize_doc_allowed_depts)
+    # 两条臂的 certify UPDATE 之后都必须立刻置 _wrote（不能等 rowcount 判断）
+    for seg in src.split("SET acl_epoch=%s")[1:]:
+        head = seg[:seg.index("if cursor.rowcount")]
+        assert "_wrote = True" in head, (
+            "certify 的 UPDATE 之后没有立刻置 _wrote —— rowcount==0 时会穿透成 unchanged 且不带 wrote")
+    # unchanged 的返回必须携带 _wrote 变量而非硬编码 False
+    assert '"unchanged", "reset_chunks": 0, "version_no": ver, "wrote": _wrote}' in src
+
+
+def test_reconcile_settles_transaction_for_every_doc(monkeypatch):
+    """★ 每一篇都必须 commit 或 rollback。
+
+    旧实现只在 certified/materialized/retracted 三支 commit；`unchanged` 与 `skipped*`
+    **既不 commit 也不 rollback**，事务被拖给下一篇。而 `unchanged` 是会**带着写**返回的
+    （certify 的 UPDATE 在 rowcount==0 时穿透），X 锁按匹配行已取到 ⇒ 一直持到整轮结束。
+    这里造一篇"值已正确"的干净文档（走 certify/unchanged 路径），断言事务被了结。
+    """
+    from opensearch_pipeline import allowed_depts_reconcile as R
+    # 关掉预筛：干净文档本会被预筛跳过、根本到不了 materialize，那样就测不到事务了结。
+    monkeypatch.setattr(R, "_prescreen_unchanged", lambda cur, targets: set())
+    st = {"approved": {"DT": ["hr"]}, "have": {"DT": ["hr"]}, "ver": {"DT": 1},
+          "perm": {"DT": "dept_internal"},
+          "owner": {"DT": "hr"}, "chunk_owner": {"DT": "hr"}}
+    _run(monkeypatch, st)
+    settled = st.get("commits", 0) + st.get("rollbacks", 0)
+    assert settled >= 1, (
+        f"该文档走完却既没 commit 也没 rollback（commits={st.get('commits',0)} "
+        f"rollbacks={st.get('rollbacks',0)}）⇒ 事务被拖给下一篇，锁不释放")
+
+
+def test_reconcile_no_longer_has_unsettled_branches():
+    """回归守卫：unchanged / certified / materialized 三支都不得再各自单独 commit。
+
+    单独 commit 意味着又回到「按 status 分派」，会漏掉「报 unchanged 但写过」这一格。
+    """
+    import inspect
+    from opensearch_pipeline import allowed_depts_reconcile as R
+    src = inspect.getsource(R.reconcile_allowed_depts)
+    head = src[:src.index('outcome.get("wrote")')]
+    assert head.count("conn.commit()") == 0, (
+        "status 分支里仍有独立 commit —— 事务了结必须统一走 wrote 分派，否则又会漏格")
+
+
+def test_reconcile_settles_even_when_certify_update_changed_nothing(monkeypatch):
+    """★★ 活 bug 的**行为级**证明：certify 的 UPDATE 匹配到行但 changed-rows=0
+    （epoch 已相等）⇒ materialize 穿透返回 status='unchanged'，而 X 锁已按匹配行取到。
+
+    旧实现按 status 分派 ⇒ unchanged 既不 commit 也不 rollback ⇒ 锁持到整轮结束。
+    这是"值已正确且 epoch 已相等"的**健康系统常态路径**，不是边缘情况。
+    """
+    from opensearch_pipeline import allowed_depts_reconcile as R
+    monkeypatch.setattr(R, "_prescreen_unchanged", lambda cur, targets: set())
+    st = {"approved": {"DZ": ["hr"]}, "have": {"DZ": ["hr"]}, "ver": {"DZ": 1},
+          "perm": {"DZ": "dept_internal"},
+          "owner": {"DZ": "hr"}, "chunk_owner": {"DZ": "hr"},
+          "update_rowcount": 0}          # ← changed-rows=0：certify 穿透成 unchanged
+    out = _run(monkeypatch, st)
+    # 🔴 必须先排除异常路径：materialize 抛异常时 reconcile 的 except 也会 rollback，
+    # 只断言 settled>=1 会被**任何**错误（如 NameError）满足 —— 本用例第一版正是这样
+    # "通过"的，掩盖了我自己引入的 `_wrote` 未初始化。
+    assert not out.get("errors"), f"不该有错误，实得 {out['errors']}"
+    assert out.get("unchanged", 0) + out.get("certified", 0) >= 1, (
+        "该文档没走到 unchanged/certified 路径，用例前提不成立")
+    settled = st.get("commits", 0) + st.get("rollbacks", 0)
+    assert settled >= 1, (
+        "certify 的 UPDATE 已发出（X 锁已取）却穿透成 unchanged，事务竟未被了结 "
+        f"(commits={st.get('commits',0)} rollbacks={st.get('rollbacks',0)}) "
+        "⇒ 锁会一直持到整轮 reconcile 结束，阻塞 stage-3 与控制台写")

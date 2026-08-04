@@ -418,11 +418,12 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
     apply=False：只算 want/have/status、不写（对账只读预览）。
 
     Returns: {"status": "skipped"|"skipped_locked"|"unchanged"|"materialized"|"retracted",
+
               "reset_chunks": int, "version_no": int|None}
     """
     import json as _json
     if not doc_id:
-        return {"status": "skipped", "reset_chunks": 0, "version_no": None}
+        return {"status": "skipped", "reset_chunks": 0, "version_no": None, "wrote": False}
     # 1. current version + 2h PROCESSING 反抢锁（与 stage-3 loader / 对账同约定）
     cursor.execute(
         f"SELECT dm.current_version_no FROM {_kb_db()}.document_meta dm "
@@ -434,7 +435,14 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
     )
     row = cursor.fetchone()
     if not row:
-        return {"status": "skipped_locked", "reset_chunks": 0, "version_no": None}
+        return {"status": "skipped_locked", "reset_chunks": 0, "version_no": None, "wrote": False}
+
+    # B1（2026-08-04）：`wrote` 是**与 status 正交**的第二维 —— status 说"结果是什么"，
+    # wrote 说"本调用有没有发出过写语句"。调用方据此决定 commit 还是 rollback。
+    # 单靠 status 表达不了这两维：certify 的 `UPDATE … SET acl_epoch` 在 rowcount==0
+    # （epoch 已相等 ⇒ changed-rows=0）时会**穿透**成 status="unchanged"，而 MySQL 对
+    # **匹配到的行**取的 X 锁与 rowcount 无关 ⇒ 报 unchanged 却持着锁。
+    _wrote = False
     ver = int(row[0] or 1)
 
     # C3′/062：**同一事务快照**内读权威 epoch，供下方两处 UPDATE stamp。
@@ -484,12 +492,16 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
                     "WHERE doc_id=%s AND version_no=%s AND is_active=1",
                     (_auth_epoch, doc_id, ver),
                 )
+                # 🔴 语句一旦发出就**必须**认作"写过"——MySQL 对匹配到的行取 X 锁，
+                # 与值是否改变无关；rowcount==0 只说明 changed-rows 为 0（epoch 已相等），
+                # 锁仍在、事务仍需被显式了结。漏了这一句，调用方会把它当纯读而不 commit/rollback。
+                _wrote = True
                 if cursor.rowcount:
-                    return {"status": "certified", "reset_chunks": 0, "version_no": ver}
-            return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
+                    return {"status": "certified", "reset_chunks": 0, "version_no": ver, "wrote": True}
+            return {"status": "unchanged", "reset_chunks": 0, "version_no": ver, "wrote": _wrote}
         status = "materialized" if want else "retracted"
         if not apply:
-            return {"status": status, "reset_chunks": 0, "version_no": ver}
+            return {"status": status, "reset_chunks": 0, "version_no": ver, "wrote": False}
         aj = _json.dumps(want, ensure_ascii=False) if want else None
         cursor.execute(
             f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, owner_dept=%s"
@@ -497,7 +509,7 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
             "WHERE doc_id=%s AND version_no=%s AND is_active=1",
             ((aj, _owner, _auth_epoch, doc_id, ver) if _stamp else (aj, _owner, doc_id, ver)),
         )
-        return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver}
+        return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver, "wrote": True}
 
     # 2. legacy:authority → 该版本 permission_level 版本限定 gate 到 dept_internal
     raw_want = resolve_allowed_depts_one(doc_id, cursor)
@@ -535,12 +547,13 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
                 "WHERE doc_id=%s AND version_no=%s AND is_active=1",
                 (_auth_epoch, doc_id, ver),
             )
+            _wrote = True      # 同上：语句发出即取锁，与 rowcount 无关
             if cursor.rowcount:
-                return {"status": "certified", "reset_chunks": 0, "version_no": ver}
-        return {"status": "unchanged", "reset_chunks": 0, "version_no": ver}
+                return {"status": "certified", "reset_chunks": 0, "version_no": ver, "wrote": True}
+        return {"status": "unchanged", "reset_chunks": 0, "version_no": ver, "wrote": _wrote}
     status = "materialized" if want else "retracted"
     if not apply:
-        return {"status": status, "reset_chunks": 0, "version_no": ver}
+        return {"status": status, "reset_chunks": 0, "version_no": ver, "wrote": False}
     aj = _json.dumps(want, ensure_ascii=False) if want else None
     cursor.execute(
         f"UPDATE {_kb_db()}.chunk_meta SET allowed_depts=%s, owner_dept=%s"
@@ -548,7 +561,7 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         "WHERE doc_id=%s AND version_no=%s AND is_active=1",
         ((aj, _owner, _auth_epoch, doc_id, ver) if _stamp else (aj, _owner, doc_id, ver)),
     )
-    return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver}
+    return {"status": status, "reset_chunks": cursor.rowcount, "version_no": ver, "wrote": True}
 
 
 # ── 投影 outbox：decide 同事务入队 + stage-3 幂等 drain（与全扫 reconcile 互补）──
