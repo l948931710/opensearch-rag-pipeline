@@ -205,7 +205,21 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                     # 行锁。**不再做第二次按状态 SELECT**——认领到的行已在 rows 内存里。行锁只在
                     # 认领事务内短暂持有，绝不跨后续 OSS/DAG 长流程（MySQL 8 支持，生产实测 8.0.36）。
                     # 进程在 commit 后崩溃留下的 LOADING 仍由 _reset_stale_stage2_locks（2h）兜底回收。
-                    cursor.execute("""
+                    # C9/B′（schema/063）：可见范围意图列。**必须探测**——063 未 apply 的
+                    # 环境硬带该列会 1054 打挂整个 stage-2 认领（与 062 的 acl_epoch 同款教训）。
+                    # 列**追加在末位**（索引 13），既有位置索引（r[12]=id 等）逐字不变。
+                    _has_pov = False
+                    try:
+                        cursor.execute(
+                            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='document_version' "
+                            "AND COLUMN_NAME='permission_override'")
+                        _r = cursor.fetchone()
+                        _has_pov = bool(_r and _r[0])
+                    except Exception:      # noqa: BLE001 — 探测失败按未 apply 处理（保守）
+                        _has_pov = False
+                    _pov_col = ",\n                            dv.permission_override" if _has_pov else ""
+                    cursor.execute(f"""
                         SELECT
                             dv.doc_id,
                             dv.version_no,
@@ -219,7 +233,7 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                             dm.title,
                             dm.owner_dept,
                             dv.raw_key,
-                            dv.id
+                            dv.id{_pov_col}
                         FROM document_version dv
                         LEFT JOIN document_meta dm ON dv.doc_id = dm.doc_id
                         WHERE (content_process_status = 'NOT_STARTED'
@@ -387,6 +401,17 @@ def run_stage(stage: int, bizdate: str, simulate: bool, cost_breaker=None):
                             "canonical_key": canonical_json_key,
                             "canonical_md_key": canonical_md_key,
                         }
+                        # ── C9/B′：管理员显式声明过的可见范围**压过** raw_key 路径解析 ──
+                        # 这是整条修复的落点：`resolve_permission_level` 的优先级 1 就是
+                        # `doc["permission_level"]`（pipeline_nodes.py:1707），把 override 放进来
+                        # 即命中；不放 = 本轮照旧按上传路径把管理员刚改的可见范围**覆盖回去**。
+                        # ⚠️ 只在**非 NULL** 时注入：NULL = 无显式意图，必须原样走路径解析
+                        # （绝不能反过来让 RDS 全局赢——stage-1 自动注册的 INSERT 不含
+                        # permission_level 列、落 schema 默认 'public'，DataWorks 批量注册更是
+                        # 硬编码 'public'，全局让 RDS 赢会确定性破坏 raw/.../internal/ 与 restricted）。
+                        _pov = row[13] if (_has_pov and len(row) > 13) else None
+                        if _pov:
+                            canonical_doc["permission_level"] = _pov
                         # F（2026-07-25）：**保留 assets 的字段存在性**。旧写法
                         # `content_json.get("assets", [])` 把"canonical 里根本没有该键"
                         # 抹成空集，会让资产集比对把一次读取/格式异常误判成"整篇图没了"

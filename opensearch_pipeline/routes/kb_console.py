@@ -3250,6 +3250,78 @@ def kb_restore(req: KbRetireRequest, request: Request,
         note="已恢复上线：重新激活并标记待重索引；若退役后 HA3 仍在则即时可检索，否则下次维护重索引后恢复")
 
 
+
+# ── C9/B′ 可见范围意图（Sam 2026-08-03 拍板；拍板单 docs/ops/c9_..._2026-08-03.md）──────
+# 权限收紧/放宽的序（数值大=可见面广）。只用于判「方向」，不参与授权判定。
+_KB_PERM_RANK = {"restricted": 0, "dept_internal": 1, "public": 2}
+
+# stage-1/2 认领谓词内的状态（dataworks_orchestrator.py:225/761）——这些是**可被抢占**的
+# pre-claim 态；本端点对当前版本行取 FOR UPDATE 后，与认领的 `FOR UPDATE OF dv SKIP LOCKED`
+# 干净互斥，故它们**安全可写**（收窄了 B′ 初稿「一并 409」的面）。
+_KB_CLAIMED_CPS = ("LOADING", "PROCESSING")
+
+
+def _kb_visibility_gate(cur, doc_id: str, cur_ver: int):
+    """锁住当前版本行并判是否可写可见范围意图。返回 None=放行，str=409 文案。
+
+    🔴 `FOR UPDATE` 是本函数存在的**主要理由**——不是为了读那两列，是为了与 stage-2 的
+    认领事务串行化。少了它，只加 override 列仍是 last-writer-wins。
+    """
+    cur.execute(f"SELECT content_process_status, index_status FROM {_kb_db()}.document_version "
+                "WHERE doc_id=%s AND version_no=%s FOR UPDATE", (doc_id, cur_ver))
+    row = cur.fetchone()
+    if not row:
+        return None            # 无当前版本行（极早期文档）：无可覆盖方，放行
+    cps = str(row[0] or "").upper()
+    ixs = str(row[1] or "").upper()
+    # ⚠️ 409 **不是永久拒绝**：>2h 无进展会被 stale-lock 接管重置为 FAILED+retry++
+    # （dataworks_orchestrator.py:711-719）⇒ 回到可写。文案必须让管理员知道「稍后重试」，
+    # 否则会以为这篇永远改不了。
+    if cps in _KB_CLAIMED_CPS:
+        return (f"该文档正在入库处理中（{cps}），此时改可见范围会被本轮处理覆盖。"
+                "请稍后重试（处理完成或超时释放后即可修改）。")
+    if ixs == "PROCESSING":
+        return ("该文档正在写入检索索引，此时改可见范围会让本轮推送带上旧权限。"
+                "请稍后重试。")
+    return None
+
+
+def _kb_write_permission_override(cur, doc_id: str, target: str) -> bool:
+    """把可见范围意图写进 document_version.permission_override（schema/063）。
+
+    capability 降级：063 未 apply 的环境（本地 dev / 旧 staging）硬写会 1054 打挂整个端点，
+    与 062 同款先探测再写 ⇒ 保住「先部署后 apply 安全」。降级=不写（行为回落到修复前）。
+    返回是否真的写了（供测试与审计文案）。
+    """
+    try:
+        cur.execute(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE()"
+            " AND TABLE_NAME=%s AND COLUMN_NAME=%s", ("document_version", "permission_override"))
+        r = cur.fetchone()
+        if not (r and r[0]):
+            return False
+    except Exception:      # noqa: BLE001 — 探测失败按未 apply 处理（保守）
+        return False
+    # 写**全部 active 版本**：stage-2 认领哪一版都要带同一意图；幂等，重复调用无副作用。
+    cur.execute(f"UPDATE {_kb_db()}.document_version SET permission_override=%s "
+                "WHERE doc_id=%s AND status='active'", (target, doc_id))
+    return True
+
+
+def _kb_has_pending_version(cur, doc_id: str, cur_ver: int) -> bool:
+    """该文档是否还有**待处理**版本（尚未走完入库的版本）。
+
+    用于 §4.3-c：放宽方向且有待处理版本 ⇒ 在线投影延后到新版本落地。
+    没有待处理版本时放宽必须立即生效，否则该变更**永远不会生效**。
+    """
+    cur.execute(
+        f"SELECT COUNT(*) FROM {_kb_db()}.document_version WHERE doc_id=%s AND status='active' "
+        "AND content_process_status NOT IN ('DONE','REJECTED','SKIPPED_DUPLICATE','QUARANTINED')",
+        (doc_id,))
+    r = cur.fetchone()
+    return bool(r and int(r[0] or 0) > 0)
+
+
 @router.post("/api/kb/set-visibility", response_model=KbSetVisibilityResponse)
 def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                       identity: Optional[Identity] = Depends(current_identity)):
@@ -3318,11 +3390,36 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                     conn.commit()       # 幂等：级别未变
                     return KbSetVisibilityResponse(doc_id=req.doc_id, permission_level=target,
                                                    changed=False, already=True, note="可见范围未变化")
-                # 1) 基础级别：document_meta + chunk_meta 去规范化副本（检索/gate 读后者）
+                # ── C9/B′：与 stage-2 互斥 + 把意图持久化（Sam 2026-08-03 拍板）───────────
+                # 机械根因：本端点只锁 document_meta，stage-2 只锁 document_version
+                # （FOR UPDATE OF dv SKIP LOCKED）⇒ **两个写方锁不相交的行、彼此零互斥**，
+                # 于是可见范围被 stage-2 按 raw_key 路径覆盖回写是必然而非偶发。
+                # 这里补上对当前版本行的 FOR UPDATE，两者才真正串行化：
+                #   · 本端点先拿到锁 ⇒ stage-2 本轮 SKIP 掉这篇，下轮带着 override 处理；
+                #   · stage-2 先拿到锁 ⇒ 本端点阻塞到它 commit，醒来即见 LOADING ⇒ 409。
+                _vg = _kb_visibility_gate(cur, req.doc_id, cur_ver)
+                if _vg:
+                    raise HTTPException(status_code=409, detail=_vg)
+
+                # 1) 基础级别：document_meta（声明意图）
                 cur.execute(f"UPDATE {_kb_db()}.document_meta SET permission_level=%s, updated_at=NOW() "
                             "WHERE doc_id=%s", (target, req.doc_id))
-                cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET permission_level=%s "
-                            "WHERE doc_id=%s AND version_no=%s", (target, req.doc_id, cur_ver))
+                # 1b) 版本级意图：让 stage-2 的 raw_key 解析不再覆盖回去（063；未 apply 则降级跳过）。
+                # 写到该文档**全部 active 版本**：stage-2 认领哪一版都得带上同一意图，且幂等。
+                _kb_write_permission_override(cur, req.doc_id, target)
+
+                # 1c) 检索投影（chunk_meta 的去规范化副本，检索/gate 实际读的是它）。
+                # 🔴 Sam 2026-08-03 §4.3 裁决：**收紧立即生效，放宽只对新版本**。
+                #   · 收紧（→restricted / public→dept_internal）⇒ 立即改在线版本：
+                #     紧急下线的唯一语义；否则管理员点完「受限」而文档仍被检索 = 最坏的安全错觉。
+                #   · 放宽（→public 等）且**存在待处理新版本** ⇒ 只落意图、**不动**在线投影：
+                #     放宽是不可逆的暴露面扩大，在线旧版内容还没按新口径复核过。
+                #     无待处理版本时照常立即生效（否则放宽将永远不生效）。
+                _widening = _KB_PERM_RANK.get(target, 0) > _KB_PERM_RANK.get(cur_perm, 0)
+                _defer = _widening and _kb_has_pending_version(cur, req.doc_id, cur_ver)
+                if not _defer:
+                    cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET permission_level=%s "
+                                "WHERE doc_id=%s AND version_no=%s", (target, req.doc_id, cur_ver))
                 # 2) 检索存续：restricted=离开检索（停用 chunk）；重新上线=激活 chunk + 标脏重推
                 if target == "restricted":
                     # 与 retire 同款【全部活跃版本】停用（不限当前版本）：双版本 gap 残留的旧版
