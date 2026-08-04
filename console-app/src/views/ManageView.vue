@@ -113,7 +113,9 @@ function askHot(q: string) { fillInput(q); void router.push('/') }
 // ── 按 tab 惰性加载（perf 2026-07-16 ①）：此前挂载即并发拉全部 ~13 个接口——首屏被最慢
 // 端点拖住（stats 实测 4.6-5.2s），还制造了 429 雪崩的请求源。现在挂载只拉三类：
 //   a) 探测（tab 自隐判据，不拉就没入口）：ontology / agent 审批 / agent 治理；
-//   b) 角标（「审批」badge + 侧栏红点，60s pollQueues 同款三队列）；
+//   b) 角标（「审批」badge + 侧栏红点）：approvals / accessRequests 两条队列，与 App.vue
+//      session-ready 的预载同源。⚠️ **没有轮询**——`STALE_MS=30_000` 是「30s 内不重拉」的
+//      staleness 门，与轮询正好相反；队列靠预载 + 写路径 force=true 刷新，不靠定时器。
 //   c) 当前 tab 所需数据。
 // 其余 tab 首次激活时补拉（ensureTabLoaded；loader 各自的 30s staleness/LoadError 手动
 // 重试语义不变——失败后面板内重试按钮直调 load*，不经本表）。
@@ -129,7 +131,7 @@ function ensureTabLoaded(t: Tab): Promise<unknown> {
     // stats 兼供台账（归属下拉全库口径）
     jobs.push(loadDocs(), loadConfig(), loadStats())
   } else if (t === 'approvals') {                    // 审批 tab：历史 + 已授权存量
-    jobs.push(loadApprovalHistory(), loadAccessGrants())   // 待办队列已全局预载+轮询
+    jobs.push(loadApprovalHistory(), loadAccessGrants())   // 待办队列已由 App ready + 本视图 onMounted 预载（无轮询）
   } else if (t === 'ops') {
     if (isKbAdmin.value) jobs.push(loadOpsMetrics())
   } else if (t === 'members') {
