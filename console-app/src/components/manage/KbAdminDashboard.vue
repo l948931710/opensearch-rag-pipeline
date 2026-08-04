@@ -7,7 +7,8 @@ import {
 import { onMounted } from 'vue'
 import { useKb } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
-import { SECTION, ZONE_HEAD, ZONE_TICK, SUBHEAD, GRID, SPLIT } from '@/lib/section'
+import { SECTION, ZONE_HEAD, ZONE_TICK, SUBHEAD, GRID, SPLIT, SKEL_H } from '@/lib/section'
+import SkeletonBlock from './SkeletonBlock.vue'
 import { fetchOrgSnapshot } from '@/composables/useOrgSnapshot'
 import { resolveOwnerBucket } from '@/lib/orgTree'
 import type { OrgNode } from '@/composables/useOrgSnapshot'
@@ -35,7 +36,7 @@ const ownerText = (key: string) => resolveOwnerBucket(key, undefined, snapById.v
 // 知识库管理员「概览看板」= 全库视角（对齐 Atlas 设计分区）。资产/状态取 /api/kb/stats、待审批
 // /pending-approvals；运行健康+治理风险+部门覆盖取 /api/kb/governance；知识效果取 /api/kb/insights。
 // 全部真实口径，无对应数据则如实显空 —— 绝不造数。
-const { kbStats, approvals, kbGovernance, kbInsights, feedbackReview, loadStats, loadGovernance, loadInsights, loadErrors, fbStats, loadFeedbackStats } = useKb()
+const { kbStats, approvals, kbGovernance, kbInsights, feedbackReview, loadStats, loadGovernance, loadInsights, loadErrors, isLoading, hasSettled, fbStats, loadFeedbackStats } = useKb()
 
 // 「待你处理」置顶条（P2）：差评复核是看板里唯一的行动区，却沉在页尾 ~2900px 深——
 // 有未处理差评时在首屏给一枚计数 chip，点击平滑定位；清零即隐，与文档管理 tab 的待办条同语言。
@@ -44,8 +45,27 @@ const { kbStats, approvals, kbGovernance, kbInsights, feedbackReview, loadStats,
 const feedbackOpenCount = computed(() => (feedbackReview.value || []).filter((x) => !x.handled).length)
 const feedbackLoadFailed = computed(() => !!loadErrors.value['feedbackReview'])
 function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
-// 资产概览卡的加载态：stats 尚未返回且无错误 → 显骨架（避免闪 0）。
-const statsLoading = computed(() => !kbStats.value && !loadErrors.value['stats'])
+// 资产概览卡的加载态。**判据是「请求是否在途」，不是「数据在不在」** —— 原写法
+// `!kbStats && !loadErrors['stats']` 在 stats 返回 404 时恒为真（noteLoadError 对 404 走静默分支，
+// 数据与错误同时恒空），审计实测 4 张 hero 卡骨架转 5 秒仍在转、0 alert、0 重试。
+const statsLoading = computed(() => isLoading('stats'))
+// 跑完了、既没数据也没错误 = 端点未上线（404 静默）。这一态必须与「在途」分开表达，
+// 否则要么永久转圈，要么把 `?? 0` 的兜底零当成真实数字显出来（StatCard 的 loading 本就是为防这个）。
+const statsUnavailable = computed(() => hasSettled('stats') && !kbStats.value && !loadErrors.value['stats'])
+/** 端点未接入（404 静默）：跑完了、没数据、也没错误。三者缺一都不是这一态。 */
+const dataOf: Record<string, () => unknown> = { governance: () => kbGovernance.value, insights: () => kbInsights.value }
+function notDeployed(key: 'governance' | 'insights'): boolean {
+  return hasSettled(key) && !dataOf[key]() && !loadErrors.value[key]
+}
+// 底部合并块只在两种情况下出：**两个端点都未接入**，或**还没跑完**（那句「稍后自动呈现」才成立）。
+// ⚠️ 判据必须是 notDeployed 而不是 hasSettled：后者不区分「跑完没数据没错误（404）」与
+// 「跑完但错了（5xx）」。混合态（一个 404 一个 5xx）下用 hasSettled 会让页面对一个返回 500 的
+// 端点断言「返回 404，数字不会自动出现」，同屏还并排着它自己的「加载失败，请重试」——
+// 对同一端点同时说两句互相矛盾的话，且基线本不作此声明，属新引入的假陈述。
+// 混合态的信息由顶部两条各自承担：说 404 的走逐端点未接入行，说 5xx 的走带前缀的 LoadError。
+const bothNotDeployed = computed(() => notDeployed('governance') && notDeployed('insights'))
+const govOrInsPending = computed(() => !hasSettled('governance') || !hasSettled('insights'))
+const showCombinedFallback = computed(() => bothNotDeployed.value || govOrInsPending.value)
 const b = (k: string) => kbStats.value?.by_badge?.[k] || 0
 const fmtN = (n?: number) => (n || 0).toLocaleString('en-US')
 const ms2s = (ms?: number) => (ms ? (ms / 1000).toFixed(1) + 's' : '—')
@@ -222,19 +242,64 @@ const downvoteItems = computed(() =>
       ><AlertTriangle :size="12" :stroke-width="1.75" /> 差评复核加载失败 · 数量未知</button>
     </div>
 
+    <!-- 端点级失败：**逐端点上报，不再要求「两个都缺」才显示**。原先唯一的错误出口挂在
+         `v-if="!kbGovernance && !kbInsights"` 上，于是 governance 5xx 而 insights 正常时
+         （或反过来）审计实测 [role=alert] 计数为 0、零重试入口——相关分区直接从 DOM 消失，
+         管理员无从区分「这个端点坏了」与「这些功能不存在」。LoadError 自身 message 为空即自隐，
+         故这里常驻两条不需要额外条件。文案就地加端点前缀，避免两条都只说「加载失败」分不清谁坏了。 -->
+    <LoadError
+      :message="loadErrors['governance'] ? `全库治理数据${loadErrors['governance']}` : ''"
+      @retry="loadGovernance()"
+    />
+    <LoadError
+      :message="loadErrors['insights'] ? `知识效果数据${loadErrors['insights']}` : ''"
+      @retry="loadInsights()"
+    />
+    <!-- 端点未接入（404 静默）同样逐端点上报。上面的错误路径已拆掉「两个都缺才显示」的耦合，
+         但 404 路径起初原样保留了同一个耦合（下方合并占位要求两个都 settled）——于是
+         insights 单边 404 时页面只是静默少掉「最常被检索 / 知识缺口」，既不报错也不解释，
+         与「真无数据」不可区分。同一缺陷换了一层，本轮主题正是「四态必须可区分」，故一并拆开。
+         这两条与下方的合并占位互斥：合并块只在**两个都**未接入时出（避免同一句话说两遍）。 -->
+    <p
+      v-if="notDeployed('governance') && !notDeployed('insights')" data-testid="governance-not-deployed"
+      class="rounded-lg border border-dashed border-border bg-surface/60 px-3 py-2 text-[12px] text-muted-foreground"
+    >
+      运行健康 / 治理风险 / 部门覆盖未接入：<code class="font-mono text-[11px]">/api/kb/governance</code>
+      返回 404，数字不会自动出现。
+    </p>
+    <p
+      v-if="notDeployed('insights') && !notDeployed('governance')" data-testid="insights-not-deployed"
+      class="rounded-lg border border-dashed border-border bg-surface/60 px-3 py-2 text-[12px] text-muted-foreground"
+    >
+      知识效果未接入：<code class="font-mono text-[11px]">/api/kb/insights</code>
+      返回 404，「最常被检索 / 知识缺口」不会自动出现。
+    </p>
+
     <!-- ① 全库资产与运行（2026-08-03 重设计：资产 hero 卡 + 状态分布 + 扁平 vitals + 趋势|文件类型）
          设计原则：只有决策数字配大卡,运行体征降为安静的 hairline 行——异常靠语义色点浮出。 -->
     <section :class="SECTION">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库资产与运行</header>
       <LoadError class="mb-3" :message="loadErrors['stats']" @retry="loadStats()" />
-      <div :class="GRID">
+      <!-- 端点未上线（404 静默）：既不能继续转骨架，也不能把 `?? 0` 的兜底零当真实数字显出来。 -->
+      <div
+        v-if="statsUnavailable" data-testid="stats-unavailable"
+        class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground"
+      >
+        全库资产口径暂不可用——<code class="font-mono text-[11.5px]">/api/kb/stats</code> 未接入（404）。
+        这不是「没有文档」，只是这台服务器上没有这个端点；数字不会自动出现。
+        <button
+          type="button" class="ml-1 font-semibold text-accent-text underline underline-offset-2"
+          @click="loadStats()"
+        >重试</button>
+      </div>
+      <div v-else :class="GRID">
         <StatCard v-for="s in assetCards" :key="s.label" v-bind="s" :loading="statsLoading" />
       </div>
       <!-- ml-0.5 已移除（2026-08-04）：本处曾是全应用唯一一个在调用点给 SUBHEAD 加 2px 左边距的
            实例，而 DeptDashboard 是把同样的 2px 烤进了它自己的常量——同一偏移两条互不知情的路径。
            抽取共享常量时统一取多数（17:3）的无偏移版，20 个 SUBHEAD 实例自此同一基准。 -->
       <p :class="SUBHEAD" class="mt-4">状态分布</p>
-      <StatusDistBar :by-badge="kbStats?.by_badge || {}" />
+      <StatusDistBar :by-badge="kbStats?.by_badge || {}" :loading="statsLoading" />
       <template v-if="kbGovernance">
         <div class="mt-4 grid gap-x-10 lg:grid-cols-2">
           <div>
@@ -273,6 +338,15 @@ const downvoteItems = computed(() =>
     </section>
 
     <!-- ② 组织覆盖（签名区）：归属轴=组织树。中心行卷积可展开;覆盖条+树表合并原三件套。 -->
+    <!-- governance 在途：用**与真实内容等高**的骨架预留版面。审计实测 governance 到达那一帧
+         main.scrollHeight 从 900 直接跳到 2616（+1716px），已在阅读的用户脚下整块位移。
+         条件必须是「请求在途」而不是 `!kbGovernance`——后者在 dashboard.spec.ts 的
+         同步 mount 场景（无 fetch）里恒为真，会把本不该出现的分区标题渲染出来打红 :121。 -->
+    <section v-if="isLoading('governance') && !kbGovernance" :class="SECTION" data-testid="skel-governance-sec">
+      <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>组织覆盖</header>
+      <SkeletonBlock :rows="6" :height="SKEL_H.orgRow" testid="skel-org-coverage" />
+    </section>
+
     <section v-if="kbGovernance" :class="SECTION">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>组织覆盖</header>
       <OrgCoverageTable :rows="kbGovernance.dept_coverage" />
@@ -344,11 +418,20 @@ const downvoteItems = computed(() =>
     </section>
 
     <!-- 治理/洞察数据加载中（端点未接入）→ 如实占位；真实失败（5xx）→ 错误条 + 重试 -->
-    <section v-if="!kbGovernance && !kbInsights" :class="SECTION">
+    <!-- 混合态（一个 404 一个 5xx）下本块整体不渲染：两条信息已由顶部的逐端点未接入行与
+         带前缀的 LoadError 各自承担，这里再出一个「全库治理看板」空壳只会让人以为还有内容。 -->
+    <section v-if="!kbGovernance && !kbInsights && showCombinedFallback" :class="SECTION">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>全库治理看板</header>
-      <div v-if="loadErrors['governance'] || loadErrors['insights']" class="space-y-2">
-        <LoadError :message="loadErrors['governance']" @retry="loadGovernance()" />
-        <LoadError :message="loadErrors['insights']" @retry="loadInsights()" />
+      <!-- 错误已上移为逐端点上报（见本文件顶部两条 LoadError），这里只剩两种「无数据」：
+           已定态 = 端点确实没接（404 静默），**不会**再自动出现——原文案一律说「稍后自动呈现」
+           是对 404 的假承诺（审计点名）；未定态 = 还没请求过/在途，那句话才成立。 -->
+      <div
+        v-if="bothNotDeployed" data-testid="gov-not-deployed"
+        class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground"
+      >
+        运行健康 / 治理风险 / 部门覆盖 / 知识效果未接入：
+        <code class="font-mono text-[11.5px]">/api/kb/governance</code> 与
+        <code class="font-mono text-[11.5px]">/api/kb/insights</code> 返回 404，数字不会自动出现。
       </div>
       <div v-else class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
         运行健康 / 治理风险 / 部门覆盖 / 知识效果数据加载中（需后端

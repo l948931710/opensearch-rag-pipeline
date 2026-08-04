@@ -1,10 +1,16 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { badgeTone } from '@/lib/kb'
+import { SKEL } from '@/lib/section'
 
 // 状态分布条：把 /api/kb/stats 的 by_badge（真实口径，按作用域聚合）画成一条堆叠比例条 + 图例。
 // 配色复用 lib/kb.badgeTone（与台账徽章同一真相），绝不在此另造色表。
-const props = defineProps<{ byBadge: Record<string, number> }>()
+// `loading` 是可选的：不传 = 旧行为（既有 dashboard.spec.ts 的两条单测就不传）。
+// 传了才把「stats 还在路上」与「确认为空」分开——审计实测本组件在 stats 在途期间就显示
+// 「暂无文档数据。」，是一句在数据到达前就下的、可能为假的结论。
+const props = withDefaults(defineProps<{ byBadge: Record<string, number>; loading?: boolean }>(), {
+  loading: false,
+})
 
 const TONE_BG: Record<string, string> = {
   live: 'bg-st-live', busy: 'bg-st-busy', queue: 'bg-st-queue',
@@ -50,6 +56,11 @@ const segs = computed(() => {
         </div>
       </div>
     </template>
+    <!-- 在途与「确认为空」必须说不同的话：前者是「还不知道」，后者是「已知道，是零」。 -->
+    <div v-else-if="loading" role="presentation" aria-busy="true" data-testid="skel-status-dist">
+      <div :class="SKEL" class="h-4 w-full" />
+      <span class="sr-only">状态分布加载中</span>
+    </div>
     <p v-else class="text-sm text-muted-foreground">暂无文档数据。</p>
   </div>
 </template>

@@ -43,7 +43,37 @@ export const USAGE_GRID = 'grid grid-cols-1 gap-3 sm:grid-cols-3'
 export const SPLIT =
   'grid overflow-hidden rounded-2xl border border-border bg-surface divide-y divide-border sm:grid-cols-2 sm:divide-y-0 sm:divide-x'
 
-/* 本模块只收**已有消费方**的常量。骨架原语（SKEL / 行高常量）曾在此轮一并定义，
-   但当时零消费方、且行高数字自称「实测」却与真实渲染对不上（StatCard 主值行实测 26px
-   而非 24、表格行 35.25–37.25px 而非 40）—— 无人校验的伪实测值放进共享模块必然腐坏。
-   已移除：等首个消费方（骨架分区化那一轮）出现时，按当时实测重建。 */
+/**
+ * 骨架条的类名 —— **与 StatCard.vue:29 逐字一致**。
+ *
+ * 消费方：`SkeletonBlock.vue`、`StatusDistBar.vue`。**`StatCard.vue:29` 有意保留字面量不改**：
+ * 它被 `__tests__/statcard.spec.ts:11,27,33` 与 e2e 的 `motion-tokens-zero-visual-change.spec.ts`
+ * G5 两道既有硬门盯着，为了「单一来源」去动它是拿受保护断言换整洁，不值得。
+ * 所以这里是「新骨架的单一来源」，不是「全应用的单一来源」——别把注释写过头。
+ *
+ * 刻意复用 Tailwind 类名串而不是自定义 CSS 类：`animate-pulse` 实际是
+ * `2s cubic-bezier(.4,0,.6,1)` 的 opacity 1↔.5（不是直觉的 ease-in-out），
+ * 手写等价 CSS 极易写偏；且 `bg-border/70` 在 Tailwind v4 下是 color-mix 不是简单 alpha。
+ * 复用类名串则等价性由 Tailwind 保证，`motion-tokens-zero-visual-change.spec.ts` 的 G5
+ * 与 `statcard.spec.ts:11,27,33` 两道既有守卫也继续有效。
+ */
+export const SKEL = 'animate-pulse rounded-md bg-border/70'
+
+/**
+ * 骨架占位高度（px）。**这组数字是独立审计在 1440px 视口对已填充数据的真实组件实测所得**，
+ * 不是从源码里的 `h-[Npx]` 字面量抄的——上一次按字面量取值被评审逐个证伪（写 24 实测 26、
+ * 写 40 实测 35.25–37.25）。改这里之前请重新实测，别照着 class 猜。
+ *
+ * 用途是让骨架**预留出与真实内容等高的版面**：审计实测 governance 到达时页面
+ * `main.scrollHeight` 在单帧内 900 → 2616（+1716px），已在阅读的用户脚下会整块位移。
+ */
+export const SKEL_H = {
+  /** VitalsList 单行 */
+  vitals: 55.5,
+  /** OrgCoverageTable tbody tr */
+  orgRow: 35.75,
+  /** BarList 单项（div.py-1.5） */
+  barItem: 59.25,
+  /** StatCard 整卡（最丰富变体：pill + subValue + hint） */
+  statCard: 171.25,
+} as const

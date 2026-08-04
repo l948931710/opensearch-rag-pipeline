@@ -349,6 +349,45 @@ function noteLoadError(key: string, e: unknown): boolean {
 }
 function clearLoadError(key: string) { delete loadErrors.value[key] }
 
+// ── GET loader 的在途/已定态（2026-08-04）────────────────────────────────────────
+// 解决的是一个实测出来的具体故障：`/api/kb/stats` 返回 404 时，noteLoadError 走静默分支
+// （delete loadErrors[key] 后直接返回），于是 kbStats 恒为 null、loadErrors 恒为空，
+// 任何写成 `!data && !error` 的加载判据**永远为真** —— 实测 4 张 hero 卡的骨架转 5 秒仍在转，
+// 0 个 alert、0 个重试。加载态必须由「请求是否在途」独立表达，不能从数据是否存在反推。
+//
+// ⚠️ 为什么不复用 withInflight：那是**行级互斥**（防重复提交），第二个调用方被直接丢弃、
+// 立即拿到 undefined。而且那个 undefined 是**承重的**——grantDeptAdmin(:1730) 写着
+// `?? false // 在途（重复点击）→ 视为未提交`，改成合流会让重复点击返回首调的 true，语义翻转；
+// setVisibility(:1624) 的返回类型也依赖它。8 个写路径调用点，不动。
+//
+// 这里要的是**请求合流**：第二个调用方不重复发请求，但**必须等到同一份真结果**。理由不是
+// 「否则 tab 级指示提前收掉」（那是后续轮次的事，今天还不成立），而是**丢弃语义根本修不好
+// 这个双拉**：ensureTabLoaded 从 dash 与 docs 各调一次 loadStats（实测 2 个并发请求），
+// 第二个调用方拿到 undefined 后 _loadedTabs 已把 docs 标记为已加载——此时若首个（dash）请求
+// 随后失败，docs tab **永远不会重拉**。合流让第二个调用方拿到真实成败。
+const loaderInflight = ref<Set<string>>(new Set())
+/** 至少完整尝试过一次（成败不论）。用来把「还没开始/在途」与「跑完了但没数据」分开。 */
+const loaderSettled = ref<Set<string>>(new Set())
+const loaderPromises = new Map<string, Promise<void>>()   // 模块闭包，不进响应式
+
+function isLoading(key: string): boolean { return loaderInflight.value.has(key) }
+function hasSettled(key: string): boolean { return loaderSettled.value.has(key) }
+
+async function withLoader(key: string, fn: () => Promise<void>): Promise<void> {
+  const joined = loaderPromises.get(key)
+  if (joined) return joined            // 合流：不重复发请求，但调用方等到同一个真结果
+  const p = (async () => {
+    loaderInflight.value = new Set(loaderInflight.value).add(key)
+    try { await fn() } finally {
+      loaderPromises.delete(key)
+      const n = new Set(loaderInflight.value); n.delete(key); loaderInflight.value = n
+      loaderSettled.value = new Set(loaderSettled.value).add(key)
+    }
+  })()
+  loaderPromises.set(key, p)
+  return p
+}
+
 // staleness 门（#82）：App ready 已为侧栏红点预载 approvals/accessRequests，30s 内再进 /manage 不重拉。
 // 起跑即记时间戳 → 预载尚在途时挂载视图也不会并发双拉；失败清零重开门（LoadError 重试按钮走非 force
 // 也能真重拉）。数据确实变化的写路径（上传产生待审批单等）传 force=true 逃生。
@@ -691,7 +730,8 @@ async function submitAccessRequest(reason: string) {
   } finally { accessReqBusy.value = false }
 }
 
-async function loadStats() {
+async function loadStats() { return withLoader('stats', _loadStats) }
+async function _loadStats() {
   // 概览真实口径（总数/状态分布/已索引分块）；失败则前端兜底用已加载文档计数（docs.length / countOf）。
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -715,7 +755,8 @@ async function loadConfig() {
 
 // ── Phase E：概览看板真实数据（缺数据/端点未上线 → 静默兜底 null，由组件如实显空/加载中）──
 // DEV ?preview 注入 mock（取自真实口径量级，便于设计走查）；prod build 死代码消除。
-async function loadInsights() {
+async function loadInsights() { return withLoader('insights', _loadInsights) }
+async function _loadInsights() {
   const s = useSession()
   if (!s.identity?.canManage) { kbInsights.value = null; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -738,7 +779,8 @@ async function loadInsights() {
   try { kbInsights.value = await apiJson<KbInsights>('/api/kb/insights', { auth: true }) } catch (e) { noteLoadError('insights', e) /* 兜底 */ }
 }
 
-async function loadGovernance() {
+async function loadGovernance() { return withLoader('governance', _loadGovernance) }
+async function _loadGovernance() {
   const s = useSession()
   if (s.role !== 'kb_admin') { kbGovernance.value = null; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -1804,7 +1846,7 @@ export function useKb() {
     dupWarn, contentDupMsg, uploadQueue, selectedNames, isBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
     shareCtx, shareBusy, shareTargets: SHARE_TARGETS,
-    ownerDepts, uploadTargetDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, kbOpsMetrics, maxUploadMb, verHistory, loadErrors,
+    ownerDepts, uploadTargetDepts, isKbAdmin, isDeptAdmin, reviewCount, kbStats, kbConfig, kbInsights, kbGovernance, kbOpsMetrics, maxUploadMb, verHistory, loadErrors, isLoading, hasSettled,
     // 方法
     loadDocs, loadMoreDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, openHistory, closeHistory, openDocPreview, setQuery, loadApprovals, sortBy, countOf,
     loadAccessRequests, approveAccess, rejectAccess, loadAccessGrants, revokeAccess, loadApprovalHistory, setScope,
@@ -1839,6 +1881,7 @@ export function __resetKb() {
   for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）
   if (qTimer) { clearTimeout(qTimer); qTimer = null }
   if (filterTimer) { clearTimeout(filterTimer); filterTimer = null }
+  loaderInflight.value = new Set(); loaderSettled.value = new Set(); loaderPromises.clear()
   clearToasts()   // 安全项：队列是模块级的，不清会让 A 的「已撤销管理权限」飘到 B 的界面上
 }
 
