@@ -487,7 +487,11 @@ function clearSelectionKeepMsg() { selectedIds.value = new Set() }
 
 /** 批量退役（复用单篇 retire 端点，逐篇顺序）。调用方已二次确认。 */
 async function bulkRetire(): Promise<void> {
-  const targets = selectedDocs.value.filter((d) => d.status_badge !== '已退役')
+  // P2-12：与 DocTable.onBulkRetire 的计数谓词**逐字一致**——公开文档需 kb_admin（后端 403），
+  // 非 kb_admin 一律跳过，绝不发注定失败的请求（「说几篇=做几篇」）。
+  const _kbAdmin = useSession().role === 'kb_admin'   // 模块级函数：isKbAdmin 在 useKb() 作用域内
+  const targets = selectedDocs.value.filter(
+    (d) => d.status_badge !== '已退役' && !(!_kbAdmin && d.permission_level === 'public'))
   await _bulkRun(targets, '退役', async (d) => {
     try {
       const s = useSession()

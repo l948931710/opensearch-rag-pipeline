@@ -232,6 +232,7 @@ async function loadPending(offset = 0) {
 }
 
 async function loadHeroes() {
+  clearLoadError('heroes')
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') { heroes.value = _previewHeroes(); return }
   try {
@@ -242,7 +243,13 @@ async function loadHeroes() {
     deptHeroes.value = r.dept_items || []
     myDeptHeroes.value = r.my_dept_items || []
     myDeptName.value = r.my_dept_name || ''
-  } catch { heroes.value = []; deptHeroes.value = []; myDeptHeroes.value = []; myDeptName.value = '' }
+  } catch (e) {
+    // P2-13：此前是静默 catch —— HeroBoard 的 `v-if="heroes.length"` 会让整块**直接消失**，
+    // 与「还没有人上榜」在界面上**完全无法区分**。榜单是奖励办法的对外口径，
+    // "看不见"必须能被解释成"加载失败"而不是"你没积分"。
+    heroes.value = []; deptHeroes.value = []; myDeptHeroes.value = []; myDeptName.value = ''
+    noteLoadError('heroes', e)
+  }
 }
 
 // ── 弹窗 / 提交 ──

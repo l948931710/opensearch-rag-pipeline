@@ -3,11 +3,12 @@ import { computed, ref } from 'vue'
 import { Trophy } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { useContribute } from '@/composables/useContribute'
+import LoadError from '@/components/manage/LoadError.vue'
 
 // 总积分榜（2026-08-01，Sam 拍板预览权重 10/1/3）：score=10×采纳+1×引用+3×有效反馈。
 // 构成随行副行展示（可审计——任何人质疑都能指到构成与口径定义）；旧后端无 score 键时
 // 回退按 count 展示（副行自隐）。正式积分换算以《AI参与奖励管理办法》定稿为准。
-const { heroes, deptHeroes, myDeptHeroes, myDeptName } = useContribute()
+const { heroes, deptHeroes, myDeptHeroes, myDeptName, loadErrors, loadHeroes } = useContribute()
 const hasScore = computed(() => heroes.value.some((h) => typeof h.score === 'number'))
 // 三榜切换（2026-08-01）：全公司个人 / 本部门个人 / 部门榜（同分按一级部门求和）。
 // 组织快照缺失 → 后端回空 → tab 栏自隐（只剩全公司，与旧版观感一致）。
@@ -33,7 +34,10 @@ function initial(name: string) { return (name || '?').trim().charAt(0) || '?' }
 
 <template>
   <!-- 卡头已带图标+标题，不再另设分区眉标 -->
-  <section v-if="heroes.length">
+  <section v-if="heroes.length || loadErrors['heroes']">
+    <!-- P2-13：加载失败不再让整块静默消失（否则等于告诉用户「榜上无人」）。 -->
+    <LoadError v-if="loadErrors['heroes']" class="mb-2.5" :message="loadErrors['heroes']" @retry="loadHeroes()" />
+    <template v-if="heroes.length">
     <div class="overflow-hidden rounded-[15px] border border-border bg-card">
       <div class="flex flex-wrap items-center gap-2.5 border-b border-border px-[18px] py-3">
         <Trophy :size="16" :stroke-width="1.75" class="text-st-warn" />
@@ -95,5 +99,6 @@ function initial(name: string) { return (name || '?').trim().charAt(0) || '?' }
         你所在部门暂无上榜数据
       </div>
     </div>
+    </template>
   </section>
 </template>

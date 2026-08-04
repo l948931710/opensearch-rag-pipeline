@@ -6,6 +6,7 @@ import { Plus, Search, Library, Lightbulb, Sun, Moon, Trash2, Sprout } from '@lu
 import { useSession } from '@/stores/session'
 import { useTheme } from '@/composables/useTheme'
 import { useAsk } from '@/composables/useAsk'
+import { useDialog } from '@/composables/useDialog'
 import { useKb } from '@/composables/useKb'
 import { useContribute } from '@/composables/useContribute'
 import { ROLE_LABEL } from '@/lib/kb'
@@ -18,7 +19,8 @@ import { ROLE_LABEL } from '@/lib/kb'
 const session = useSession()
 const { identity, role, canManage } = storeToRefs(session)
 const { theme, toggle } = useTheme()
-const { activeId, newConversation, switchTo, removeConversation, searchConversations } = useAsk()
+const { activeId, conversations, newConversation, switchTo, removeConversation, searchConversations } = useAsk()
+const { confirm } = useDialog()
 const { reviewCount } = useKb()   // 待你审核数（红点/角标）；App.vue 在 ready 后已预加载，故入口红点即时可见
 const { reviewCount: contribReviewCount } = useContribute()   // 待审核的知识贡献数（管理员）
 const route = useRoute()
@@ -42,7 +44,18 @@ function isActiveConv(id: string) { return route?.path === '/' && id === activeI
 
 function onNewChat() { newConversation(); if (route.path !== '/') void router.push('/') }
 function onPickConv(id: string) { switchTo(id); if (route.path !== '/') void router.push('/') }
-function onDelConv(id: string, e: Event) { e.stopPropagation(); removeConversation(id) }
+// P2-13：删除会话是**不可逆**的——本地 splice + schedulePersist 落盘，并向服务端发
+// DELETE /api/conversations/<id>。此前点垃圾桶即刻执行，误触无从挽回（侧栏列表密集、
+// 删除图标紧挨会话标题）。改为与「批量退役」等破坏性操作同款的 ConfirmDialog。
+async function onDelConv(id: string, e: Event) {
+  e.stopPropagation()
+  const c = conversations.value.find((x) => x.id === id)
+  const ok = await confirm({
+    title: '删除会话', confirmText: '删除', danger: true,
+    message: `确认删除《${c?.title || '新对话'}》？\n该会话的问答记录将从本地和服务端移除，无法恢复。`,
+  })
+  if (ok) removeConversation(id)
+}
 
 const initial = computed(() => (identity.value?.name || '?').trim().charAt(0) || '?')
 const kbLabel = computed(() => (canManage.value ? '知识库管理' : '知识库'))

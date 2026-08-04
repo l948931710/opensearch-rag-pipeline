@@ -739,3 +739,30 @@ describe('useContribute.loadMine 分页', () => {
     expect(c.myContribs.value.map((x) => x.contribution_id)).toEqual(['a'])
   })
 })
+
+// ── P2-13：loadHeroes 此前静默 catch，HeroBoard 的 v-if="heroes.length" 会让整块消失 ──
+describe('useContribute.loadHeroes 失败可见性', () => {
+  it('加载失败 → 记 loadErrors["heroes"]（不再与「榜上无人」混同）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}), text: async () => 'boom' })))
+    const c = useContribute()
+    await c.loadHeroes()
+    expect(c.heroes.value).toEqual([])
+    expect(c.loadErrors.value['heroes']).toBeTruthy()
+  })
+
+  it('重试成功 → 错误清除', async () => {
+    let n = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      n += 1
+      return n === 1
+        ? { ok: false, status: 500, json: async () => ({}), text: async () => 'boom' }
+        : { ok: true, status: 200, json: async () => ({ items: [{ author_name: '张三', count: 3 }] }) }
+    }))
+    const c = useContribute()
+    await c.loadHeroes()
+    expect(c.loadErrors.value['heroes']).toBeTruthy()
+    await c.loadHeroes()
+    expect(c.loadErrors.value['heroes']).toBeFalsy()
+    expect(c.heroes.value.length).toBe(1)
+  })
+})

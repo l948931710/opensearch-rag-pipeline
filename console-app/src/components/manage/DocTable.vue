@@ -33,6 +33,16 @@ function onPage(p: number) {
   void loadDocsPage(p)
 }
 
+// P2-12：退役/恢复对**公开文档需 kb_admin**（后端 kb_retire/kb_restore 两处都 403：
+// 「公开文档需知识库管理员退役/恢复」——公开影响全公司，与上传同款不对称授权）。
+// 此前前端不做前置判断 ⇒ dept_admin 在公开文档上点「退役下线」，会先弹一次危险确认框、
+// 确认后才吃 403 失败提示：一个**注定失败的破坏性确认**。照 ShareDocModal 的既有范式
+// （levelDisabled + 「需知识库管理员操作」提示）改成前置禁用 + 悬停说明。
+function retireDenied(d: DocItem): string {
+  return (!isKbAdmin.value && d.permission_level === 'public')
+    ? '「全公司」文档影响全员，需知识库管理员退役/恢复。' : ''
+}
+
 // 「权限」入口条件：可管理 + 非退役 + 非隔离。弹窗内含 基础可见范围（改级别）+ 跨部门共享。
 // 放宽到全部可见级别（不再只 dept_internal）：public 文档也要能被改回本部门/受限。
 // 已隔离 = 安全隔离（PII 等）：后端对可见范围/恢复一律 409（唯一出路是脱敏重灌），入口直接不给。
@@ -60,11 +70,21 @@ const bulkVisOpts = computed(() =>
   (isKbAdmin.value ? ['dept_internal', 'public', 'restricted'] : ['dept_internal', 'restricted']))
 
 async function onBulkRetire() {
-  const n = selectedDocs.value.filter((d) => d.status_badge !== '已退役').length
-  if (!n) return
+  // P2-12（批量侧同款）：计数必须与**实际会发出的请求**一致。此前把 dept_admin 无权退役的
+  // 公开文档也算进「退役 N 篇」，确认后逐篇吃 403 → 变成「N 篇里 M 篇失败」的事后解释。
+  // bulkRetire 用同一条谓词过滤，保证「说几篇=做几篇」。同文件的 bulkVisOpts 早已按角色
+  // 收窄 public 选项，这里补齐一致性。
+  const pickable = selectedDocs.value.filter((d) => d.status_badge !== '已退役')
+  const blocked = pickable.filter((d) => !!retireDenied(d)).length
+  const n = pickable.length - blocked
+  if (!n) {
+    if (blocked) void notice({ title: '无可退役文档', message: `选中的 ${blocked} 篇均为「全公司」文档，需知识库管理员退役。` })
+    return
+  }
   const okGo = await confirm({
     title: '批量退役', confirmText: `退役 ${n} 篇`, danger: true,
-    message: `确认退役选中的 ${n} 篇文档？\n将逐篇标记下线、停止作为升版目标（可逆，从检索移除在下次维护完成）。`,
+    message: `确认退役选中的 ${n} 篇文档？\n将逐篇标记下线、停止作为升版目标（可逆，从检索移除在下次维护完成）。`
+      + (blocked ? `\n（另有 ${blocked} 篇「全公司」文档需知识库管理员，已跳过）` : ''),
   })
   if (okGo) void bulkRetire()
 }
@@ -428,14 +448,16 @@ async function onRestore(d: DocItem) {
                 <div class="mx-1.5 my-1 h-px bg-border" role="separator" />
                 <button
                   v-if="d.status_badge !== '已退役'"
-                  type="button" role="menuitem" :disabled="retireRowId === d.doc_id"
-                  class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-st-fail transition hover:bg-st-fail/10 disabled:opacity-50"
+                  type="button" role="menuitem" data-testid="doc-retire"
+                  :disabled="retireRowId === d.doc_id || !!retireDenied(d)" :title="retireDenied(d)"
+                  class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-st-fail transition hover:bg-st-fail/10 disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent"
                   @click="menuAct(() => onRetire(d))"
                 ><Archive :size="14" :stroke-width="1.75" /> 退役下线</button>
                 <button
                   v-else
-                  type="button" role="menuitem" :disabled="retireRowId === d.doc_id"
-                  class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-st-live transition hover:bg-st-live/10 disabled:opacity-50"
+                  type="button" role="menuitem" data-testid="doc-restore"
+                  :disabled="retireRowId === d.doc_id || !!retireDenied(d)" :title="retireDenied(d)"
+                  class="flex items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-st-live transition hover:bg-st-live/10 disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent"
                   @click="menuAct(() => onRestore(d))"
                 ><ArchiveRestore :size="14" :stroke-width="1.75" /> 恢复上线</button>
               </div>
