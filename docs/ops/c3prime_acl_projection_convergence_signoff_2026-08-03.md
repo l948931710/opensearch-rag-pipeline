@@ -185,9 +185,12 @@ approved 跨部门授权 0**；`RAG_ALLOWED_DEPTS_ACL` env 未设 ⇒ 默认 **F
 
 ### ⛔ B3 · stage-3 的「先读 ACL、后抢锁」TOCTOU —— **改管线，不是改 materializer**
 
-stage-3 在 `dataworks_orchestrator.py:472` 就把 chunk/ACL 读进内存，抢 `PROCESSING` 却是
-DAG 首节点（`:627`）⇒ **即使 materializer 锁了并提交，已读到旧 ACL 的 stage-3 仍会把旧值
-推回 HA3**。按 `version_no` 排序**解决不了**。
+stage-3 先把 chunk 读进内存（`FROM chunk_meta cm`）并在 `:603-650` **重解析** allowed_depts
+（那段刻意不信 chunk_meta 投影、直读权威授权表），而抢 `PROCESSING` 是 `dag.run(ctx)`（`:663`）
+里的首节点 `node_acquire_index_lock` ⇒ **即使 materializer 锁了并提交，已读到旧 ACL 的
+stage-3 仍会把旧值推回 HA3**。按 `version_no` 排序**解决不了**。
+（行号为 2026-08-03 e6ca2f4 之后的当前值——该文件当日因 C9/B′ 加过 capability 探测，
+原稿的 `:472/:627` 已漂移，勿按旧号定位。）
 **修法**：stage-3 改 **claim-before-read**，或抢锁后重读重算 ACL 再进 embedding/push。
 另：materializer 不应继续硬编码 2h（`access_grants.py:387`），应复用 `ingest_lease.takeover_where_sql()`。
 
