@@ -18,17 +18,21 @@ from unittest.mock import patch, MagicMock
 from opensearch_pipeline import retriever
 
 
-def _chunks():
+# ⚠️ 桩里必须带 `version_no`（2026-08-04 补）：补图的版本轴是 **fail-closed** —— 两边
+# 版本都已知且相等才补。此前桩完全没建模该字段，于是这些用例是在一个**现实中不存在**
+# 的形态上跑（真实 HA3 表有 version_no INT64，见 docs/ha3_stg_table_spec.md 的生产表实时
+# 导出；`HA3_DEFAULT_OUTPUT_FIELDS` 也一直请求它）。补齐后它们验的才是真实形态。
+def _chunks(ver=3):
     return [
-        {"doc_id": "A", "chunk_index": 0, "chunk_type": "text_chunk", "chunk_text": "a0", "title": "DocA"},
-        {"doc_id": "B", "chunk_index": 0, "chunk_type": "text_chunk", "chunk_text": "b0", "title": "DocB"},
-        {"doc_id": "A", "chunk_index": 1, "chunk_type": "text_chunk", "chunk_text": "a1", "title": "DocA"},
+        {"doc_id": "A", "version_no": ver, "chunk_index": 0, "chunk_type": "text_chunk", "chunk_text": "a0", "title": "DocA"},
+        {"doc_id": "B", "version_no": ver, "chunk_index": 0, "chunk_type": "text_chunk", "chunk_text": "b0", "title": "DocB"},
+        {"doc_id": "A", "version_no": ver, "chunk_index": 1, "chunk_type": "text_chunk", "chunk_text": "a1", "title": "DocA"},
     ]
 
 
 _IMGS = [
-    {"doc_id": "A", "chunk_index": 9, "chunk_type": "image", "source_image": "oss/a.png", "visual_summary": "imgA"},
-    {"doc_id": "B", "chunk_index": 9, "chunk_type": "image", "source_image": "oss/b.png", "visual_summary": "imgB"},
+    {"doc_id": "A", "version_no": 3, "chunk_index": 9, "chunk_type": "image", "source_image": "oss/a.png", "visual_summary": "imgA"},
+    {"doc_id": "B", "version_no": 3, "chunk_index": 9, "chunk_type": "image", "source_image": "oss/b.png", "visual_summary": "imgB"},
 ]
 
 
@@ -99,3 +103,60 @@ def test_retrieve_and_enrich_opt_in_gating(mock_search, mock_stitch, mock_expand
     assert mock_cosurf.called
     # search_chunks receives the pre-computed embedding (no re-embed inside)
     assert mock_search.call_args.kwargs.get("query_embedding") is not None
+
+
+# ── 版本轴 fail-closed（2026-08-04，复核 codex 对 e5e29ce 的建议后改回）─────────
+
+@patch("opensearch_pipeline.retriever._parse_ha3_response")
+@patch("opensearch_pipeline.retriever._get_ha3_client")
+@patch("opensearch_pipeline.retriever.get_query_embedding", return_value=([0.1] * 8, [], []))
+def test_stale_version_image_is_dropped(mock_emb, mock_client, mock_parse):
+    """★ 旧版本的图**不得**配到当前版本的正文上。
+
+    双活版本窗口（新版已 INDEXED、旧版尚未 deactivate）里旧版本 chunk 仍 `is_active=1`
+    ⇒ 它能干净通过 4c（`_revalidate_main_hits` 只比 chunk_id/is_active/permission/owner/id，
+    **不看版本**）。版本轴是唯一能挡住它的一道。
+    """
+    mock_client.return_value = MagicMock()
+    mock_parse.return_value = [dict(_IMGS[0], version_no=2)]      # 正文是 v3，图是 v2
+    out = retriever.cosurface_doc_images("q", _chunks(ver=3))
+    assert not [c for c in out if c["chunk_type"] == "image"], "旧版本的图被配进了当前版本正文"
+
+
+@patch("opensearch_pipeline.retriever._parse_ha3_response")
+@patch("opensearch_pipeline.retriever._get_ha3_client")
+@patch("opensearch_pipeline.retriever.get_query_embedding", return_value=([0.1] * 8, [], []))
+def test_unknown_version_is_fail_closed(mock_emb, mock_client, mock_parse):
+    """★ 任一边版本未知 ⇒ **不补**（fail-closed，codex 原议）。
+
+    此前是 fail-open，写的理由是「HA3 是否回填 version_no 无法验证」。那条理由**是错的**：
+    `docs/ha3_stg_table_spec.md` 是生产表实时导出、含 `version_no INT64`；且
+    `stitch_neighbor_chunks` 自 `16eb40b`(2026-06-28) 起就拿它建 WHERE —— 若 HA3 不回该字段，
+    邻居拼接从那天起会是静默全空。⇒ 生产上"版本未知"是**异常**，对异常 fail-open 是错的默认。
+    """
+    mock_client.return_value = MagicMock()
+    for bad in ({}, {"version_no": 0}, {"version_no": None}, {"version_no": ""}):
+        mock_parse.return_value = [dict(_IMGS[0], **bad)] if bad else [
+            {k: v for k, v in _IMGS[0].items() if k != "version_no"}]
+        out = retriever.cosurface_doc_images("q", _chunks(ver=3))
+        assert not [c for c in out if c["chunk_type"] == "image"], f"图侧版本={bad} 仍被放行"
+    # 反过来：正文侧版本未知也不补
+    mock_parse.return_value = list(_IMGS)
+    out = retriever.cosurface_doc_images("q", [{k: v for k, v in c.items() if k != "version_no"}
+                                               for c in _chunks()])
+    assert not [c for c in out if c["chunk_type"] == "image"], "正文侧版本未知时仍补了图"
+
+
+def test_local_os_fallback_selects_version_no():
+    """🔴 本地 OpenSearch 回退路径必须取 `version_no`。
+
+    写侧 `Chunk.to_opensearch_doc`（chunker.py:205）一直在写它，是**读侧**漏了 ⇒ 下游恒得 0，
+    而 `stitch_neighbor_chunks` 用它建 `WHERE version_no=%s`
+    ⇒ 该路径的邻居拼接自 2026-06-28 起一直**静默全空**（fail-open 风格让它不报错）。
+    """
+    import pathlib
+    src = pathlib.Path("opensearch_pipeline/retriever.py").read_text(encoding="utf-8")
+    i = src.index('"_source": ["chunk_id"')
+    block = src[i:i + 400]
+    assert '"version_no"' in block, "本地 OS 回退的 _source 漏了 version_no（邻居拼接会静默全空）"
+    assert '"version_no": src.get("version_no")' in src, "本地 OS 回退的结果字典没回填 version_no"

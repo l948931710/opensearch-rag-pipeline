@@ -941,10 +941,15 @@ def _search_chunks_opensearch(
         ]
     body = {
         "size": fetch_k,
+        # 🔴 `version_no` 是**必取**字段（2026-08-04 补）：写侧 `Chunk.to_opensearch_doc`
+        #    （chunker.py:205）一直在写它，是这里的**读侧**漏了 ⇒ 下游拿到 0，而
+        #    `stitch_neighbor_chunks`（:1469，`16eb40b` 2026-06-28 起）用它建
+        #    `WHERE version_no=%s` ⇒ **本回退路径的邻居拼接自那天起一直是静默全空**
+        #    （fail-open 风格让它不报错，所以没人发现）。补图的版本轴同样依赖它。
         "_source": ["chunk_id", "id", "doc_id", "chunk_text", "chunk_type", "title",
                     "section_title", "chunk_index", "page_num", "kb_type",
                     "permission_level", "owner_dept", "category_l1",
-                    "source_image", "visual_summary"],
+                    "source_image", "visual_summary", "version_no"],
         "query": {"bool": {
             "should": rank_should,
             "filter": [{"bool": {"should": perm_should, "minimum_should_match": 1}}],
@@ -963,6 +968,9 @@ def _search_chunks_opensearch(
             "title": src.get("title") or "",
             "section_title": src.get("section_title") or "",
             "doc_id": src.get("doc_id") or "",
+            # 与 HA3 路径（clients.parse_ha3_response）同键同缺省，供邻居拼接的版本约束
+            # 与补图版本轴消费；缺失退 0（= 不拼别版本、不补图，fail-closed 方向）。
+            "version_no": src.get("version_no") or 0,
             "category_l1": src.get("category_l1") or "",
             "chunk_index": src.get("chunk_index") or 0,
             "page_num": src.get("page_num") or 0,
@@ -2223,14 +2231,38 @@ def cosurface_doc_images(
         if d and d not in _ver_by_doc and str(v or "") not in ("", "0"):
             _ver_by_doc[d] = str(v)
     _n_raw = len(img_results)
-    # 版本轴：两边都已知才比对。未知则放行交给下面的 4b/4c —— 那两条才是权威轴，
-    # 而"HA3 是否回填了 version_no"这件事本会话无法对真实 HA3 验证，
-    # 拿一个无法验证的字段做 fail-closed 会把"没图"变成不可预见的功能性回归。
-    img_results = [
-        r for r in img_results
-        if not (_ver_by_doc.get(r.get("doc_id")) and str(r.get("version_no") or "0") != "0"
-                and str(r.get("version_no")) != _ver_by_doc[r.get("doc_id")])
-    ]
+    # 版本轴：**fail-closed** —— 版本对不上、或任一边版本未知，都不补这张图（2026-08-04 改）。
+    #
+    # 🔴 本处原为 fail-open，理由写的是「HA3 是否回填 version_no 无法对真实 HA3 验证」。
+    #    那条理由**是错的**，仓内有三份证据（2026-08-04 复核 codex 建议时查出）：
+    #      1. `docs/ha3_stg_table_spec.md` 是**生产表 fuling_kb_chunks 的实时导出**
+    #         （2026-06-10 只读 get_table），23 个字段里明确含 `version_no INT64`；
+    #      2. `stitch_neighbor_chunks`（本文件 :1469，`16eb40b` 2026-06-28 起）拿 HA3 返回的
+    #         version_no 去建 `WHERE version_no=%s` —— 若 HA3 不回该字段，`center_ver=0`，
+    #         邻居拼接从那天起就会是**静默全空**；它没有，所以 HA3 确实回了真值；
+    #      3. `_fetch_cosurface_images` 用的 `HA3_DEFAULT_OUTPUT_FIELDS` 本就请求了 version_no。
+    #    ⇒ 生产路径上"版本未知"是**异常**而非常态，对异常 fail-open 是错的默认。
+    #
+    # 为什么这一轴不能省（4b/4c 都覆盖不到）：`_revalidate_main_hits` 只比
+    # chunk_id / is_active / permission_level / owner_dept / id，**不看版本**；而双活版本
+    # 窗口里旧版本 chunk 本就是 `is_active=1` ⇒ 旧版本的图能干干净净地通过 4c。
+    _ver_bad = 0
+
+    def _ver_ok(r) -> bool:
+        want = _ver_by_doc.get(r.get("doc_id"))
+        if not want:                       # 主命中侧版本未知 ⇒ 无从比对 ⇒ 不补（codex 原议）
+            return False
+        got = str(r.get("version_no") or "0")
+        return got != "0" and got == want
+
+    img_results, _kept = [], img_results
+    for r in _kept:
+        if _ver_ok(r):
+            img_results.append(r)
+        else:
+            _ver_bad += 1
+    if _ver_bad:
+        logger.info("cosurface 版本轴丢弃 %d 条（版本不符或任一边版本未知，fail-closed）", _ver_bad)
     # 4b：撤销跨部门授权即时生效（4c 有意不比对 allowed_depts，故这条不可省）
     img_results = _deny_revoked_cross_dept(img_results, user_dept, acl_ctx=acl_ctx)
     # 4c：is_active / ACL 轴 / 物理 PK 轴。strict——补图失败只是没配图，绝不拿未复核的图去赌

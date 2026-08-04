@@ -86,6 +86,8 @@ UI 该显示什么（能"加载更多"才给按钮，否则给一句"结果已�
 3. **xdist flake 家族已确认不止一员**，值得单独立项（属 xdist-ontology-flake 同族）：
    - `test_stream_gate::test_flag_off_refusal_passthrough_unchanged`（三跑红一次）
    - `test_miniapp_serving::test_token_tamper_and_garbage`（2026-08-03 新见）
+   - `test_reconcile::test_scan_ha3_pks_bucket_clamped_and_half_open`（**2026-08-04 新见**：
+     全量并行一次红；随后 5 次全绿——2 次带同一改动 + 3 次干净树。**不归因、未解决**）
    共同特征：**单独跑必绿、全量并行跑偶发红、干净树亦复现**。每次只是确认"与本改动无因果"，
    根因（跨测试模块互踩 / 模块级状态未隔离）始终没查。它正在稀释 `make test` 的信号价值——
    现在每次全量红都要先花一轮排除 flake。
