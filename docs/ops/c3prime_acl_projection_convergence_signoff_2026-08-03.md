@@ -160,7 +160,20 @@ approved 跨部门授权 0**；`RAG_ALLOWED_DEPTS_ACL` env 未设 ⇒ 默认 **F
 第 2 步经 codex 实现评审后确认**不是"再走一步"，而是三块独立工程**，Sam 2026-08-03 拍板
 **在此打住、分别立项**。三条 blocker 逐条记录（均已核实到代码行）：
 
-### ⛔ B1 · 两个调用面的事务语义不一致（返回契约要重构）
+### ✅ B1 · 两个调用面的事务语义不一致 —— **已修（2026-08-04，`2a08738`）**
+
+> 落地后发现它**不是预防性重构，是活 bug 且命中常态路径**：
+> certify 的 `UPDATE … SET acl_epoch` 在 `rowcount==0`（epoch 已相等 ⇒ changed-rows=0）时
+> **穿透**成 `status="unchanged"`，而 MySQL 对**匹配行**取的 X 锁与 rowcount 无关。
+> reconcile 旧实现按 status 分派 ⇒ `unchanged`/`skipped*` 既不 commit 也不 rollback
+> ⇒ 锁持到整轮结束，阻塞 stage-3 与控制台写。「值已正确且 epoch 已相等」正是健康系统常态。
+>
+> **修法**：加与 status **正交**的 `wrote` 维（"本调用有没有发出过写语句"），
+> reconcile 改为 `commit if wrote else rollback`，**不再有不了结的分支**。
+> 拍板单原提的 `complete`/`locked_versions`/`versions[]` 属**多版本 materializer**（B3 相邻、
+> 未实现）所需，本次**刻意不做** —— 不为不存在的场景加字段。
+
+<details><summary>原始记录（已解决）</summary>
 
 - outbox drain 对 `skipped_locked` **仍 commit**，只是不标 done（`access_grants.py:606/630`）
 - reconcile **只在 `materialized/retracted` 时 commit**（`allowed_depts_reconcile.py:226/230`）
@@ -169,6 +182,8 @@ approved 跨部门授权 0**；`RAG_ALLOWED_DEPTS_ACL` env 未设 ⇒ 默认 **F
 要么丢，要么被后续文档的 commit 意外带上。
 **修法**：返回值加显式控制字段 `complete` / `wrote_projection` / `locked_versions` / `versions[]`。
 **不能靠单一 status 表达两个正交维度。**
+
+</details>
 
 ### ⛔ B2 · certify 未闭环 —— **其中一条是第 1 步已落码的潜伏缺口**
 
