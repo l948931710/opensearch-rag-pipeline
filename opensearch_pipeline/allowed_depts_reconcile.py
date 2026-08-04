@@ -71,16 +71,24 @@ def _prescreen_unchanged(cur, targets) -> set:
             return set()
     grants = resolve_allowed_depts(targets, cur)         # ① 应有授权（一条 IN 查询）
     placeholders = ",".join(["%s"] * len(targets))
+    # B2-②（2026-08-03）：**去掉 `cm.version_no=dm.current_version_no`**。
+    # 旧口径只看 current 版本 ⇒「current 干净、旧 active 版 dirty」会被提前判 unchanged，
+    # materialize 永不执行、旧版本带着错投影继续被检索（旧版本 chunk 仍 is_active=1 时可服务）。
+    # 现在**全部 active 版本**都进预筛，任一版本不符即交逐 doc 复核。
     cur.execute(                                         # ② 现存投影 + 版本限定权限（一条查询）
-        f"SELECT DISTINCT cm.doc_id, cm.allowed_depts, cm.permission_level, "
+        f"SELECT DISTINCT cm.doc_id, cm.version_no, cm.allowed_depts, cm.permission_level, "
         f"       cm.owner_dept, dm.owner_dept "
         f"FROM {_kb_db()}.chunk_meta cm "
-        f"JOIN {_kb_db()}.document_meta dm "
-        f"  ON dm.doc_id=cm.doc_id AND cm.version_no=dm.current_version_no "
+        f"JOIN {_kb_db()}.document_meta dm ON dm.doc_id=cm.doc_id "
         f"WHERE cm.is_active=1 AND cm.doc_id IN ({placeholders})",
         tuple(targets),
     )
     rows = cur.fetchall()
+    # B2-②：`have_rows[d]` 是**逐行**的集合列表，**不是并集**。
+    # 并集是有损的：current=[a,b]、旧版=[] 时并集仍等于 want ⇒ 旧版的漂移被 current 盖住、
+    # 判成 unchanged。与 certify 侧 `projection_rows_all_match()` 的逐行哲学统一：
+    # 判「要不要复核」宁可宽（多跑一次 materialize 无害），绝不漏。
+    have_rows: dict = {}
     have_map: dict = {}
     perm_map: dict = {}
     owner_map: dict = {}          # doc → chunk 投影轴 owner 集合（集合语义，见下）
@@ -88,8 +96,8 @@ def _prescreen_unchanged(cur, targets) -> set:
     bad: set = set()
     for row in rows:
         try:
-            d, ad, perm = row[0], row[1], row[2]
-            cm_owner, dm_owner = row[3], row[4]
+            d, ad, perm = row[0], row[2], row[3]
+            cm_owner, dm_owner = row[4], row[5]
         except Exception:  # noqa: BLE001 — 行形状异常（桩/驱动差异）→ 整体放弃预筛，全量复核
             return set()
         owner_map.setdefault(d, set()).add(cm_owner or "")
@@ -97,13 +105,19 @@ def _prescreen_unchanged(cur, targets) -> set:
         perm_map.setdefault(d, set())
         if perm is not None:                     # 与 GROUP_CONCAT 同口径：NULL 权限不计入 gate 判定
             perm_map[d].add(perm)
+        # ⚠️ NULL/空 allowed_depts **也要记一行空集**（旧实现 `continue` 直接跳过 ⇒ 该行
+        # 对判定完全隐形：want 非空而某版本为 NULL 时照样判 unchanged，与并集是同族泄漏）。
         if not ad:
+            have_rows.setdefault(d, []).append(set())
             continue
         if isinstance(ad, list):
+            have_rows.setdefault(d, []).append(set(ad))
             have_map.setdefault(d, set()).update(ad)
             continue
         try:
-            have_map.setdefault(d, set()).update(_json.loads(ad) or [])
+            _parsed = set(_json.loads(ad) or [])
+            have_rows.setdefault(d, []).append(_parsed)
+            have_map.setdefault(d, set()).update(_parsed)
         except (ValueError, TypeError):
             bad.add(d)                           # 坏 JSON → 该 doc 不预筛，交 materialize 复核
 
@@ -115,7 +129,9 @@ def _prescreen_unchanged(cur, targets) -> set:
         # 版本限定 gate（与 materialize 的 GROUP_CONCAT==‘dept_internal’ 等价）：
         # 唯一权限级且为 dept_internal 才保留 want，否则 want=[]。
         want = raw_want if perm_map[d] == {"dept_internal"} else []
-        if sorted(want) != sorted(have_map.get(d, set())):
+        # B2-②：**每一行**都必须等于 want（逐版本严格），不再拿并集比。
+        _rows_d = have_rows.get(d) or [set()]
+        if any(sorted(_r) != sorted(want) for _r in _rows_d):
             continue
         # owner 投影轴（C3）：allowed_depts 一致但 chunk owner 与应有值不符也是漂移，
         # 此前预筛完全不看这一维 ⇒ stale-owner 文档被判 unchanged、materialize 永不执行。
@@ -197,10 +213,61 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
             except Exception as e:   # noqa: BLE001 — schema/060 未 apply（无 acl_mode 列）
                 logger.debug("node stale-owner 候选跳过（060 未 apply?）: %s", e)
                 node_stale_owner = set()
+            # ── B2-① epoch 候选源（schema/062）——**sweep 的前提** ──────────────────
+            # 此前候选只有「有 approved 授权 / 已有投影 / node 授权 / node stale-owner」四路，
+            # 全是**从别处推出来**的。062 落了两列却**零消费**：
+            #   · `chunk_meta.acl_epoch IS NULL` = **从未投影过** —— 恰恰是 C3′ 要修的那类
+            #     （diff 在无上次结果时恒为空 ⇒ 永远判 unchanged），四路候选一条都覆盖不到；
+            #   · `chunk_meta.acl_epoch < document_meta.acl_epoch` = 投影**落后于失效代次**。
+            # 逐版本判（不限 current）：非 current 的旧 active 版同样要收敛。
+            # capability 探测：062 未 apply 的环境降级为空集，绝不 1054 打挂整轮对账。
+            epoch_dirty: set = set()
+            try:
+                cur.execute(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='chunk_meta' "
+                    "AND COLUMN_NAME='acl_epoch'")
+                _r = cur.fetchone()
+                if _r and _r[0]:
+                    cur.execute(
+                        f"SELECT DISTINCT cm.doc_id FROM {_kb_db()}.chunk_meta cm "
+                        f"JOIN {_kb_db()}.document_meta dm ON dm.doc_id=cm.doc_id "
+                        "WHERE cm.is_active=1 "
+                        "  AND (cm.acl_epoch IS NULL OR cm.acl_epoch < dm.acl_epoch)")
+                    epoch_dirty = {r[0] for r in cur.fetchall() if r and r[0]}
+            except Exception as e:   # noqa: BLE001 — 062 未 apply / 列缺失
+                logger.debug("epoch 候选跳过（062 未 apply?）: %s", e)
+                epoch_dirty = set()
+
+            # ── B2-③ 不变量破坏：chunk.acl_epoch **不可能**大于 dm.acl_epoch ────────────
+            # chunk 的章是从 doc 水位盖下来的，而 doc 水位单调只增 ⇒ 出现 `>` 只可能是
+            # 手工改库 / 回滚 / 迁移错序 / 并发写乱序。这类文档**绝不可**被判 unchanged
+            # （它的 epoch 会让后续 sweep 认为"已投影且更新"，永久掩盖真实漂移）。
+            # 处置：大声报错 + **强制排除出预筛跳过集**，让它每轮都走完整 materialize 复核。
+            invariant_bad: set = set()
+            try:
+                cur.execute(
+                    f"SELECT DISTINCT cm.doc_id FROM {_kb_db()}.chunk_meta cm "
+                    f"JOIN {_kb_db()}.document_meta dm ON dm.doc_id=cm.doc_id "
+                    "WHERE cm.is_active=1 AND cm.acl_epoch IS NOT NULL "
+                    "  AND cm.acl_epoch > dm.acl_epoch")
+                invariant_bad = {r[0] for r in cur.fetchall() if r and r[0]}
+            except Exception:   # noqa: BLE001 — 062 未 apply 时无从判，跳过
+                invariant_bad = set()
+            if invariant_bad:
+                _msg = (f"🔴 ACL epoch 不变量破坏：{len(invariant_bad)} 篇文档的 chunk.acl_epoch "
+                        f"> document_meta.acl_epoch（章不可能新过水位）。样本："
+                        f"{sorted(invariant_bad)[:5]}。这些文档已强制排除出预筛跳过集、每轮全量复核；"
+                        "请排查手工改库/迁移错序/回滚。")
+                logger.error(_msg)
+                result["errors"].append(_msg)
+                result["invariant_violations"] = len(invariant_bad)
+
             # 全量扫描候选，但按【实际漂移写】数封顶（_LIMIT）——unchanged 文档只读不占写预算，故高位
             # 漂移文档绝不会被一致文档挤出（旧实现 sorted(...)[:_LIMIT] 固定切片会饿死高位漂移；Step 5
             # 审计）。漂移文档本轮处理后下轮即变 unchanged，预算自然腾给后续漂移 → 自清、最终全覆盖。
-            targets = sorted(set(approved) | have_ad | node_granted | node_stale_owner)
+            targets = sorted(set(approved) | have_ad | node_granted | node_stale_owner
+                             | epoch_dirty | invariant_bad)
 
             # perf E#36：批量预筛（2 条聚合查询）先在内存 diff 出确定无漂移的 doc，跳过其
             # 逐 doc 4×SQL 复核；漂移/存疑子集仍走单一注入点 materialize 复核+写（锁/gate/
@@ -210,6 +277,8 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
                 prescreen_unchanged = _prescreen_unchanged(cur, targets)
             except Exception as pe:  # noqa: BLE001 — 预筛失败绝不影响对账本体
                 logger.warning("allowed_depts 预筛失败，退回全量逐 doc 复核: %s", pe)
+            # B2-③：不变量破坏的文档**永不**享受预筛跳过（其 epoch 不可信）。
+            prescreen_unchanged -= invariant_bad
             result["unchanged"] += len(prescreen_unchanged)
 
             for doc_id in targets:

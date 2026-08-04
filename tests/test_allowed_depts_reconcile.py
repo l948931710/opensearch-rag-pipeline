@@ -70,6 +70,18 @@ class _Cur:
                        if m == "node"
                        and self.st.get("chunk_owner", {}).get(d, "") != sentinel
                        and d in self.st.get("ver", {})]
+        # ── B2（C3′ 剩余三条）：epoch 候选源 / 不变量告警。必须【先于】通用
+        #    information_schema 与 current_version_no 分支，理由同上（错路由=假绿）。
+        elif "acl_epoch" in s and "information_schema" in s:        # 062 capability 探测
+            self._r = [] if self.st.get("epoch_col_missing") else [(1,)]
+        elif "cm.acl_epoch > dm.acl_epoch" in s:                    # B2-③ 不变量破坏
+            if self.st.get("epoch_col_missing"):
+                raise RuntimeError("Unknown column 'acl_epoch'")
+            self._r = [(d,) for d in self.st.get("invariant_bad", [])]
+        elif "cm.acl_epoch is null" in s:                           # B2-① epoch 脏候选
+            if self.st.get("epoch_col_missing"):
+                raise RuntimeError("Unknown column 'acl_epoch'")
+            self._r = [(d,) for d in self.st.get("epoch_dirty", [])]
         elif "information_schema" in s:                             # _node_acl_columns_present
             self._r = [(1,)] if not self.st.get("node_acl_col_missing") else []
         elif "select doc_id, acl_mode" in s:                        # 模式批查（预筛 / resolve_acl_modes）
@@ -78,12 +90,23 @@ class _Cur:
             self._r = [(d, self.st.get("mode", {}).get(d, "legacy")) for d in p]
         elif "cm.doc_id" in s and "cm.allowed_depts" in s:          # 预筛聚合查询（真实路径）
             ids = set(p)
-            self._r = [(d,
-                        json.dumps(self.st["have"][d]) if self.st.get("have", {}).get(d) else None,
+            # B2-②：预筛查询改为**全部 active 版本**（不再 JOIN current_version_no），
+            # 列表多出 version_no ⇒ 桩按 6 列喂。`have_by_ver` 让用例能造「current 干净、
+            # 旧版 dirty」这种此前被并集盖住的形态；缺省时所有版本同值（= 旧用例语义不变）。
+            self._r = [(d, v,
+                        json.dumps(self.st["have_by_ver"][d][v])
+                        if (self.st.get("have_by_ver", {}).get(d, {}).get(v) is not None)
+                        else (json.dumps(self.st["have"][d])
+                              if self.st.get("have", {}).get(d) else None),
                         self.st.get("perm", {}).get(d),
                         self.st.get("chunk_owner", {}).get(d, ""),
                         self.st.get("owner", {}).get(d, ""))
-                       for d in ids if d in self.st.get("ver", {})]
+                       for d in ids if d in self.st.get("ver", {})
+                       for v in sorted(self.st.get("have_by_ver", {}).get(d, {})
+                                       or {self.st["ver"][d]: None})
+                       # ⚠️ 桩必须**忠实模拟** JOIN 的 current_version_no 限定：不模拟的话，
+                       # 「预筛退回 current-only」这个回归对测试完全隐形（反证不打红=假绿）。
+                       if ("current_version_no" not in s) or v == self.st["ver"][d]]
         elif "current_version_no" in s:                             # per-doc 版本 + 反抢锁
             d = p[0]
             self._r = [(self.st["ver"].get(d, 1),)] if d in self.st["ver"] else []
@@ -340,3 +363,91 @@ def test_prescreen_still_works_when_060_not_applied(monkeypatch):
           "node_acl_col_missing": True}
     _run(monkeypatch, st)
     assert "DC2" not in seen
+
+
+# ── C3′ B2 剩余三条（2026-08-03）：epoch 候选源 / 全版本预筛 / 不变量告警 ──────────
+
+def test_epoch_null_doc_becomes_a_candidate(monkeypatch):
+    """★ B2-①：`chunk_meta.acl_epoch IS NULL` = **从未投影过**。
+
+    这正是 C3′ 要修的那类（diff 在无上次结果时恒为空 ⇒ 永远判 unchanged），
+    而原四路候选（approved / 已有投影 / node 授权 / node stale-owner）**一条都覆盖不到**
+    —— 062 落了两列却零消费。没有这一路，sweep 根本选不到这些文档。
+    """
+    seen = _spy_targets(monkeypatch)
+    st = {"approved": {}, "have": {}, "ver": {"DE": 1},
+          "perm": {"DE": "dept_internal"}, "owner": {"DE": "hr"},
+          "epoch_dirty": ["DE"]}
+    _run(monkeypatch, st)
+    assert "DE" in seen, "acl_epoch IS NULL 的文档未进候选 ⇒ sweep 永远选不到它"
+
+
+def test_epoch_candidate_degrades_when_062_not_applied(monkeypatch):
+    """062 未 apply ⇒ 探测后降级为空集，绝不 1054 打挂整轮对账。"""
+    seen = _spy_targets(monkeypatch)
+    st = {"approved": {"DX": ["hr"]}, "have": {"DX": ["hr"]}, "ver": {"DX": 1},
+          "perm": {"DX": "dept_internal"}, "owner": {"DX": "hr"},
+          "chunk_owner": {"DX": "hr"}, "epoch_col_missing": True}
+    out = _run(monkeypatch, st)
+    assert not out.get("errors"), f"062 缺列不该产生错误：{out.get('errors')}"
+    # 降级 ≠ 瘫痪：其余四路候选与预筛照常工作（DX 各维干净 ⇒ 仍被预筛跳过）。
+    assert "DX" not in seen, "062 缺列时对账退化成全量逐 doc 复核了"
+    assert out.get("invariant_violations") is None
+
+
+def test_prescreen_catches_old_version_drift_hidden_by_current(monkeypatch):
+    """★ B2-②：current 干净、**旧 active 版 dirty**。
+
+    旧口径两处都漏：① JOIN 限定 `current_version_no` ⇒ 旧版根本不在行里；
+    ② 即便在，`have_map` 是**并集** ⇒ current=[hr] 会把旧版的 [] 盖住、判 unchanged。
+    """
+    seen = _spy_targets(monkeypatch)
+    st = {"approved": {"DV": ["hr"]}, "have": {}, "ver": {"DV": 2},
+          "have_by_ver": {"DV": {1: [], 2: ["hr"]}},   # v1 漂移、v2 干净
+          "perm": {"DV": "dept_internal"},
+          "owner": {"DV": "hr"}, "chunk_owner": {"DV": "hr"}}
+    _run(monkeypatch, st)
+    assert "DV" in seen, "旧版本漂移被 current 的干净值盖住 ⇒ 判成 unchanged"
+
+
+def test_prescreen_still_skips_when_every_version_clean(monkeypatch):
+    """反向对照：**所有**版本都干净时仍然跳过（保住 perf E#36 的 N+1 收益）。"""
+    seen = _spy_targets(monkeypatch)
+    st = {"approved": {"DW": ["hr"]}, "have": {}, "ver": {"DW": 2},
+          "have_by_ver": {"DW": {1: ["hr"], 2: ["hr"]}},
+          "perm": {"DW": "dept_internal"},
+          "owner": {"DW": "hr"}, "chunk_owner": {"DW": "hr"}}
+    _run(monkeypatch, st)
+    assert "DW" not in seen, "全版本干净却没被预筛跳过 —— N+1 优化失效"
+
+
+def test_invariant_violation_is_reported_and_never_prescreened(monkeypatch):
+    """★ B2-③：`chunk.acl_epoch > dm.acl_epoch` **不可能**（章从水位盖下、水位单调只增）。
+
+    出现即手工改库/迁移错序/回滚。这类文档绝不可判 unchanged —— 它的 epoch 会让后续
+    sweep 认为「已投影且更新」，**永久掩盖**真实漂移。必须报错 + 强制全量复核。
+    """
+    seen = _spy_targets(monkeypatch)
+    st = {"approved": {"DI": ["hr"]}, "have": {"DI": ["hr"]}, "ver": {"DI": 1},
+          "perm": {"DI": "dept_internal"},
+          "owner": {"DI": "hr"}, "chunk_owner": {"DI": "hr"},   # 各维都"干净"
+          "invariant_bad": ["DI"]}
+    out = _run(monkeypatch, st)
+    assert out.get("invariant_violations") == 1
+    assert any("不变量破坏" in e for e in out.get("errors", []))
+    assert "DI" in seen, "不变量破坏的文档仍被预筛跳过 ⇒ 漂移被其不可信的 epoch 永久掩盖"
+
+
+def test_prescreen_catches_null_allowed_depts_version(monkeypatch):
+    """B2-② 同族泄漏：某版本 `allowed_depts` 为 **NULL**。
+
+    旧实现 `if not ad: continue` 直接跳过该行 ⇒ 它对判定**完全隐形**：want 非空而该版本
+    根本没有投影，照样判 unchanged。NULL 必须记成**空集**参与逐行比较。
+    """
+    seen = _spy_targets(monkeypatch)
+    st = {"approved": {"DN": ["hr"]}, "have": {}, "ver": {"DN": 2},
+          "have_by_ver": {"DN": {1: None, 2: ["hr"]}},   # v1 从未投影（NULL）
+          "perm": {"DN": "dept_internal"},
+          "owner": {"DN": "hr"}, "chunk_owner": {"DN": "hr"}}
+    _run(monkeypatch, st)
+    assert "DN" in seen, "NULL allowed_depts 的版本被跳过 ⇒ 未投影却判 unchanged"
