@@ -54,6 +54,25 @@ codex 完成了缺陷核查与修法建议，**但没看到实现 diff**。两�
 本条其实在额度用尽**之前**，但也没单独过评审。风险：**已部署的定时任务可能开始变红**——
 那是本意（此前是假绿），但 Sam 应先知道再让它触发。
 
+### B7 🟠 `a4f6e37` P2-11 分页（我的贡献 / 复审任务）
+- **决定本身要复核**：我给 review-tasks 新加了一个 **OFFSET** 分页端点，而同一批的 `d2c8e12`
+  刚刚论证过 OFFSET 对活数据有窗口平移竞态、keyset 才是正解。选 OFFSET 的理由是"与控制台
+  既有 has_more+offset 范式一致"（loadMoreDocs / contributions），但这是**把技术债对齐**，
+  不是消除它。是否该借这次直接上 keyset？
+- 三个已踩过的坑已修并有测试（ORDER BY 补 `t.task_id`、`offset` 进 cache key、`&` 拼接），
+  但请复核 `_dashboard_cache` 与分页的整体交互——缓存 TTL 内翻页看到的是不同时刻的快照。
+
+### B8 🔴 差评复核分页 —— **本条没做，需设计裁决**
+`kb_feedback_review` 是**两层静默截断**：SQL 硬 `LIMIT 300` 扫原始行 → Python 按
+`message_id` 去重聚合 → 凑满 `limit`(20) 就不再收新消息。两层都不对外暴露。
+⇒ 管理员看到的"差评就这些"可能只是全量的一小部分，**而且无从知道**。
+直接加 `OFFSET` **不成立**：SQL 的 offset 作用在原始 join 行上，与去重后的条目不对齐
+（同一 message 有多条 cited-doc 行），会漏消息/重消息。
+可选方案：(a) `SELECT DISTINCT message_id ... LIMIT/OFFSET` 子查询再补 docs；
+(b) keyset by `(created_at, message_id)`；(c) 先只暴露 `has_more`/`truncated` 让截断不再静默。
+👉 **在拍板前，(c) 是零风险的最小改进**（符合本仓"no silent caps"纪律），但也需确认
+UI 该显示什么（能"加载更多"才给按钮，否则给一句"结果已截断，请收窄时间窗/筛选"）。
+
 ## C. 复核时要一并回答的横向问题
 
 1. **B1 的 `version_no` 现网一验**（上面已给方法）——一个查询就能定案，优先做。
