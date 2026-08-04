@@ -75,6 +75,13 @@ test.describe('硬门 — 轮 4 命中区与对比度', () => {
     const head = await hitBox(page, '.led-head [role="checkbox"]');
     expect(head.w).toBeGreaterThanOrEqual(32);
     expect(head.h, '表头封顶 32——44 会与首行命中区叠上').toBe(32);
+
+    // 守卫（评审 P3）：表头命中区右缘与首个排序按钮左缘实测恰好 0px——无重叠但零余量。
+    // 不缩尺寸（会让掉 2px 合规余量），只钉「不重叠」：将来谁动表头 gap/内边距把两者
+    // 压叠，这里红，而不是静默抢点。
+    const sort = await page.locator('.led-head .led-sort').first().boundingBox();
+    expect(head.cx + head.w / 2, '表头勾选框命中区不得压上排序按钮（现距 0px，零余量）')
+      .toBeLessThanOrEqual(sort!.x);
   });
 
   test('H3 行操作：中心距 30→38，命中区不重叠且留死区', async ({ page }) => {
