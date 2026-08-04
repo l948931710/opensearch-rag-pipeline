@@ -83,9 +83,12 @@ UI 该显示什么（能"加载更多"才给按钮，否则给一句"结果已�
 1. **B1 的 `version_no` 现网一验**（上面已给方法）——一个查询就能定案，优先做。
 2. 这批共 8 条修复，是否有**互相干扰**的面？我判断没有（分属摄取 provenance / 隔离 /
    检索补图 / 控制台读路径 / 前端状态机），但没做交叉分析。
-3. `test_stream_gate::test_flag_off_refusal_passthrough_unchanged` 的 **xdist flake**
-   （三跑红一次、单独跑必绿、干净树亦复现）始终没根治，只是每次确认"与本改动无因果"。
-   属 [[xdist-ontology-flake-fix-2026-07-17]] 同族，值得单独立项。
+3. **xdist flake 家族已确认不止一员**，值得单独立项（属 xdist-ontology-flake 同族）：
+   - `test_stream_gate::test_flag_off_refusal_passthrough_unchanged`（三跑红一次）
+   - `test_miniapp_serving::test_token_tamper_and_garbage`（2026-08-03 新见）
+   共同特征：**单独跑必绿、全量并行跑偶发红、干净树亦复现**。每次只是确认"与本改动无因果"，
+   根因（跨测试模块互踩 / 模块级状态未隔离）始终没查。它正在稀释 `make test` 的信号价值——
+   现在每次全量红都要先花一轮排除 flake。
 
 ## D. 状态
 
@@ -93,5 +96,5 @@ UI 该显示什么（能"加载更多"才给按钮，否则给一句"结果已�
   仓内无法获取）。
 - P0/P1 里仍**待 Sam 拍板**：C9（业务裁决）、C5（合规二选一）、C4（需先查生产钉钉端点）。
 - P2-11 **2/3 完成**（我的贡献 + 复审任务，`a4f6e37`）；差评复核见 **B8**（需设计裁决）。
-- P2-14/15 完成（`c5c7d59`）。**剩 P2-12**（DocTable 退役/恢复按 `perm==="public" && !isKbAdmin`
-  前置禁用）、**P2-13**（HeroBoard/候选队列接 `noteLoadError`；删除会话加 ConfirmDialog）。
+- P2-12 / P2-13 / P2-14 / P2-15 **全部完成**（`200f850`、`c5c7d59`）。
+- ⇒ **P2 批次除 B8（差评复核分页）外全清**；P3（设计债 4 项）未动。
