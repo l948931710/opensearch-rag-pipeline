@@ -84,23 +84,67 @@ quarantine），但**无 `content_process_status` 守卫**；而 raw_key 的权�
 
 ---
 
-## 4. 状态矩阵（拍板输入，须填满）
+## 4. 状态矩阵 —— **Claude 拟稿（2026-08-03），待 Sam 勾**
 
-`content_process_status` 的取值不能按名称直觉分类 —— **`FAILED` 且 `retry_count < 3` 仍会被
-重认领**（`dataworks_orchestrator.py:225`），不是终态。
+> 说明：矩阵不该逐格手填 —— 大部分格子是**机制强制**的（没有可选项），真正需要拍板的
+> 只有 §4.3 那三行。先把两类分开，免得把力气花在没有自由度的格子上。
 
-**维度一**：`{新文档, 有在线旧版本的升版}`
-**维度二**：`content_process_status ∈ {PENDING_APPROVAL, NOT_STARTED, LOADING, PROCESSING,
-FAILED&retry<3, FAILED&retry>=3, DONE}`
-**维度三**：`当前 permission → 目标 permission`（`→restricted` 与 `public↔dept_internal` 全版本行为不同）
-**维度四**：`document_version.index_status ∈ {PROCESSING, PENDING_DELETE, SUCCESS, ...}`
-（⚠️ 成功值是 **`SUCCESS`**；stage-3 已有 `PROCESSING→终态` CAS 用于保住控制台写入的 `PENDING_DELETE`）
+### 4.0 三条机制事实（先核过代码，带行号）
 
-| 项 | 内容 | 状态 |
+| # | 事实 | 证据 |
 |---|---|---|
-| 待拍板 | 逐格填"允许 / 409 / 允许但不 override" | ☐ |
+| F1 | stage-1/2 的认领谓词**完全相同**：`content_process_status='NOT_STARTED' OR (='FAILED' AND retry_count<3)` | `dataworks_orchestrator.py:225-226` / `:761-762` |
+| F2 | 认领 SELECT 是 **`FOR UPDATE OF dv SKIP LOCKED`**，与置 `LOADING` 在**同一事务**内 | `dataworks_orchestrator.py:234`、`:248` |
+| F3 | **两个写方今天锁的是不相交的行**：`kb_set_visibility` 只锁 `document_meta`（`kb_console.py:3299`），stage-2 只锁 `document_version` ⇒ **彼此零互斥**。这就是 C9 覆盖的机械根因 | 同上 |
 
----
+🔴 **F2 收窄了 B′ 原本的 409 面**：拍板单 §2 担心「只加列不加互斥仍是 last-writer-wins」。
+但只要 set-visibility **也对当前 `document_version` 行取 `FOR UPDATE`**，`SKIP LOCKED` 就让
+两者干净互斥：
+- set-visibility 先拿到锁 ⇒ stage-2 本轮 **SKIP** 掉这篇（不认领），下轮带着 override 处理；
+- stage-2 先拿到锁 ⇒ set-visibility **阻塞到它 commit**，醒来重读即见 `LOADING` ⇒ 409。
+⇒ **`NOT_STARTED` 与 `FAILED&retry<3` 是安全可写的**，不必像 B′ 初稿那样一并 409。
+
+### 4.1 机制强制格（无自由度，不需要拍板）
+
+| `content_process_status` | 是否会被认领 | 写 override | 依据 |
+|---|---|---|---|
+| `PENDING_APPROVAL` | 否（不在谓词内） | ✅ 允许 | F1 |
+| `NOT_STARTED` | 是 | ✅ 允许（dv 锁互斥） | F1+F2 |
+| `FAILED` & `retry_count<3` | 是 | ✅ 允许（同上） | F1+F2 |
+| `FAILED` & `retry_count>=3` | 否（已出谓词） | ✅ 允许 | F1 |
+| `LOADING` / `PROCESSING` | **已认领、在途** | ⛔ **409** | 该轮已持快照，拦不住 |
+| `REJECTED` / `SKIPPED_DUPLICATE` | 否 | ✅ 允许 | 终态 |
+| `DONE` | 否 | ✅ 允许 | 终态；见 §4.3 |
+
+> ⚠️ `LOADING`/`PROCESSING` 的 409 **不是永久拒绝**：>2h 无进展会被 stale-lock 接管重置成
+> `FAILED`+`retry_count++`（`dataworks_orchestrator.py:711-719`）⇒ 回到可写。409 文案应
+> 明确「稍后重试」，不要让管理员以为这篇永远改不了。
+
+### 4.2 `document_version.index_status`（维度四）
+
+| 取值 | 处置 | 理由 |
+|---|---|---|
+| `PENDING_DELETE` | ✅ 允许写 override，但**不撤销**该握手 | 退役/收紧握手在途；stage-3 收尾 CAS 已保住它（`pipeline_nodes.py:7477`） |
+| `PROCESSING` | ⛔ **409** | stage-3 正在推送，推的行带旧 permission；与 `LOADING` 同理 |
+| `SUCCESS` / 其它 | ✅ 允许 | —— |
+
+> 🔴 提醒：成功值是 **`SUCCESS`**，**不是 `INDEXED`**（`reindex_states.py:65-70`，2026-06-15
+> canary 事故）。任何守卫写 `index_status='INDEXED'` 都是**永远空集**的静默 no-op。
+
+### 4.3 🔴 真正待 Sam 拍板的三行（业务裁决）
+
+维度一（新文档 / 有在线旧版本的升版）× 维度三（权限变更方向）：
+
+| # | 场景 | 选项 | 我的建议 | 状态 |
+|---|---|---|---|---|
+| a | **升版中**（有在线旧版本），目标 = `restricted`（收紧/紧急下线） | (i) 立即作用于在线旧版本 　(ii) 只对新版本生效 | **(i) 立即** —— 这是紧急下线的**唯一**语义；若只对新版本生效，管理员点完「受限」而文档仍在被检索，是最坏的安全错觉 | ☐ |
+| b | **升版中**，`public → dept_internal`（收紧一档） | 同上 | **(i) 立即** —— 同为收紧方向，安全侧一致 | ☐ |
+| c | **升版中**，`dept_internal → public`（**放宽**到全公司） | 同上 | **(ii) 只对新版本** —— 放宽是不可逆的暴露面扩大；在线旧版本的内容尚未按「全公司」口径复核过。⚠️ 但这与 a/b 不对称，管理员可能困惑，需 UI 文案说明 | ☐ |
+
+> **新文档**（无在线旧版本）三种方向都无歧义：override 落到待处理版本即可，不涉及"在线的谁"。
+>
+> 若 Sam 对 c 选 (i)（放宽也立即），则三行统一为「可见范围是**文档级意图**，恒立即生效」——
+> 实现更简单、心智更一致，但要接受"放宽即刻扩大暴露面"。**这是产品决定，不是工程决定。**
 
 ## 5. R1 · `acl_revision` CAS 域
 
