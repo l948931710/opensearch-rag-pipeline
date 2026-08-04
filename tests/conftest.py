@@ -212,6 +212,39 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(autouse=True)
+def _restore_global_config_cache():
+    """`opensearch_pipeline.config._config` 是**进程级全局**，且惰性加载后**永不失效**。
+
+    ── 这条 fixture 治的是什么（2026-08-04，xdist flake 家族根因）────────────────
+    7 个测试模块用「`monkeypatch.setenv(...)` + `CONF._config = None`」来强制按新 env 重建
+    配置。`monkeypatch` 会在测试结束**还原 env**，但**不会**还原这个缓存 ⇒ 缓存里留着
+    **按已被还原的那份 env 建出来的 config**，后续所有测试都读到它。
+
+    确定性复现（本次据以定位）：
+        pytest tests/test_sensitive_guard_eval.py \
+               tests/test_stream_gate.py::TestStreamGateE2E::test_flag_off_refusal_passthrough_unchanged
+    前者设 `RAG_GENERAL_ABILITY_MODE=office` / `RAG_SENSITIVE_QUERY_GUARD` 并清缓存；
+    后者本应看到「flag 全关」的纯拒答，实得带 `"source": "guard"` + `"suggest_titles"` 的改道流
+    ⇒ **必红**。单跑必绿。
+
+    在 xdist 下，conftest 按**模块**分组（`group = mod`）⇒ 同模块内顺序确定、不会互踩；
+    但一个 worker 会**顺序跑很多模块**，谁先谁后随分发变化 ⇒ 表现为**间歇性**红。
+    这就是 `test_stream_gate` / `test_miniapp_serving` 那一族「单跑必绿、全量偶红、
+    干净树亦复现」的成因——**不是 xdist 的问题，是进程级状态泄漏**。
+
+    修法只还原**对象身份**，不无条件重建：只 monkeypatch 配置对象**属性**的测试（绝大多数）
+    留下的是同一个对象、由 monkeypatch 自行还原，本 fixture 对它们零成本；只有真正**替换/清空**
+    过缓存的测试才会被回滚。原值为 None（进程首测）时还原成 None，下次 get_config 按当时
+    （已还原的）env 重建，语义正确。
+    """
+    import opensearch_pipeline.config as _C
+    _saved = _C._config
+    yield
+    if _C._config is not _saved:
+        _C._config = _saved
+
+
+@pytest.fixture(autouse=True)
 def _reset_node_acl_capability_cache():
     """node-ACL capability 探测的 positive-only 进程内缓存（access_grants，2026-07-31）。
 
