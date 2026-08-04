@@ -149,6 +149,21 @@ def node_scan_raw_files(ctx: dict):
                     _pq_on = ctx.get("process_quarantine", False)
                     _q_pred = "" if _pq_on else "AND dv.raw_key NOT LIKE %s\n                          "
                     _q_params = () if _pq_on else (stage1_quarantine_like_pattern(),)
+                    # C8（schema/064）：内容绑定两列。用 information_schema 探测而不是
+                    # 1054 回退——`_exec_node_guarded` 只在两个 SQL 变体间二选一，再叠一维
+                    # 会变成 4 种组合。**追加在最末位**：既有位置索引 row[0..8] 逐字不变
+                    # （与 `_pov_col`/`_epoch_col` 同款纪律，插中间会静默移位）。
+                    _bind_ok = False
+                    try:
+                        cursor.execute(
+                            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='document_version' "
+                            "AND COLUMN_NAME='content_binding_mode'")
+                        _r = cursor.fetchone()
+                        _bind_ok = bool(_r and _r[0])
+                    except Exception:   # noqa: BLE001 — 探测失败 ⇒ 当未 apply（降级为今天的行为）
+                        _bind_ok = False
+                    _bind_cols = ", dv.raw_version_id, dv.content_binding_mode" if _bind_ok else ""
                     _base_sql = f"""
                         SELECT
                             dv.doc_id,
@@ -157,7 +172,7 @@ def node_scan_raw_files(ctx: dict):
                             dv.raw_key,
                             dv.file_ext,
                             dm.title,
-                            dm.owner_dept{{mode_cols}}
+                            dm.owner_dept{{mode_cols}}{_bind_cols}
                         FROM document_version dv
                         LEFT JOIN document_meta dm ON dv.doc_id = dm.doc_id
                         WHERE dv.content_process_status = 'NOT_STARTED'
@@ -189,6 +204,11 @@ def node_scan_raw_files(ctx: dict):
                             "dept": (row[6] or "") if _mode == "node" else (row[6] or "unknown"),
                             "acl_mode": _mode,
                             "owner_dept_id": _oid,
+                            # C8：绑定身份随任务下传给 node_extract_text_with_ocr；
+                            # 未 apply/未绑定 ⇒ ("", "LEGACY_UNBOUND") = 今天的取件方式。
+                            "raw_version_id": (row[-2] or "") if _bind_ok else "",
+                            "content_binding_mode": (row[-1] or "LEGACY_UNBOUND") if _bind_ok
+                                                    else "LEGACY_UNBOUND",
                         })
                     print(f"    [Scanner] Scanned {len(tasks)} pending raw tasks from RDS")
             except Exception as e:
@@ -517,23 +537,72 @@ def node_extract_text_with_ocr(ctx: dict):
                         f"[OVERSIZE] {raw_key} {_osize} bytes > cap {_max_bytes}："
                         "未下载未提取；确需摄取请调高 RAG_EXTRACT_MAX_BYTES 或人工拆分文档")
                 else:
-                    try:
-                        bucket.get_object_to_file(raw_key, local_path)
-                        file_size = os.path.getsize(local_path)
-                        task["local_path"] = local_path
-                        print(f"    📥 {doc_id}: downloaded {raw_key} ({file_size} bytes)")
-                    except Exception as e:
-                        # A2（2026-07-25）：取件失败必须留显式哨兵。此前只 print + 清空
-                        # local_path，抽取照跑并产出 0 字 canonical，定稿路径无条件写
-                        # canonical_json_key + extraction_status='COMPLETED'——而 stage-1 认领
-                        # 谓词要求 keys IS NULL，于是这篇文档【再也不会被重捡】，只能人工改库。
-                        # 判据用异常本身（不做 warning 文案匹配，避免误伤内容合法为空的文档）；
-                        # 键沿用同函数 _raw_checksum 的 (doc_id, version_no) 约定。
-                        print(f"    ⚠️ Failed to download {raw_key} from OSS: {e}")
+                    # ── C8 内容绑定：按 register 固化的**对象版本**取件（schema/064）──────
+                    # 绑定后，审批人预览的与这里下载的是**同一个 version** —— 期间任何重 PUT
+                    # 只产生新版本，改不了这一份。它修的不是「ETag 会碰撞」，而是
+                    # 「同一签名 PUT URL 30 分钟内可反复覆写」（拍板单 §1/§2.2：
+                    # 审批前 PUT A 给人看、审批后 PUT B 过 If-Match ⇒ 裸 ETag 复核挡不住）。
+                    # LEGACY_UNBOUND（存量 / flag 关 / 064 未 apply）⇒ params=None，
+                    # 取件方式与改动前**逐字节相同**。
+                    #
+                    # ⚠️ 本处在 `_extract_one` **函数**内，不是循环 —— 不可 `continue`。
+                    # 与既有 oversize / 取件失败两支同款：置空 `local_path` + 记哨兵后自然下落。
+                    _bmode = str(task.get("content_binding_mode") or "LEGACY_UNBOUND")
+                    _bvid = str(task.get("raw_version_id") or "")
+                    _bound = (_bmode == "VERSION_ID")
+                    _mismatch = ""
+                    if _bound and not _bvid:
+                        # 三态契约：VERSION_ID 必须有版本号。缺失=数据不一致，**绝不**退回
+                        # 不带 versionId 的取件（那等于绕过绑定去摄取"当前对象"）。
+                        _mismatch = "binding_mode=VERSION_ID 但 raw_version_id 为空（数据不一致）"
+                    if _mismatch:
+                        print(f"    🛑 {doc_id}: {_mismatch} —— 拒绝取件（CONTENT_MISMATCH）")
                         task["local_path"] = ""
-                        ctx.setdefault("_fetch_errors", {})[
-                            (task["doc_id"], task.get("version_no"))
-                        ] = f"{type(e).__name__}: {e}"
+                        ctx.setdefault("_content_mismatch", {})[
+                            (task["doc_id"], task.get("version_no"))] = _mismatch
+                    else:
+                        try:
+                            if _bound:
+                                _obj = bucket.get_object_to_file(
+                                    raw_key, local_path, params={"versionId": _bvid})
+                                # 取回后**核对身份**：OSS 回的 version-id 必须正是要的那个。
+                                # 不核就等于只信请求参数 —— 代理 / SDK 降级 / 桶策略变化
+                                # 都可能让它悄悄落回"当前版本"。
+                                try:
+                                    _got = (_obj.headers.get("x-oss-version-id") or "").strip()
+                                except Exception:   # noqa: BLE001 — 无 headers ⇒ 无法证明身份
+                                    _got = ""
+                            else:
+                                bucket.get_object_to_file(raw_key, local_path)
+                                _got = _bvid = ""
+                            if _bound and _got != _bvid:
+                                print(f"    🛑 {doc_id}: 取回版本 {_got or '(空)'} ≠ 绑定版本 "
+                                      f"{_bvid} —— CONTENT_MISMATCH，不摄取")
+                                try:
+                                    os.remove(local_path)
+                                except OSError:
+                                    pass
+                                task["local_path"] = ""
+                                ctx.setdefault("_content_mismatch", {})[
+                                    (task["doc_id"], task.get("version_no"))
+                                ] = f"取回版本 {_got or '(空)'} ≠ 绑定版本 {_bvid}"
+                            else:
+                                file_size = os.path.getsize(local_path)
+                                task["local_path"] = local_path
+                                print(f"    📥 {doc_id}: downloaded {raw_key} ({file_size} bytes)"
+                                      + (f" @version {_bvid}" if _bound else ""))
+                        except Exception as e:
+                            # A2（2026-07-25）：取件失败必须留显式哨兵。此前只 print + 清空
+                            # local_path，抽取照跑并产出 0 字 canonical，定稿路径无条件写
+                            # canonical_json_key + extraction_status='COMPLETED'——而 stage-1
+                            # 认领谓词要求 keys IS NULL，于是这篇文档【再也不会被重捡】。
+                            # 判据用异常本身（不做文案匹配，避免误伤内容合法为空的文档）；
+                            # 键沿用同函数 _raw_checksum 的 (doc_id, version_no) 约定。
+                            print(f"    ⚠️ Failed to download {raw_key} from OSS: {e}")
+                            task["local_path"] = ""
+                            ctx.setdefault("_fetch_errors", {})[
+                                (task["doc_id"], task.get("version_no"))
+                            ] = f"{type(e).__name__}: {e}"
         elif simulate_oss and "mock_text" not in task and not task.get("local_path"):
             # 本地零 OSS 形态（LOCAL-DEV，见 docs/environment_design.md）：
             # 真实文档由 scripts/sample_corpus.py 预先采样到 scratch/sample_corpus/<raw_key>，
@@ -979,6 +1048,35 @@ def _same_image_ref(a: dict, b: dict) -> bool:
     return False
 
 
+def _mark_content_mismatch(doc_id, version_no, reason: str, simulate_db: bool) -> None:
+    """C8：内容身份不符 ⇒ **不可自动重试**的安全终态（拍板单 §4.2）。
+
+    与 `_mark_extraction_failed` 的分工：后者是**瞬断/环境**失败，刻意留 `canonical keys=NULL`
+    让 stage-1 下轮**自动重捡自愈**；本条是**安全不变量破坏** —— 审批放行的字节 ≠ 现场字节。
+    复用那条会让它每天重捡、反复占队头，而 OSS 上那个对象永远不会变回去。
+
+    故写 `content_process_status='CONTENT_MISMATCH'`：该值**不在** stage-1
+    （NOT_STARTED / FAILED&retry<3）与 stage-2 的任何认领谓词里 ⇒ 天然终态、零自动重试。
+    唯一出路是撤回 / 重新上传形成新版本。**绝不静默改用现场对象。**
+    """
+    if simulate_db:
+        return
+    try:
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE document_version SET content_process_status='CONTENT_MISMATCH', "
+                    "extraction_status='FAILED', content_process_error=%s, updated_at=NOW() "
+                    "WHERE doc_id=%s AND version_no=%s",
+                    (reason[:500], doc_id, version_no))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 — 留痕失败不吞守卫本身（canonical keys 仍未写）
+        print(f"    ⚠️ 标记 CONTENT_MISMATCH 失败（不影响拦截本身）: {e}")
+
+
 def _mark_extraction_failed(doc_id, version_no, reason: str, simulate_db: bool) -> None:
     """把单篇标 `extraction_status='FAILED'` + 留痕（**不写 canonical keys**）。
 
@@ -1022,6 +1120,7 @@ def node_build_canonical(ctx: dict):
     cost_defer_docs = []   # COST-DEFER 守卫命中清单（瞬态预算顺延；同 ENV-DEP 循环后 raise）
     fetch_failures = []    # OSS-FETCH 守卫命中清单（取件失败；同 ENV-DEP 形态，循环后 raise）
     _fetch_errors = ctx.get("_fetch_errors") or {}
+    _content_mismatch = ctx.get("_content_mismatch") or {}
     finalize_failures = []  # B2：单篇定稿失败（OSS/RDS）清单；循环后与其它守卫一起 raise
     extract_failures = []   # B2：抽取层传来的单篇失败（见下方 simulate_db 之后的落库循环）
 
@@ -1121,6 +1220,24 @@ def node_build_canonical(ctx: dict):
         # extraction_status='FAILED' + content_process_error 留痕、循环后统一 raise 炸红运行。
         # 不动 retry_count：stage-1 全链路无任何一处给它自增，加谓词会命中
         # ingest_policy 的「计得到、领不走 → 无进展守卫永久判死」陷阱。
+        # ── C8 CONTENT_MISMATCH：**不可自动重试**的安全终态（拍板单 §4.2，Sam 2026-08-04）──
+        # 与下面 OSS-FETCH 的关键区别：那条是**瞬断**，故意留 keys=NULL 让 stage-1 自动重捡自愈；
+        # 内容身份不符是**安全不变量破坏**，复用那条会让它每天自动重捡、反复占队头，
+        # 而 OSS 上那个对象永远也不会变回来。故：
+        #   · `content_process_status='CONTENT_MISMATCH'`（终态，不在 stage-1/2 任何认领谓词里）
+        #   · 写审计 + 告警；徽章显示「内容不符」
+        #   · 唯一出路是**撤回/重新上传形成新版本**，绝不静默改用现场对象
+        # 🔴 刻意**不**借用 NEEDS_REVIEW（拍板单点名）：那是"可服务但内容不完整"，与本条语义相反。
+        _mm = _content_mismatch.get((canonical["doc_id"], canonical["version_no"]))
+        if _mm:
+            _mm_reason = f"[CONTENT-MISMATCH] {_mm}"[:500]
+            print(f"    🛑 SECURITY {canonical['doc_id']} v{canonical['version_no']}: {_mm_reason}")
+            _mark_content_mismatch(canonical["doc_id"], canonical["version_no"],
+                                   _mm_reason, simulate_db)
+            fetch_failures.append(
+                f"{canonical['doc_id']} v{canonical['version_no']}: {_mm_reason}")
+            continue
+
         _fetch_err = _fetch_errors.get((canonical["doc_id"], canonical["version_no"]))
         if _fetch_err:
             _fetch_reason = f"[OSS-FETCH] failed to download raw object: {_fetch_err}"[:500]

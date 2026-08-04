@@ -75,6 +75,7 @@ def generate_signed_url(
     method: str = "GET",
     content_type: Optional[str] = None,
     bucket=None,
+    params: Optional[dict] = None,
 ) -> str:
     """
     将 OSS 对象 key 转为带签名的公开访问 URL。
@@ -128,7 +129,10 @@ def generate_signed_url(
 
         # PUT 绑定 Content-Type：签入 headers → 客户端必须发一致的 Content-Type，否则 OSS 403。
         sign_headers = {"Content-Type": content_type} if (content_type and method.upper() == "PUT") else None
-        url = bucket.sign_url(method, oss_key, expires, headers=sign_headers)
+        # C8：`params={"versionId": ...}` 把**具体版本**签进 URL —— 审批人预览到的字节
+        # 就此固定，之后任何重 PUT 只产生新版本、看不到。无 params 时传 None 保持原调用形态。
+        url = bucket.sign_url(method, oss_key, expires, headers=sign_headers,
+                              params=(params or None))
 
         # 强制 HTTPS — 钉钉客户端要求图片 URL 必须是 HTTPS
         if url.startswith("http://"):
@@ -159,13 +163,26 @@ def _sim_head_object(oss_key: str) -> dict:
     except ValueError:
         size = 1024
     etag = os.environ.get("RAG_SIM_OSS_HEAD_ETAG") or hashlib.sha256(oss_key.encode("utf-8")).hexdigest()[:32].upper()
-    return {"size": size, "content_type": mime_for_ext(oss_key), "etag": etag}
+    # C8：sim 下也给确定性 version_id，否则 VERSION_ID 绑定支在 simulate 里永远走不到
+    # （本仓纪律是"改动先在 simulate 验证"）。置 `RAG_SIM_OSS_VERSION_ID=""` 可模拟
+    # **未开 versioning** 的 bucket，用来测 fail-closed 分支。
+    _vid = os.environ.get("RAG_SIM_OSS_VERSION_ID")
+    if _vid is None:
+        _vid = "simver_" + hashlib.sha256(oss_key.encode("utf-8")).hexdigest()[:16]
+    return {"size": size, "content_type": mime_for_ext(oss_key), "etag": etag, "version_id": _vid}
 
 
 def head_object(oss_key: str) -> Optional[dict]:
-    """对 OSS 对象做 HEAD：存在返回 {size, content_type, etag}，不存在/失败返回 None。
+    """对 OSS 对象做 HEAD：存在返回 {size, content_type, etag, version_id}，不存在/失败返回 None。
 
     供 kb register 校验"客户端确已把文件直传到后端钦定的 raw_key"。只读，无写副作用。
+
+    C8（2026-08-04）：**必须把 `version_id` 一并回吐**。它是审批内容绑定的锚 ——
+    register 存下它之后，预览与摄取都按该版本取件；期间任何重 PUT 只产生**新版本**，
+    动不了已固化的这一个。此前本包装器把它丢掉（只回 size/content_type/etag），
+    是 C8 落地的第一个卡点。
+    ⚠️ bucket 未开 versioning（或 Suspended）时 OSS 不回该字段 ⇒ 这里是 `""`。
+    调用方**不得**把空值当作"绑定成功"——三态契约见 schema/064。
     """
     if not oss_key:
         return None
@@ -187,10 +204,17 @@ def head_object(oss_key: str) -> Optional[dict]:
         public_endpoint = _ensure_public_endpoint(config.oss.endpoint)
         bucket = oss2.Bucket(oss2.Auth(access_id, access_secret), public_endpoint, config.oss.bucket_name)
         meta = bucket.head_object(oss_key)
+        # oss2 2.19.1 把版本号放在响应头 `x-oss-version-id`；未开 versioning 时该头不存在。
+        # 走 headers 而非属性：不同 oss2 版本的属性名不稳（versionid / version_id），headers 是协议面。
+        try:
+            _vid = (meta.headers.get("x-oss-version-id") or "").strip()
+        except Exception:      # noqa: BLE001 — 桩/旧版本无 headers ⇒ 视作未开 versioning
+            _vid = ""
         return {
             "size": int(meta.content_length or 0),
             "content_type": meta.content_type or "",
             "etag": (meta.etag or "").strip('"'),
+            "version_id": _vid,
         }
     except Exception as e:
         logger.info("head_object(%s) 未命中/失败: %s", oss_key[:80], e)

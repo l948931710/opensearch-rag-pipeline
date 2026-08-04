@@ -347,3 +347,57 @@ def test_032_lands_on_main_byte_identical_to_branch():
         pytest.skip("本地无 claude/ontology-p0 分支——跳过跨分支一致性比对")
     assert hashlib.sha256(branch_bytes).hexdigest() == local, (
         "schema/032 与 ontology-p0 版本发生字节漂移——两分支必须同 sha256")
+
+
+def test_schema_ledger_inserts_use_real_columns_and_pk():
+    """🔴 手写的台账 INSERT 必须用**真实列名**且带 PK `filename`（2026-08-04）。
+
+    `schema_migrations` 的列是 `filename`(PK) / `version` / `applied_at` / `applied_by` / `notes`
+    （schema/011:21-28）——**没有 `description`**。凭印象写成
+    `(version, description, applied_at)` 会在 apply 当场 `ERROR 1054` + 缺 PK 双杀。
+
+    实测触发：`schema/063` 与 `064` 都是这么写的，本地 apply 直接报 1054。
+    **063 当时已排队等生产 PROD-RW apply** —— 这条守卫就是为了让这类错在 CI 就红。
+    """
+    import pathlib
+    import re
+    REAL = {"filename", "version", "applied_at", "applied_by", "notes", "checksum"}
+    bad = []
+    for f in sorted(pathlib.Path("schema").glob("*.sql")):
+        src = f.read_text(encoding="utf-8")
+        for m in re.finditer(r"INSERT\s+(?:IGNORE\s+)?INTO\s+schema_migrations\s*\(([^)]*)\)",
+                             src, re.I):
+            line = src[:m.start()].count("\n") + 1
+            # 注释掉的示例（011 的基线回填）不算
+            if src[src.rfind("\n", 0, m.start()) + 1:m.start()].lstrip().startswith("--"):
+                continue
+            cols = {c.strip().strip("`") for c in m.group(1).split(",") if c.strip()}
+            if cols - REAL:
+                bad.append(f"{f.name}:{line} 用了不存在的列 {sorted(cols - REAL)}")
+            elif "filename" not in cols:
+                bad.append(f"{f.name}:{line} 漏了 PK `filename`")
+    assert not bad, ("台账 INSERT 列名/PK 有误（apply 时必失败）：\n  " + "\n  ".join(bad))
+
+
+def test_post_032_schema_files_defer_the_ledger_to_apply_migration():
+    """032 起的文件**不再手写**台账 —— checksum 必须由 `apply_migration.py` 算。
+
+    032 引入「同名异 checksum」漂移检测（apply_migration.py:12），它靠脚本写入的 checksum；
+    手写行 checksum 为 NULL ⇒ `_ledger_conflict` 视作史前记录直接放行 ⇒ 该文件的漂移检测**永久失效**。
+    019/020/021 三个早于该约定的文件保持原样（列名正确，只是没 checksum），不追溯改。
+    """
+    import pathlib
+    import re
+    bad = []
+    for f in sorted(pathlib.Path("schema").glob("*.sql")):
+        m = re.match(r"(\d+)", f.name)
+        if not m or int(m.group(1)) < 32 or f.name.startswith("011_"):
+            continue
+        for i, ln in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if ln.strip().startswith("--"):
+                continue
+            if re.search(r"INSERT\s+(?:IGNORE\s+)?INTO\s+schema_migrations", ln, re.I):
+                bad.append(f"{f.name}:{i}")
+    assert not bad, (
+        "这些 ≥032 的 schema 文件手写了台账 INSERT（checksum 漂移检测会对它们失效）：\n  "
+        + "\n  ".join(bad) + "\n改为在文件末尾注明「一律走 python scripts/apply_migration.py schema/<file>」。")

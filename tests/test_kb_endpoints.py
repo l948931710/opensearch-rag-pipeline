@@ -24,6 +24,11 @@ def _default_node_capability_absent(monkeypatch):
     monkeypatch.setattr(api, "_kb_node_capability", lambda cur: "absent")
     monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "absent")
     monkeypatch.setattr(kb_access, "_kb_node_capability", lambda cur: "absent")
+    # C8（2026-08-04）：schema/064 的能力探测同理默认 absent —— 同一个理由（真探针会多发一次
+    # information_schema 查询，把按次数弹结果的桩游标整体错位）。absent ⇒ 生成与改动前
+    # **逐字节相同**的 SQL/INSERT 列清单，本文件既有断言语义不变。
+    # 需要覆盖绑定分支的用例请**显式**打成 True 并在桩行末尾自带 raw_version_id/content_binding_mode。
+    monkeypatch.setattr(kb_console, "_kb_content_binding_columns", lambda cur: False)
 
 
 def _skip_if_not_sim():
@@ -800,7 +805,10 @@ def test_ledger_filter_anomaly_badge_in_clause():
     from opensearch_pipeline.routes.kb_console import _kb_ledger_filter_sql
     from opensearch_pipeline.api import _KB_BAD_BADGES
     sql, params = _kb_ledger_filter_sql("", "异常", "")
-    assert "IN (%s,%s,%s,%s)" in sql and list(params) == list(_KB_BAD_BADGES)
+    # 占位符个数**跟随** _KB_BAD_BADGES，不写死 4 个 —— 写死等于每加一个合法异常徽章
+    # （如 C8 的「内容不符」）就红一次，而本条要守的是「IN 集合与该常量同口径」。
+    assert f"IN ({','.join(['%s'] * len(_KB_BAD_BADGES))})" in sql
+    assert list(params) == list(_KB_BAD_BADGES)
     sql1, params1 = _kb_ledger_filter_sql("", "已上线", "")
     assert sql1.rstrip().endswith("= %s") and params1 == ["已上线"]
 
@@ -1918,7 +1926,7 @@ def test_doc_preview_signs_raw_key(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     _stub_multi(monkeypatch, [("marketing", "报价单.pdf", "raw/marketing/D1/v2/报价单.pdf", 2, "", None)])
     monkeypatch.setattr("opensearch_pipeline.oss_url.generate_signed_url",
-                        lambda key, expires=None, method="GET": f"https://oss.example/{key}?sig=x")
+                        lambda key, expires=None, method="GET", **kw: f"https://oss.example/{key}?sig=x")
     from opensearch_pipeline import api
     resp = api.kb_doc_preview(request=None, doc_id="D1", version=2, identity=api.Identity(user_id="adm1"))
     assert resp.available is True and resp.url.startswith("https://oss.example/")
@@ -2015,7 +2023,7 @@ def test_doc_preview_mime_from_raw_key_ext(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     _stub_multi(monkeypatch, [("marketing", "合同.pdf", "raw/marketing/D6/v1/合同初稿.docx", 1, "", None)])
     monkeypatch.setattr("opensearch_pipeline.oss_url.generate_signed_url",
-                        lambda key, expires=None, method="GET": f"https://oss.example/{key}?sig=x")
+                        lambda key, expires=None, method="GET", **kw: f"https://oss.example/{key}?sig=x")
     from opensearch_pipeline import api
     resp = api.kb_doc_preview(request=None, doc_id="D6", version=1, identity=api.Identity(user_id="adm1"))
     assert resp.available is True
@@ -2036,7 +2044,7 @@ def test_doc_preview_node_mode_kb_admin_ok(monkeypatch):
     _force_capability_present(monkeypatch)
     _stub_multi(monkeypatch, [("", "SOP.pdf", "raw/node-42/D7/v1/SOP.pdf", 1, "", None, "node", 42)])
     monkeypatch.setattr("opensearch_pipeline.oss_url.generate_signed_url",
-                        lambda key, expires=None, method="GET": f"https://oss.example/{key}?sig=x")
+                        lambda key, expires=None, method="GET", **kw: f"https://oss.example/{key}?sig=x")
     from opensearch_pipeline import api
     resp = api.kb_doc_preview(request=None, doc_id="D7", version=1, identity=api.Identity(user_id="adm1"))
     assert resp.available is True and resp.version_no == 1
@@ -2301,7 +2309,8 @@ def test_kb_status_badge_closed_set():
     from opensearch_pipeline.api import _kb_status_badge, _KB_BADGE_VOCAB
 
     content_vals = ["", "NOT_STARTED", "DONE", "FAILED", "REJECTED",
-                    "SKIPPED_DUPLICATE", "PENDING_APPROVAL", "RUNNING", "whatever"]
+                    "SKIPPED_DUPLICATE", "PENDING_APPROVAL", "RUNNING", "whatever",
+                    "CONTENT_MISMATCH"]   # C8：内容身份不符的安全终态（拍板单 §4.2）
     index_vals = ["", "NOT_INDEXED", "SUCCESS", "INDEXED", "FAILED"]
     doc_vals = [None, "active", "retired"]
     publish_vals = [None, "PUBLISHED", "QUARANTINED", "SKIPPED_EXPLOSION"]

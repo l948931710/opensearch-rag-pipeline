@@ -77,13 +77,15 @@ def _install(monkeypatch, conn):
     return conn
 
 
-def _approve(doc_id="DOC_X", version_no=None, user_id="u1"):
+# C8 §4.1（Sam 2026-08-04）：审批/驳回**强制单版本**，故辅助函数默认给具体版本；
+# 「省略 version_no」现在是 400，由 test_approve_requires_explicit_version 专门验。
+def _approve(doc_id="DOC_X", version_no=3, user_id="u1"):
     from opensearch_pipeline import api
     return api.kb_approve(api.KbApprovalRequest(doc_id=doc_id, version_no=version_no),
                           request=None, identity=api.Identity(user_id=user_id))
 
 
-def _reject(doc_id="DOC_X", version_no=None, reason=None, user_id="u1"):
+def _reject(doc_id="DOC_X", version_no=3, reason=None, user_id="u1"):
     from opensearch_pipeline import api
     return api.kb_reject(api.KbApprovalRequest(doc_id=doc_id, version_no=version_no,
                                                reason=reason),
@@ -147,7 +149,9 @@ def test_approve_only_touches_pending_versions(monkeypatch, audit):
         "必须只放行待审版本——丢了这个谓词会把 FAILED/REJECTED 版本一并复活")
     assert "SET content_process_status='NOT_STARTED'" in sql
     assert "approval_status='APPROVED'" in sql
-    assert params == ("DOC_X",)
+    # C8 §4.1：审批恒带版本谓词（`_approve()` 默认 version_no=3）——
+    # 改前省略即放行该文档全部 pending 版本，参数只有 ("DOC_X",)。
+    assert params == ("DOC_X", 3)
     assert conn.committed
     assert audit and audit[0]["action_type"] == "APPROVE"
 
@@ -175,18 +179,33 @@ def test_approve_refuses_to_revive_a_retired_doc(monkeypatch, audit):
 
 
 def test_approve_version_scoped_vs_all_pending(monkeypatch, audit):
-    """带 version_no → 谓词收窄到该版本；不带 → 放行该文档全部 pending 版本。"""
+    """★ C8 §4.1：审批/驳回**必须**精确到单个版本；省略 version_no 一律 400。
+
+    改前：`vfilter = "AND version_no=%s" if req.version_no else ""` ⇒ 省略即放行该文档
+    **全部** pending 版本。前端一直传具体版本（useKb.ts:1002），但**API 安全边界不能
+    依赖前端** —— 直连 API 省掉该字段就能一次放行多版。
+
+    与内容绑定的关系：绑定把「审批放行的字节」钉在**某一个版本**上；若审批能一次覆盖多版，
+    绑定语义当场残缺（批的是哪一版的内容？）。所以这条是内容绑定的**前提**。
+
+    ⚠️ 本用例此前断言的是旧行为（"不带 → 放行全部"）—— 那是**把漏洞写成了规范**。
+    """
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    conn = _install(monkeypatch, _Conn())
+    conn = _install(monkeypatch, _Conn(rowcount=1))
+    # 带版本 → 谓词收窄到该版本
     _approve(version_no=3)
     sql, params = _updates(conn)[0]
     assert "AND version_no=%s" in sql and params == ("DOC_X", 3)
 
-    conn2 = _install(monkeypatch, _Conn())
-    _approve()
-    sql2, params2 = _updates(conn2)[0]
-    assert "version_no=%s" not in sql2 and params2 == ("DOC_X",)
+    # 不带版本 → 400，且**在任何 DB 写之前**
+    for fn in (_approve, _reject):
+        conn2 = _install(monkeypatch, _Conn(rowcount=1))
+        with pytest.raises(Exception) as ei:
+            fn(version_no=None)
+        assert _status(ei) == 400
+        assert "version_no" in str(getattr(ei.value, "detail", ""))
+        assert _updates(conn2) == [], "省略 version_no 时不得下发任何 UPDATE"
 
 
 # ── reject 行为 ─────────────────────────────────────────────────────────────

@@ -157,8 +157,24 @@ conn = pymysql.connect(
 )
 
 with conn.cursor() as cursor:
-    cursor.execute("""
-        SELECT dv.doc_id, dv.version_no, dv.raw_key, dv.file_ext, dm.owner_dept
+    # 🔴 C8 §4.3（Sam 2026-08-04 拍板「排除已绑定版本」）：本工具会把既有 raw_key 改写到
+    # 另一个 OSS 对象，**却不更新 ETag / version-id**。对内容已绑定的版本，那等于
+    # 「把同一个审批过的版本悄悄指向另一份字节」—— 正是 C8 要修的攻击面，只不过换成
+    # 我们自己动手。故已绑定版本一律**跳过**并单独列出，交人工按「重新上传成新版本」处理。
+    # 064 未 apply 的环境无该列 ⇒ 回退旧查询（行为逐字节不变）。
+    _bind_ok = False
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='document_version' "
+            "AND COLUMN_NAME='content_binding_mode'")
+        _r = cursor.fetchone()
+        _bind_ok = bool(_r and _r[0])
+    except Exception:      # noqa: BLE001 — 探测失败 ⇒ 当未 apply
+        _bind_ok = False
+    _bind_col = ", dv.content_binding_mode" if _bind_ok else ", NULL"
+    cursor.execute(f"""
+        SELECT dv.doc_id, dv.version_no, dv.raw_key, dv.file_ext, dm.owner_dept{_bind_col}
         FROM document_version dv
         LEFT JOIN document_meta dm ON dv.doc_id = dm.doc_id
         WHERE dv.status = 'active'
@@ -179,9 +195,17 @@ ambiguous = []       # 文件名匹配到多个 OSS 路径
 
 db_raw_keys = set()
 
-for doc_id, version_no, raw_key, file_ext, owner_dept in db_records:
+bound_skipped = []   # C8：内容已绑定，禁止改写 raw_key
+
+for doc_id, version_no, raw_key, file_ext, owner_dept, _bmode in db_records:
     db_raw_keys.add(raw_key)
-    
+
+    # C8 §4.3：已绑定版本绝不改写（改写=把审批过的版本指向另一份字节）。
+    # 放在最前：连"存在性匹配"的统计都不参与，避免它被计进 matched_ok 掩盖掉。
+    if str(_bmode or "") == "VERSION_ID":
+        bound_skipped.append((doc_id, version_no, raw_key))
+        continue
+
     if raw_key in oss_files:
         matched_ok += 1
         continue
@@ -303,6 +327,16 @@ if not DRY_RUN and needs_update:
     print(f"   🔄 停用重复: {deactivated} 条")
 elif DRY_RUN and needs_update:
     print("\n💡 DRY_RUN 模式，未执行修改。改为 DRY_RUN = False 后重跑即可实际更新。")
+
+
+# C8 §4.3：内容已绑定的版本本轮被跳过 —— 单独列出交人工（绝不静默改写）。
+if bound_skipped:
+    print(f"\n🔒 C8 内容已绑定、跳过改写: {len(bound_skipped)} 条"
+          f"（这些版本的字节已随审批固化；确需换文件请重新上传形成**新版本**并重新审批）")
+    for _d, _v, _k in bound_skipped[:20]:
+        print(f"     · {_d} v{_v}  {_k}")
+    if len(bound_skipped) > 20:
+        print(f"     … 另有 {len(bound_skipped) - 20} 条")
 
 conn.close()
 print("\n✅ 完成！")

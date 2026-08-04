@@ -2731,6 +2731,7 @@ _KB_MAX_OFFSET = 10000   # 文档列表分页 offset 上界（全库 ~1600 篇�
 _KB_BADGE_VOCAB = frozenset({
     "已退役", "已隔离", "未入索引", "已上线", "处理失败",
     "已驳回", "内容未变", "待审核", "排队中", "处理中",
+    "内容不符",
 })
 
 
@@ -2769,6 +2770,14 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
     # 0-chunk 疑似失败那条同时写 content_process_status='FAILED'，已由「处理失败」覆盖。
     if str(chunk_status or "").upper() == "NEEDS_REVIEW":
         return "未入索引"
+    # C8（拍板单 §4.2，Sam 2026-08-04）：内容身份不符 —— 审批放行的字节 ≠ 摄取到的字节。
+    # 🔴 必须排在「已上线」**之前**（与 B13 的 NEEDS_REVIEW 同款理由）：`_mark_content_mismatch`
+    #    只改 content_process_status / extraction_status，**不动 index_status** ⇒ 升版场景里
+    #    上一轮残留的 SUCCESS 会让它先命中「已上线」，把一次被拦截的调包显示成"正常在线"。
+    #    也必须排在「处理失败」之前：本终态同时写 extraction_status='FAILED'，落到「处理失败」
+    #    运维会当成瞬断去重试，而它**不可自动重试**（唯一出路是重新上传形成新版本）。
+    if cs == "CONTENT_MISMATCH":
+        return "内容不符"
     # 管线把 document_version.index_status 置 'SUCCESS'（非 'INDEXED'）作为上线成功值。
     if ix in ("INDEXED", "SUCCESS") and (chunk_active is None or chunk_active > 0):
         return "已上线"
@@ -2806,6 +2815,8 @@ _KB_BADGE_CASE_SQL = (
     "      OR LEFT(UPPER(COALESCE(v.publish_status,'')),7) = 'SKIPPED' THEN '未入索引'"
     # B13：与 _kb_status_badge 同位插入（parity 测试守着两者同序同义）
     " WHEN UPPER(COALESCE(v.chunk_status,'')) = 'NEEDS_REVIEW' THEN '未入索引'"
+    # C8：与 _kb_status_badge 同位（在「已上线」之前）——parity 测试守着两者同序同义
+    " WHEN UPPER(COALESCE(v.content_process_status,'')) = 'CONTENT_MISMATCH' THEN '内容不符'"
     " WHEN UPPER(COALESCE(v.index_status,'')) IN ('INDEXED','SUCCESS') THEN '已上线'"
     " WHEN UPPER(COALESCE(v.content_process_status,'')) = 'FAILED'"
     "      OR UPPER(COALESCE(v.index_status,'')) = 'FAILED' THEN '处理失败'"
@@ -2817,7 +2828,7 @@ _KB_BADGE_CASE_SQL = (
 )
 
 # 「异常」聚合筛选的坏徽章集合（与 console 前端 useKb.BAD_BADGES、待办条「异常文档」同口径）。
-_KB_BAD_BADGES = ("未入索引", "处理失败", "已隔离", "已驳回")
+_KB_BAD_BADGES = ("未入索引", "处理失败", "已隔离", "已驳回", "内容不符")
 
 
 def _require_kb_console(identity: Optional[Identity]):

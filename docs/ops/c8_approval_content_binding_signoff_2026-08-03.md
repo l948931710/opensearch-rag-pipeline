@@ -16,6 +16,30 @@
 > 🔴 `content_binding_mode`（LEGACY_UNBOUND / VERSION_ID / FROZEN_KEY）三态契约**必须写死**，
 > 只靠 `raw_version_id IS NULL` 区分不了「存量」与「新写失败」。
 > 方案 F 未采纳 ⇒ 其 register 幂等 BLOCKER 随之**不阻塞本项**。
+>
+> ---
+> ## 🟢 2026-08-04 实施完成（代码已落，flag 默认 off）
+>
+> ⚠️ **标签澄清（Sam 2026-08-04 确认）**：本单表头写「方案 E」，但描述的实施要点逐条都是
+> §3「方案 V（version-id 固化）」的内容；而 §88 定义的 E 是「只给 stage-1 加 If-Match」。
+> **实际拍板与落地的是 V 的机制** ⇒ 它同时固定「审批预览读的」与「摄取读的」两处身份，
+> **C8 可关闭**，不需要另指终局方案的 owner + 期限（§60-61 的治理边界只适用于真正的 E）。
+>
+> §4 四条companion决策（Sam 2026-08-04 全定）：
+> - §4.0 内容绑定对**全部上传**生效（不只审批分支）✅ —— 绑定写在 register，与是否需审批无关
+> - §4.1 审批/驳回**强制单 version_no**（缺失 400）✅
+> - §4.2 mismatch 终态 = **`CONTENT_MISMATCH`**（新独立终态，不可自动重试，徽章「内容不符」）✅
+> - §4.3 `scan_oss_sync_keys` **排除已绑定版本**（跳过并单独列出）✅
+>
+> 落地面：`schema/064` · `oss_url.head_object`(回吐 version_id)/`generate_signed_url`(params)
+> · register(绑定+fail-closed) · doc-preview(按 versionId 签) · stage-1(按 versionId 取件+核返回身份)
+> · `_mark_content_mismatch` 终态 · 徽章两侧 + 前端词表 · scan 工具
+>
+> 🔴 **开 flag 前置（仍需 Sam 确认，本会话在 SIM 无法查）**：
+> 1. `schema/064` apply（走 `python scripts/apply_migration.py schema/064_content_binding.sql`）
+> 2. 生产 OSS versioning 是 **Enabled** 而非 Suspended
+> 3. **生命周期规则不会删历史版本** —— 若会删，被绑定的对象会在保留期后消失，
+>    fail-closed 会把那批文档全部卡死。这一条是本单表头自己列的 🔴，**未解除**。
 
 ## 1. 缺陷（已核验）
 

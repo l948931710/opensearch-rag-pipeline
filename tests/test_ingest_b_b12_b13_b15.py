@@ -163,7 +163,17 @@ def test_b13_sql_mirror_kept_in_sync():
 
 
 def test_b13_needs_review_not_added_to_bad_badges():
-    """不得把 NEEDS_REVIEW 整体当异常：VLM 降级路径明写"文本照常可检索"。"""
+    """不得把 NEEDS_REVIEW 整体当异常：VLM 降级路径明写"文本照常可检索"。
+
+    ⚠️ 断言方式改了（2026-08-04）：原来钉 `len(_KB_BAD_BADGES) == 4`，那是**用计数当代理**
+    ——加任何一个合法的新异常徽章都会红，而它想守的其实只有「NEEDS_REVIEW 那一类不算异常」。
+    C8 新增「内容不符」（内容身份不符的安全终态）正当其冲。改为直接断言意图。
+    """
     from opensearch_pipeline.api import _KB_BAD_BADGES
     assert "未入索引" in _KB_BAD_BADGES        # 既有取值不变
-    assert len(_KB_BAD_BADGES) == 4
+    # 本条真正要守的：VLM 降级那类"可服务但内容不完整"不得被计成异常。
+    # `_kb_status_badge` 把 chunk_status='NEEDS_REVIEW' 映射成「未入索引」而非独立词，
+    # 故这里断言的是**没有**为它新造一个异常徽章。
+    assert not {b for b in _KB_BAD_BADGES if "复核" in b or "REVIEW" in b.upper()}
+    # C8：内容不符是**安全终态**（不可自动重试），必须计入异常集
+    assert "内容不符" in _KB_BAD_BADGES

@@ -19,7 +19,9 @@ function toggleExpand(id: string) { expanded.value = { ...expanded.value, [id]: 
 // 待审核=卡 kb_admin 放行（等人）；已隔离/未入索引/处理失败=管线死链（重试不自愈/作者无重试权，
 // 统一「入库受阻」家族给重投出路）；内容未变=系统判定与在库内容相同（良性，muted，不给重投——
 // 原样重投仍判重复）；其余回落默认。
-const STALLED_BADGES = new Set(['已隔离', '未入索引', '处理失败'])
+// C8「内容不符」计入 stalled：作者重试**不会**自愈（OSS 上那个对象不会变回去），
+// 唯一出路是重新上传形成新版本 —— 与其它 stalled 徽章同一处置心智。
+const STALLED_BADGES = new Set(['已隔离', '未入索引', '处理失败', '内容不符'])
 function displayState(c: ContributionItem): string {
   if (c.state !== 'registering' || !c.doc_badge) return c.state
   if (c.doc_badge === '待审核') return 'pending_approval'
@@ -33,6 +35,11 @@ function stallHint(c: ContributionItem): string {
   }
   if (c.doc_badge === '处理失败') {
     return '入库处理失败（非正常排队）——请修改后重新提交；反复失败请联系管理员排查。'
+  }
+  if (c.doc_badge === '内容不符') {
+    // C8：审批放行的字节与实际入库字节不一致（签名直传 URL 被重复覆写）。
+    // 重试无用——OSS 上那份对象不会变回去；必须重新上传形成**新版本**。
+    return '入库内容与提交时不一致，出于安全已拦截——请重新提交一次（会生成新版本）；若反复出现请联系管理员。'
   }
   return '未能生成可检索内容（内容被整篇隔离或过短），请修改后重新提交或联系管理员。'
 }

@@ -507,7 +507,9 @@ describe('MyContributions — 隐形态补全与分流重投（ε-5 R1）', () =
 describe('台账词表 seam 锁（ε-5 R2）', () => {
   // 与 opensearch_pipeline/api.py::_KB_BADGE_VOCAB 逐字镜像——改词表两边测试都得动（有意的摩擦）
   const BACKEND_VOCAB = ['已退役', '已隔离', '未入索引', '已上线', '处理失败',
-                         '已驳回', '内容未变', '待审核', '排队中', '处理中']
+                         '已驳回', '内容未变', '待审核', '排队中', '处理中',
+                         // C8（2026-08-04）：审批放行的字节 ≠ 摄取到的字节，不可自动重试
+                         '内容不符']
 
   it('BADGE_TONE 键集 = 后端封闭集镜像（漂移=可见性静默回归，先在这里红）', async () => {
     const { BADGE_TONE } = await import('@/lib/kb')
@@ -517,7 +519,7 @@ describe('台账词表 seam 锁（ε-5 R2）', () => {
   it('MyContributions displayState 特判词 ⊆ 词表（新增徽章词没做分流决策 → 这里红）', async () => {
     const { BADGE_TONE } = await import('@/lib/kb')
     // 与 MyContributions.vue 的 STALLED_BADGES + 待审核/内容未变 特判逐字对齐
-    const DISPLAY_KEYS = ['待审核', '内容未变', '已隔离', '未入索引', '处理失败']
+    const DISPLAY_KEYS = ['待审核', '内容未变', '已隔离', '未入索引', '处理失败', '内容不符']
     for (const k of DISPLAY_KEYS) expect(k in BADGE_TONE, `特判词 ${k} 不在词表`).toBe(true)
   })
 })

@@ -27,7 +27,8 @@ ALTER TABLE document_version
     ADD COLUMN permission_override VARCHAR(32) DEFAULT NULL
         COMMENT 'C9/B′：管理员显式声明的可见范围意图（canonical 值）；NULL=无意图，走 raw_key 路径解析';
 
--- 台账（schema/README.md 的 F-35 纪律）
-INSERT INTO schema_migrations (version, description, applied_at)
-VALUES ('063', 'C9/B-prime: document_version.permission_override（可见范围意图版本级持久化）', NOW())
-ON DUPLICATE KEY UPDATE applied_at = VALUES(applied_at);
+-- ── 台账（F-35 纪律：schema 文件 + schema_migrations 一行，缺一即事故预备役）──
+-- ⚠️ **不要手写 INSERT**（与 062 同款纪律）：`schema_migrations` 的 PK 是 `filename`、
+--    并无 `description` 列，且 checksum 由 apply_migration.py 计算写入
+--    （032 起的「同名异 checksum」漂移检测依赖它）。一律走：
+--        python scripts/apply_migration.py schema/063_visibility_intent.sql

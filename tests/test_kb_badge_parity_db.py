@@ -41,7 +41,7 @@ _AXES = {
     "chunk_status": [None, "", "EMPTY", "empty", "NEEDS_REVIEW", "needs_review", "OK"],
     "index_status": [None, "", "INDEXED", "SUCCESS", "success", "FAILED", "PROCESSING", "DELETED"],
     "content_process_status": [None, "", "NOT_STARTED", "FAILED", "REJECTED", "SKIPPED_DUPLICATE",
-                               "PENDING_APPROVAL", "DONE", "LOADING"],
+                               "PENDING_APPROVAL", "DONE", "LOADING", "CONTENT_MISMATCH", "content_mismatch"],
     "gate_status": [None, "", "quarantined", "QUARANTINED", "pending_clean"],
 }
 _COLS = list(_AXES)

@@ -472,6 +472,12 @@ class RAGConfig:
     # 全仓实测零消费方（console / 小程序 / 钉钉 / eval 皆不调，仅测试与 docs 提及）。
     # 开回来时**同时**补上 guard 前置（见 api.py 的注册点），别只翻 flag。
     search_endpoint_enable: bool = False  # RAG_SEARCH_ENDPOINT_ENABLE
+    # C8 审批内容绑定（Sam 2026-08-04 拍板 version-id 固化）。默认 **off**：
+    # off ⇒ register 一律写 content_binding_mode='LEGACY_UNBOUND'、预览与摄取都不带
+    # versionId ⇒ 逐字节等价于今天。on ⇒ register 必须拿到非空 version_id 才算绑定成功。
+    # 🔴 开之前必须先 apply schema/064，且确认生产 OSS **versioning=Enabled**（非 Suspended）
+    # 以及生命周期规则**不会删历史版本**——否则被绑定的对象会在保留期后消失、fail-closed 把老文档卡死。
+    content_binding: bool = False         # RAG_CONTENT_BINDING
     # ── 纯文本生成开关（pure-text mode） ─────────────────────────
     # True  → 生成纯文字回答：system prompt 去掉 <<IMG:N>> 图片插入规则，
     #         context 不再注入 <<IMG:N>> 标记，卡片只展示文字（图片语义仍以
@@ -1066,6 +1072,7 @@ def load_config() -> PipelineConfig:
             sensitive_query_guard=_env_bool("SENSITIVE_QUERY_GUARD", False),    # RAG_SENSITIVE_QUERY_GUARD
             sensitive_prompt_guard=_env_bool("SENSITIVE_PROMPT_GUARD", False),  # RAG_SENSITIVE_PROMPT_GUARD
             search_endpoint_enable=_env_bool("SEARCH_ENDPOINT_ENABLE", False),  # RAG_SEARCH_ENDPOINT_ENABLE
+            content_binding=_env_bool("CONTENT_BINDING", False),                # RAG_CONTENT_BINDING
             dingtalk_streaming=_env_bool("DINGTALK_STREAMING", False),          # RAG_DINGTALK_STREAMING
             dingtalk_stream_interval_ms=_env_int("DINGTALK_STREAM_INTERVAL_MS", 500),  # RAG_DINGTALK_STREAM_INTERVAL_MS
             image_cosurface=_env_bool("IMAGE_COSURFACE", True),                 # RAG_IMAGE_COSURFACE

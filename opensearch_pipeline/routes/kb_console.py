@@ -2338,9 +2338,13 @@ def kb_doc_preview(request: Request, doc_id: str, version: int = 0,
                 _cap = _kb_node_capability(cur)
                 _mc = ", m.acl_mode, m.owner_dept_id" if _cap == "present" else ""
                 # 一次 JOIN 取 归属 + 原文件名 + 该版本 raw_key + 隔离标记（version=0 → current_version_no）。
+                # C8：`_bc` 把内容绑定两列追加在**最末位**（与 `_mc` 同款纪律：既有位置索引
+                # 逐字不变；插中间会静默移位、造成比原 bug 更坏的错配）。064 未 apply ⇒ 空串降级。
+                _bc = (", v.raw_version_id, v.content_binding_mode"
+                       if _kb_content_binding_columns(cur) else "")
                 cur.execute(
                     f"SELECT m.owner_dept, m.original_filename, v.raw_key, v.version_no,"
-                    f" v.publish_status, v.gate_status{_mc}"
+                    f" v.publish_status, v.gate_status{_mc}{_bc}"
                     f" FROM {_kb_db()}.document_meta m"
                     f" JOIN {_kb_db()}.document_version v"
                     "   ON v.doc_id = m.doc_id AND v.version_no = IF(%s > 0, %s, m.current_version_no)"
@@ -2373,7 +2377,26 @@ def kb_doc_preview(request: Request, doc_id: str, version: int = 0,
     if not raw_key:
         return KbDocPreviewResponse(doc_id=doc_id, version_no=vno, filename=filename, available=False)
     from opensearch_pipeline.oss_url import generate_signed_url, mime_for_ext
-    url = generate_signed_url(raw_key, expires=_KB_PREVIEW_TTL_SECONDS, method="GET")
+    # ── C8：审批人预览必须看到**被绑定的那一版字节** ─────────────────────────────
+    # 这是 C8 的另一半（拍板单 §2.2）：只在摄取侧加 If-Match 挡不住
+    # 「审批前 PUT A 给人看 → 审批后 PUT B 过校验」。按保存的 versionId 签 GET 之后，
+    # 审批人看到的就是 register 那一刻的对象，期间的重 PUT 只产生新版本、看不到。
+    # 位置索引：绑定两列在最末（见上方 `_bc`），故用长度判定而非固定下标。
+    _bind_mode = str(row[-1] or "LEGACY_UNBOUND") if _bc else "LEGACY_UNBOUND"
+    _bind_vid = str(row[-2] or "") if _bc else ""
+    _params = None
+    if _bind_mode == "VERSION_ID":
+        if not _bind_vid:
+            # 三态契约：VERSION_ID 必须有版本号。缺失 ⇒ **fail-closed**，绝不退回不带
+            # versionId 的签名（那等于把"绑定过"的版本按"当前对象"给审批人看）。
+            logger.error("doc-preview: doc=%s v=%s 标记 VERSION_ID 却无 raw_version_id —— 拒绝出预览",
+                         doc_id, vno)
+            raise HTTPException(
+                status_code=409,
+                detail="该版本标记为内容已绑定但缺少版本号，预览已拒绝（数据不一致，请联系管理员）")
+        _params = {"versionId": _bind_vid}
+    url = generate_signed_url(raw_key, expires=_KB_PREVIEW_TTL_SECONDS, method="GET",
+                              params=_params)
     return KbDocPreviewResponse(
         doc_id=doc_id, version_no=vno, filename=filename,
         # MIME 按该版本实物扩展名推导（raw_key），文档级 filename 只兜底——旧版本
@@ -2448,6 +2471,8 @@ class KbRegisterResponse(BaseModel):
 
 class KbApprovalRequest(BaseModel):
     doc_id: str
+    # 🔴 C8 §4.1（Sam 2026-08-04 拍板「强制单版本」）：保持 Optional 只为**兼容既有调用形态**
+    # 的反序列化；端点入口会强制它非空。理由见 `_require_single_version`。
     version_no: Optional[int] = None
     reason: Optional[str] = None
 
@@ -2791,6 +2816,25 @@ def kb_register(req: KbRegisterRequest, request: Request,
     etag_val = (meta.get("etag") or "")[:128]
 
     cfg = get_config()
+    # ── C8 内容绑定（schema/064）─────────────────────────────────────────────
+    # 把 register 这一刻的 OSS **对象版本**钉下来：之后预览与摄取都按它取件，
+    # 期间任何重 PUT 只产生新版本，动不了这一个。⚠️ 这修的不是「ETag 会碰撞」，
+    # 而是「同一 put_url 30 分钟内可反复覆写」——裸 ETag 复核挡不住
+    # 「审批前 PUT A 给人看、审批后 PUT B 过 If-Match」（拍板单 §2.2）。
+    #
+    # 三态契约（schema/064）：flag 关 ⇒ 恒 LEGACY_UNBOUND（行为逐字节不变）；
+    # flag 开但 HEAD 没拿到版本号（bucket 未开 versioning / Suspended）⇒ **fail-closed**，
+    # 绝不退回 LEGACY 静默放行 —— 否则绑定形同虚设，而运维还以为已经开了。
+    _binding_mode = "LEGACY_UNBOUND"
+    _raw_version_id = None
+    if cfg.rag.content_binding:
+        _raw_version_id = (meta.get("version_id") or "").strip()[:128]
+        if not _raw_version_id:
+            raise HTTPException(
+                status_code=503,
+                detail="内容绑定已启用，但对象存储未返回版本号（bucket versioning 未开启或已 Suspended）；"
+                       "请联系管理员确认后重试——此时登记会绕过审批内容绑定，故拒绝。")
+        _binding_mode = "VERSION_ID"
     assert_metadata_write_allowed("kb_register_upload", cfg.rds.host, kind="rds")
 
     cps = "PENDING_APPROVAL" if requires_approval else "NOT_STARTED"
@@ -2930,16 +2974,24 @@ def kb_register(req: KbRegisterRequest, request: Request,
                     )
                 # raw_key_hash 与生产管线/批量注册一致写入（自助路径此前置 NULL）——供 reconcile/dedup
                 # 工具按内容键去重（hash 已在函数入口处统一计算，幂等点查同键）。
+                # C8：064 已 apply 且本次确实绑定成功时才扩列；否则用与改动前**逐字节相同**的
+                # 列清单（列不存在时扩列会 1054 打挂整个登记路径）。
+                _bind_cols = _bind_vals = ""
+                if _binding_mode == "VERSION_ID" and _kb_content_binding_columns(cur):
+                    _bind_cols = ", raw_version_id, content_binding_mode"
+                    _bind_vals = ", %s, %s"
                 try:
                     cur.execute(
                         f"""
                         INSERT INTO {_kb_db()}.document_version
                           (doc_id, version_no, bucket_name, raw_key, raw_key_hash, etag, file_ext, mime_type,
-                           file_size_bytes, content_process_status, approval_status, status, received_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',NOW())
+                           file_size_bytes, content_process_status, approval_status, status, received_at
+                           {_bind_cols})
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',NOW(){_bind_vals})
                         """,
                         (doc_id, version_no, bucket, raw_key, raw_key_hash, etag_val, payload.get("ext"),
-                         kb_upload.expected_mime(payload.get("ext")), size, cps, appr),
+                         kb_upload.expected_mime(payload.get("ext")), size, cps, appr)
+                        + ((_raw_version_id, _binding_mode) if _bind_cols else ()),
                     )
                 except Exception as ins_err:
                     # uk_doc_version(doc_id,version_no) 唯一键 1062：并发双提交（同一 upload_token 双击/
@@ -3010,6 +3062,27 @@ def kb_register(req: KbRegisterRequest, request: Request,
     )
 
 
+def _require_single_version(req) -> int:
+    """C8 §4.1：审批/驳回**必须**精确到单个 `version_no`（Sam 2026-08-04 拍板）。
+
+    此前 `vfilter = "AND version_no=%s" if req.version_no else ""` ⇒ **省略即批准该文档
+    【全部】pending 版本**。前端确实一直传具体版本（`useKb.ts:1002`），但
+    **API 安全边界不能依赖前端** —— 直连 API 省掉该字段就能一次放行多版。
+
+    与内容绑定的关系：绑定把「审批放行的字节」钉在**某一个版本**上；若审批能一次覆盖多版，
+    绑定语义当场残缺（批的是哪一版的内容？）。所以这条是内容绑定的**前提**，不是可选加固。
+    """
+    try:
+        v = int(req.version_no or 0)
+    except (TypeError, ValueError):
+        v = 0
+    if v <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="必须指定 version_no（审批/驳回精确到单个版本；省略会一次放行该文档全部待审版本）")
+    return v
+
+
 @router.post("/api/kb/approve")
 def kb_approve(req: KbApprovalRequest, request: Request,
                identity: Optional[Identity] = Depends(current_identity)):
@@ -3022,6 +3095,7 @@ def kb_approve(req: KbApprovalRequest, request: Request,
 
     if not req.doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
+    _require_single_version(req)   # C8 §4.1：必须精确到单版本
     assert_metadata_write_allowed("kb_approve", get_config().rds.host, kind="rds")
     trace_id = get_request_id()
     try:
@@ -3037,7 +3111,7 @@ def kb_approve(req: KbApprovalRequest, request: Request,
                 if _m and str(_m[0] or "active").lower() != "active":
                     conn.commit()
                     return {"status": "ok", "approved": 0, "note": "文档已退役，未放行任何版本"}
-                vfilter = "AND version_no=%s" if req.version_no else ""
+                vfilter = "AND version_no=%s"   # C8 §4.1：入口已强制单版本，恒带该谓词
                 vargs = (req.version_no,) if req.version_no else ()
                 n = cur.execute(
                     f"UPDATE {_kb_db()}.document_version "
@@ -3069,6 +3143,7 @@ def kb_reject(req: KbApprovalRequest, request: Request,
 
     if not req.doc_id:
         raise HTTPException(status_code=400, detail="缺少 doc_id")
+    _require_single_version(req)   # C8 §4.1：必须精确到单版本
     assert_metadata_write_allowed("kb_reject", get_config().rds.host, kind="rds")
     trace_id = get_request_id()
     try:
@@ -3076,7 +3151,7 @@ def kb_reject(req: KbApprovalRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                vfilter = "AND version_no=%s" if req.version_no else ""
+                vfilter = "AND version_no=%s"   # C8 §4.1：入口已强制单版本，恒带该谓词
                 vargs = (req.version_no,) if req.version_no else ()
                 n = cur.execute(
                     f"UPDATE {_kb_db()}.document_version "
@@ -3180,6 +3255,25 @@ def kb_retire(req: KbRetireRequest, request: Request,
     return KbRetireResponse(
         doc_id=req.doc_id, retired=True,
         note="已退役：已标记下线并加入索引清除队列，下次入库批处理自动从检索移除（本操作可逆）")
+
+
+def _kb_content_binding_columns(cursor) -> bool:
+    """schema/064 是否已 apply（`document_version.content_binding_mode` 存在）。
+
+    C8 的读写两侧都靠它降级：**先部署后 apply 安全**（与 048/049/050/062/063 同款纪律）。
+    探测失败一律当 absent —— 那只会让本次登记落回 LEGACY_UNBOUND（= 今天的行为），
+    不会造成"以为绑上了其实没绑"的假安全；真正的 fail-closed 在 flag 那一侧（拿不到
+    version_id 就 503）。
+    """
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='document_version' "
+            "AND COLUMN_NAME='content_binding_mode'")
+        r = cursor.fetchone()
+        return bool(r and r[0])
+    except Exception:   # noqa: BLE001 — 探测失败 ⇒ 当未 apply（降级，不阻断登记）
+        return False
 
 
 def _kb_version_quarantined(publish_status, gate_status) -> bool:

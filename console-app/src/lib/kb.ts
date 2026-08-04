@@ -76,6 +76,9 @@ export const admissionReasonLabel = (r: string) => ADMISSION_REASON_LABEL[r] || 
 export const BADGE_TONE: Record<string, string> = {
   已上线: 'live', 处理中: 'busy', 排队中: 'queue', 待审核: 'queue', 未入索引: 'warn',
   已隔离: 'hold', 处理失败: 'fail', 已驳回: 'fail', 已退役: 'muted', 内容未变: 'muted',
+  // C8（2026-08-04）：审批放行的字节 ≠ 摄取到的字节。用 'fail' 而非 'warn'——它是
+  // **不可自动重试**的安全终态，唯一出路是重新上传形成新版本，不是"等一等会好"。
+  内容不符: 'fail',
 }
 export const badgeTone = (badge: string) => BADGE_TONE[badge] || 'muted'
 
