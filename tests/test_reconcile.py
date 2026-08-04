@@ -688,3 +688,87 @@ def test_alert_vanished_at_risk_or_unclassified_stays_critical(monkeypatch):
     reconcile._alert_on_drift(report2)
     assert sent[0][2]["severity"] == "critical"
     assert "未定性" in sent[0][1]
+
+
+# ── 探针失败 ≠ 数据漂移：告警标题层（C1 同族，2026-08-04 B6 复核）─────────────
+
+def _capture_alerts(monkeypatch):
+    sent = []
+    import opensearch_pipeline.alerting as al
+    monkeypatch.setattr(al, "send_ops_alert",
+                        lambda title, text, **kw: sent.append((title, text, kw)))
+    return sent
+
+
+def test_oss_parity_probe_error_does_not_alert_as_drift(monkeypatch):
+    """★ 探针失败必须以「探针失败」为标题发，**不能**顶着「parity drift」。
+
+    `_job_exit` 那一层早就把 error(3) 与 drift(2) 分开了（ops_monitor.py:83），
+    但告警**标题**层没跟上：正文写 "errored"、标题却是 "…parity drift" + critical。
+    看板 / 钉钉卡片只显标题 ⇒ 一次 DNS 解析失败被读成"数据真丢了"。
+
+    实测来源：本机 launchd `com.fuling.ops-monitor` 日志里 24 条被抑制的 CRITICAL，
+    最后一条正是 RDS 连不上（Errno 8）时发出的「OSS↔RDS image parity drift」。
+    """
+    from opensearch_pipeline import reconcile
+    sent = _capture_alerts(monkeypatch)
+    reconcile._alert_on_oss_drift(
+        {"ok": False, "complete": False, "error": "OperationalError: (2003, ...)", "counts": {}})
+    assert len(sent) == 1
+    title, text, kw = sent[0]
+    assert "探针失败" in title, f"探针失败却用了 drift 标题：{title!r}"
+    assert "drift" not in title.lower(), f"标题里仍带 drift：{title!r}"
+    assert kw.get("dedup_key", "").endswith(":error"), "去重槽没分开——探针失败会压掉真 drift"
+
+
+def test_oss_parity_real_drift_keeps_drift_title(monkeypatch):
+    """反向：真漂移仍用 drift 标题与原去重槽（防上一条把两类都改成"探针失败"）。"""
+    from opensearch_pipeline import reconcile
+    sent = _capture_alerts(monkeypatch)
+    reconcile._alert_on_oss_drift({"ok": False, "complete": True, "counts": {"missing": 7, "orphan": 2}})
+    title, text, kw = sent[0]
+    assert title == "OSS↔RDS image parity drift"
+    assert kw.get("dedup_key") == "reconcile:oss-rds-parity"
+    assert "**7**" in text
+
+
+def test_ha3_parity_probe_error_does_not_alert_as_drift(monkeypatch):
+    """RDS↔HA3 那条同款（日志里 18/24 条被抑制的 CRITICAL 都是它）。"""
+    from opensearch_pipeline import reconcile
+    sent = _capture_alerts(monkeypatch)
+    reconcile._alert_on_drift({"ok": False, "complete": False,
+                                      "error": "OperationalError: (2003, ...)", "counts": {}})
+    title, _text, kw = sent[0]
+    assert "探针失败" in title and "drift" not in title.lower(), title
+    assert kw.get("dedup_key", "").endswith(":error")
+
+
+def test_every_parity_alert_splits_probe_error_from_drift():
+    """🔴 守卫：`reconcile` 里**每一个** parity 告警函数都必须把「探针失败」与「漂移」
+    分成两个标题 + 两个 dedup_key。
+
+    加新对账时最容易照抄旧模板 —— 而旧模板正是「正文说 errored、标题说 drift」。
+    判据取 AST 层的 `send_ops_alert` 调用：其 title 实参必须是条件表达式
+    （`X if _errored else Y`），而不是一个裸字符串常量。
+    """
+    import ast
+    import pathlib
+    src = pathlib.Path("opensearch_pipeline/reconcile.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    bad, seen = [], 0
+    for fn in ast.walk(tree):
+        # 只查 drift 类告警函数；`_alert_on_duration`（耗时超标）不是 parity 二分，天然不适用
+        if not (isinstance(fn, ast.FunctionDef) and fn.name.startswith("_alert_on")
+                and fn.name.endswith("drift")):
+            continue
+        for node in ast.walk(fn):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "send_ops_alert"):
+                continue
+            if not node.args:
+                continue
+            seen += 1
+            if not isinstance(node.args[0], ast.IfExp):
+                bad.append(f"{fn.name} (line {node.lineno})")
+    assert seen >= 3, f"只扫到 {seen} 个 drift 告警——守卫可能已失效"
+    assert not bad, ("这些 parity 告警没把探针失败与漂移分开（标题是裸常量/裸 f-string）：\n  "
+                     + "\n  ".join(bad))

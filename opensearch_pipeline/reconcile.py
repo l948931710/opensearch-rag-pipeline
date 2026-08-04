@@ -880,13 +880,24 @@ def _alert_on_oss_drift(report: Dict[str, Any]) -> None:
     try:
         from opensearch_pipeline.alerting import send_ops_alert
         c = report.get("counts", {})
-        if report.get("error"):
+        # C1 同族（2026-08-04 B6 复核实测）：**探针失败不得顶着「drift」的标题发**。
+        # `_job_exit` 那一层早已把 error(3) 与 drift(2) 分开（ops_monitor.py:83），
+        # 但告警**标题**这一层没跟上 —— 正文写着 "errored"、标题却是 "parity drift" +
+        # severity=critical。看板/钉钉卡片只显标题 ⇒ 一次 DNS 解析失败被读成"数据真漂移"。
+        # 实测证据：本机 launchd `com.fuling.ops-monitor` 的日志里 24 条被抑制的 CRITICAL，
+        # 其中最后一条正是 RDS 连不上（Errno 8 DNS）时发出的 "OSS↔RDS image parity drift"。
+        _errored = bool(report.get("error"))
+        if _errored:
             text = f"OSS parity check errored: {report['error']}"
         else:
             text = (f"active-chunk image oss_keys missing from OSS: **{c.get('missing', 0)}** "
                     f"(broken images); orphan OSS objects: {c.get('orphan', 0)}")
-        send_ops_alert("OSS↔RDS image parity drift", text, severity="critical",
-                       dedup_key="reconcile:oss-rds-parity")
+        send_ops_alert(
+            "OSS↔RDS 图片 parity 探针失败" if _errored else "OSS↔RDS image parity drift",
+            text, severity="critical",
+            # dedup_key 也分开：否则"探针失败"会把真 drift 的去重槽占掉（反之亦然），
+            # 两类事件互相压制。
+            dedup_key="reconcile:oss-rds-parity:error" if _errored else "reconcile:oss-rds-parity")
     except Exception:  # noqa: BLE001
         logger.warning("reconcile(oss): ops-alert dispatch failed (non-fatal)", exc_info=True)
 
@@ -975,8 +986,12 @@ def _alert_on_raw_drift(report: Dict[str, Any]) -> None:
         else:
             text = (f"active docs whose raw source file is MISSING from OSS: **{c.get('missing', 0)}** "
                     f"(of {c.get('have_raw_key', 0)} with raw_key; {c.get('null_raw_key', 0)} have none)")
-        send_ops_alert("raw_key↔OSS parity drift", text, severity="warning",
-                       dedup_key="reconcile:raw-oss-parity")
+        # 同上（C1 同族）：探针失败与数据漂移必须标题可辨、去重槽分开。
+        _errored = bool(report.get("error"))
+        send_ops_alert(
+            "raw_key↔OSS parity 探针失败" if _errored else "raw_key↔OSS parity drift",
+            text, severity="warning",
+            dedup_key="reconcile:raw-oss-parity:error" if _errored else "reconcile:raw-oss-parity")
     except Exception:  # noqa: BLE001
         logger.warning("reconcile(raw): ops-alert dispatch failed (non-fatal)", exc_info=True)
 
@@ -1020,8 +1035,12 @@ def _alert_on_drift(report: Dict[str, Any]) -> None:
                 text += f"（fetch 二次定性失败，维持枚举单口径: {fr.get('error')}）"
             if report.get("unhealthy_buckets"):
                 text += f"; 不健康桶={list(report['unhealthy_buckets'].items())[:3]}"
-        send_ops_alert("RDS↔HA3 parity drift", text, severity="critical",
-                       dedup_key="reconcile:rds-ha3-parity")
+        # 同上（C1 同族）：探针失败与数据漂移必须标题可辨、去重槽分开。
+        _errored = bool(report.get("error"))
+        send_ops_alert(
+            "RDS↔HA3 parity 探针失败" if _errored else "RDS↔HA3 parity drift",
+            text, severity="critical",
+            dedup_key="reconcile:rds-ha3-parity:error" if _errored else "reconcile:rds-ha3-parity")
     except Exception:  # noqa: BLE001
         logger.warning("reconcile: ops-alert dispatch failed (non-fatal)", exc_info=True)
 
