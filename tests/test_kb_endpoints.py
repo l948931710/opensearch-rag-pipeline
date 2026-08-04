@@ -281,8 +281,8 @@ def test_browse_can_manage_flags_dept_admin(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
     monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
     rows = [
-        ("D1", "营销规范", "a.pdf", "marketing", "dept_internal", 1, "active", "2026-06-26", "DONE", "SUCCESS", None, "DONE"),
-        ("D2", "HR 手册", "b.pdf", "hr", "dept_internal", 2, "active", "2026-06-25", "DONE", "SUCCESS", None, "DONE"),
+        ("D1", "营销规范", "a.pdf", "marketing", "dept_internal", 1, "active", "2026-06-26", "DONE", "SUCCESS", None, "DONE", None),
+        ("D2", "HR 手册", "b.pdf", "hr", "dept_internal", 2, "active", "2026-06-25", "DONE", "SUCCESS", None, "DONE", None),
     ]
     _stub_rows(monkeypatch, rows)
     from opensearch_pipeline import api
@@ -296,7 +296,7 @@ def test_browse_kb_admin_all_manageable(monkeypatch):
     """kb_admin 全部门皆可管：can_manage 恒 True。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    rows = [("D1", "x", "a.pdf", "hr", "dept_internal", 1, "active", "t", "DONE", "SUCCESS", None, "DONE")]
+    rows = [("D1", "x", "a.pdf", "hr", "dept_internal", 1, "active", "t", "DONE", "SUCCESS", None, "DONE", None)]
     _stub_rows(monkeypatch, rows)
     from opensearch_pipeline import api
     resp = api.kb_browse(request=None, scope="all", identity=api.Identity(user_id="dev1"))
@@ -758,8 +758,8 @@ def test_my_docs_usage_enrich_when_fact_join_on(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: True)
     docrows = [
-        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None),
-        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None),
+        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None, None),
+        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None, None),
     ]
     _stub_multi(monkeypatch, [[], docrows, [("D1", 5, "2026-07-01 10:00:00")]])   # 首个 []=faceted 计数查询
     from opensearch_pipeline import api
@@ -774,7 +774,7 @@ def test_my_docs_usage_none_when_fact_join_off(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
-    docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None)]
+    docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None, None)]
     _stub_multi(monkeypatch, [[], docrows])   # 首个 []=faceted 计数查询
     from opensearch_pipeline import api
     resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
@@ -788,8 +788,8 @@ def test_my_docs_reject_reason_only_when_rejected(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
     docrows = [
-        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "REJECTED", None, None, "DONE", "内容过期，已被 v3 取代"),
-        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "FAILED", "FAILED", None, "DONE", "OCR timeout traceback…"),
+        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "REJECTED", None, None, "DONE", "内容过期，已被 v3 取代", None),
+        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "FAILED", "FAILED", None, "DONE", "OCR timeout traceback…", None),
     ]
     _stub_multi(monkeypatch, [[], docrows])   # 首个 []=faceted 计数查询
     from opensearch_pipeline import api
@@ -2326,6 +2326,28 @@ def test_kb_status_badge_closed_set():
     assert seen == _KB_BADGE_VOCAB, f"词表不再全可达（死词该从封闭集摘除）：缺 {_KB_BADGE_VOCAB - seen}"
 
 
+def test_my_docs_and_browse_gate_only_row_renders_quarantined(monkeypatch):
+    """★ 渲染侧 gate 轴（2026-08-04 独立核验 B2）：gate-only 隔离行在**列表渲染**也必须显
+    「已隔离」——此前筛选/计数走 SQL 镜像认 gate、渲染调用不传 gate_status，同一行会
+    「按已隔离筛出、列表里显示已上线」自相矛盾。my-docs 与 browse 双端点各钉一枚。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
+    from opensearch_pipeline import api
+    # my-docs：14 列（…, cpe, gate_status）
+    docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts",
+                "DONE", "SUCCESS", None, "DONE", None, "quarantined")]
+    _stub_multi(monkeypatch, [[], docrows])
+    resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
+    assert resp.items[0].status_badge == "已隔离"
+    # browse：13 列（…, chunk_status, gate_status）
+    rows = [("D2", "y", "b.pdf", "hr", "dept_internal", 1, "active", "t",
+             "DONE", "SUCCESS", None, "DONE", "quarantined")]
+    _stub_multi(monkeypatch, [[], rows])
+    resp2 = api.kb_browse(request=None, identity=api.Identity(user_id="adm1"))
+    assert resp2.items[0].status_badge == "已隔离"
+
+
 def test_my_docs_badge_counts_faceted(monkeypatch):
     """faceted 计数（2026-07-16 Sam 反馈）：badge_counts 与主查询同筛选（除 badge 自身）——
     计数查询不含 badge 谓词参数、按徽章 GROUP BY；响应携带映射供 chips/标题总数跟随筛选。"""
@@ -2334,7 +2356,7 @@ def test_my_docs_badge_counts_faceted(monkeypatch):
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
     counts_rows = [("已上线", 12), ("未入索引", 3), ("已退役", 5)]
     docrows = [("D1", "t1", "a.pdf", "production", "dept_internal", 1, "active", "ts",
-                "DONE", "SUCCESS", None, "DONE", None)]
+                "DONE", "SUCCESS", None, "DONE", None, None)]
     sink = _stub_multi(monkeypatch, [counts_rows, docrows])
     from opensearch_pipeline import api
     resp = api.kb_my_docs(request=None, limit=20, offset=0, owner_dept="production",

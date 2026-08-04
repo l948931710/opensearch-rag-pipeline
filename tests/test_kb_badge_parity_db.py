@@ -142,14 +142,26 @@ def test_gate_only_quarantine_is_unreachable_today():
     """
     import pathlib
     import re
+    # 2026-08-04 独立核验拓宽：旧版只扫 3 个硬编码文件 + 单引号字面量——参数化写法、
+    # 新文件、双引号全逃逸（且当时就漏数了 dataworks_nodes/register_new_files.py 的写点）。
+    # 现改全仓 *.py 扫描 + 引号两态 + 参数化形态（gate_status 出现在 SET/VALUES 且值经
+    # 绑定参数传 'quarantined' 的启发式：捕 "gate_status" 与 quarantined 同语句共现）。
+    # 仍是文本级启发式（AST 对 SQL 字符串无能为力），但覆盖面从「碰巧选中的 3 文件」
+    # 变成「全仓任何 .py」——新增 gate-only 写方想逃逸得同时绕开两种形态。
     offenders = []
-    for f in ("opensearch_pipeline/spot_checker.py", "opensearch_pipeline/extraction/cost_breaker.py",
-              "opensearch_pipeline/pipeline_nodes.py"):
-        src = pathlib.Path(f).read_text(encoding="utf-8")
-        for m in re.finditer(r"gate_status\s*=\s*'quarantined'", src):
+    root = pathlib.Path("opensearch_pipeline")
+    extra = [pathlib.Path("dataworks_nodes"), pathlib.Path("scripts"), pathlib.Path("deploy")]
+    files = [p for base in [root, *extra] if base.exists()
+             for p in base.rglob("*.py")]
+    pat = re.compile(r"gate_status\s*=\s*(?:'quarantined'|\"quarantined\"|%s|%\(\w+\)s)")
+    for p in files:
+        src = p.read_text(encoding="utf-8", errors="ignore")
+        for m in pat.finditer(src):
             stmt = src[max(0, m.start() - 800):m.start() + 400]
-            if "publish_status" not in stmt:
-                offenders.append(f"{f}:{src[:m.start()].count(chr(10)) + 1}")
+            # 参数化形态只有当 quarantined 字面量在同窗口出现时才算命中（排除读侧比较）
+            if m.group(0).endswith(("'quarantined'", '"quarantined"')) or "quarantined" in stmt.lower():
+                if "publish_status" not in stmt and "SELECT" not in stmt[:200].upper():
+                    offenders.append(f"{p}:{src[:m.start()].count(chr(10)) + 1}")
     assert not offenders, (
         "出现了只写 gate_status='quarantined' 而不写 publish_status 的写方：" + str(offenders)
         + " —— 徽章 gate 轴从此不再是拆隐雷，请复核列表/聚合口径")

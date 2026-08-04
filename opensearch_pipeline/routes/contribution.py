@@ -684,12 +684,14 @@ def _contrib_doc_badges(cur, doc_ids) -> Optional[dict]:
         ph = ",".join(["%s"] * len(ids))
         cur.execute(
             f"SELECT dv.doc_id, dv.content_process_status, dv.index_status,"
-            f" dv.publish_status, dv.chunk_status, dm.status"
+            f" dv.publish_status, dv.chunk_status, dm.status, dv.gate_status"
             f" FROM {_kb_db()}.document_version dv"
             f" LEFT JOIN {_kb_db()}.document_meta dm ON dm.doc_id = dv.doc_id"
             f" WHERE dv.version_no=1 AND dv.doc_id IN ({ph})",
             tuple(ids))
-        return {r[0]: _kb_status_badge(r[1], r[2], r[5], None, r[3], r[4])
+        # gate_status 随行传入（渲染侧 gate 轴，2026-08-04 独立核验 B2）：缺了它，
+        # gate-only 隔离件在贡献列表会显「已上线」，与台账筛选口径自相矛盾。
+        return {r[0]: _kb_status_badge(r[1], r[2], r[5], None, r[3], r[4], gate_status=r[6])
                 for r in (cur.fetchall() or [])}
     except Exception as e:   # noqa: BLE001 — 徽章派生绝不拖垮主列表
         logger.info("贡献管线徽章派生失败（诚实 None）: %s", e)

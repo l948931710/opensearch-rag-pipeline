@@ -35,6 +35,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--docs", required=True, help="JSON file: list of doc_ids or {doc_ids:[...]}")
     ap.add_argument("--commit", action="store_true", help="write (default: preview only)")
+    ap.add_argument("--include-quarantined", action="store_true",
+                    help="允许对隔离件（publish=QUARANTINED / gate=quarantined）执行 reset。"
+                         "默认硬拒：隔离件 reset 后走非 orchestrator 裸跑可铸出 gate-only 态"
+                         "（列表侧口径分叉的唯一残余链，2026-08-04 独立核验 B2）。")
     args = ap.parse_args()
 
     docs = _load_doc_ids(args.docs)
@@ -48,7 +52,7 @@ def main():
     ro = get_prod_readonly_conn()
     with ro.cursor() as cur:
         cur.execute(f"""SELECT dv.doc_id, dv.version_no, dv.content_process_status, dv.chunk_status,
-              dv.index_status
+              dv.index_status, dv.publish_status, dv.gate_status
             FROM document_version dv
             JOIN document_meta dm ON dm.doc_id = dv.doc_id AND dv.version_no = dm.current_version_no
             WHERE dv.doc_id IN ({ph})""", docs)
@@ -56,9 +60,20 @@ def main():
     ro.close()
     found = {r["doc_id"] for r in rows}
     missing = set(docs) - found
+    # 隔离守卫（2026-08-04 独立核验 B2）：与 _kb_version_quarantined 同 OR 语义（authority
+    # 在 api.py；此处内联避免拉起整个 FastAPI 依赖面）。隔离件 reset + 非 orchestrator 裸跑
+    # 是铸出 gate-only 态（列表徽章口径分叉）的唯一残余链——在链条第一步显式拒绝。
+    quarantined = [r for r in rows
+                   if str(r.get("publish_status") or "").upper() == "QUARANTINED"
+                   or str(r.get("gate_status") or "").lower() == "quarantined"]
     print(f"[preview] current-version rows found: {len(rows)} / {len(docs)} requested")
     if missing:
         print(f"[preview] WARNING: {len(missing)} doc(s) have no current-version row: {sorted(missing)[:5]}")
+    if quarantined:
+        print(f"[preview] 🔴 {len(quarantined)} QUARANTINED doc(s) in target set: "
+              f"{sorted(r['doc_id'] for r in quarantined)[:5]}"
+              + ("" if args.include_quarantined else "  (--commit will REFUSE; "
+                 "re-run with --include-quarantined only if you understand the gate-only risk)"))
     for r in rows[:8]:
         print(f"   {r['doc_id'][:40]:40} v{r['version_no']} "
               f"content={r['content_process_status']} chunk={r['chunk_status']} index={r['index_status']}")
@@ -85,6 +100,12 @@ def main():
     ack = os.environ.get("PROD_RW_ACK") or os.environ.get("RAG_PROD_RW_ACK")
     if not ack:
         raise SystemExit("--commit requires PROD_RW_ACK=PROD-RW:<today> in the environment")
+    if quarantined and not args.include_quarantined:
+        raise SystemExit(
+            f"REFUSED: {len(quarantined)} target doc(s) are quarantined "
+            f"({sorted(r['doc_id'] for r in quarantined)[:5]}...). Reset on quarantined docs "
+            "can mint a gate-only state via a bare (non-orchestrator) stage-2 run. "
+            "Remove them from the doc set, or pass --include-quarantined explicitly.")
 
     rw = get_prod_rw_conn(ack=ack)
     with rw.cursor() as cur:

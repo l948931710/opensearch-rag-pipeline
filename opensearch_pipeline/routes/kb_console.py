@@ -310,7 +310,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status,
-                           v.chunk_status, v.content_process_error{_mc}
+                           v.chunk_status, v.content_process_error, v.gate_status{_mc}
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -323,7 +323,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
                 node_names = _kb_node_names(
-                    cur, [r[14] for r in rows[:limit] if cap == "present" and r[14]])
+                    cur, [r[15] for r in rows[:limit] if cap == "present" and r[15]])
         finally:
             conn.close()
     except HTTPException:
@@ -336,8 +336,9 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     has_more = len(rows) > limit
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks, cpe) = r[:13]
-        _mode, _oid = ((r[13] or "legacy"), r[14]) if cap == "present" else ("legacy", None)
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated,
+         cps, ixs, pubs, chks, cpe, gate) = r[:14]
+        _mode, _oid = ((r[14] or "legacy"), r[15]) if cap == "present" else ("legacy", None)
         _okey, _olabel = _kb_owner_dto(_mode, owner or "", _oid, node_names)
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
@@ -345,7 +346,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
             owner_dept=owner or "", acl_mode=_mode, owner_key=_okey, owner_label=_olabel,
             permission_level=perm or "public",
             current_version_no=int(cur_ver or 1), status=status or "active",
-            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
+            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs,
+                                          chunk_status=chks, gate_status=gate),
             updated_at=str(updated) if updated else "",
             cited_count=(None if usage is None else (_u[0] if _u else 0)),
             last_cited_at=(_u[1] if _u else ""),
@@ -409,7 +411,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status,
-                           v.chunk_status{_mc}
+                           v.chunk_status, v.gate_status{_mc}
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -424,7 +426,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
                 node_names = _kb_node_names(
-                    cur, [r[13] for r in rows[:limit] if _bcap == "present" and r[13]])
+                    cur, [r[14] for r in rows[:limit] if _bcap == "present" and r[14]])
         finally:
             conn.close()
     except HTTPException:
@@ -441,8 +443,9 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
     _descendants = _kb_managed_descendants(kb)
     items = []
     for r in rows[:limit]:
-        (doc_id, title, fname, owner, perm, cur_ver, status, updated, cps, ixs, pubs, chks) = r[:12]
-        _mode, _oid = ((r[12] or "legacy"), r[13]) if _bcap == "present" else ("legacy", None)
+        (doc_id, title, fname, owner, perm, cur_ver, status, updated,
+         cps, ixs, pubs, chks, gate) = r[:13]
+        _mode, _oid = ((r[13] or "legacy"), r[14]) if _bcap == "present" else ("legacy", None)
         _okey, _olabel = _kb_owner_dto(_mode, owner or "", _oid, node_names)
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
@@ -450,7 +453,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
             owner_dept=owner or "", acl_mode=_mode, owner_key=_okey, owner_label=_olabel,
             permission_level=perm or "dept_internal",
             current_version_no=int(cur_ver or 1), status=status or "active",
-            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs, chunk_status=chks),
+            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs,
+                                          chunk_status=chks, gate_status=gate),
             updated_at=str(updated) if updated else "",
             can_manage=_cmd(kb, _mode, owner or "", _oid, _descendants),
             cited_count=(None if usage is None else (_u[0] if _u else 0)),
