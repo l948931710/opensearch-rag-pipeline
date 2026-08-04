@@ -12,7 +12,7 @@ import LoadError from './LoadError.vue'
 const {
   reviewTasks, loadReviewTasks, loadErrors,
   showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
-  reviewTasksHasMore,
+  reviewTasksHasMore, reviewTasksLoadBusy,
 } = useKb()
 const { promptText } = useDialog()
 
@@ -123,10 +123,10 @@ const TYPE_LABEL: Record<string, string> = {
     </div>
     <div v-else-if="reviewTasksHasMore" class="mt-2 text-center">
       <button
-        type="button" data-testid="review-task-load-more"
-        class="rounded-lg border border-border px-4 py-1.5 text-[12.5px] font-medium text-foreground transition hover:border-border-strong"
+        type="button" data-testid="review-task-load-more" :disabled="reviewTasksLoadBusy"
+        class="rounded-lg border border-border px-4 py-1.5 text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
         @click="loadReviewTasks((reviewTasks || []).length)"
-      >加载更多</button>
+      >{{ reviewTasksLoadBusy ? '加载中…' : '加载更多' }}</button>
     </div>
     <p class="ml-0.5 mt-2 text-[11.5px] text-faint">
       管线安全网登记的人工复审（权限抽查不一致等）——先用「谁能看到 / 调整可见范围 / 退役」核实并整改文档，再回来标记已处理。

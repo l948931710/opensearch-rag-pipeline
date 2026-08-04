@@ -219,3 +219,52 @@ describe('FeedbackReviewList — 截断如实告知（B8）', () => {
     expect(w.find('[data-testid="feedback-truncated"]').exists()).toBe(false)
   })
 })
+
+describe('B8 截断标志 × 部门筛选视图（2026-08-04 独立核验：两名核验员各自撞出同一缺陷）', () => {
+  it('筛选视图自身截断 → 横幅可见（此前视图 loader 丢标志，静默截断在该路径复活）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      jsonResp({ items: [fb('m1')], truncated_scan: true })))
+    const pinia = activePinia(identity())
+    const kb = useKb()
+    await kb.loadFeedbackReviewView('legacy:marketing')
+    expect(kb.feedbackReviewViewTruncated.value).toBe(true)
+
+    const w = mount(FeedbackReviewList, { props: { ownerKey: 'legacy:marketing' },
+                                          global: { plugins: [pinia], stubs } })
+    await new Promise((r) => setTimeout(r, 10))
+    expect(w.find('[data-testid="feedback-truncated"]').exists()).toBe(true)
+  })
+
+  it('收件箱截断 + 筛选视图干净 → 视图模式横幅不误报（标志随本次筛选数据走）', async () => {
+    const pinia = activePinia(identity())
+    const kb = useKb()
+    // 先造出「收件箱截断」态
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      jsonResp({ items: [fb('m0')], truncated_messages: true })))
+    await kb.loadFeedbackReview()
+    expect(kb.feedbackReviewTruncated.value).toBe(true)
+    // 再拉一个干净的筛选视图
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResp({ items: [fb('m1')] })))
+    await kb.loadFeedbackReviewView('legacy:hr')
+    expect(kb.feedbackReviewViewTruncated.value).toBe(false)
+
+    const w = mount(FeedbackReviewList, { props: { ownerKey: 'legacy:hr' },
+                                          global: { plugins: [pinia], stubs } })
+    await new Promise((r) => setTimeout(r, 10))
+    expect(w.find('[data-testid="feedback-truncated"]').exists()).toBe(false)
+  })
+
+  it('文案不再指路「收窄时间窗」死胡同（端点无时间窗参数，前端下拉是纯本地过滤）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      jsonResp({ items: [fb('m1')], truncated_scan: true })))
+    const pinia = activePinia(identity())
+    const kb = useKb()
+    await kb.loadFeedbackReview()
+    const w = mount(FeedbackReviewList, { global: { plugins: [pinia], stubs } })
+    await new Promise((r) => setTimeout(r, 10))
+    const banner = w.find('[data-testid="feedback-truncated"]')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).not.toContain('收窄时间窗')
+    expect(banner.text()).toContain('处理并标记现有条目')
+  })
+})

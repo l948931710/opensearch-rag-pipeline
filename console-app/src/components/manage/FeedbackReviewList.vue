@@ -19,9 +19,12 @@ const {
   feedbackReview, loadFeedbackReview, loadErrors,
   feedbackReviewView, loadFeedbackReviewView,
   showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
-  feedbackReviewTruncated,
+  feedbackReviewTruncated, feedbackReviewViewTruncated,
 } = useKb()
 const viewMode = computed(() => props.ownerKey !== undefined)
+// B8 截断标志按当前视图取值（独立核验：横幅曾恒读收件箱标志——筛选视图截断无提示、
+// 收件箱截断误挂到筛选数据上，双向失真）
+const truncated = computed(() => (viewMode.value ? feedbackReviewViewTruncated.value : feedbackReviewTruncated.value))
 const rows = computed(() => (viewMode.value ? feedbackReviewView.value : feedbackReview.value))
 const errKey = computed(() => (viewMode.value && props.ownerKey ? 'feedbackReviewView' : 'feedbackReview'))
 function reload() {
@@ -240,9 +243,14 @@ function scrollWhenReady(id: string, deadlineMs = 1500) {
          对外暴露 ⇒ 管理员看到的「差评就这些」可能只是全量的一小部分、且无从知道。
          ⚠️ 这里**刻意不给「加载更多」**：后端 offset 作用在原始 join 行上、与按 message_id
          去重聚合后的条目不对齐，加了会漏消息/重消息。真分页属设计变更，另议。 -->
-    <p v-if="feedbackReviewTruncated" data-testid="feedback-truncated"
+    <!-- 文案（独立核验 C-2）：原「收窄时间窗」是死胡同——端点没有时间窗参数，前端时间
+         下拉是纯本地过滤，永远找不回被截断的行。真实出路：①处理并标记现有条目（默认查询
+         排除已处理 ⇒ 刷新后余量续出）；②kb_admin 看板有部门筛选控件时按部门收窄。 -->
+    <p v-if="truncated" data-testid="feedback-truncated"
        class="ml-0.5 mt-2 text-[11.5px] text-st-warn">
-      结果已截断，未显示全部差评 —— 请收窄时间窗或按部门筛选后再查看。
+      结果已截断，未显示全部差评 ——
+      {{ viewMode && !props.ownerKey ? '可按部门筛选收窄范围，或处理并标记现有条目后刷新续出剩余项。'
+                                     : '处理并标记现有条目后刷新，可继续露出未显示的差评。' }}
     </p>
   </div>
 </template>

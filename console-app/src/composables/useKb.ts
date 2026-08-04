@@ -224,6 +224,9 @@ const visErr = ref('')
 // 差评联动复核（看板卡片）：引用了我作用域文档的回答收到 👎。null=尚未加载（显占位不显 0）。
 const feedbackReview = ref<FeedbackReviewItem[] | null>(null)
 const feedbackReviewTruncated = ref(false)   // B8：后端两层截断任一命中即 true（如实告知，不做分页）
+const feedbackReviewViewTruncated = ref(false)   // B8 视图侧（2026-08-04 独立核验：两名核验员各自撞出
+                                                 // 同一缺陷——筛选视图丢标志 ⇒ 静默截断在该路径复活 +
+                                                 // 收件箱标志误挂到筛选数据上）
 // P3-3（2026-08-04）：硬 LIMIT 队列的截断标记。后端 `LIMIT N+1` 取探针行，多出来即置位。
 // 键 = 队列名；无键 = 该队列本轮没截断。与 B8 同族：**先让截断不再静默**，不做真分页
 // —— 真分页需要稳定排序键（`DATETIME` 只到秒，OFFSET 翻页会漏/重）+ 前端翻页，属设计变更。
@@ -245,6 +248,7 @@ const feedbackResolveBusy = ref<Set<string>>(new Set())   // 处置在途（按 
 // 入库复审任务队列（盲区审计 P2-33：review_task 补消费端，kb_admin 专属）。
 const reviewTasks = ref<ReviewTaskItem[] | null>(null)
 const reviewTasksHasMore = ref(false)   // P2-11：后端 limit=20 此前静默截断，前端无从知道还有
+const reviewTasksLoadBusy = ref(false)   // 「加载更多」追加在途（独立核验：双击重复追加）
 const showClosedReviewTasks = ref(false)
 const reviewTaskResolveBusy = ref<Set<string>>(new Set())
 // 共享目标可选项 = 10 个用户面 ACL 组码（与后端 sanitize 白名单同源；生产子线是 owner 粒度、非读者组）。
@@ -1407,18 +1411,25 @@ async function loadFeedbackReviewView(ownerKey: string) {
   const mySeq = ++fbViewSeq
   if (!ownerKey) {
     await loadFeedbackReview()
-    if (mySeq === fbViewSeq) feedbackReviewView.value = feedbackReview.value
+    if (mySeq === fbViewSeq) {
+      feedbackReviewView.value = feedbackReview.value
+      feedbackReviewViewTruncated.value = feedbackReviewTruncated.value   // 镜像行也镜像标志
+    }
     return
   }
   clearLoadError('feedbackReviewView')
   feedbackReviewView.value = null            // 进加载态——绝不把上一 scope 的行挂在新筛选标签下（ux-review D1/D3）
   try {
     const qs = `?owner_key=${encodeURIComponent(ownerKey)}${showResolvedFeedback.value ? '&include_resolved=true' : ''}`
-    const r = await apiJson<{ items: FeedbackReviewItem[] }>(`/api/kb/feedback-review${qs}`, { auth: true })
+    const r = await apiJson<{ items: FeedbackReviewItem[]; truncated_messages?: boolean; truncated_scan?: boolean }>(
+      `/api/kb/feedback-review${qs}`, { auth: true })
     if (mySeq !== fbViewSeq) return
     feedbackReviewView.value = r.items || []
+    // 标志随本次筛选数据走（不读收件箱那次 fetch 的标志）——静默截断/误报横幅双向修
+    feedbackReviewViewTruncated.value = !!(r.truncated_messages || r.truncated_scan)
   } catch (e) {
     if (mySeq !== fbViewSeq) return
+    feedbackReviewViewTruncated.value = false
     // 404=端点未上线兜底空；真错误保留 null ⇒ 组件显式错误占位——不回退全库/旧 scope 数据
     if (!noteLoadError('feedbackReviewView', e)) feedbackReviewView.value = []
   }
@@ -1500,6 +1511,20 @@ export interface ReviewTaskItem {
 
 /** 拉入库复审任务队列（kb_admin 专属）：默认只列 PENDING（不设时间窗、老单先出）。 */
 async function loadReviewTasks(offset = 0) {
+  // 追加在途闸（2026-08-04 独立核验）：双击「加载更多」= 同 offset 双请求 = 同批 20 条
+  // 重复追加（duplicate key）。闸只作用于追加对追加（offset>0 在途时再追加 no-op）；
+  // 替换路径（offset=0，含 toggle 的 void 重载）完全不置忙也不受闸——替换本就 last-wins，
+  // 且置忙会把「toggle 后立刻追加」误伤掉（既有契约测试钉着）。
+  if (offset) {
+    if (reviewTasksLoadBusy.value) return
+    reviewTasksLoadBusy.value = true
+    try { await _loadReviewTasksInner(offset) } finally { reviewTasksLoadBusy.value = false }
+    return
+  }
+  await _loadReviewTasksInner(0)
+}
+
+async function _loadReviewTasksInner(offset = 0) {
   const s = useSession()
   if (s.role !== 'kb_admin') { reviewTasks.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -1940,8 +1965,8 @@ export function useKb() {
     nodeCandidates, loadNodeCandidates, decideNodeCandidate,
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     feedbackReview, feedbackReviewTruncated, truncatedQueues, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
-    feedbackReviewView, loadFeedbackReviewView, fbStats, loadFeedbackStats,
-    reviewTasks, loadReviewTasks, reviewTasksHasMore, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
+    feedbackReviewView, feedbackReviewViewTruncated, loadFeedbackReviewView, fbStats, loadFeedbackStats,
+    reviewTasks, loadReviewTasks, reviewTasksHasMore, reviewTasksLoadBusy, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, accessNoteOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
