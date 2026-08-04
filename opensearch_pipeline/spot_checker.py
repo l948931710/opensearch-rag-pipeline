@@ -189,9 +189,31 @@ def _safety_review_llm(title, doc_text, *, api_key, model_name, api_base_url):
     return json.loads(cleaned_content)
 
 
+def _enumerate_chunk_pks(conn, doc_id: str, version_no: int) -> set:
+    """按 (doc_id, version_no) 取 chunk_meta 主键集（= HA3 pk_field 的取值，见 to_ha3_doc）。
+
+    ⚠️ 读到的是**调用时刻该连接读视图下**的一代 PK。同版本 re-chunk 是 DELETE+INSERT，
+    自增 id 不复用 ⇒ 新旧两代 PK 不相交，而 HA3 里两代可能**同时存在**（stage-2 只删 RDS
+    行；stage-3 的旧版本清理谓词是 `version_no < N`，同版本旧 PK 不归它删）。所以判"该删
+    哪些"时不能只信任一个读视图 —— 调用方需要哪几代就取哪几代，取并集。
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT id FROM chunk_meta WHERE doc_id = %s AND version_no = %s",
+            (doc_id, version_no))
+        return {r[0] for r in cursor.fetchall()}
+
+
 def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config,
-                              client=None, deadline_ts: float = None) -> None:
-    """从搜索索引中删除指定文档的所有 chunks。
+                              client=None, deadline_ts: float = None,
+                              pk_ids: set = None) -> set:
+    """从搜索索引中删除指定文档的所有 chunks。返回本次**请求删除**的 PK 集合。
+
+    pk_ids：显式指定要删的主键集（隔离路径用它传"新旧两代的并集"）。None = 按
+    (doc_id, version_no) 现场枚举，即历史行为。
+    ⚠️ 返回值语义是「请求删除的集合」，**不是「已确认删除的集合」** —— HA3 的 2xx
+    响应体仍可能含逐文档错误（对比 push add 路径的逐文档错误解析）。要断言"确实不在
+    索引里"只能用 fetch 权威读（见 HA3 行蒸发战役的结论：存在性唯 fetch 为准）。
 
     成功时静默返回，失败时抛出异常由调用方处理。
 
@@ -216,22 +238,18 @@ def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config,
         config.alibaba_vector.endpoint or config.alibaba_vector.instance_id or config.opensearch.host,
         kind="search")
 
-    if hasattr(os_client, "push_documents"):
-        # HA3 Engine: 查询 chunk 主键后用 push_documents cmd=delete 删除
-        ha3_cfg = config.alibaba_vector
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT id FROM chunk_meta
-                WHERE doc_id = %s AND version_no = %s
-            """, (doc_id, version_no))
-            chunk_rows = cursor.fetchall()
+    if pk_ids is None:
+        pk_ids = _enumerate_chunk_pks(conn, doc_id, version_no)
 
-        if chunk_rows:
+    if hasattr(os_client, "push_documents"):
+        # HA3 Engine: 用 push_documents cmd=delete 按主键删除
+        ha3_cfg = config.alibaba_vector
+        if pk_ids:
             from alibabacloud_ha3engine_vector.models import PushDocumentsRequest
 
             delete_docs = [
-                {"cmd": "delete", "fields": {ha3_cfg.pk_field: row[0]}}
-                for row in chunk_rows
+                {"cmd": "delete", "fields": {ha3_cfg.pk_field: _pk}}
+                for _pk in sorted(pk_ids)     # 排序=批次可复现，便于对照日志
             ]
             ha3_batch_size = 100
             for i in range(0, len(delete_docs), ha3_batch_size):
@@ -268,6 +286,10 @@ def _delete_chunks_from_index(doc_id: str, version_no: int, conn, config,
             "Deleted chunks from OpenSearch index '%s' for %s v%s. Response: %s",
             index_name, doc_id, version_no, delete_resp,
         )
+        # ⚠️ 本分支（本地 dev 回退）是**按谓词删**，覆盖面天然是"删除时刻索引里所有
+        # (doc_id, version_no) 文档"，与 pk_ids 集合语义不等价：它可能已经删掉了 pk_ids
+        # 之外的新文档。调用方拿它做集合比对会偏保守（可能误报未封堵），不会漏报。
+    return set(pk_ids)
 
 
 def reconcile_pending_deletes() -> dict:
@@ -883,6 +905,39 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                 # 「已隔离」而文档仍以【旧的过宽权限】被检索命中（越权泄漏）。与 node_deactivate_old_chunks
                 # / reconcile_stranded_versions 的「先删索引后动 RDS」对齐。_delete_chunks_from_index 按
                 # (doc_id,version_no) 枚举 PK（不看 is_active），此处 is_active 尚为 TRUE 不影响其取键。
+                # ── 附录B：陈旧快照 + 无栅栏（2026-08-03）────────────────────────────
+                # 本连接 autocommit=False，run 起始那次文档清单 SELECT 就开了事务；此后
+                # phase ①（重构文本）② （并发 LLM，纯 HTTP 不碰 DB）都没有 commit/rollback
+                # ⇒ REPEATABLE READ 下这里仍在**run 起始的读视图**里，中间隔着整批 LLM
+                # 复审（分钟级）。两个后果：枚举 PK 用陈旧快照；_suggests_tightening 的输入
+                # current_permission 也是陈旧的。
+                #
+                # ⚠️ 但**只刷新**是不够的，甚至更糟：stage-2 同版本 re-chunk 是 DELETE+INSERT
+                # （新自增 id），而 stage-3 的旧版本清理谓词是 `version_no < N`、本文件的
+                # orphan 对账又是 dry_run=True ⇒ **同版本旧 PK 会滞留在 HA3**。若只删刷新后
+                # 的新 PK，就恰好忘掉那一代真正躺在索引里的行。故取 **S_old ∪ S_fresh**：
+                # 自增 id 不复用，两代不相交、也不会跨文档撞号，多删=幂等清理孤儿。
+                _s_old = _enumerate_chunk_pks(conn, doc_id, version_no)
+                conn.rollback()   # 丢弃 run 起始读视图（此处无未提交写；同 reconcile 的做法）
+
+                # 权限也要按新鲜值重判：陈旧的 current_permission 可能已被他人收紧。
+                # 不能"一变就跳过"——public→dept_internal 后 LLM 仍可能建议 restricted，
+                # 那是真缺口。只有**新鲜值下已不再需要收紧**才放行。
+                with conn.cursor() as _pc:
+                    _pc.execute("SELECT permission_level FROM document_meta WHERE doc_id = %s",
+                                (doc_id,))
+                    _prow = _pc.fetchone()
+                _fresh_perm = _prow[0] if _prow else current_permission
+                if _fresh_perm != current_permission:
+                    if not _suggests_tightening(suggested_perm, _fresh_perm):
+                        print(f"       └─ ⏭️ {doc_id} v{version_no} 权限已被并发收紧 "
+                              f"({current_permission}→{_fresh_perm})，无需隔离，跳过")
+                        report["mismatch_detected"] -= 1
+                        continue
+                    current_permission = _fresh_perm
+
+                _s_target = _s_old | _enumerate_chunk_pks(conn, doc_id, version_no)
+
                 task_id = f"spot_rev_{doc_id}_v{version_no}"
                 review_reason = f"Spot-check permission level mismatch: current={current_permission}, suggested={suggested_perm}. Reason: {reason}"
                 # Defensively truncate to prevent database column VARCHAR(500) limit issues
@@ -904,9 +959,21 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                                   f"processing/canonical/{doc_id}/v{version_no}/content.md",
                                   review_reason, doc["owner_dept"], suggested_perm)
 
+                # ⚠️⚠️ 本轮改动是 **detector, not fence** —— 以下残余洞**仍然存在**，
+                # 需要写方栅栏协议（持久化 spot-delete intent + 代际；stage-2 提交前验栅；
+                # stage-3 push 后验所有权并补偿删除；spot 专用 reconciler 落全套隔离元数据）
+                # 才能真正关闭，属跨 stage-2/stage-3/spot/schema 的协议变更，另案决策：
+                #   1. **同 PK 复活**：node_acquire_index_lock 有 SUCCESS→PROCESSING 重锁支且
+                #      commit 放锁后才 push；stage-3 用**同一** rds_id 重 add，PK 集合不变，
+                #      本探测器天然看不见。
+                #   2. **提交后写方**：本检查是时点的；spot commit 之后才落地的 re-chunk
+                #      照样产生新 PK。
+                #   3. **请求删除 ≠ 确认删除**：HA3 2xx 响应体仍可能含逐文档错误；要断言
+                #      "确实不在索引里"须 fetch 权威读。
                 # Phase 1: 先删 HA3（唯一影响检索的动作）
                 try:
-                    _delete_chunks_from_index(doc_id, version_no, conn, config)
+                    _delete_chunks_from_index(doc_id, version_no, conn, config,
+                                              pk_ids=_s_target)
                 except Exception as os_err:
                     # HA3 删除失败 → 文档仍在检索。不翻 is_active/permission/QUARANTINED（RDS 如实反映
                     # 「仍在服务」，绝不谎报已隔离），只标 PENDING_DELETE 供重试 + 登记 review_task 供人工
@@ -975,8 +1042,36 @@ def run_spot_check_pipeline(limit_or_percent: float = 0.05, simulate: bool = Non
                             WHERE doc_id = %s AND version_no = %s
                         """, (f"[SPOT CHECK MISMATCH] Spot-check recommends tightening permission to {suggested_perm}", doc_id, version_no))
 
+                        # 探测器（**不是栅栏**）：Phase-1 删除之后、本事务提交之前，是否
+                        # 冒出过我们从未删过的新 PK？FOR UPDATE = 明确的 current read，
+                        # 不依赖"这之前恰好没有别的普通 SELECT"这种脆弱语句顺序。
+                        cursor.execute(
+                            "SELECT id FROM chunk_meta WHERE doc_id = %s AND version_no = %s "
+                            "FOR UPDATE", (doc_id, version_no))
+                        _unsealed = {r[0] for r in cursor.fetchall()} - _s_target
+                        if _unsealed:
+                            # ⚠️ 仍然提交：今天这笔事务会把并发新行停用 + 版本置 QUARANTINED，
+                            # 那是**已生效的 RDS 侧封堵**。回滚会让新行退回 is_active=1、
+                            # 重新可被 stage-3 认领推送 —— 相对现状反而**新增**泄漏面。
+                            # 我们只收回"隔离成功"这个断言，不收回封堵动作。
+                            _review_params = _review_params[:4] + (
+                                (f"[HA3 CONTAINMENT UNCONFIRMED] {len(_unsealed)} chunk PK(s) "
+                                 f"appeared after the index delete (concurrent re-chunk); "
+                                 f"RDS contained but these PKs were never deleted from HA3. "
+                                 + review_reason)[:490],
+                            ) + _review_params[5:]
                         cursor.execute(_review_sql, _review_params)
                     conn.commit()
+                    if _unsealed:
+                        _msg = (f"HA3 containment UNCONFIRMED for {doc_id} v{version_no}: "
+                                f"{len(_unsealed)} chunk PK(s) appeared after the index delete "
+                                f"(concurrent re-chunk). RDS 侧已封堵，但这些 PK 从未被删除——"
+                                f"若已被 stage-3 推送，文档仍以旧权限可检索。")
+                        print(f"       🚨 {_msg}")
+                        report["errors"].append(_msg)
+                        report["ha3_containment_unconfirmed"] = (
+                            report.get("ha3_containment_unconfirmed", 0) + 1)
+                        continue   # 不进 quarantined_documents：绝不谎报"已隔离"
                     print(f"       └─ ✅ Chunks deleted from index + RDS quarantined for {doc_id} v{version_no}")
                 except Exception as db_err:
                     # HA3 已删但 RDS 隔离态提交失败 → 文档已不在检索（无泄漏），仅 RDS 落后；

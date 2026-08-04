@@ -33,7 +33,7 @@ def test_quarantine_deletes_ha3_before_committing_rds_is_active():
     import inspect
     from opensearch_pipeline import spot_checker
     src = inspect.getsource(spot_checker.run_spot_check_pipeline)
-    i_delete = src.index("_delete_chunks_from_index(doc_id, version_no, conn, config)")
+    i_delete = src.index("_delete_chunks_from_index(doc_id, version_no, conn, config")
     i_inactive = src.index("SET is_active = FALSE")
     assert i_delete < i_inactive, "HA3 delete 必须在 chunk_meta is_active=FALSE 之前"
     # 删除失败分支：标 PENDING_DELETE 后 continue，绝不 fall through 到翻隔离态
