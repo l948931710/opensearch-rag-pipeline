@@ -2735,7 +2735,7 @@ _KB_BADGE_VOCAB = frozenset({
 
 
 def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None,
-                     publish_status=None, chunk_status=None) -> str:
+                     publish_status=None, chunk_status=None, gate_status=None) -> str:
     """把管线多字段折叠为用户可读态（输出恒 ∈ _KB_BADGE_VOCAB，封闭集测试锁定）。"""
     cs = (content_status or "").upper()
     ix = (index_status or "").upper()
@@ -2743,7 +2743,16 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
         return "已退役"
     # PII 隔离优先于"已上线"：隔离件的 index_status 可能残留 'SUCCESS'，但 chunk 已停用、不在检索中，
     # 绝不能显示"已上线"（会被误读为可搜/已脱敏）。统一显示"已隔离"，等脱敏重灌。
-    if str(publish_status or "").upper() == "QUARANTINED":
+    # 隔离判定与 `_kb_version_quarantined` 同为 **OR 语义**（publish 或 gate 任一命中）。
+    # 收进本 helper 的原因（2026-08-04 B2 复核）：此前 gate 轴只活在 doc-status / 版本历史
+    # 两处的 `_is_q` 外挂里，而 my-docs / browse / 徽章服务端筛选 / stats 聚合走的是
+    # `_KB_BADGE_CASE_SQL`，那份镜像**只看 publish** ⇒ 一旦出现 gate-only 隔离，
+    # 列表侧会把它显示成「已上线」（正是下方注释判为绝不可接受的那种误读）。
+    # ⚠️ 现状是**不可达**的：全仓 gate_status 只有三个写方（pipeline_nodes 的
+    # 'pending_clean' 初值、cost_breaker、spot_checker），后两者都与 publish_status
+    # 在同一条 UPDATE 里写。这里是**拆隐雷**，不是修在线 bug —— 行为零变化。
+    if (str(publish_status or "").upper() == "QUARANTINED"
+            or str(gate_status or "").lower() == "quarantined"):
         return "已隔离"
     # 0-chunk / 版本被跳过终态（chunk_status='EMPTY'、publish_status='SKIPPED_*'——低文本图纸、
     # 整篇 PII 隔离弃件、chunk 爆炸弃版等）：永远不会进索引，此前一律落到默认「处理中」，
@@ -2790,7 +2799,9 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
 _KB_BADGE_CASE_SQL = (
     "CASE"
     " WHEN m.status IS NOT NULL AND LOWER(m.status) NOT IN ('active','') THEN '已退役'"
-    " WHEN UPPER(COALESCE(v.publish_status,'')) = 'QUARANTINED' THEN '已隔离'"
+    # gate 轴与 publish 轴 OR（与 _kb_status_badge / _kb_version_quarantined 同语义）
+    " WHEN UPPER(COALESCE(v.publish_status,'')) = 'QUARANTINED'"
+    "      OR LOWER(COALESCE(v.gate_status,'')) = 'quarantined' THEN '已隔离'"
     " WHEN UPPER(COALESCE(v.chunk_status,'')) = 'EMPTY'"
     "      OR LEFT(UPPER(COALESCE(v.publish_status,'')),7) = 'SKIPPED' THEN '未入索引'"
     # B13：与 _kb_status_badge 同位插入（parity 测试守着两者同序同义）
