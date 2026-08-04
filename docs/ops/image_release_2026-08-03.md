@@ -8,14 +8,26 @@
 | 项 | 值 |
 |---|---|
 | git sha | `d34a1bd8e9d47c266ffc9cefcc709adef48e0cce` |
-| 镜像 | `fuling-registry.cn-hangzhou.cr.aliyuncs.com/fuling/rag-serving:d34a1bd8e9d4` |
+| 镜像 | `fuling-registry.cn-hangzhou.cr.aliyuncs.com/fuling/rag-serving:<CI promotion run 的 12 位 sha>` |
+| 发布路线 | ✅ **CI 正式路线**（`image.yml` workflow_dispatch + `push_acr=true`，过 `acr-promotion` 审批门）|
 | 大小 | 412MB |
 | 上一版镜像基线 | `4a01d0a`（本次含 **41 个 commit**） |
 
-⚠️ **本镜像是本地 `docker build` 产物，不是 CI 工件。** 与 `.github/workflows/image.yml`
+✅ **最终采用 CI 正式路线**（Sam 2026-08-03 选定）。本地曾构建并开始推送同内容镜像，但**未完成 manifest、ACR 无可用 tag**，已主动中止以免与 CI 抢同一 tag。
+
+以下关于「本地构建」的说明保留作背景：本地 `docker build` 产物与 CI 工件的差别在于—— 与 `.github/workflows/image.yml`
 的正式路线相比，**缺少 attestation**（v1/v2 两份 immutable artifact 与 manifest digest 记录）。
-CI 会在 `main` 推送后自行构建同 sha 的镜像——⚠️ **若 ACR 仓库允许覆盖同名 tag，
-CI 的构建会覆盖掉本次推送的镜像**（内容应当等价，但不是逐字节同工件）。
+
+✅ **更正（2026-08-03，核 workflow 后）**：本文件初稿曾写「CI 会在 main 推送后自行构建同 sha
+并可能覆盖本 tag」——**这是错的**。`image.yml` 的 ACR 推送 job 条件是
+`if: github.event_name == 'workflow_dispatch' && inputs.push_acr == 'true'`（:132），
+**只有手动 dispatch 且显式勾 `push_acr` 才推 ACR**；推 main 仅触发 build+smoke。
+⇒ 本次本地推送的 tag **不会被 CI 自动覆盖**。
+（`d34a1bd` 的 push run 已 completed/success——CI 侧的 build+smoke 独立复现了本地结果。）
+
+📌 **若要正式（带 attestation）的工件**：手动 dispatch `image.yml` 并勾 `push_acr=true`。
+该 job 挂在 `environment: acr-promotion`（:136，required reviewers）⇒ **那时才需要你 approve**。
+上一版 `4a01d0a` 正是走的这条路（记录里有其 workflow_dispatch run）。
 
 ## 2. 为什么豁免 release-gate（不是"忘了跑"）
 
