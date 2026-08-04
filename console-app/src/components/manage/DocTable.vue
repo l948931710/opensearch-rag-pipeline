@@ -498,7 +498,7 @@ async function onRestore(d: DocItem) {
       </div>
 
       <div v-if="!filtered.length" class="px-4 py-10 text-center text-sm text-muted-foreground">
-        {{ loadingDocs ? '加载中…' : (q ? '无匹配文档' : (docScope === 'all' ? '暂无可浏览的文档' : '暂无文档，先上传一篇吧')) }}
+        {{ loadingDocs ? '加载中…' : loadErrors['docs'] ? '文档列表暂不可用——上方错误条可重试。' : (q ? '无匹配文档' : (docScope === 'all' ? '暂无可浏览的文档' : '暂无文档，先上传一篇吧')) }}
       </div>
 
       <!-- 尾部页码翻页器（设计稿 doc-table.html .pager）：「第 x–y 条 · 共 N 条」+ 页码。

@@ -3,7 +3,8 @@ import { computed } from 'vue'
 import { Activity, Coins, Gauge, RefreshCw, Users } from '@lucide/vue'
 import { useKb } from '@/composables/useKb'
 import { admissionReasonLabel, deptLabel } from '@/lib/kb'
-import { SECTION, ZONE_HEAD, ZONE_TICK, SUBHEAD, GRID, SPLIT } from '@/lib/section'
+import { SECTION, ZONE_HEAD, ZONE_TICK, SUBHEAD, GRID, SPLIT, SKEL_H } from '@/lib/section'
+import SkeletonBlock from './SkeletonBlock.vue'
 import LoadError from './LoadError.vue'
 import StatCard from './StatCard.vue'
 import BarList from './BarList.vue'
@@ -13,7 +14,7 @@ import TrendChart, { type TrendSeries } from './TrendChart.vue'
 // 口径纪律（审计 1c：同名指标两套算法）——本页所有比率来自 qa_daily_metrics（按北京日物化、
 // 含 Agent 调用）；概览看板的「问答 API 成功率」是实时 30 天滑窗且【排除】Agent 行。两处数字
 // 天然对不上，各卡就地标注口径，绝不让同名数字裸奔。
-const { kbOpsMetrics, loadOpsMetrics, loadErrors } = useKb()
+const { kbOpsMetrics, loadOpsMetrics, loadErrors, isLoading, hasSettled } = useKb()
 
 const m = computed(() => kbOpsMetrics.value)
 const fmtN = (n?: number | null) => (n || 0).toLocaleString('en-US')
@@ -149,6 +150,23 @@ const admissionReasonItems = computed(() => (m.value?.admission_reasons || []).m
       <p v-else-if="m && !m.llm_available" class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
         LLM 用量查询失败或账本表未建（llm_call_log，schema/023）——数量未知，非零调用。
       </p>
+      <SkeletonBlock v-else-if="isLoading('opsMetrics')" :rows="3" :height="SKEL_H.barItem" testid="skel-ops-llm" />
+      <!-- 四态分叉（三个分区同款，理由只写这一份）。原写法只有一个兜底 `v-else 数据加载中…`——
+           评审实测 404 后 4 秒这句仍在、alert=0，正是轮 2a 消灭的「骨架永远转」缺陷的**文本版**。
+           ⚠️ 判「未接入」光看 hasSettled 不够：withLoader 的 loaderSettled 在 finally 里无条件
+           加 key，5xx 同样算「已定态」。少了 `!loadErrors` 这半，503 会被印成「返回 404」，而
+           kb_console.py:1929 那条路径 raise 的是 500——管理员照此判断会停止排障，后端此刻正带着
+           trace id 在报错。两半都判，缺一是把「加载失败」伪装成「端点没上线」。
+           testid 逐分区加后缀：三个分区共用一个名字会让不带 .first() 的断言必红（strict mode）。 -->
+      <p
+        v-else-if="hasSettled('opsMetrics') && !loadErrors['opsMetrics']" data-testid="ops-not-deployed-llm"
+        class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground"
+      >
+        运营指标未接入：<code class="font-mono text-[11.5px]">/api/kb/ops-metrics</code> 返回 404，数字不会自动出现。
+      </p>
+      <p v-else-if="loadErrors['opsMetrics']" data-testid="ops-load-failed-llm" class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
+        运营指标暂不可用——上方错误条可重试。
+      </p>
       <p v-else class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">数据加载中…</p>
     </section>
 
@@ -189,6 +207,17 @@ const admissionReasonItems = computed(() => (m.value?.admission_reasons || []).m
       <p v-else-if="m && !m.slo_available" class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
         SLO 查询失败（qa_daily_metrics）——趋势未知。
       </p>
+      <SkeletonBlock v-else-if="isLoading('opsMetrics')" :rows="3" :height="SKEL_H.barItem" testid="skel-ops-slo" />
+      <!-- 四态分叉，理由见 D1 分区那份注释（尤其「hasSettled 必须并 !loadErrors」那半）。 -->
+      <p
+        v-else-if="hasSettled('opsMetrics') && !loadErrors['opsMetrics']" data-testid="ops-not-deployed-slo"
+        class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground"
+      >
+        运营指标未接入：<code class="font-mono text-[11.5px]">/api/kb/ops-metrics</code> 返回 404，数字不会自动出现。
+      </p>
+      <p v-else-if="loadErrors['opsMetrics']" data-testid="ops-load-failed-slo" class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
+        运营指标暂不可用——上方错误条可重试。
+      </p>
       <p v-else class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">数据加载中…</p>
     </section>
 
@@ -219,6 +248,17 @@ const admissionReasonItems = computed(() => (m.value?.admission_reasons || []).m
       </template>
       <p v-else-if="m && !m.admission_available" class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
         准入统计查询失败（qa_admission_reject）——未知，非零拒绝。
+      </p>
+      <SkeletonBlock v-else-if="isLoading('opsMetrics')" :rows="3" :height="SKEL_H.barItem" testid="skel-ops-admission" />
+      <!-- 四态分叉，理由见 D1 分区那份注释（尤其「hasSettled 必须并 !loadErrors」那半）。 -->
+      <p
+        v-else-if="hasSettled('opsMetrics') && !loadErrors['opsMetrics']" data-testid="ops-not-deployed-admission"
+        class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground"
+      >
+        运营指标未接入：<code class="font-mono text-[11.5px]">/api/kb/ops-metrics</code> 返回 404，数字不会自动出现。
+      </p>
+      <p v-else-if="loadErrors['opsMetrics']" data-testid="ops-load-failed-admission" class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
+        运营指标暂不可用——上方错误条可重试。
       </p>
       <p v-else class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">数据加载中…</p>
     </section>

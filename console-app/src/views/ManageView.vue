@@ -29,7 +29,7 @@ import OpsMetricsPanel from '@/components/manage/OpsMetricsPanel.vue'
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
 // reviewCount（侧栏红点口径）不再在本视图使用——「审批」tab 角标改用 approvalsBadge（见下）。
-const { isKbAdmin, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadReviewTasks, applyPendingVersion } = useKb()
+const { isKbAdmin, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, loadErrors, isLoading, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadReviewTasks, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 const route = useRoute()
@@ -120,6 +120,7 @@ function askHot(q: string) { fillInput(q); void router.push('/') }
 // 其余 tab 首次激活时补拉（ensureTabLoaded；loader 各自的 30s staleness/LoadError 手动
 // 重试语义不变——失败后面板内重试按钮直调 load*，不经本表）。
 const _loadedTabs = new Set<Tab>()
+const pendingTabs = ref<Set<Tab>>(new Set())
 function ensureTabLoaded(t: Tab): Promise<unknown> {
   if (_loadedTabs.has(t)) return Promise.resolve()
   _loadedTabs.add(t)
@@ -138,19 +139,29 @@ function ensureTabLoaded(t: Tab): Promise<unknown> {
     if (isKbAdmin.value) jobs.push(loadAdminGrants())
   }
   // （main 版无 ontology/agent_gov tab）
-  return Promise.allSettled(jobs.map((j) => Promise.resolve(j)))
+  const all = Promise.allSettled(jobs.map((j) => Promise.resolve(j)))
+  // 在途登记就挂在这个聚合 promise 上——见下方 loadingTab 的注释。
+  pendingTabs.value = new Set(pendingTabs.value).add(t)
+  void all.finally(() => {
+    const n = new Set(pendingTabs.value); n.delete(t); pendingTabs.value = n
+  })
+  return all
 }
 // ── tab 级在途指示 + hover 预取（2026-08-04）────────────────────────────────────
 // 审计实测：点 tab 到该 tab 首个内容出现约 1.25s，而**被点的那个 tab 按钮自身零状态变化**
 // （无 aria-busy、无 spinner，只有 active/inactive 类）。目的地面板各自的表现还不一致——
 // 「审批」在这 1145ms 里显示的是「暂无审批历史」（本轮已改），所以 chrome 层必须有个统一信号。
-const loadingTab = ref<Tab | ''>('')
-watch(activeTab, async (t) => {
-  if (!canManage.value) return
-  if (_loadedTabs.has(t)) return void ensureTabLoaded(t)   // 已加载过：不闪指示
-  loadingTab.value = t
-  try { await ensureTabLoaded(t) } finally { if (loadingTab.value === t) loadingTab.value = '' }
-})
+// 判据是**该 tab 的数据此刻是否真在途**，不是「这次点击是否首次加载」。
+// 后者被预取吃掉：评审实测悬停 300ms 再点 → 指示不出现，而鼠标用户悬停通常就是 200-600ms，
+// 即主路径下 spinner 基本看不到（当时的门能绿只因 Playwright 的 click 快于 150ms 闸）。
+// 改成查在途后，无论请求由预取还是点击发起，只要点进去时还没回来就照常提示。
+// 在途判据直接读 ensureTabLoaded 的聚合 promise，**不维护 loader 名单**。
+// 名单版试过，是错的：dash 派 5 个 job（含 feedbackReview/reviewTasks），表里只列得出 3 个——
+// 另两个走 null 哨兵、docs 走专用布尔 loadingDocs，名单这种形状根本表达不了它们。评审实测：
+// 只延迟那两个，dash 的指示恒为 0。而且两处清单相隔 30 行、无任何编译期约束把它们绑在一起，
+// 以后给某个 tab 加 loader 时漏改，指示会静默失效。挂聚合 promise 则是「派什么就等什么」。
+const loadingTab = computed<Tab | ''>(() => (pendingTabs.value.has(activeTab.value) ? activeTab.value : ''))
+watch(activeTab, (t) => { if (canManage.value) void ensureTabLoaded(t) })
 
 // hover 预取：悬停到点击通常 200-600ms，提前把这段吃掉。两道闸——
 //  ① 150ms 悬停延迟：扫过 tab 栏不该把 5 个 tab 全预取一遍（aux 限流 30/分）；
@@ -330,7 +341,10 @@ onMounted(async () => {
         当前无待处理 —— 新的{{ isKbAdmin ? '上传审批 / ' : '' }}授权申请会先出现在这里。
       </p>
 
-      <section v-if="accessGrants.length">
+      <!-- 门不能只看「有没有数据」：5xx 时 accessGrants 被清空 → 整个 section 不渲染 →
+           AccessGrantList 里那条 LoadError **根本没机会挂载**，评审实测 alert=0、重试=0。
+           与轮 2a 的 B2 完全相同的结构性错误（错误出口被门在数据存在上），换了个组件。 -->
+      <section v-if="accessGrants.length || loadErrors['accessGrants'] || isLoading('accessGrants')">
         <p :class="ZONE">生效中 · 已授权</p>
         <AccessGrantList />
       </section>

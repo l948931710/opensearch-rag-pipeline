@@ -369,22 +369,47 @@ const loaderInflight = ref<Set<string>>(new Set())
 /** 至少完整尝试过一次（成败不论）。用来把「还没开始/在途」与「跑完了但没数据」分开。 */
 const loaderSettled = ref<Set<string>>(new Set())
 const loaderPromises = new Map<string, Promise<void>>()   // 模块闭包，不进响应式
+const loaderCount = new Map<string, number>()             // 同上；join:false 时同 key 可真并发
+const loaderGen = new Map<string, number>()               // 同上；见 withLoader 的世代号
 
 function isLoading(key: string): boolean { return loaderInflight.value.has(key) }
 function hasSettled(key: string): boolean { return loaderSettled.value.has(key) }
+/** 在途按 key 计数，不是布尔——否则 join:false 下先返回的那次会把仍在途的骨架提前撤掉。 */
+function bumpLoading(key: string, d: 1 | -1) {
+  const n = (loaderCount.get(key) || 0) + d
+  if (n > 0) loaderCount.set(key, n); else loaderCount.delete(key)
+  const s = new Set(loaderInflight.value)
+  if (n > 0) s.add(key); else s.delete(key)
+  loaderInflight.value = s
+}
 
-async function withLoader(key: string, fn: () => Promise<void>): Promise<void> {
-  const joined = loaderPromises.get(key)
-  if (joined) return joined            // 合流：不重复发请求，但调用方等到同一个真结果
+/**
+ * 四态记账（在途/已定态）+ **可选**请求合流。
+ *
+ * ⚠️ `join` 默认 true，但**写后权威重拉必须传 `join:false`**。合流会让重拉 join 到一个
+ * 快照早于本次写的在途 GET 上：评审实测连撤两个 dept_admin，第二次撤销后服务端已生效、
+ * 界面仍显示该行，且 `revokeAdminGrant` 的 toast 就挂在重拉之后播报「已撤销全部管理权限」
+ * （见 :1761 那条注释——它承诺的正是「播报时列表已是最终状态」）。`_loadedTabs` 短路让
+ * 切走再切回也不重拉，脏行留到整页刷新。属「改了没生效」家族（console-web-fixes-2026-07-15）。
+ * 反之 stats 必须保留合流：dash 与 docs 各调一次，去掉会退回并发双拉（loading-states G5）。
+ */
+async function withLoader(key: string, fn: () => Promise<void>, opts?: { join?: boolean }): Promise<void> {
+  if (opts?.join !== false) {
+    const joined = loaderPromises.get(key)
+    if (joined) return joined          // 合流：不重复发请求，但调用方等到同一个真结果
+  }
+  // 世代号：join:false 覆盖过本 key 时，先落地的旧请求不得删掉新请求的登记
+  const gen = (loaderGen.get(key) || 0) + 1
+  loaderGen.set(key, gen)
   const p = (async () => {
-    loaderInflight.value = new Set(loaderInflight.value).add(key)
+    bumpLoading(key, 1)
     try { await fn() } finally {
-      loaderPromises.delete(key)
-      const n = new Set(loaderInflight.value); n.delete(key); loaderInflight.value = n
+      if (loaderGen.get(key) === gen) loaderPromises.delete(key)
+      bumpLoading(key, -1)
       loaderSettled.value = new Set(loaderSettled.value).add(key)
     }
   })()
-  loaderPromises.set(key, p)
+  loaderPromises.set(key, p)           // 后来者若合流，join 到更新的那次（快照更近）
   return p
 }
 
@@ -829,7 +854,8 @@ async function _loadGovernance() {
 // 批次γ：运营数据面（governance 同款单门模式——kb_admin 短路 + loadErrors，无 supported 探测：
 // 端点无 flag 语义，「三块各自 available」是业务降级不是功能开关）。
 // （分支侧另有 P0-D 身份指纹判废——随大合并收敛；main 无运行期身份切换，指纹恒等。）
-async function loadOpsMetrics() {
+async function loadOpsMetrics() { return withLoader('opsMetrics', _loadOpsMetrics) }
+async function _loadOpsMetrics() {
   const s = useSession()
   if (s.role !== 'kb_admin') { kbOpsMetrics.value = null; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -1159,7 +1185,7 @@ async function uploadBatch(files: File[]) {
   if (principalChangedSince(epoch0)) return         // 批末汇总不写新身份 UI
   uploadMsg.value = `${okN} 成功${badN ? `，${badN} 失败/跳过` : ''}`
   void loadDocs(); void loadApprovals(true)   // force：批量里可能有待审批单
-  if (shared && okN) void loadAccessGrants()  // 批末一次权威刷新（逐文件已抑制）
+  if (shared && okN) void loadAccessGrants({ afterWrite: true })  // 批末一次权威刷新（逐文件已抑制）
 }
 
 function doUpload() {
@@ -1231,7 +1257,7 @@ async function approveAccess(d: AccessRequestItem) {
       await apiJson('/api/kb/access-requests/approve', { method: 'POST', auth: true, body: JSON.stringify({ id: d.id }) })
       // 定向更新（#82）：本地移除该单（与 preview 分支同构）；新授权落到「已授权清单」→ 只刷真正受影响的列表。
       accessRequests.value = accessRequests.value.filter((x) => x.id !== d.id)
-      void loadAccessGrants()
+      void loadAccessGrants({ afterWrite: true })
     } catch (e: any) { void notice({ title: '授权失败', message: uploadErrText(e), danger: true }) }
   })
 }
@@ -1250,7 +1276,9 @@ async function rejectAccess(d: AccessRequestItem, reason: string) {
 // 已授权清单（审批人侧 · approved 存量）：后端 /api/kb/access-grants 未上线 → 静默兜底空；DEV ?preview 注入 mock。
 // grantsSeq 竞态守卫（同 docsSeq）：批量上传的并发 worker 各自触发刷新时，仅最新一次落地，防旧响应覆盖新清单。
 let grantsSeq = 0
-async function loadAccessGrants() {
+/** `afterWrite`：写后权威重拉，禁止合流（理由见 withLoader 注释）。读路径不传，照常合流。 */
+async function loadAccessGrants(o?: { afterWrite?: boolean }) { return withLoader('accessGrants', _loadAccessGrants, { join: !o?.afterWrite }) }
+async function _loadAccessGrants() {
   const seq = ++grantsSeq
   const s = useSession()
   if (!s.identity?.canManage) { accessGrants.value = []; return }
@@ -1277,7 +1305,7 @@ async function revokeAccess(g: AccessGrantItem, reason: string) {
       const s = useSession()
       if (import.meta.env.DEV && s.token === 'dev-preview') { accessGrants.value = accessGrants.value.filter((x) => x.id !== g.id); return }
       await apiJson('/api/kb/access-requests/revoke', { method: 'POST', auth: true, body: JSON.stringify({ id: g.id, reason }) })
-      await loadAccessGrants()
+      await loadAccessGrants({ afterWrite: true })
     } catch (e: any) { void notice({ title: '撤销失败', message: uploadErrText(e), danger: true }) }
   })
 }
@@ -1577,7 +1605,7 @@ async function createGrants(docId: string, depts: string[], reason = '',
     method: 'POST', auth: true,
     body: JSON.stringify({ doc_id: docId, target_depts: depts, ...(reason ? { reason } : {}) }),
   })
-  if (opts.refresh !== false) void loadAccessGrants()
+  if (opts.refresh !== false) void loadAccessGrants({ afterWrite: true })
   return r
 }
 
@@ -1699,7 +1727,14 @@ async function _loadApprovalHistory() {
 }
 
 // ── Phase F：成员/角色管理（仅 kb_admin）──
-async function loadAdminGrants() {
+// adminSeq 竞态守卫（与 accessGrants 的 grantsSeq 对称）：合流在时同 key 不可能并发，缺口被掩盖；
+// afterWrite 打开真并发后暴露——withInflight 的 key 是 `member:${userId}`（按人），撤销两个不同
+// dept_admin 可以重叠，若旧快照后到就会覆盖新清单，界面出现「已撤销的行复活」。
+let adminSeq = 0
+/** `afterWrite`：写后权威重拉，禁止合流（理由见 withLoader 注释）。读路径不传，照常合流。 */
+async function loadAdminGrants(o?: { afterWrite?: boolean }) { return withLoader('adminGrants', _loadAdminGrants, { join: !o?.afterWrite }) }
+async function _loadAdminGrants() {
+  const seq = ++adminSeq
   const s = useSession()
   if (s.role !== 'kb_admin') { adminGrants.value = []; grantableDepts.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -1714,9 +1749,10 @@ async function loadAdminGrants() {
   clearLoadError('adminGrants')
   try {
     const r = await apiJson<{ items: AdminItem[]; grantable_owner_depts: string[] }>('/api/kb/admin-grants', { auth: true })
+    if (seq !== adminSeq) return           // 竞态守卫：仅最新结果落地
     adminGrants.value = r.items || []
     grantableDepts.value = r.grantable_owner_depts || []
-  } catch (e) { adminGrants.value = []; grantableDepts.value = []; noteLoadError('adminGrants', e) }   // 404 静默；5xx 显错
+  } catch (e) { if (seq === adminSeq) { adminGrants.value = []; grantableDepts.value = []; noteLoadError('adminGrants', e) } }   // 404 静默；5xx 显错
 }
 
 // 阶段 B：管辖根候选队列（org_sync 派生的中心级/超规模/换根待 kb_admin 确认）
@@ -1735,7 +1771,9 @@ async function decideNodeCandidate(id: number, action: 'confirm' | 'reject'): Pr
   try {
     await apiJson('/api/kb/admin-node-candidates/decide', {
       method: 'POST', auth: true, body: JSON.stringify({ candidate_id: id, action }) })
-    await Promise.all([loadNodeCandidates(), loadAdminGrants()])
+    // 第七个写后重拉点（我最初的清单只列了六个，把它误记成读路径）：确认候选会改管辖根，
+    // 名单必须重取，同样禁止合流。
+    await Promise.all([loadNodeCandidates(), loadAdminGrants({ afterWrite: true })])
     return null
   } catch (e: any) {
     await loadNodeCandidates()
@@ -1757,7 +1795,7 @@ async function grantDeptAdmin(userId: string, userName: string, ownerDepts: stri
         return true
       }
       await apiJson('/api/kb/admin-grants', { method: 'POST', auth: true, body: JSON.stringify({ user_id: userId, user_name: userName, owner_depts: ownerDepts, note, ...(nodeRoots !== undefined ? { node_roots: nodeRoots } : {}) }) })
-      await loadAdminGrants()
+      await loadAdminGrants({ afterWrite: true })
       return true
     } catch (e: any) { void notice({ title: '授予失败', message: uploadErrText(e), danger: true }); return false }
   })) ?? false   // 在途（重复点击）→ 视为未提交
@@ -1780,7 +1818,7 @@ async function revokeAdminGrant(userId: string, ownerDept = '', nodeRoot = 0): P
       // （实测 ~960ms）；toast 挂在重拉之后，保证播报时列表已是最终状态。
       // dev-preview 分支走上面的本地 splice 且提前 return——刻意不合并两条路径：
       // __tests__/member-role-manager.spec.ts:84-96 断言的正是那条本地 splice 的即时性。
-      await loadAdminGrants()
+      await loadAdminGrants({ afterWrite: true })
       toast(ownerDept || nodeRoot ? '已撤销该部门的管理权限' : '已撤销全部管理权限')
     } catch (e: any) { void notice({ title: '撤销失败', message: uploadErrText(e), danger: true }) }
   })
@@ -1882,7 +1920,14 @@ export function __resetKb() {
   for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）
   if (qTimer) { clearTimeout(qTimer); qTimer = null }
   if (filterTimer) { clearTimeout(filterTimer); filterTimer = null }
-  loaderInflight.value = new Set(); loaderSettled.value = new Set(); loaderPromises.clear()
+  loaderInflight.value = new Set(); loaderSettled.value = new Set()
+  loaderPromises.clear()
+  // ⚠️ 刻意**不清** loaderCount / loaderGen —— 我原先清了它们，注释里的理由还写反了：
+  //   · loaderCount：不清才守恒（旧 1 → 新 2 → 旧落地 1 → 新落地 0）。清了才会让旧请求把
+  //     新请求的计数减到 0，骨架提前撤——正是计数式记账要消灭的那个现象。
+  //   · loaderGen：清了会让新请求的世代号从 1 重来、与重置前仍在途的旧请求撞号，旧请求落地
+  //     时判等成立 ⇒ 删掉新请求的登记 ⇒ 后续读路径不再合流、多发一次请求。世代号本就是防这个的。
+  // 两者都是模块闭包内的单调/守恒量，跨身份不携带任何用户数据，无需复位。
   clearToasts()   // 安全项：队列是模块级的，不清会让 A 的「已撤销管理权限」飘到 B 的界面上
 }
 

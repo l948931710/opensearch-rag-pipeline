@@ -106,6 +106,10 @@ function metaOf(r: ApprovalHistoryItem): string {
       <div v-if="isLoading('approvalHistory') && !approvalHistory.length" class="px-[18px] py-6" data-testid="skel-approval-history">
         <SkeletonBlock :rows="3" :height="52" :widths="['96%', '88%', '92%']" />
       </div>
+      <!-- 失败与「确认为空」也必须说不同的话：5xx 时数组同样是空的，而「一条都没有」是结论。 -->
+      <div v-else-if="loadErrors['approvalHistory']" class="px-[18px] py-10 text-center text-[13px] text-muted-foreground">
+        审批历史暂不可用——上方错误条可重试。
+      </div>
       <div v-else-if="!approvalHistory.length" class="px-[18px] py-10 text-center text-[13px] text-muted-foreground">
         暂无审批历史 —— 通过 / 驳回 / 撤销 / 采纳后，记录会在这里留痕。
       </div>

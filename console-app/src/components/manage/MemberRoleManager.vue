@@ -4,6 +4,7 @@ import { UserCog, ShieldCheck, Plus, X, GitBranch } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
 import { useKb, type AdminItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
+import SkeletonBlock from './SkeletonBlock.vue'
 import OrgTreePicker, { type PickedNode } from './OrgTreePicker.vue'
 import TruncationNotice from '@/components/manage/TruncationNotice.vue'
 import { useDialog } from '@/composables/useDialog'
@@ -13,7 +14,7 @@ import { useDialog } from '@/composables/useDialog'
 // 阶段 B：双轴——legacy 组码 + node 管辖根（manual；auto 由组织同步派生，中心级/超规模/换根
 // 进下方候选队列待确认）。覆盖语义按轴隔离：不动节点选择器 = 不动节点轴。
 const { adminGrants, grantableDepts, isBusy, grantDeptAdmin, revokeAdminGrant, loadAdminGrants, loadErrors,
-        nodeAclGrant, nodeCandidates, truncatedQueues, loadNodeCandidates, decideNodeCandidate } = useKb()
+        nodeAclGrant, nodeCandidates, truncatedQueues, loadNodeCandidates, decideNodeCandidate, isLoading } = useKb()
 const { confirm } = useDialog()
 
 const formUser = ref('')
@@ -175,7 +176,13 @@ async function onRevokeDept(a: AdminItem, d: string) {
         <button type="button" class="self-start rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="startEdit(a)">编辑</button>
         <button type="button" class="self-start rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="onRevokeAll(a)">撤销全部</button>
       </div>
-      <div v-if="!deptAdmins.length" class="border-t border-border px-[18px] py-6 text-center text-sm text-muted-foreground">暂无部门管理员，点「授予」添加</div>
+      <!-- 在途期间不得断言「暂无」——那是还没有依据的结论。与 ApprovalHistory 同一形状的缺陷。 -->
+      <div v-if="isLoading('adminGrants') && !deptAdmins.length" class="border-t border-border px-[18px] py-4" data-testid="skel-admin-grants">
+        <SkeletonBlock :rows="2" :height="44" :widths="['94%', '86%']" />
+      </div>
+      <!-- 失败与「确认为空」说不同的话：5xx 时数组同样是空的，而「一个都没有」是结论。 -->
+      <div v-else-if="loadErrors['adminGrants']" class="border-t border-border px-[18px] py-6 text-center text-sm text-muted-foreground">部门管理员名单暂不可用——上方错误条可重试。</div>
+      <div v-else-if="!deptAdmins.length" class="border-t border-border px-[18px] py-6 text-center text-sm text-muted-foreground">暂无部门管理员，点「授予」添加</div>
 
       <!-- 知识库管理员（只读，受保护） -->
       <div
