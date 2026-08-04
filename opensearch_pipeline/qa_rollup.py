@@ -410,16 +410,24 @@ def run_rollup(*, metric_date: Optional[str] = None, tz_shift_hours: int = _DEFA
 
 
 def _alert_on_slo(report: Dict[str, Any]) -> None:
+    # C1 同族（2026-08-04 独立核验实测）：探针失败不得顶着「SLO breach」的标题发。
+    # 本机 launchd `com.fuling.qa-rollup` 日志里 14 条被抑制的 CRITICAL 全部题为
+    # "QA serving SLO breach"，实际全是 DNS 解析失败（Errno 8）——与 reconcile 三处
+    # 被 9cd9436 修掉的是同一模板病。标题可辨 + 去重槽分开，双向不互压。
     try:
         from opensearch_pipeline.alerting import send_ops_alert
-        if report.get("error"):
+        _errored = bool(report.get("error"))
+        if _errored:
             text = f"QA rollup errored: {report['error']}"
+            title = "QA rollup 探针失败"
+            dk = f"qa-slo:error:{report.get('metric_date') or 'unknown'}"
         else:
             lines = "\n".join(f"- {b['slo']}: {b['value']} (threshold {b['threshold']})"
                               for b in report.get("breaches", []))
             text = f"SLO breach on {report.get('metric_date')}:\n{lines}"
-        send_ops_alert("QA serving SLO breach", text, severity="critical",
-                       dedup_key=f"qa-slo:{report.get('metric_date')}")
+            title = "QA serving SLO breach"
+            dk = f"qa-slo:{report.get('metric_date')}"
+        send_ops_alert(title, text, severity="critical", dedup_key=dk)
     except Exception:  # noqa: BLE001
         logger.warning("qa_rollup: ops-alert dispatch failed (non-fatal)", exc_info=True)
 

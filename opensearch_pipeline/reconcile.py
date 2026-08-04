@@ -1036,11 +1036,24 @@ def _alert_on_drift(report: Dict[str, Any]) -> None:
             if report.get("unhealthy_buckets"):
                 text += f"; 不健康桶={list(report['unhealthy_buckets'].items())[:3]}"
         # 同上（C1 同族）：探针失败与数据漂移必须标题可辨、去重槽分开。
+        # 2026-08-04 独立核验补刀：`complete=False` 无 error 的家族（不健康桶 / fetch 整体
+        # 失败 / enum_invisible / unclassified）此前仍顶「drift」标题+占真 drift 去重槽——
+        # 包括 ok=True + enum_invisible（fetch 刚**证明**数据全在）这种 07-21 的真实历史
+        # 形态。与 `_exit_code` 的判准对齐：那层归 error/incomplete(3) 的，标题层不得宣称
+        # drift。唯一例外：fetch 已确认真丢失（missing_confirmed>0）——存在性唯 fetch 为准，
+        # 即使核验不完整也必须以 drift 名义叫醒人。severity 三态恒 critical（见 docstring）。
         _errored = bool(report.get("error"))
-        send_ops_alert(
-            "RDS↔HA3 parity 探针失败" if _errored else "RDS↔HA3 parity drift",
-            text, severity="critical",
-            dedup_key="reconcile:rds-ha3-parity:error" if _errored else "reconcile:rds-ha3-parity")
+        _incomplete = (not _errored
+                       and not (c.get("missing_confirmed") or 0)
+                       and (report.get("complete") is False
+                            or (report.get("enum_health") or "healthy") != "healthy"))
+        if _errored:
+            title, dk = "RDS↔HA3 parity 探针失败", "reconcile:rds-ha3-parity:error"
+        elif _incomplete:
+            title, dk = "RDS↔HA3 parity 核验不完整", "reconcile:rds-ha3-parity:incomplete"
+        else:
+            title, dk = "RDS↔HA3 parity drift", "reconcile:rds-ha3-parity"
+        send_ops_alert(title, text, severity="critical", dedup_key=dk)
     except Exception:  # noqa: BLE001
         logger.warning("reconcile: ops-alert dispatch failed (non-fatal)", exc_info=True)
 

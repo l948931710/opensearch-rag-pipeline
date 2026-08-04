@@ -634,7 +634,11 @@ def test_finalize_verdict_no_fetch_basis_leaves_ok_untouched():
 
 def test_alert_enum_invisible_is_critical_not_info(monkeypatch):
     """13116d2 的「纯盲区降 info」在倒排枚举下**有意翻回 critical**：
-    零向量时代盲区是预期伪影，倒排下它意味着枚举/锚点失效，必须叫醒人。"""
+    零向量时代盲区是预期伪影，倒排下它意味着枚举/锚点失效，必须叫醒人。
+
+    2026-08-04 独立核验修正：severity 维持 critical，但该形态（ok=True、fetch 刚证明
+    数据全在、只是枚举面不完整）**不得**顶「drift」标题/占真 drift 去重槽——07-21 六次
+    「行蒸发」伪事件正是这么被误读的。标题/槽改走「核验不完整」三态。"""
     sent = []
     import opensearch_pipeline.alerting as al
     monkeypatch.setattr(al, "send_ops_alert",
@@ -646,10 +650,94 @@ def test_alert_enum_invisible_is_critical_not_info(monkeypatch):
                          "missing_unclassified": 0},
               "fetch_reclassify": _fr(invisible=[1, 2, 3])}
     reconcile._alert_on_drift(report)
-    (_, text, kw) = sent[0]
+    (title, text, kw) = sent[0]
     assert kw["severity"] == "critical"
-    assert kw["dedup_key"] == "reconcile:rds-ha3-parity"
+    assert "核验不完整" in title and "drift" not in title.lower(), title
+    assert kw["dedup_key"] == "reconcile:rds-ha3-parity:incomplete"
     assert "锚点不完整" in text and "enum_health=degraded" in text
+
+
+def test_alert_incomplete_family_never_claims_drift(monkeypatch):
+    """`complete=False` 无 error 的家族（不健康桶/fetch 整体失败等）不得顶 drift 标题。
+    （2026-08-04 独立核验的 DEFECT-1：此前该家族与真 drift 共用标题+去重槽。）"""
+    sent = _capture_alerts(monkeypatch)
+    reconcile._alert_on_drift({
+        "ok": False, "complete": False, "enum_health": "degraded",
+        "counts": {"rds_active_missing": 5, "vanished_docs": 0, "missing_confirmed": 0},
+        "unhealthy_buckets": {"b3": "totalCount=0"}})
+    title, _text, kw = sent[0]
+    assert "核验不完整" in title and "drift" not in title.lower(), title
+    assert kw["dedup_key"] == "reconcile:rds-ha3-parity:incomplete"
+
+
+def test_alert_fetch_confirmed_loss_still_claims_drift_even_if_incomplete(monkeypatch):
+    """例外路径：fetch 已确认真丢失（missing_confirmed>0）——存在性唯 fetch 为准，
+    哪怕核验不完整也必须以 drift 名义叫醒人、占真 drift 去重槽。"""
+    sent = _capture_alerts(monkeypatch)
+    reconcile._alert_on_drift({
+        "ok": False, "complete": False, "verdict_basis": "fetch",
+        "counts": {"rds_active_missing": 4, "vanished_docs": 1, "vanished_at_risk": 1,
+                   "ha3_stale": 0, "missing_confirmed": 4, "enum_invisible": 0,
+                   "missing_unclassified": 0},
+        "fetch_reclassify": _fr(confirmed=[1, 2, 3, 4])})
+    title, _text, kw = sent[0]
+    assert "drift" in title and "核验不完整" not in title, title
+    assert kw["dedup_key"] == "reconcile:rds-ha3-parity"
+
+
+def test_alert_true_drift_direction_keeps_drift_title(monkeypatch):
+    """真漂移方向（complete=True、ok=False）标题必须仍是 drift——防止三态分流把
+    真事件误降成「不完整」。（独立核验指出 ha3 真漂移方向此前零测试钉扎。）"""
+    sent = _capture_alerts(monkeypatch)
+    reconcile._alert_on_drift({
+        "ok": False, "complete": True, "verdict_basis": "fetch",
+        "counts": {"rds_active_missing": 2, "vanished_docs": 0, "vanished_at_risk": 0,
+                   "ha3_stale": 0, "missing_confirmed": 2, "enum_invisible": 0,
+                   "missing_unclassified": 0},
+        "fetch_reclassify": _fr(confirmed=[1, 2])})
+    title, _text, kw = sent[0]
+    assert "drift" in title, title
+    assert kw["dedup_key"] == "reconcile:rds-ha3-parity"
+
+
+def test_raw_parity_alert_both_directions(monkeypatch):
+    """raw 对账双向行为测试（独立核验指出此前**零**行为测试：条件整体反转全绿）。"""
+    sent = _capture_alerts(monkeypatch)
+    reconcile._alert_on_raw_drift({"ok": False, "complete": False,
+                                   "error": "OperationalError: (2003, ...)", "counts": {}})
+    title, _text, kw = sent[0]
+    assert "探针失败" in title and "drift" not in title.lower(), title
+    assert kw["dedup_key"].endswith(":error")
+
+    sent.clear()
+    reconcile._alert_on_raw_drift({"ok": False, "complete": True,
+                                   "counts": {"missing": 3, "have_raw_key": 100,
+                                              "null_raw_key": 2}})
+    title, _text, kw = sent[0]
+    assert "drift" in title and "探针失败" not in title, title
+    assert kw["dedup_key"] == "reconcile:raw-oss-parity"
+
+
+def test_qa_rollup_alert_splits_probe_error_from_breach(monkeypatch):
+    """qa_rollup 同族缺陷（独立核验 DEFECT-2：本机 14 条被抑制 CRITICAL 全部顶着
+    "QA serving SLO breach"，实际是 DNS 探针失败）——修后双向钉扎。"""
+    from opensearch_pipeline import qa_rollup
+    sent = []
+    import opensearch_pipeline.alerting as al
+    monkeypatch.setattr(al, "send_ops_alert",
+                        lambda title, text, **k: sent.append((title, text, k)) or True)
+    qa_rollup._alert_on_slo({"ok": False, "error": "gaierror: [Errno 8] ..."})
+    title, _text, kw = sent[0]
+    assert "探针失败" in title and "breach" not in title.lower(), title
+    assert ":error:" in kw["dedup_key"]
+
+    sent.clear()
+    qa_rollup._alert_on_slo({"ok": True, "metric_date": "2026-08-03", "slo_ok": 0,
+                             "breaches": [{"slo": "p95_latency", "value": 9.1,
+                                           "threshold": 8.0}]})
+    title, _text, kw = sent[0]
+    assert title == "QA serving SLO breach"
+    assert kw["dedup_key"] == "qa-slo:2026-08-03"
 
 
 def test_alert_unhealthy_buckets_surface_reason(monkeypatch):
@@ -744,31 +832,39 @@ def test_ha3_parity_probe_error_does_not_alert_as_drift(monkeypatch):
 
 
 def test_every_parity_alert_splits_probe_error_from_drift():
-    """🔴 守卫：`reconcile` 里**每一个** parity 告警函数都必须把「探针失败」与「漂移」
+    """🔴 守卫：监控模块里**每一个** `_alert_on*` 函数都必须把「探针失败」与「数据事件」
     分成两个标题 + 两个 dedup_key。
 
-    加新对账时最容易照抄旧模板 —— 而旧模板正是「正文说 errored、标题说 drift」。
-    判据取 AST 层的 `send_ops_alert` 调用：其 title 实参必须是条件表达式
-    （`X if _errored else Y`），而不是一个裸字符串常量。
+    加新告警时最容易照抄旧模板 —— 而旧模板正是「正文说 errored、标题说 drift/breach」。
+    2026-08-04 独立核验证明旧守卫有三条旁路（关键字传参 / `alerting.send_ops_alert`
+    属性调用 / 只扫 `*drift` 命名 + 只扫 reconcile.py —— qa_rollup 同病灶因此漏网），
+    本版逐条闭合。判据：title 实参（位置或 `title=` 关键字）**不得是裸字符串常量或
+    裸 f-string** —— 必须是条件表达式或分支赋值出的变量。语义正确性（哪个分支该配哪个
+    标题）由本文件的双向行为测试钉住，本守卫只负责"新增点不许照抄单标题模板"。
     """
     import ast
     import pathlib
-    src = pathlib.Path("opensearch_pipeline/reconcile.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
+    scan = ["opensearch_pipeline/reconcile.py", "opensearch_pipeline/qa_rollup.py"]
+    allow = {"_alert_on_duration"}   # 耗时超标不是「探针失败 vs 数据事件」二分，天然单标题
     bad, seen = [], 0
-    for fn in ast.walk(tree):
-        # 只查 drift 类告警函数；`_alert_on_duration`（耗时超标）不是 parity 二分，天然不适用
-        if not (isinstance(fn, ast.FunctionDef) and fn.name.startswith("_alert_on")
-                and fn.name.endswith("drift")):
-            continue
-        for node in ast.walk(fn):
-            if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "send_ops_alert"):
+    for path in scan:
+        tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not (isinstance(fn, ast.FunctionDef) and fn.name.startswith("_alert_on")
+                    and fn.name not in allow):
                 continue
-            if not node.args:
-                continue
-            seen += 1
-            if not isinstance(node.args[0], ast.IfExp):
-                bad.append(f"{fn.name} (line {node.lineno})")
-    assert seen >= 3, f"只扫到 {seen} 个 drift 告警——守卫可能已失效"
-    assert not bad, ("这些 parity 告警没把探针失败与漂移分开（标题是裸常量/裸 f-string）：\n  "
-                     + "\n  ".join(bad))
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                callee = (getattr(node.func, "id", "")            # send_ops_alert(...)
+                          or getattr(node.func, "attr", ""))      # alerting.send_ops_alert(...)
+                if callee != "send_ops_alert":
+                    continue
+                title = node.args[0] if node.args else next(
+                    (kw.value for kw in node.keywords if kw.arg == "title"), None)
+                seen += 1
+                if title is None or isinstance(title, (ast.Constant, ast.JoinedStr)):
+                    bad.append(f"{path}::{fn.name} (line {node.lineno})")
+    assert seen >= 4, f"只扫到 {seen} 个告警调用（应含 oss/raw/ha3/qa_rollup ≥4）——守卫可能已失效"
+    assert not bad, ("这些告警没把探针失败与数据事件分开（标题是裸常量/裸 f-string，"
+                     "或无法定位 title 实参）：\n  " + "\n  ".join(bad))
