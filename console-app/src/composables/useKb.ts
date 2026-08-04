@@ -1670,7 +1670,8 @@ async function setVisibility(d: DocItem, level: string, reason = '',
 
 // 审批历史（只读聚合）：后端按角色作用域 —— dept_admin 见本部门 access+contribution、kb_admin 见全库四类。
 // 404（未上线）静默兜底空；5xx 显错。DEV ?preview 注入 mock（kb_admin 见四类混合、dept_admin 仅两类）。
-async function loadApprovalHistory() {
+async function loadApprovalHistory() { return withLoader('approvalHistory', _loadApprovalHistory) }
+async function _loadApprovalHistory() {
   const s = useSession()
   if (!s.identity?.canManage) { approvalHistory.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {

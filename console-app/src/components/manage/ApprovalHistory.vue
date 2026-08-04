@@ -5,11 +5,12 @@ import { useKb, type ApprovalHistoryItem } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
 import LoadError from './LoadError.vue'
 import QueuePager from './QueuePager.vue'
+import SkeletonBlock from './SkeletonBlock.vue'
 
 // 审批历史（只读时间线）：四条审批流的历史决策合并展示，数据来自 /api/kb/approval-history。
 // 后端已按角色作用域（dept_admin 本部门 access+contribution、kb_admin 全库四类）+ PII 脱敏；
 // 前端只做类型 chip 的本地过滤，不再请求。时间线轴复用 VersionHistoryModal 视觉。
-const { approvalHistory, loadApprovalHistory, loadErrors, isKbAdmin } = useKb()
+const { approvalHistory, loadApprovalHistory, loadErrors, isKbAdmin, isLoading } = useKb()
 
 // 类型 → 中文短标（badge）。
 const KIND_LABEL: Record<string, string> = {
@@ -100,7 +101,12 @@ function metaOf(r: ApprovalHistoryItem): string {
       </div>
 
       <!-- 空态 -->
-      <div v-if="!approvalHistory.length" class="px-[18px] py-10 text-center text-[13px] text-muted-foreground">
+      <!-- 在途与「确认为空」必须说不同的话。实测切到本 tab 后这句「暂无审批历史」从 97ms
+           一直显示到 1242ms、再被真实内容悄悄换掉——那 1145ms 里它是一句还没有依据的结论。 -->
+      <div v-if="isLoading('approvalHistory') && !approvalHistory.length" class="px-[18px] py-6" data-testid="skel-approval-history">
+        <SkeletonBlock :rows="3" :height="52" :widths="['96%', '88%', '92%']" />
+      </div>
+      <div v-else-if="!approvalHistory.length" class="px-[18px] py-10 text-center text-[13px] text-muted-foreground">
         暂无审批历史 —— 通过 / 驳回 / 撤销 / 采纳后，记录会在这里留痕。
       </div>
       <div v-else-if="!rows.length" class="px-[18px] py-10 text-center text-[13px] text-muted-foreground">

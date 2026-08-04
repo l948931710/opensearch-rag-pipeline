@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
-import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, Stamp, Lightbulb, Gauge } from '@lucide/vue'
+import { Building2, MessagesSquare, Sparkles, LayoutDashboard, FolderOpen, UserCog, Stamp, Lightbulb, Gauge, Loader2 } from '@lucide/vue'
 import { useSession } from '@/stores/session'
 import { consumePendingVersion } from '@/composables/useAuth'
 import { useKb } from '@/composables/useKb'
@@ -140,7 +140,29 @@ function ensureTabLoaded(t: Tab): Promise<unknown> {
   // （main 版无 ontology/agent_gov tab）
   return Promise.allSettled(jobs.map((j) => Promise.resolve(j)))
 }
-watch(activeTab, (t) => { if (canManage.value) void ensureTabLoaded(t) })
+// ── tab 级在途指示 + hover 预取（2026-08-04）────────────────────────────────────
+// 审计实测：点 tab 到该 tab 首个内容出现约 1.25s，而**被点的那个 tab 按钮自身零状态变化**
+// （无 aria-busy、无 spinner，只有 active/inactive 类）。目的地面板各自的表现还不一致——
+// 「审批」在这 1145ms 里显示的是「暂无审批历史」（本轮已改），所以 chrome 层必须有个统一信号。
+const loadingTab = ref<Tab | ''>('')
+watch(activeTab, async (t) => {
+  if (!canManage.value) return
+  if (_loadedTabs.has(t)) return void ensureTabLoaded(t)   // 已加载过：不闪指示
+  loadingTab.value = t
+  try { await ensureTabLoaded(t) } finally { if (loadingTab.value === t) loadingTab.value = '' }
+})
+
+// hover 预取：悬停到点击通常 200-600ms，提前把这段吃掉。两道闸——
+//  ① 150ms 悬停延迟：扫过 tab 栏不该把 5 个 tab 全预取一遍（aux 限流 30/分）；
+//  ② _loadedTabs 保证每 tab 至多一次，故 click 隐含的 hover 不会造成重复请求。
+// 刻意**不动 loadingTab**：预取是后台行为，不该让用户看到自己没点过的 tab 在转。
+let prefetchTimer: ReturnType<typeof setTimeout> | null = null
+function onTabPrefetch(t: Tab) {
+  if (prefetchTimer) clearTimeout(prefetchTimer)
+  prefetchTimer = setTimeout(() => { if (canManage.value) void ensureTabLoaded(t) }, 150)
+}
+function cancelPrefetch() { if (prefetchTimer) { clearTimeout(prefetchTimer); prefetchTimer = null } }
+onUnmounted(cancelPrefetch)
 
 onMounted(async () => {
   if (canManage.value) {
@@ -236,11 +258,18 @@ onMounted(async () => {
       <button
         v-for="t in tabs" :key="t.key" type="button" role="tab"
         :aria-selected="activeTab === t.key"
+        :aria-busy="loadingTab === t.key"
+        :data-testid="loadingTab === t.key ? 'tab-loading' : undefined"
         class="relative -mb-px flex items-center gap-2 border-b-2 px-3.5 py-2.5 text-sm font-medium transition"
         :class="activeTab === t.key ? 'border-accent-strong text-accent-text' : 'border-transparent text-muted-foreground hover:text-foreground'"
         @click="activeTab = t.key"
+        @pointerenter="onTabPrefetch(t.key)"
+        @pointerleave="cancelPrefetch()"
+        @focus="onTabPrefetch(t.key)"
       >
-        <component :is="t.icon" :size="15" :stroke-width="1.75" />
+        <!-- 图标位复用给 spinner：不新增控件、不改 tab 宽度（换图标不换盒子，避免 tab 栏抖动） -->
+        <Loader2 v-if="loadingTab === t.key" :size="15" :stroke-width="1.75" class="animate-spin" />
+        <component v-else :is="t.icon" :size="15" :stroke-width="1.75" />
         {{ t.label }}
         <span
           v-if="t.key === 'approvals' && approvalsBadge"

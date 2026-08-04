@@ -4,7 +4,8 @@ import { Database, CheckCircle2, Loader, Clock, Percent, UserCheck, Quote } from
 import { onMounted, ref } from 'vue'
 import { useKb } from '@/composables/useKb'
 import { deptLabel } from '@/lib/kb'
-import { SECTION, ZONE_HEAD, ZONE_TICK, SUBHEAD, GRID, USAGE_GRID } from '@/lib/section'
+import { SECTION, ZONE_HEAD, ZONE_TICK, SUBHEAD, GRID, USAGE_GRID, SKEL_H } from '@/lib/section'
+import SkeletonBlock from './SkeletonBlock.vue'
 import { fetchOrgSnapshot, type OrgNode } from '@/composables/useOrgSnapshot'
 import { resolveOwnerBucket } from '@/lib/orgTree'
 import StatusDistBar from './StatusDistBar.vue'
@@ -16,9 +17,19 @@ import FeedbackReviewList from './FeedbackReviewList.vue'
 // 部门管理员「概览看板」= 本部门视角。/api/kb/stats 已按 managed owner_dept 作用域聚合，
 // 故资产/状态口径只覆盖本部门。「待审核」用 by_badge（= 我提交、待 kb_admin 放行的版本）。
 // 使用成效/知识缺口取自 /api/kb/insights（retrieved_docs_json→doc_id→owner_dept 归属，本部门文档）。
-const { kbStats, kbInsights, loadStats, loadInsights, loadErrors } = useKb()
+const { kbStats, kbInsights, loadStats, loadInsights, loadErrors, isLoading, hasSettled } = useKb()
 // 概览指标卡的加载态：stats 尚未返回且无错误 → 显骨架（避免闪 0）。
-const statsLoading = computed(() => !kbStats.value && !loadErrors.value['stats'])
+// 与 KbAdminDashboard 同一判据（2026-08-04）：**在途，而不是「数据在不在」**。
+// 原写法在 stats 返回 404 时恒为真——评审实测 dept_admin 侧与 kb_admin 侧一模一样：
+// 4 张骨架转 5 秒仍在转、0 alert、0 重试。同一缺陷此前只在兄弟文件里修了一半。
+const statsLoading = computed(() => isLoading('stats'))
+const statsUnavailable = computed(() => hasSettled('stats') && !kbStats.value && !loadErrors.value['stats'])
+// 「状态分布」的显示谓词不能只挡 404：5xx 同样是**不知道**分布，而不是分布为空。
+// 评审实测 stats 5xx 时页面同屏出「加载失败」alert 与「暂无文档数据。」——同一原则漏执行一半。
+const statsUnknown = computed(() => statsUnavailable.value || !!loadErrors.value['stats'])
+/** insights 未接入（404 静默）：跑完了、没数据、也没错误。与「还在路上」必须分开说。 */
+const insightsNotDeployed = computed(() =>
+  hasSettled('insights') && !kbInsights.value && !loadErrors.value['insights'])
 const b = (k: string) => kbStats.value?.by_badge?.[k] || 0
 const fmtN = (n?: number) => (n || 0).toLocaleString('en-US')
 const pct = (x?: number) => (x === undefined ? '—' : (x * 100).toFixed(1) + '%')
@@ -75,11 +86,26 @@ const gapItems = computed(() =>
     <section :class="SECTION">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>本部门资产概览</header>
       <LoadError class="mb-3" :message="loadErrors['stats']" @retry="loadStats()" />
-      <div :class="GRID">
+      <div
+        v-if="statsUnavailable" data-testid="stats-unavailable"
+        class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground"
+      >
+        本部门资产口径暂不可用——<code class="font-mono text-[11.5px]">/api/kb/stats</code> 未接入（404）。
+        这不是「没有文档」，数字不会自动出现。
+        <button
+          type="button" class="ml-1 font-semibold text-accent-text underline underline-offset-2"
+          @click="loadStats()"
+        >重试</button>
+      </div>
+      <div v-else :class="GRID">
         <StatCard v-for="s in cards" :key="s.label" v-bind="s" :loading="statsLoading" />
       </div>
-      <p :class="SUBHEAD" class="mt-4">状态分布</p>
-      <StatusDistBar :by-badge="kbStats?.by_badge || {}" />
+      <!-- stats 未接入时整块隐藏：上面的占位已说明原因，这里再渲染一条会独立断言
+           「暂无文档数据。」——那是**不知道**分布，不是分布为空。 -->
+      <template v-if="!statsUnknown">
+        <p :class="SUBHEAD" class="mt-4">状态分布</p>
+        <StatusDistBar :by-badge="kbStats?.by_badge || {}" :loading="statsLoading" />
+      </template>
     </section>
 
     <!-- 使用成效（真实，近 N 天，本部门文档被使用情况） -->
@@ -115,7 +141,20 @@ const gapItems = computed(() =>
     <section v-else :class="SECTION">
       <header :class="ZONE_HEAD"><span :class="ZONE_TICK"></span>使用成效 · 知识缺口</header>
       <LoadError :message="loadErrors['insights']" @retry="loadInsights()" />
-      <div v-if="!loadErrors['insights']" class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
+      <!-- 三态分开说：在途 → 骨架；已定态无数据 → 未接入（**不会**自动出现，原文案一律说
+           「稍后自动呈现」对 404 是假承诺）；还没请求过 → 才是那句「稍后自动呈现」。 -->
+      <SkeletonBlock
+        v-if="isLoading('insights')" :rows="3" :height="SKEL_H.barItem"
+        testid="skel-dept-insights"
+      />
+      <div
+        v-else-if="insightsNotDeployed" data-testid="insights-not-deployed"
+        class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground"
+      >
+        使用成效与知识缺口未接入：<code class="font-mono text-[11.5px]">/api/kb/insights</code>
+        返回 404，数字不会自动出现。
+      </div>
+      <div v-else-if="!loadErrors['insights']" class="rounded-[14px] border border-dashed border-border bg-surface/60 p-5 text-[12.5px] text-muted-foreground">
         使用成效与知识缺口数据加载中（需后端 <code class="font-mono text-[11.5px]">/api/kb/insights</code>）；稍后自动呈现。
       </div>
     </section>

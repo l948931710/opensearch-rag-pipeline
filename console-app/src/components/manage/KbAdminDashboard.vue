@@ -52,6 +52,9 @@ const statsLoading = computed(() => isLoading('stats'))
 // 跑完了、既没数据也没错误 = 端点未上线（404 静默）。这一态必须与「在途」分开表达，
 // 否则要么永久转圈，要么把 `?? 0` 的兜底零当成真实数字显出来（StatCard 的 loading 本就是为防这个）。
 const statsUnavailable = computed(() => hasSettled('stats') && !kbStats.value && !loadErrors.value['stats'])
+// 「状态分布」的显示谓词不能只挡 404：5xx 同样是**不知道**分布，而不是分布为空。
+// 评审实测 stats 5xx 时页面同屏出「加载失败」alert 与「暂无文档数据。」——同一原则漏执行一半。
+const statsUnknown = computed(() => statsUnavailable.value || !!loadErrors.value['stats'])
 /** 端点未接入（404 静默）：跑完了、没数据、也没错误。三者缺一都不是这一态。 */
 const dataOf: Record<string, () => unknown> = { governance: () => kbGovernance.value, insights: () => kbInsights.value }
 function notDeployed(key: 'governance' | 'insights'): boolean {
@@ -298,8 +301,13 @@ const downvoteItems = computed(() =>
       <!-- ml-0.5 已移除（2026-08-04）：本处曾是全应用唯一一个在调用点给 SUBHEAD 加 2px 左边距的
            实例，而 DeptDashboard 是把同样的 2px 烤进了它自己的常量——同一偏移两条互不知情的路径。
            抽取共享常量时统一取多数（17:3）的无偏移版，20 个 SUBHEAD 实例自此同一基准。 -->
-      <p :class="SUBHEAD" class="mt-4">状态分布</p>
-      <StatusDistBar :by-badge="kbStats?.by_badge || {}" :loading="statsLoading" />
+      <!-- stats 未接入时整块隐藏：上面的占位已说明原因，这里再渲染一条会独立断言
+           「暂无文档数据。」——那是**不知道**分布，不是分布为空。轮 2a 漏了这一处，
+           轮 2b 的 dept_admin 门（同款场景）把它抓了出来，两侧一并修。 -->
+      <template v-if="!statsUnknown">
+        <p :class="SUBHEAD" class="mt-4">状态分布</p>
+        <StatusDistBar :by-badge="kbStats?.by_badge || {}" :loading="statsLoading" />
+      </template>
       <template v-if="kbGovernance">
         <div class="mt-4 grid gap-x-10 lg:grid-cols-2">
           <div>

@@ -28,6 +28,9 @@ test.describe('硬门 — 加载四态', () => {
     await expect(page.locator('.animate-pulse')).toHaveCount(0);
     await expect(placeholder).toContainText('404');
     await expect(placeholder.getByRole('button', { name: '重试' })).toBeEnabled();
+    // 这条是轮 2a 漏掉、被轮 2b 的 dept_admin 同款门抓出来的：资产卡换成占位后，下方的
+    // 状态分布条仍会独立断言「暂无文档数据。」——那是**不知道**分布，不是分布为空。
+    await expect(page.getByText('暂无文档数据。'), '未接入 ≠ 没有文档').toHaveCount(0);
   });
 
   test('G2 governance 5xx 而 insights 正常：必须逐端点上报（基线 alert=0）', async ({ page }) => {
