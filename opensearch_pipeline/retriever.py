@@ -758,8 +758,15 @@ def _keep_public_only_if_strict(results, reason: str):
     return kept
 
 
-def _revalidate_main_hits(results):
+def _revalidate_main_hits(results, *, strict_on_unavailable: bool = False):
     """主命中 RDS 复核（盲区审计 P3-1）——权限执行不对称的补齐。
+
+    strict_on_unavailable（2026-08-03，cosurface 补图用）：**权威复核没跑成**时（RDS 不可达 /
+    返回空集 / 两个轴都没有键）直接返回空集，而不是 fail-open 保留。仅对"可选增强"路径开启：
+    主命中 fail-open 的理由是"不把 RDS 故障放大成全站无答案"，但**补图失败的代价只是没有配图，
+    正文答案不受影响** —— 那里没有任何理由拿未复核的图去赌。
+    ⚠️ 只作用于"复核**没跑成**"，不作用于"复核**按配置不跑**"（`main_hit_revalidate` 关、
+    `simulate_db`）—— 后者是运维/测试的显式选择，不该让补图比主命中更严。
 
     邻居拼接/step 扩展路径一直按 RDS 复核（is_active=1 + _same_permission），而**主 HA3
     命中**此前直接投放：任何 RDS→HA3 投影延迟（管理员收紧 public→dept_internal、下线
@@ -791,7 +798,7 @@ def _revalidate_main_hits(results):
     pk_axis = sorted({str(r.get("id")) for r in results
                       if not r.get("chunk_id") and r.get("id") not in (None, "")})
     if not cid_axis and not pk_axis:
-        return results
+        return [] if strict_on_unavailable else results
     try:
         from opensearch_pipeline.db import _get_db_conn   # 惰性：tests monkeypatch db._get_db_conn
         conn = _get_db_conn()
@@ -815,10 +822,14 @@ def _revalidate_main_hits(results):
             conn.close()
     except Exception as e:   # noqa: BLE001 — 权威不可达 → 默认保留（HA3 是第一道边界）；strict 只留 public
         logger.warning("主命中 RDS 复核失败（HA3 结果）: %s", e)
+        if strict_on_unavailable:
+            return []
         return _keep_public_only_if_strict(results, "RDS 不可达")
     if not rows:
         logger.warning("主命中 RDS 复核返回空集（%d 个键全部未知）——按权威不可用处理",
                        len(cid_axis) + len(pk_axis))
+        if strict_on_unavailable:
+            return []
         return _keep_public_only_if_strict(results, "复核返回空集")
     # r[4]=chunk_meta.id；对不含该列的行形态（旧桩/降级查询）取 None，下面据此跳过 PK 比对
     def _row(r):
@@ -2118,7 +2129,9 @@ def _fetch_cosurface_images(
         table_name=cfg.table_name,
         vector=dense,
         sparse_data=sparse_data,
-        top_k=max_images * 2,
+        # 复核会丢掉候选（陈旧/孤儿/旧版本），×2 的余量在丢弃后常常一张都不剩 ⇒ 有界
+        # 过取：×4 仍是十几行的小查询，但给"排第一的被丢、排第二的递补"留出空间。
+        top_k=max_images * 4,
         include_vector=False,
         output_fields=list(_DEFAULT_OUTPUT_FIELDS),
         filter=filter_expr,
@@ -2191,6 +2204,41 @@ def cosurface_doc_images(
                 acl_ctx=acl_ctx)
     except Exception as e:
         logger.warning("图片召回补充失败 (non-fatal): %s", e)
+        return chunks
+
+    # ── 补图必须走与主命中【同一条】权威复核链（附录B，2026-08-03）─────────────────
+    # 此前 _fetch_cosurface_images 的结果从 HA3 直接进最终 chunks —— cosurface 是
+    # retrieve_and_enrich 的最后一个检索步骤（其后只有 _attach_doc_dates 这种纯元数据），
+    # 全程没有任何下游复核。"doc 已授权"**不能**替代"这条 image 行有效"：
+    #   · 同版本重切留下的孤儿 PK（4c 的 B7 段专门治它——旧 PK 既不在 deactivate 的
+    #     `version_no < N` 覆盖面，也不在按 version 删的 PENDING_DELETE 里）；
+    #   · 主命中复核完成【之后】才发生的 retire / visibility 收紧 / spot 隔离（真 TOCTOU）；
+    #   · 旧版本图片：本查询的 filter 不带 version_no，而 _cosurface_top_doc_ids 又把版本轴
+    #     折叠掉了 ⇒ 稳态下当前版本正文也能配上旧版本的图。
+    # 复核必须在 best_by_doc **之前**：否则排第一的失效图被丢后，同文档排第二的有效图
+    # 没有递补机会（本来能出图的文档变成不出图）。
+    _ver_by_doc = {}
+    for c in chunks:
+        d, v = c.get("doc_id"), c.get("version_no")
+        if d and d not in _ver_by_doc and str(v or "") not in ("", "0"):
+            _ver_by_doc[d] = str(v)
+    _n_raw = len(img_results)
+    # 版本轴：两边都已知才比对。未知则放行交给下面的 4b/4c —— 那两条才是权威轴，
+    # 而"HA3 是否回填了 version_no"这件事本会话无法对真实 HA3 验证，
+    # 拿一个无法验证的字段做 fail-closed 会把"没图"变成不可预见的功能性回归。
+    img_results = [
+        r for r in img_results
+        if not (_ver_by_doc.get(r.get("doc_id")) and str(r.get("version_no") or "0") != "0"
+                and str(r.get("version_no")) != _ver_by_doc[r.get("doc_id")])
+    ]
+    # 4b：撤销跨部门授权即时生效（4c 有意不比对 allowed_depts，故这条不可省）
+    img_results = _deny_revoked_cross_dept(img_results, user_dept, acl_ctx=acl_ctx)
+    # 4c：is_active / ACL 轴 / 物理 PK 轴。strict——补图失败只是没配图，绝不拿未复核的图去赌
+    img_results = _revalidate_main_hits(img_results, strict_on_unavailable=True)
+    if len(img_results) != _n_raw:
+        logger.info("cosurface 补图复核：%d → %d 条（丢弃陈旧/已停用/越权图片行）",
+                    _n_raw, len(img_results))
+    if not img_results:
         return chunks
 
     # 每个文档取最相关（首个）的有效图片
