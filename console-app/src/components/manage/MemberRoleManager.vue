@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref, computed } from 'vue'
-import { UserCog, ShieldCheck, Plus, X, GitBranch } from '@lucide/vue'
+import { UserCog, ShieldCheck, Plus, X, GitBranch, Loader2 } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
 import { useKb, type AdminItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
@@ -144,7 +144,7 @@ async function onRevokeDept(a: AdminItem, d: string) {
         </div>
         <input v-model="formNote" placeholder="备注（可空，如授权依据）" class="w-full rounded-lg border border-border bg-card px-3 py-1.5 text-sm text-foreground placeholder:text-faint" />
         <div class="flex gap-2">
-          <button type="button" :disabled="isBusy(`member:${formUser.trim()}`)" class="rounded-lg bg-primary px-4 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50" @click="submit">提交授予</button>
+          <button type="button" :disabled="isBusy(`member:${formUser.trim()}`)" class="inline-flex items-center gap-1 rounded-lg bg-primary px-4 py-[7px] text-[12.5px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50" @click="submit"><Loader2 v-if="isBusy(`member:${formUser.trim()}`)" :size="12" :stroke-width="2" class="animate-spin" />{{ isBusy(`member:${formUser.trim()}`) ? "提交中…" : "提交授予" }}</button>
           <button type="button" class="rounded-lg border border-border px-4 py-[7px] text-[12.5px] text-foreground transition hover:border-border-strong" @click="formOpen = false">取消</button>
         </div>
       </div>
@@ -160,7 +160,7 @@ async function onRevokeDept(a: AdminItem, d: string) {
           <div class="mt-1 flex flex-wrap gap-1.5">
             <span v-for="d in a.managed_owner_depts" :key="d" class="inline-flex items-center gap-1 rounded-md bg-panel px-2 py-0.5 text-[11.5px] text-muted-foreground">
               {{ deptLabel(d) }}
-              <button type="button" class="text-faint transition hover:text-st-busy disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="onRevokeDept(a, d)"><X :size="11" :stroke-width="2.5" /></button>
+              <button type="button" class="text-faint transition hover:text-st-busy disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="onRevokeDept(a, d)"><Loader2 v-if="isBusy(`member:${a.user_id}`)" :size="11" :stroke-width="2.5" class="animate-spin" /><X v-else :size="11" :stroke-width="2.5" /></button>
             </span>
             <span
               v-for="n in (a.managed_node_roots || [])" :key="'n' + n.dept_id"
@@ -168,13 +168,15 @@ async function onRevokeDept(a: AdminItem, d: string) {
               :title="n.source === 'auto' ? '组织同步自动派生' : '手动指定'"
             >
               <GitBranch :size="10" :stroke-width="2" />{{ n.name }}<span v-if="n.source === 'auto'" class="text-[10px] opacity-70">auto</span>
-              <button type="button" class="text-faint transition hover:text-st-busy disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="revokeAdminGrant(a.user_id, '', n.dept_id)"><X :size="11" :stroke-width="2.5" /></button>
+              <button type="button" class="text-faint transition hover:text-st-busy disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="revokeAdminGrant(a.user_id, '', n.dept_id)"><Loader2 v-if="isBusy(`member:${a.user_id}`)" :size="11" :stroke-width="2.5" class="animate-spin" /><X v-else :size="11" :stroke-width="2.5" /></button>
             </span>
             <span v-if="!a.managed_owner_depts.length && !(a.managed_node_roots || []).length" class="text-[11.5px] text-faint">（无可管理部门）</span>
           </div>
         </div>
+        <!-- 「编辑」刻意**不加** spinner：它只是打开表单，不是异步操作。这里的 disabled 表达的是
+             「被在途的撤销挡住」而不是「正在进行中」，加转圈会把两种状态混成一种谎。 -->
         <button type="button" class="self-start rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="startEdit(a)">编辑</button>
-        <button type="button" class="self-start rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="onRevokeAll(a)">撤销全部</button>
+        <button type="button" class="inline-flex items-center gap-1 self-start rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong disabled:opacity-50" :disabled="isBusy(`member:${a.user_id}`)" @click="onRevokeAll(a)"><Loader2 v-if="isBusy(`member:${a.user_id}`)" :size="12" :stroke-width="2" class="animate-spin" />{{ isBusy(`member:${a.user_id}`) ? '撤销中…' : '撤销全部' }}</button>
       </div>
       <!-- 在途期间不得断言「暂无」——那是还没有依据的结论。与 ApprovalHistory 同一形状的缺陷。 -->
       <div v-if="isLoading('adminGrants') && !deptAdmins.length" class="border-t border-border px-[18px] py-4" data-testid="skel-admin-grants">
@@ -213,10 +215,16 @@ async function onRevokeDept(a: AdminItem, d: string) {
           </div>
           <div class="mt-0.5 text-[11.5px] text-st-busy">{{ riskLabel(c.risk_reason) }} · 快照 rev {{ c.derived_snapshot_rev }}</div>
         </div>
-        <button type="button" class="rounded-lg bg-primary px-3 py-[6px] text-[12px] font-semibold text-primary-foreground transition hover:opacity-90"
-                @click="onDecide(c.id, 'confirm')">确认生效</button>
-        <button type="button" class="rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong"
-                @click="onDecide(c.id, 'reject')">驳回</button>
+        <!-- 这两个原先是全组件唯一**零防护**的写按钮：无 :disabled、useKb 侧也无 busy 追踪，
+             连点可并发发出多个决策请求，且在途期间界面零反应。补上与本文件其余 5 个按钮
+             同一套 isBusy（useKb 的 withInflight key 为 `cand:${id}`），并套用全站既有的
+             Loader2 范式。 -->
+        <button type="button" :disabled="isBusy(`cand:${c.id}`)" data-testid="cand-confirm"
+                class="inline-flex items-center gap-1 rounded-lg bg-primary px-3 py-[6px] text-[12px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
+                @click="onDecide(c.id, 'confirm')"><Loader2 v-if="isBusy(`cand:${c.id}`)" :size="12" :stroke-width="2" class="animate-spin" />{{ isBusy(`cand:${c.id}`) ? '处理中…' : '确认生效' }}</button>
+        <button type="button" :disabled="isBusy(`cand:${c.id}`)" data-testid="cand-reject"
+                class="inline-flex items-center gap-1 rounded-lg border border-border px-3 py-[6px] text-[12px] text-foreground transition hover:border-border-strong disabled:opacity-50"
+                @click="onDecide(c.id, 'reject')"><Loader2 v-if="isBusy(`cand:${c.id}`)" :size="12" :stroke-width="2" class="animate-spin" />驳回</button>
       </div>
       <!-- P3-3：后端硬 LIMIT 200 的截断此前完全静默 —— 被截掉的候选永远不被裁决。 -->
       <TruncationNotice class="px-[18px] pb-3" :when="truncatedQueues.nodeCandidates" :cap="200" label="待裁决候选" hint="先处理完当前批再刷新" />

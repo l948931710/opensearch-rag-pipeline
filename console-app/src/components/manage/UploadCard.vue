@@ -11,7 +11,7 @@ import OrgTreeSelect from './OrgTreeSelect.vue'
 const {
   verCtx, newTitle, newOwner, newOwnerNode, newPerm, newShareDepts, newShareNodes, nodeAclGrant,
   shareTargets, uploadTargetDepts, selectedNames, isDeptAdmin, kbConfig,
-  dupWarn, uploadBusy, uploadMsg, uploadErr, uploadOk, contentDupMsg, uploadQueue,
+  dupWarn, uploadBusy, uploadMsg, uploadPct, uploadErr, uploadOk, contentDupMsg, uploadQueue,
   onFileSelected, doUpload, exitVersionMode, maxUploadMb, maybeAutoSeedOwner,
 } = useKb()
 const session = useSession()
@@ -264,6 +264,17 @@ function onDrop(e: DragEvent) {
         {{ uploadBusy ? '上传中…' : (verCtx ? '上传新版本' : '上传') }}
       </button>
       <span v-if="uploadMsg" class="text-sm" :class="uploadOk ? 'text-st-live' : 'text-muted-foreground'">{{ uploadMsg }}</span>
+      <!-- 只在真有百分比的那一段渲染（uploadPct !== null）。「申请上传地址」「登记」两段
+           没有任何可测进度 ⇒ 整条不渲染，绝不画成 valuenow=0 的假条（redline③）。
+           刻意做成按钮的**兄弟元素**而非把百分比拼进按钮文案：ux-gate 断言按钮名恰为
+           「上传中…」/「^上传$」，动文案会打红那道门。 -->
+      <div
+        v-if="uploadPct !== null" role="progressbar" data-testid="upload-progress"
+        :aria-valuenow="uploadPct" aria-valuemin="0" aria-valuemax="100" :aria-label="`上传文件进度 ${uploadPct}%`"
+        class="h-1 w-28 shrink-0 overflow-hidden rounded-full bg-border"
+      >
+        <div class="h-full rounded-full bg-accent-strong transition-[width] duration-[var(--dur-fast)]" :style="{ width: `${uploadPct}%` }" />
+      </div>
     </div>
     <p v-if="uploadErr" class="mt-2 text-sm text-destructive">{{ uploadErr }}</p>
     <p v-if="contentDupMsg" class="mt-2 rounded-lg border border-st-warn/30 bg-st-warn/10 px-3 py-2 text-xs text-st-warn">{{ contentDupMsg }}</p>
@@ -275,6 +286,15 @@ function onDrop(e: DragEvent) {
           <span class="min-w-0 flex-1 truncate text-foreground">{{ row.name }}</span>
           <StatusPill :badge="row.status" kind="queue" />
           <span class="shrink-0 text-xs text-muted-foreground">{{ row.msg }}</span>
+          <!-- QueueRow.pct 自定义以来就没被渲染过（useKb 里唯一赋值点在 OSS PUT 回调）。
+               同样只在有真值时出现：排队中/登记中/已提交都是 null ⇒ 不渲染。 -->
+          <div
+            v-if="row.pct !== null && row.pct !== undefined" role="progressbar" data-testid="queue-progress"
+            :aria-valuenow="row.pct" aria-valuemin="0" aria-valuemax="100" :aria-label="`${row.name} 上传进度 ${row.pct}%`"
+            class="h-1 w-16 shrink-0 overflow-hidden rounded-full bg-border"
+          >
+            <div class="h-full rounded-full bg-accent-strong transition-[width] duration-[var(--dur-fast)]" :style="{ width: `${row.pct}%` }" />
+          </div>
         </div>
         <p v-if="row.dupMsg" class="mt-1 text-xs text-st-warn">{{ row.dupMsg }}</p>
       </div>

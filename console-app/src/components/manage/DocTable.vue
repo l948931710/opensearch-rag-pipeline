@@ -19,7 +19,7 @@ const {
   setQuery, sortBy, setScope, enterVersionMode, retire, restore, openHistory, openDocPreview,
   openAccessRequest, accessStateOf, accessNoteOf, loadDocs, loadErrors,
   openShare, openDocMeta, grantedLabelsByDoc, openVisibility,
-  selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
+  selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkDone, bulkTotal, bulkRetire, bulkSetVisibility,
 } = useKb()
 
 // 页码翻页（设计稿 doc-table.html 尾部 pager）：加载中不受理（防连点竞态，useKb 侧 docsSeq 是
@@ -160,12 +160,20 @@ const menuDocId = ref('')
 function toggleMenu(id: string) { menuDocId.value = menuDocId.value === id ? '' : id }
 function closeMenu() { menuDocId.value = '' }
 function menuAct(fn: () => void) { closeMenu(); fn() }
+// 两类菜单（行内「更多操作」与批量「改可见范围」）共用这一对全局手势。
+// 原写法有两处缺陷，导致批量下拉**点外部和 Esc 都关不掉**（审计活体复现两次）：
+//   ① 首行 `if (!menuDocId.value) return` —— 批量下拉单独打开时 menuDocId 为空，
+//      函数在检查 DOM 之前就返回了；
+//   ② 判据 `[data-act-menu]` 只标在行菜单容器上，批量下拉容器没有该属性。
+// 修法必须给两类不同的**属性值**：若都用裸 `data-act-menu`，点行菜单锚点时
+// closest 也会命中，于是批量下拉又关不掉——两者会互相误伤。
 function onGlobalPointerDown(e: Event) {
-  if (!menuDocId.value) return
   const t = e.target as Element | null
-  if (!t?.closest?.('[data-act-menu]')) closeMenu()   // 点在任一菜单锚点/弹层内不关（切换行由 toggle 处理）
+  const kind = t?.closest?.('[data-act-menu]')?.getAttribute('data-act-menu')
+  if (kind !== 'row') closeMenu()                 // 切换行由 toggle 处理，这里只管「点到别处」
+  if (kind !== 'bulk') bulkVisMenu.value = false
 }
-function onGlobalKeydown(e: KeyboardEvent) { if (e.key === 'Escape') closeMenu() }
+function onGlobalKeydown(e: KeyboardEvent) { if (e.key === 'Escape') { closeMenu(); bulkVisMenu.value = false } }
 onMounted(() => {
   document.addEventListener('pointerdown', onGlobalPointerDown)
   document.addEventListener('keydown', onGlobalKeydown)
@@ -299,20 +307,31 @@ async function onRestore(d: DocItem) {
     >
       <span class="text-[12.5px] font-semibold text-accent-text">已选 {{ selectedCount }} 篇</span>
       <span v-if="bulkMsg" class="text-[11.5px] text-muted-foreground">· {{ bulkMsg }}</span>
+      <!-- 真实进度：串行 for 的 i+1/total 是确定值，不是估算。bulkTotal=0（未开始/已收条）
+           时整条不渲染——结果留在 bulkMsg 文本里，不留一根 100% 的残条。h-1 内联同一 flex 行，
+           不换行不增高。 -->
+      <div
+        v-if="bulkTotal > 0" role="progressbar" data-testid="bulk-progress"
+        :aria-valuenow="bulkDone" aria-valuemin="0" :aria-valuemax="bulkTotal"
+        :aria-label="`批量处理进度 ${bulkDone}/${bulkTotal}`"
+        class="h-1 w-24 shrink-0 overflow-hidden rounded-full bg-border"
+      >
+        <div class="h-full rounded-full bg-accent-strong transition-[width] duration-[var(--dur-fast)]" :style="{ width: `${Math.round((bulkDone / bulkTotal) * 100)}%` }" />
+      </div>
       <div class="flex-1" />
       <button
         type="button" :disabled="bulkBusy"
         class="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
         @click="onBulkRetire"
       ><Archive :size="12" :stroke-width="1.75" /> 批量退役</button>
-      <div class="relative">
+      <div class="relative" data-act-menu="bulk">
         <button
-          type="button" :disabled="bulkBusy"
+          type="button" :disabled="bulkBusy" aria-haspopup="menu" :aria-expanded="bulkVisMenu"
           class="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
           @click="bulkVisMenu = !bulkVisMenu"
         ><Lock :size="12" :stroke-width="1.75" /> 改可见范围</button>
         <div
-          v-if="bulkVisMenu"
+          v-if="bulkVisMenu" role="menu"
           class="absolute right-0 top-full z-10 mt-1 w-32 overflow-hidden rounded-lg border border-border bg-card py-1 shadow-lg"
         >
           <button
@@ -411,7 +430,7 @@ async function onRestore(d: DocItem) {
               class="grid size-7 place-items-center rounded-md text-muted-foreground transition hover:bg-panel hover:text-foreground"
               title="下载原始文件" @click="openDocPreview(d.doc_id)"
             ><Download :size="14" :stroke-width="1.75" /></button>
-            <div class="relative" data-act-menu>
+            <div class="relative" data-act-menu="row">
               <button
                 type="button" data-testid="doc-more" aria-label="更多操作" aria-haspopup="menu"
                 :aria-expanded="menuDocId === d.doc_id"

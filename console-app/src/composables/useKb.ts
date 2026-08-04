@@ -4,6 +4,7 @@ import { useSession } from '@/stores/session'
 import { useDialog } from '@/composables/useDialog'
 import { useToast } from '@/composables/useToast'
 import type { OrgSnapshot } from '@/composables/useOrgSnapshot'
+import { scrollIntoViewSafely } from '@/lib/utils'
 import {
   GROUP_LABEL, MAX_UPLOAD_MB, TERMINAL_BADGES, deptLabel, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
 } from '@/lib/kb'
@@ -69,7 +70,11 @@ export interface MyAccessRequestItem {
   decision_note?: string         // 审批人驳回原因（rejected 时有值）：申请人侧闭环
 }
 export type AccessState = 'none' | 'pending' | 'approved_pending_sync' | 'projected' | 'rejected'
-export interface QueueRow { name: string; status: string; pct: number; msg: string; dupMsg?: string }
+// pct 必须可空：null = 该行此刻没有可测进度（排队 / 申请上传地址 / 登记 / 已提交 / 失败），
+// 与 uploadPct 同一语义。写成非空的 number 并播种 0，会让 UploadCard 的守卫静态恒真——
+// 评审实测：3 个文件卡在「申请上传地址」时 3 行全渲染 aria-valuenow=0 的条，批量失败终态后
+// 条还冻在 0 不消失。那正是 redline③ 禁的假条，只是从单文件路径漏到了队列路径。
+export interface QueueRow { name: string; status: string; pct: number | null; msg: string; dupMsg?: string }
 export interface VerCtx { doc_id: string; title: string; owner_dept: string; permission_level: string; current_version_no: number }
 
 interface MyDocsResp { items: DocItem[]; has_more: boolean; badge_counts?: Record<string, number> | null }
@@ -182,6 +187,12 @@ const sortDir = ref<1 | -1>(-1)
 const selectedIds = ref<Set<string>>(new Set())
 const bulkBusy = ref(false)
 const bulkMsg = ref('')
+// 批量真实进度。串行 for 循环里的 i+1/total 本来就是确定值（不是估算），此前只拼进 bulkMsg
+// 文本。拆成结构化字段是为了让进度条读到数字——**注意**：方案说这是「替代从字符串解析」，
+// 审计核实该前提不成立（全仓没有任何代码解析 bulkMsg，DocTable 只原样显示）。所以这是新增
+// 地基，不是替换解析器。bulkTotal=0 表示不在批量中 ⇒ 进度条整个不渲染。
+const bulkDone = ref(0)
+const bulkTotal = ref(0)
 
 // 上传表单 / 状态
 const newTitle = ref('')
@@ -241,6 +252,10 @@ const SHARE_TARGETS = Object.keys(GROUP_LABEL)
 const verCtx = ref<VerCtx | null>(null)
 const uploadBusy = ref(false)
 const uploadMsg = ref('')
+// 上传真实百分比。四个阶段里**只有 OSS PUT 这一段**有真值（XHR upload.onprogress）；
+// 「申请上传地址」「登记」两段没有任何可测进度。null = 无真实进度 ⇒ UI 侧整个进度条不渲染。
+// 绝不在这两段渲染成 valuenow=0 或三段式假条——那正是 redline③「不做假阶段状态条」禁的东西。
+const uploadPct = ref<number | null>(null)
 const uploadErr = ref('')
 const uploadOk = ref(false)
 const dupWarn = ref('')                // 文件名级预查重
@@ -541,13 +556,16 @@ async function _bulkRun(docsToRun: DocItem[], label: string,
                         one: (d: DocItem) => Promise<string | null>): Promise<void> {
   if (bulkBusy.value || !docsToRun.length) return
   bulkBusy.value = true
+  bulkDone.value = 0; bulkTotal.value = docsToRun.length
   let ok = 0; const fails: string[] = []
   for (let i = 0; i < docsToRun.length; i++) {
     bulkMsg.value = `${label}中… ${i + 1}/${docsToRun.length}`
     const err = await one(docsToRun[i])
     if (err) fails.push(`${docsToRun[i].title || docsToRun[i].doc_id}：${err}`); else ok++
+    bulkDone.value = i + 1                       // 该篇已结（成败不论）——进度是「跑完几篇」不是「成功几篇」
   }
   bulkBusy.value = false
+  bulkTotal.value = 0                            // 收条：结果留在 bulkMsg 文本里，进度条撤掉
   bulkMsg.value = `${label}完成：成功 ${ok}${fails.length ? `，失败 ${fails.length}` : ''}`
   // 明细最多列 8 条防弹窗爆屏；超出部分显式声明数量——绝不让「列出的」被误读成「全部失败原因」。
   if (fails.length) {
@@ -985,7 +1003,7 @@ async function loadApprovals(force = false) {
 // 模式切换发生在屏幕外,点击处零反馈=「点了没反应」(与 77e5f97 筛选钳底同族视口问题)。
 function scrollToUploadCard() {
   if (typeof document === 'undefined') return
-  void nextTick(() => document.getElementById('kb-sec-upload')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+  void nextTick(() => scrollIntoViewSafely(document.getElementById('kb-sec-upload'), 'start'))
 }
 
 function enterVersionMode(d: DocItem) {
@@ -1093,9 +1111,11 @@ async function uploadSingle(file: File) {
     const u = await apiJson<UploadUrlResp>('/api/kb/upload-url', { method: 'POST', auth: true, body: JSON.stringify(body) })
     if (principalChangedSince(epoch0)) return
     uploadMsg.value = '上传文件到 OSS… 0%'
+    uploadPct.value = 0                             // ← 进入唯一有真实进度的阶段
     await putWithProgress(u.put_url, file, (pct) => {
-      if (!principalChangedSince(epoch0)) uploadMsg.value = `上传文件到 OSS… ${pct}%`
+      if (!principalChangedSince(epoch0)) { uploadMsg.value = `上传文件到 OSS… ${pct}%`; uploadPct.value = pct }
     }, u.content_type)
+    uploadPct.value = null                          // ← 离开该阶段，「登记…」没有真实进度可报
     if (principalChangedSince(epoch0)) return       // 换人后不再 register（token uid 也必被后端 403）
     uploadMsg.value = '登记…'
     const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
@@ -1123,7 +1143,7 @@ async function uploadSingle(file: File) {
   } catch (e: any) {
     if (principalChangedSince(epoch0)) return       // 旧身份的失败不写新身份 UI
     uploadErr.value = uploadErrText(e); uploadMsg.value = ''
-  } finally { uploadBusy.value = false }
+  } finally { uploadBusy.value = false; uploadPct.value = null }   // 任何退出路径都撤条，含 PUT 中途失败
 }
 
 // 批量上传并发度（E#35）。跨文件小并发池：每文件内部 upload-url → OSS PUT → register 三步顺序不变，
@@ -1136,14 +1156,30 @@ async function uploadBatch(files: File[]) {
   uploadErr.value = ''; uploadOk.value = false; contentDupMsg.value = ''; uploadMsg.value = ''
   trackSeq++
   const epoch0 = useSession().principalEpoch        // 身份代际（与 uploadSingle 同款防线）
-  const rows: QueueRow[] = files.map((f) => ({ name: f.name, status: '排队', pct: 0, msg: '' }))
+  const rows: QueueRow[] = files.map((f) => ({ name: f.name, status: '排队', pct: null, msg: '' }))
   uploadQueue.value = rows
+  // 捕获 ref 里的 proxy 数组一次。**不能**在 worker 里每次经 uploadQueue.value 取：
+  // onFileSelected()（「清空已选文件」/file input/dropzone 三个入口在批量期间都可点、
+  // 都没有 :disabled="uploadBusy"）会把 uploadQueue.value 重新指向 []，于是 [i] 取到
+  // undefined ⇒ row.status 抛 TypeError ⇒ 被 catch 接住 ⇒ catch 里的 row.pct = null
+  // **二次抛出且无人接** ⇒ Promise.all reject ⇒ uploadBusy 永不复位 = 上传卡永久锁死，
+  // 且本批已 register 成功的文档因 loadDocs() 不执行而不进台账，界面还不报错。
+  // 捕获后写的仍是 proxy 元素（反应式不退化），只是免疫重指向：队列被清空后那些写入
+  // 不再被模板观察，变成无害的空转。
+  const qrows = uploadQueue.value
   uploadBusy.value = true
   let okN = 0, badN = 0
   // 单文件全流程（三步顺序不变）；异常只落到本行——与原串行版一致的失败隔离，其余文件照常。
   const shared = newPerm.value === 'shared'   // 「指定部门」模式对批量同样生效（每文件登记后放行同一组目标）
   const uploadOne = async (i: number) => {
-    const f = files[i], row = rows[i]
+    // ⚠️ 取 qrows[i]（上面捕获的 proxy 数组），**不是**建行时的裸数组 `rows[i]`，也**不是**
+    // 每次经 `uploadQueue.value[i]`（会被清空重指向打成 undefined，见上方注释）。
+    // 用裸数组的后果：ref 里存的是 Vue 包出来的 proxy，模板读的也是它；改裸对象不过 set trap
+    // ⇒ 不发通知、不重渲染。评审实测 onprogress 确实在跑、row.pct 确实写进去了，但队列进度条
+    // 与既有的「N%」文本在整个上传期间都不出现；强制一次无关的响应式变更后才一起冒出来。
+    // `row.status = '上传中'` 看起来正常只是搭了 `uploadQueue.value = rows` 那次首屏渲染的
+    // 便车——PUT 期间的更新没有这个便车。
+    const f = files[i], row = qrows[i]
     if (f.size <= 0 || f.size > maxUploadBytes.value) { row.status = '跳过'; row.msg = f.size <= 0 ? '空文件' : `超过 ${maxUploadMb.value}MB`; badN++; return }
     try {
       row.status = '上传中'
@@ -1155,6 +1191,7 @@ async function uploadBatch(files: File[]) {
       await putWithProgress(u.put_url, f, (pct) => {
         if (!principalChangedSince(epoch0)) { row.pct = pct; row.msg = `${pct}%` }
       }, u.content_type)
+      row.pct = null                                // 离开唯一有真实进度的阶段（同单文件路径纪律）
       if (principalChangedSince(epoch0)) return     // 换人后不再 register（token uid 后端必 403）
       row.status = '登记中'; row.msg = ''
       const r = await apiJson<RegisterResp>('/api/kb/register', { method: 'POST', auth: true, body: JSON.stringify({ upload_token: u.upload_token }) })
@@ -1168,6 +1205,7 @@ async function uploadBatch(files: File[]) {
       const dm = buildDupMsg(r.content_dups, r.content_dups_other); if (dm) row.dupMsg = dm
       okN++
     } catch (e: any) {
+      row.pct = null                                // PUT 中途失败也要撤条，否则冻在原值不消失
       if (principalChangedSince(epoch0)) return     // 旧身份的失败不写新身份 UI
       row.status = '失败'; row.msg = uploadErrText(e); badN++
     }
@@ -1767,18 +1805,26 @@ async function loadNodeCandidates() {
 }
 
 /** 确认/驳回候选。409 = 快照已翻或候选失效——刷新队列并把后端文案回给调用方。 */
+// 审计发现：这是全组件里唯一**零防护**的写操作——按钮无 :disabled、这里也无 busy 追踪，
+// 连点可并发发出多个决策请求，且在途期间界面无任何反应（同文件其余 5 个按钮都有 isBusy）。
+// 补上与它们同一套 withInflight 互斥；key 按候选 id，两个候选可各自独立操作。
+// 在途重复调用返回 undefined ⇒ 这里归一成 null（等同「没有错误可报」），不让调用方把
+// 「被互斥拦下」误显示成失败。
 async function decideNodeCandidate(id: number, action: 'confirm' | 'reject'): Promise<string | null> {
-  try {
-    await apiJson('/api/kb/admin-node-candidates/decide', {
-      method: 'POST', auth: true, body: JSON.stringify({ candidate_id: id, action }) })
-    // 第七个写后重拉点（我最初的清单只列了六个，把它误记成读路径）：确认候选会改管辖根，
-    // 名单必须重取，同样禁止合流。
-    await Promise.all([loadNodeCandidates(), loadAdminGrants({ afterWrite: true })])
-    return null
-  } catch (e: any) {
-    await loadNodeCandidates()
-    return e?.detail?.message || e?.detail || '操作失败，请刷新后重试'
-  }
+  const r = await withInflight(`cand:${id}`, async (): Promise<string | null> => {
+    try {
+      await apiJson('/api/kb/admin-node-candidates/decide', {
+        method: 'POST', auth: true, body: JSON.stringify({ candidate_id: id, action }) })
+      // 第七个写后重拉点（我最初的清单只列了六个，把它误记成读路径）：确认候选会改管辖根，
+      // 名单必须重取，同样禁止合流。
+      await Promise.all([loadNodeCandidates(), loadAdminGrants({ afterWrite: true })])
+      return null
+    } catch (e: any) {
+      await loadNodeCandidates()
+      return e?.detail?.message || e?.detail || '操作失败，请刷新后重试'
+    }
+  })
+  return r ?? null
 }
 
 // 授予/更新一名部门管理员（owner_depts = 权威全集,提交即覆盖）。成功返回 true。
@@ -1880,8 +1926,8 @@ export function useKb() {
     // 页码翻页器（DocTable 尾部 QueuePager）
     docsPage, docsTotal, docsPerPage: DOCS_PAGE, docsMaxPage: DOCS_MAX_PAGE, loadDocsPage,
     // 多选 / 批量
-    selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkRetire, bulkSetVisibility,
-    newTitle, newOwner, newOwnerNode, newPerm, newShareDepts, newShareNodes, nodeAclGrant, verCtx, uploadBusy, uploadMsg, uploadErr, uploadOk,
+    selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkDone, bulkTotal, bulkRetire, bulkSetVisibility,
+    newTitle, newOwner, newOwnerNode, newPerm, newShareDepts, newShareNodes, nodeAclGrant, verCtx, uploadBusy, uploadMsg, uploadPct, uploadErr, uploadOk,
     dupWarn, contentDupMsg, uploadQueue, selectedNames, isBusy, retireBusy,
     accessReqDoc, accessReqBusy, requestedDocIds, myAccessReqs,
     shareCtx, shareBusy, shareTargets: SHARE_TARGETS,
@@ -1910,6 +1956,7 @@ export function __resetKb() {
   docScope.value = 'managed'; accessReqDoc.value = null; accessReqBusy.value = false; requestedDocIds.value = new Set(); myAccessReqs.value = new Map()
   q.value = ''; filter.value = ''; permFilter.value = ''; ownerFilter.value = ''; citedFilter.value = ''; sortKey.value = 'updated_at'; sortDir.value = -1
   selectedIds.value = new Set(); bulkBusy.value = false; bulkMsg.value = ''
+  bulkDone.value = 0; bulkTotal.value = 0; uploadPct.value = null
   resetUploadDraft()                                // 上传草稿域（含 selectedFiles/autoSeedDoneFor/轮询作废）
   shareCtx.value = null; shareBusy.value = false
   uploadBusy.value = false
