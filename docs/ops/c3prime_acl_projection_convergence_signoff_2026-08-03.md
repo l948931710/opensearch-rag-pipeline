@@ -179,9 +179,19 @@ approved 跨部门授权 0**；`RAG_ALLOWED_DEPTS_ACL` env 未设 ⇒ 默认 **F
 - ✅ **已修**：新增 `projection_rows_all_match()` **逐行**校验替代并集口径作为**认证判据**。
   分工写死：`current_allowed_for_doc`（并集）判**要不要重投影**（少计只朝重投影自愈，安全）；
   新 helper（逐行全等）判**能不能盖章**（宁可不盖，绝不误认证）。坏 JSON/任一行不符 ⇒ 拒绝。
-- reconcile 候选仍是旧来源，**没有 `acl_epoch IS NULL/<` 这一路**（`allowed_depts_reconcile.py:203`）
-- legacy 预筛仍 current-only（`:74`）⇒「current 干净、旧 active 版 dirty」会被提前判 unchanged
-- 缺 `chunk.acl_epoch > dm.acl_epoch` 的**不变量破坏阻断告警**
+- ✅ **已修（2026-08-03，commit `0b8c3ae`）**：候选源加 **epoch 一路**
+  （`acl_epoch IS NULL` = 从未投影过，正是四路旧候选一条都覆盖不到的那类；
+  `acl_epoch < dm.acl_epoch` = 落后于失效代次）。逐版本判、带 062 capability 探测降级。
+  ⇒ **062 的两列自此才有消费方**。
+- ✅ **已修（`0b8c3ae`）**：预筛去掉 `current_version_no` 限定，改看**全部 active 版本**。
+  🔴 修的过程中发现**同族的另两个泄漏**（原 blocker 未记）：
+    · `have_map` 用**并集**比较 ⇒ current 的干净值会把旧版漂移盖住 → 改**逐行严格**；
+    · `if not ad: continue` 让 **NULL allowed_depts 的版本对判定完全隐形** → NULL 记空集。
+- ✅ **已修（`0b8c3ae`）**：`chunk.acl_epoch > dm.acl_epoch` 不变量破坏 → 报错 +
+  `invariant_violations` 计数 + **强制排除出预筛跳过集**（其 epoch 不可信，绝不允许它
+  让 sweep 误认为"已投影且更新"而永久掩盖漂移）。
+
+⇒ **B2 五条全部完成。** 剩 B1 / B3。
 
 ### ⛔ B3 · stage-3 的「先读 ACL、后抢锁」TOCTOU —— **改管线，不是改 materializer**
 
