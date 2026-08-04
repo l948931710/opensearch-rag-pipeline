@@ -152,6 +152,64 @@ approved 跨部门授权 0**；`RAG_ALLOWED_DEPTS_ACL` env 未设 ⇒ 默认 **F
 
 ---
 
+## 5. 🔴 第 2 步（C3′ 多版本 materializer + 全版本 sweep）——**2026-08-03 立项拆分,未实施**
+
+第 1 步（写方）已落码（commit `72c9e22`）：bump 单一入口 + 7 个权威写点 + 三处 stamp +
+`projection_complete` + 姿态 A ⇒ **epoch 已在正常积累**。
+
+第 2 步经 codex 实现评审后确认**不是"再走一步"，而是三块独立工程**，Sam 2026-08-03 拍板
+**在此打住、分别立项**。三条 blocker 逐条记录（均已核实到代码行）：
+
+### ⛔ B1 · 两个调用面的事务语义不一致（返回契约要重构）
+
+- outbox drain 对 `skipped_locked` **仍 commit**，只是不标 done（`access_grants.py:606/630`）
+- reconcile **只在 `materialized/retracted` 时 commit**（`allowed_depts_reconcile.py:226/230`）
+
+⇒ "部分版本写成功 + 聚合报 `skipped_locked`" 会让 reconcile **不提交已经发生的写** ——
+要么丢，要么被后续文档的 commit 意外带上。
+**修法**：返回值加显式控制字段 `complete` / `wrote_projection` / `locked_versions` / `versions[]`。
+**不能靠单一 status 表达两个正交维度。**
+
+### ⛔ B2 · certify 未闭环 —— **其中一条是第 1 步已落码的潜伏缺口**
+
+- 🔴 **`materialize` 在投影值相等时于 stamp 之前就 `return unchanged`**（node `:431` / legacy `:469`）
+  ⇒ **「值正确但 `acl_epoch IS NULL`」的文档永远盖不上章、永久 dirty**。
+  **这是 commit `72c9e22` 里的既有缺口**；今天不咬人（生产零 active chunk），**开 sweep 前必须先修**。
+- 🔴 `current_allowed_for_doc` 用 `vals = set()` **取并集**（`:290`）⇒ 期望 `["finance"]` 时
+  一行 `["finance"]` + 一行 `NULL` 并集仍相等 —— **并集掩盖逐行不一致**。
+  **正确 certify 必须逐 active chunk 验证规范化后的 `(owner_dept, allowed_depts)`。**
+- reconcile 候选仍是旧来源，**没有 `acl_epoch IS NULL/<` 这一路**（`allowed_depts_reconcile.py:203`）
+- legacy 预筛仍 current-only（`:74`）⇒「current 干净、旧 active 版 dirty」会被提前判 unchanged
+- 缺 `chunk.acl_epoch > dm.acl_epoch` 的**不变量破坏阻断告警**
+
+### ⛔ B3 · stage-3 的「先读 ACL、后抢锁」TOCTOU —— **改管线，不是改 materializer**
+
+stage-3 在 `dataworks_orchestrator.py:472` 就把 chunk/ACL 读进内存，抢 `PROCESSING` 却是
+DAG 首节点（`:627`）⇒ **即使 materializer 锁了并提交，已读到旧 ACL 的 stage-3 仍会把旧值
+推回 HA3**。按 `version_no` 排序**解决不了**。
+**修法**：stage-3 改 **claim-before-read**，或抢锁后重读重算 ACL 再进 embedding/push。
+另：materializer 不应继续硬编码 2h（`access_grants.py:387`），应复用 `ingest_lease.takeover_where_sql()`。
+
+### 已达成共识、实施时直接采用的设计点
+
+| 项 | 结论 |
+|---|---|
+| 选版 | `DISTINCT version_no FROM chunk_meta WHERE doc_id=? AND is_active=1`，**按 version_no 升序**；零 active chunk 才终态 `skipped` |
+| 预算 | `reset_chunks` 求和后 `_LIMIT` 仍只限**文档数** ⇒ 须加独立 `reset_chunks` 预算 + stage-3 `NOT_INDEXED` backlog 暂停门；certify-only 另计 |
+| 锁序 | 统一 `document_meta → document_version(version_no 升序) → chunk_meta`，并同步修订 `spot_checker.py:23` 的既有声明 |
+| **两 flag 分离** | `RAG_ACL_MULTIVERSION`（唯一写实现）与 `RAG_ACL_EPOCH_SWEEP`（全扫候选）分开；运行时不变量 **`SWEEP=true 且 MULTIVERSION=false` 必须拒绝启动**。启用序 multiversion→sweep，回滚序相反 |
+| outbox 队头饥饿 | `ORDER BY enqueued_at LIMIT 200`（`:581`），locked 只累加 attempts 不出队 ⇒ 200 条持续锁定即饿死新撤权意图。**不得自动标 done**；需退避/到期调度或配额分离 + 按 attempts/年龄告警 |
+| `apply=False` | preview 整轮不逐文档 rollback ⇒ **不得无条件加 `FOR UPDATE`**（会持锁到连接关闭）。走非锁定严格快照或每文档显式 rollback |
+
+### ⚠️ 实施前必须补的证据
+
+- 「stage-3 已预读旧 ACL → 权威变更 → stage-3 抢锁」的**确定性并发测试**
+- 多版本**逐行混合投影**测试（`["finance"]`/`NULL` 并存但并集恰好等于 want 的反例）
+- staging 合成大文档实测：多版本单文档的事务耗时、锁等待、`NOT_INDEXED` 增量
+  （生产当前零 active 数据，给不出可靠预算）
+
+---
+
 ## 附：本单引用的研究文档自带的三条限定
 
 1. **Amazon Kendra** 2026-06-30 起维护模式、07-30 起不接新客户 —— 设计可参考，**不可选型**。

@@ -9,9 +9,14 @@
 -- codex 评审 2026-08-03（第二批第 1 轮 REVISE → 本文件为修订版 v2）
 --
 -- ✅ **2026-08-03 已 apply staging + 生产**（Sam 当日授权 PROD-RW:2026-08-03）。
--- ⚠️ 但**代码侧仍零消费这两列** —— bump/stamp 写方、certify 回填、全版本 sweep 与 C3′
---    多版本 materializer 全部仍待拍板单勾选。当前状态 = 列已就位、水位恒 0/NULL、
---    行为与 apply 前逐字节一致。
+-- ✅ **第 1 步写方已落码**（commit 72c9e22）：bump 单一入口（不受 flag 门控）+ 7 个权威写点
+--    + 三处 stamp（含 stage-2 chunk INSERT，capability 探测降级）+ projection_complete + 姿态 A。
+--    ⇒ **epoch 已在正常积累**。
+-- ⚠️ **但仍无消费方**：全版本 sweep 与 C3′ 多版本 materializer **未实施**（三条 blocker 已立项，
+--    见拍板单 §5.5）。对 serving/HA3 行为逐字节不变。
+-- 🔴 **已知潜伏缺口**（拍板单 §5.5-B2）：materialize 在投影值相等时于 stamp **之前**就
+--    `return unchanged` ⇒「值正确但 acl_epoch IS NULL」的文档永远盖不上章。今天不咬人
+--    （生产零 active chunk），**开 sweep 前必须先修**。
 --
 -- ── 为何需要（C3/C3′ 的机制根）─────────────────────────────────────────────
 -- allowed_depts_reconcile._prescreen_unchanged 用 **diff** 判"无漂移"：want(权威) vs
