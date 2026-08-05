@@ -2923,7 +2923,18 @@ def kb_register(req: KbRegisterRequest, request: Request,
                                                 and str(_prev[0]) == str(etag_val))
                     except Exception as _e14:   # noqa: BLE001 — advisory，查不出不影响升版
                         logger.warning("同 ETag 升版检测失败（忽略）: %s", _e14)
-                    version_no = int(mrow[0] or 1) + 1
+                    # 红队缺陷链（2026-08-04）：skip-gate（RAG_SKIP_UNCHANGED_REINGEST，生产默认
+                    # true）命中同正文重传时把 current_version_no 回退到旧值，但 SKIPPED_DUPLICATE
+                    # 的 document_version 行（version_no=旧+1）保留 —— 此后真实升版按
+                    # current_version_no+1 取号必与残留行同号撞 uk_doc_version(1062)，而 1062 兜底
+                    # 按【新 raw_key】查不到旧 raw_key 的残留行 → 500。取号一并纳入 dv 侧最大号。
+                    # FOR UPDATE：REPEATABLE READ 下普通 SELECT 读事务快照（本事务首个 SELECT 在
+                    # 拿 meta 行锁之前），锁定读才保证读到最新已提交号；且 meta→dv 锁序与写方
+                    # （本函数下方 INSERT、DW register_metadata、skip-gate F3 纪律）一致，不成环。
+                    cur.execute(f"SELECT MAX(version_no) FROM {_kb_db()}.document_version "
+                                "WHERE doc_id=%s FOR UPDATE", (doc_id,))
+                    _dv_max = (cur.fetchone() or (None,))[0]
+                    version_no = max(int(mrow[0] or 1), int(_dv_max or 0)) + 1
                     cur.execute(f"UPDATE {_kb_db()}.document_meta "
                                 "SET current_version_no=%s, updated_at=NOW() WHERE doc_id=%s",
                                 (version_no, doc_id))
@@ -3012,7 +3023,21 @@ def kb_register(req: KbRegisterRequest, request: Request,
                                    (raw_key, raw_key_hash))
                         won = c2.fetchone()
                     if not won:
-                        raise   # 1062 但查不到赢家行 → 非预期，按 500 处理
+                        # 撞号行存在但非本次 raw_key（skip-gate 残留 SKIPPED_DUPLICATE 行、或
+                        # DW 侧并发登记）→ 取号竞态而非双提交：重试会在 MAX(version_no) 之后
+                        # 重新取号，给 409 可重试；撞号行也查不到才是真非预期，保持 500。
+                        with conn.cursor() as c3:
+                            c3.execute("SELECT raw_key, content_process_status "
+                                       f"FROM {_kb_db()}.document_version "
+                                       "WHERE doc_id=%s AND version_no=%s LIMIT 1",
+                                       (doc_id, version_no))
+                            _clash = c3.fetchone()
+                        if _clash:
+                            logger.warning(
+                                "kb_register 1062 撞号行非本次写入：doc=%s v=%s 撞号行 raw_key=%s "
+                                "status=%s（可重试）", doc_id, version_no, _clash[0], _clash[1])
+                            raise HTTPException(status_code=409, detail="版本号分配冲突，请重试")
+                        raise   # 1062 但撞号行也查不到 → 非预期，按 500 处理
                     logger.info("kb_register 并发幂等命中：raw_key=%s 赢家 doc=%s v=%s", raw_key, won[0], won[1])
                     return KbRegisterResponse(
                         doc_id=won[0], version_no=int(won[1]),

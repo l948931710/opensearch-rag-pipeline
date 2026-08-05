@@ -47,6 +47,12 @@ class _FakeCur:
 
     def fetchone(self):
         s = self._last
+        if "MAX(version_no)" in s:
+            # 升版取号的 dv 侧最大号锁定读（残留 SKIPPED_DUPLICATE 行场景钩子）
+            return (self.conn.dv_max,)
+        if "raw_key, content_process_status" in s:
+            # 1062 兜底的撞号行诊断查询
+            return self.conn.clash_row
         if "document_version" in s and "WHERE raw_key=" in s:
             self.conn._rawkey_query_count += 1
             if self.conn.rolled_back:
@@ -69,11 +75,14 @@ class _FakeCur:
 
 class _FakeConn:
     def __init__(self, *, idempotent_row=None, meta_row=None, winner_row=None, raise_dupkey=False,
-                 dup_rows=None, raise_on_dedup=False, lock_recheck_row=None):
+                 dup_rows=None, raise_on_dedup=False, lock_recheck_row=None,
+                 dv_max=None, clash_row=None):
         self.idempotent_row = idempotent_row
         self.meta_row = meta_row
         self.winner_row = winner_row
         self.lock_recheck_row = lock_recheck_row   # F-38 升版锁内复查命中行（None=不命中）
+        self.dv_max = dv_max          # 升版取号 MAX(version_no) 返回值（None=无 dv 行）
+        self.clash_row = clash_row    # 1062 兜底撞号行诊断返回 (raw_key, content_process_status)
         self._rawkey_query_count = 0
         self.raise_dupkey_on_version_insert = raise_dupkey
         self.dup_rows = dup_rows or []        # 内容查重 SELECT 返回的 (doc_id, title, owner_dept) 行
@@ -336,6 +345,60 @@ def test_head_object_sim_returns_synthetic_meta(monkeypatch):
     monkeypatch.setenv("RAG_SIM_OSS_HEAD_SIZE", "0")       # 可覆盖（0 字节/超限分支钩子）
     assert head_object("raw/x/y.pdf")["size"] == 0
     assert head_object("") is None                         # 空 key → None
+
+
+def test_register_version_up_skips_residual_duplicate_row(monkeypatch):
+    """红队缺陷链复现（2026-08-04）：skip-gate 把 current_version_no 回退到 1 后，残留
+    v2 SKIPPED_DUPLICATE 行仍在 document_version → 升版取号必须越过残留行
+    （max(current=1, MAX(dv)=2)+1=3），不再与 v2 撞 uk_doc_version。修复前此处取号=2。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        idempotent_row=None, meta_row=(1, "dept_internal", "active"), dv_max=2))
+    resp = _call(monkeypatch, _mint(action="version", permission_level="dept_internal"))
+    assert resp.version_no == 3
+    sql, params = _version_insert_call(conn)
+    assert params is not None and 3 in params
+    # current_version_no 同步推进到 3（UPDATE 参数序 = (version_no, doc_id)）
+    assert any("SET current_version_no" in s and p and p[0] == 3 for s, p in conn.calls)
+
+
+def test_register_version_concurrent_dupkey_idempotent(monkeypatch):
+    """并发双击升版幂等语义不回归：1062 → 回滚 → 按 raw_key 查到赢家行 → 幂等返回赢家版本。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        idempotent_row=None, meta_row=(3, "dept_internal", "active"),
+        winner_row=("DOC_TEST", 4, "NOT_STARTED"), raise_dupkey=True))
+    resp = _call(monkeypatch, _mint(action="version", permission_level="dept_internal"))
+    assert resp.idempotent is True and resp.version_no == 4
+    assert conn.rolled_back is True
+
+
+def test_register_version_dupkey_residual_row_409(monkeypatch):
+    """1062 兜底加固：raw_key 查不到赢家、但撞号行存在（残留 SKIPPED_DUPLICATE，旧 raw_key）
+    → 409 可重试，而非修复前的 re-raise 500。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch)
+    _install_conn(monkeypatch, _FakeConn(
+        idempotent_row=None, meta_row=(1, "dept_internal", "active"),
+        winner_row=None, raise_dupkey=True,
+        clash_row=("raw/marketing/DOC_TEST/OLD_UP/旧件.pdf", "SKIPPED_DUPLICATE")))
+    with pytest.raises(Exception) as ei:
+        _call(monkeypatch, _mint(action="version", permission_level="dept_internal"))
+    assert getattr(ei.value, "status_code", None) == 409
+
+
+def test_register_version_dupkey_no_clash_row_500(monkeypatch):
+    """1062 但赢家行与撞号行都查不到 → 仍是非预期，保持 500（兜底不放宽真异常）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch)
+    _install_conn(monkeypatch, _FakeConn(
+        idempotent_row=None, meta_row=(1, "dept_internal", "active"),
+        winner_row=None, raise_dupkey=True, clash_row=None))
+    with pytest.raises(Exception) as ei:
+        _call(monkeypatch, _mint(action="version", permission_level="dept_internal"))
+    assert getattr(ei.value, "status_code", None) == 500
 
 
 def test_register_concurrent_dupkey_returns_idempotent(monkeypatch):
