@@ -36,5 +36,7 @@
       tag `rag-serving:8eaef983d776`，manifest digest
       `sha256:ff3a70db2060e6b50ed77418aa38999cfc96b88353a8e52e6b18b676ced56ef5`，
       工件 attestation 链同 run 逐字节（artifact sha256 `d9ea36e8…`）
-- [ ] SAE 控制台切镜像（Sam）+ 冒烟四联
+- [x] SAE 切镜像完成（Sam，2026-08-04 晚）+ 冒烟四联绿：`/api/version`
+      git_commit=8eaef98 ✓ / `/api/health` 200(0.7s) / `/console/` 200 /
+      `/api/kb/config` node_acl_grant=true
 - [ ] 正门补验：重灌收敛 → 金集重标 → baseline refreeze 后跑 `make release-gate`
