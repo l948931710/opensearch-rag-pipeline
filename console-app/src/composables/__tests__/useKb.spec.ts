@@ -237,11 +237,33 @@ describe('useKb 台账筛选 + 多选 + 批量', () => {
     vi.stubGlobal('fetch', routeFetch({ myDocs: jsonResp({ items, has_more: false }) }))
     const kb = useKb()
     await kb.loadDocs()
-    expect(kb.ownerOptions.value).toEqual(['finance', 'production', 'production_mold'])
+    // 选项形状 = facet 键（`legacy:<code>` | `node:<id>`），与 stats.owner_facets / 后端
+    // ?owner_dept= 入参同一口径；node 归属靠它才进得了下拉。
+    expect(kb.ownerOptions.value.map((o) => o.key))
+      .toEqual(['legacy:finance', 'legacy:production', 'legacy:production_mold'])
+    // 兼容：裸组码（旧深链 / 旧后端派生值）仍能筛出来——两侧都过 ownerFilterKey 归一。
     kb.ownerFilter.value = 'production'
+    expect(kb.filtered.value.map((d) => d.doc_id).sort()).toEqual(['a', 'c'])
+    kb.ownerFilter.value = 'legacy:production'
     expect(kb.filtered.value.map((d) => d.doc_id).sort()).toEqual(['a', 'c'])
     kb.permFilter.value = 'restricted'
     expect(kb.filtered.value.map((d) => d.doc_id)).toEqual(['c'])   // 叠加
+  })
+
+  it('node 文档：owner_dept 恒空，靠 owner_key 进下拉、按 node:<id> 筛得出来', async () => {
+    // 2026-08-05 回归：此前下拉从 owner_dept 派生 ⇒ node 文档既不出现在选项里也筛不出来。
+    const nd: DocItem = {
+      ...mk('n1', '', 'dept_internal'), acl_mode: 'node', owner_key: 'node:34265162', owner_label: '人力资源部',
+    }
+    vi.stubGlobal('fetch', routeFetch({ myDocs: jsonResp({ items: [nd, mk('a', 'production', 'dept_internal')], has_more: false }) }))
+    const kb = useKb()
+    await kb.loadDocs()
+    expect(kb.ownerOptions.value.map((o) => o.key)).toContain('node:34265162')
+    expect(kb.ownerOptions.value.find((o) => o.key === 'node:34265162')?.label).toBe('人力资源部')
+    kb.ownerFilter.value = 'node:34265162'
+    expect(kb.filtered.value.map((d) => d.doc_id)).toEqual(['n1'])
+    kb.ownerFilter.value = 'legacy:production'
+    expect(kb.filtered.value.map((d) => d.doc_id)).toEqual(['a'])   // node 文档不误入 legacy 桶
   })
 
   it('多选：toggle / 全选可见 / 隐藏行不参与；筛选后 selectedDocs 收敛', async () => {

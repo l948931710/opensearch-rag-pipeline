@@ -5,6 +5,7 @@ import { useDialog } from '@/composables/useDialog'
 import { useToast } from '@/composables/useToast'
 import type { OrgSnapshot } from '@/composables/useOrgSnapshot'
 import { scrollIntoViewSafely } from '@/lib/utils'
+import { ownerFilterKey } from '@/lib/orgTree'
 import {
   GROUP_LABEL, MAX_UPLOAD_MB, TERMINAL_BADGES, deptLabel, putWithProgress, uploadErrText, buildDupMsg, fileCore, unsupportedNames, type DupDoc,
 } from '@/lib/kb'
@@ -83,7 +84,15 @@ export interface QueueRow { name: string; status: string; pct: number | null; ms
 export interface VerCtx { doc_id: string; title: string; owner_dept: string; permission_level: string; current_version_no: number }
 
 interface MyDocsResp { items: DocItem[]; has_more: boolean; badge_counts?: Record<string, number> | null }
-export interface KbStats { total: number; active: number; retired: number; chunks: number; new_this_month: number; by_badge: Record<string, number>; owner_depts?: string[] }
+/** 归属 facet（后端 KbOwnerFacet）：key=`legacy:<code>` | `node:<id>`，label 为展示名
+ *  （legacy 回的是组码原文、由前端 deptLabel 转；node 回后端 JOIN dept_dim 的现名）。 */
+export interface OwnerFacet { key: string; label: string }
+export interface KbStats {
+  total: number; active: number; retired: number; chunks: number; new_this_month: number
+  by_badge: Record<string, number>
+  owner_depts?: string[]        // 仅 legacy（后端保留兼容）；node 归属只在 owner_facets 里
+  owner_facets?: OwnerFacet[]   // 阶段 B 双轴 facet —— 台账归属下拉的全库口径来源
+}
 // Phase E 概览看板真实数据（镜像 api.py KbInsightsResponse / KbGovernanceResponse，字段一一对应）
 export interface KbTopDoc { title: string; owner_dept: string; hits: number }
 export interface KbGapQuery { query: string; count: number; avg_top: number }
@@ -465,14 +474,23 @@ const filtered = computed(() =>
   sortDocs(docs.value.filter((d) =>
     (!filter.value || (filter.value === ANOMALY_FILTER ? BAD_BADGES.includes(d.status_badge) : d.status_badge === filter.value))
     && (!permFilter.value || d.permission_level === permFilter.value)
-    && (!ownerFilter.value || d.owner_dept === ownerFilter.value)
+    // 归属比较统一到 facet 键形：node 文档的 owner_dept 恒空，按旧写法永远筛不出来。
+    && (!ownerFilter.value || ownerFilterKey(d.owner_key, d.owner_dept) === ownerFilterKey(ownerFilter.value))
     // 利用度：never=真·从未被引用（cited_count===0，退役候选）；used=有引用。
     // 数据不可用（null/undefined，RAG_QA_FACT_JOIN 未开）两个档都不入——0 与「不知道」必须可区分。
     && (!citedFilter.value || (citedFilter.value === 'never' ? d.cited_count === 0 : (d.cited_count ?? 0) > 0))
   ), sortKey.value, sortDir.value))
 
-// 归属筛选选项 = 已加载文档里出现过的 owner_dept（含生产子线，如 production_mold）→ 覆盖"按子部门管理"。
-const ownerOptions = computed(() => Array.from(new Set(docs.value.map((d) => d.owner_dept).filter(Boolean))).sort())
+// 归属筛选选项（已加载页派生，stats 不可用时的兜底）= 出现过的归属 facet 键（含生产子线如
+// production_mold，也含 node 节点）。label 交给渲染侧 resolveDocOwner 统一转，这里只出键。
+const ownerOptions = computed<OwnerFacet[]>(() => {
+  const seen = new Map<string, string>()
+  for (const d of docs.value) {
+    const k = ownerFilterKey(d.owner_key, d.owner_dept)
+    if (k && !seen.has(k)) seen.set(k, d.owner_label || '')
+  }
+  return [...seen].map(([key, label]) => ({ key, label })).sort((a, b) => a.key.localeCompare(b.key))
+})
 
 function countOf(badge: string): number {
   return badge ? docs.value.filter((d) => d.status_badge === badge).length : docs.value.length
@@ -523,9 +541,12 @@ const ledgerTotal = computed<number | null>(() => {
   if (filter.value) return c[filter.value] || 0
   return _sumCounts(Object.keys(c))
 })
-// 归属下拉选项：全库口径下取 stats.owner_depts；否则已加载页派生。
-const ledgerOwnerOptions = computed<string[]>(() =>
-  (fullScopeCounts.value && kbStats.value!.owner_depts?.length) ? kbStats.value!.owner_depts! : ownerOptions.value)
+// 归属下拉选项：全库口径下取 stats.owner_facets（双轴，含 node）；否则已加载页派生。
+// ⚠️ 不再用 stats.owner_depts —— 那个字段后端只回 legacy 组码，node 归属永远进不了下拉。
+const ledgerOwnerOptions = computed<OwnerFacet[]>(() =>
+  (fullScopeCounts.value && kbStats.value!.owner_facets?.length)
+    ? kbStats.value!.owner_facets!
+    : ownerOptions.value)
 // 异常文档数（待办摘要条）：faceted 口径优先（跟随筛选）；退 stats 全库；再退已加载页计数。
 const anomalyCount = computed<number>(() => {
   if (serverBadgeCounts.value) return _sumCounts(BAD_BADGES)

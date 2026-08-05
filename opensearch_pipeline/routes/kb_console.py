@@ -208,6 +208,13 @@ def _kb_owner_facet_sql(owner_dept: str):
     （owner DTO 单一键语义——中文名不当键）；legacy 传组码不变（含生产子线）。
     参数化本身防注入，这里再剥离注入字符 + 限长做纵深防御。返回 (None, None) = 非法 facet（fail-closed）。"""
     raw = (owner_dept or "").strip()
+    # 键闭环（2026-08-05）：stats.owner_facets 回的 legacy 键带 `legacy:` 前缀，此前本函数只认
+    # **裸组码**，facet 键不能原样回传当筛选值 —— 调用方得自己记得剥前缀，漏剥即静默 fail-closed
+    # 空列表（清洗后 'legacyhr' 不匹配任何 owner_dept）。这里接住前缀，两种形态都合法。
+    if raw.startswith("legacy:"):
+        raw = raw[len("legacy:"):].strip()
+        if not raw:
+            return None, None       # 裸 'legacy:' = 非法，别退化成"不筛选"
     if raw.startswith("node:"):
         tail = raw[5:]
         if not (tail.isdigit() and tail[0] != "0"):

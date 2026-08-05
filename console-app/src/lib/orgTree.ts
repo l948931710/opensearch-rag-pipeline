@@ -97,6 +97,19 @@ export function resolveDocOwner(
   return resolveOwnerBucket(norm, ownerLabel, byId, legacyLabel)
 }
 
+/** 归属**筛选键**归一 → `legacy:<code>` | `node:<id>` | ''（= stats.owner_facets.key 的形状，
+ *  也是 /api/kb/my-docs?owner_dept= 的合法入参）。
+ *
+ *  ⚠️ 与 `resolveDocOwner` 的归一**方向相反**，别混：那边为了**显示**要剥掉 `legacy:` 前缀
+ *  交给 deptLabel；这边为了**比较与回传**要统一补上前缀。两处各自有测试钉着。
+ *  容忍裸组码入参（旧深链、旧后端派生的下拉选项），故新旧筛选值都能对上号。 */
+export function ownerFilterKey(ownerKey: string | undefined, ownerDept?: string): string {
+  const k = (ownerKey || '').trim()
+  if (k.startsWith('node:') || k.startsWith('legacy:')) return k
+  const bare = k || (ownerDept || '').trim()
+  return bare ? `legacy:${bare}` : ''
+}
+
 /** 节点 → 最近 depth<=1 祖先（=中心,org_sync 契约:中心 depth=1、无公司根行）。
  *  自身 depth<=1 即自身;快照缺链/超 20 跳 → null（调用方按顶层独立行处理,不猜中心）。 */
 export function centerOf(id: number, byId: Map<number, OrgNode>): number | null {

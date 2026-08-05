@@ -209,3 +209,38 @@ def test_conditional_acl_columns_are_read_by_capability():
     for ln in sites:
         assert '== "present"' in ln, f"未按 capability 判定：{ln.strip()[:100]}"
 
+
+
+# ── 归属 facet 筛选键闭环（2026-08-05）────────────────────────────────────────
+# stats.owner_facets 回的 legacy 键带 `legacy:` 前缀，而筛选入参此前只认**裸组码**。
+# 键不闭环 = 调用方必须自己记得剥前缀，漏剥则清洗成 'legacyhr' 匹配不到任何行、
+# 静默返回空台账（fail-closed 得毫无线索）。这一组把两种形态都钉住。
+def _facet(v):
+    from opensearch_pipeline.routes.kb_console import _kb_owner_facet_sql
+    return _kb_owner_facet_sql(v)
+
+
+def test_facet_accepts_legacy_prefixed_key_same_as_bare_code():
+    """`legacy:hr` 与裸 `hr` 必须产出**同一条**谓词——facet 键可原样回传。"""
+    assert _facet("legacy:hr") == _facet("hr") == ("AND m.owner_dept = %s", ["hr"])
+
+
+def test_facet_node_key_targets_node_axis_only():
+    sql, params = _facet("node:34265162")
+    assert sql == "AND m.acl_mode = 'node' AND m.owner_dept_id = %s"
+    assert params == [34265162]
+
+
+def test_facet_bare_legacy_prefix_is_rejected_not_silently_unfiltered():
+    """裸 `legacy:` 是非法值，必须 fail-closed（None）——绝不能退化成「不筛选」而泄露全作用域。"""
+    assert _facet("legacy:") == (None, None)
+    assert _facet("legacy:   ") == (None, None)
+
+
+def test_facet_empty_means_no_filter_and_injection_still_stripped():
+    assert _facet("") == ("", [])
+    # 剥前缀后仍走同一套清洗：引号/分号被剥掉（连字符按 _SANITIZE_RE 设计保留——
+    # 组码里合法），且恒参数化，不拼串。
+    assert _facet("legacy:';DROP--") == ("AND m.owner_dept = %s", ["DROP--"])
+    # 清洗后为空 = 传了但清不出东西 → fail-closed，不是"不筛选"
+    assert _facet("legacy:!!!") == (None, None)

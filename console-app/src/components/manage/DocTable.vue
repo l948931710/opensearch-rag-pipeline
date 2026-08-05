@@ -5,7 +5,7 @@ import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock,
 import { deptLabel, permLabel, PERM_LABEL } from '@/lib/kb'
 import { resolveDocOwner } from '@/lib/orgTree'
 import type { OrgNode } from '@/composables/useOrgSnapshot'
-import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
+import { useKb, type DocItem, type OwnerFacet, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 import AccessSyncPill from './AccessSyncPill.vue'
 import LoadError from './LoadError.vue'
@@ -63,6 +63,9 @@ function sharedLabels(docId: string): string[] { return grantedLabelsByDoc.value
 const NO_ORG_SNAPSHOT = new Map<number, OrgNode>()
 const ownerText = (d: DocItem): string =>
   resolveDocOwner(d.owner_key, d.owner_dept, d.owner_label, NO_ORG_SNAPSHOT, deptLabel).label
+// 归属下拉选项文案：与列渲染同一口径（facet 的 legacy label 后端回的是组码原文，故仍走 deptLabel）
+const ownerFacetText = (o: OwnerFacet): string =>
+  resolveDocOwner(o.key, '', o.label, NO_ORG_SNAPSHOT, deptLabel).label
 
 // 利用度副行文案：0=真·从未被引用（退役候选，amber 提示）；>0=引用 N 次；null/undefined=数据不可用不显示。
 function usageText(d: DocItem): string {
@@ -283,7 +286,7 @@ async function onRestore(d: DocItem) {
           @change="setOwnerFilter(($event.target as HTMLSelectElement).value)"
         >
           <option value="">全部归属</option>
-          <option v-for="o in ledgerOwnerOptions" :key="o" :value="o">{{ deptLabel(o) }}</option>
+          <option v-for="o in ledgerOwnerOptions" :key="o.key" :value="o.key">{{ ownerFacetText(o) }}</option>
         </select>
         <select
           :value="permFilter" aria-label="按可见范围筛选"
