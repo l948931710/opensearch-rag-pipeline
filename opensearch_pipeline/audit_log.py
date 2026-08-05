@@ -61,6 +61,24 @@ _ACL_AUDIT_ACTIONS = frozenset({
 })
 
 
+def mask_staff_id(sid) -> str:
+    """审计 message 里嵌钉钉 staffId 时的首4…尾4掩码。
+
+    展示侧（/api/kb/approval-history）对审计 message 无条件过 redaction.redact_text
+    （跨用户安全边界，不放宽），而 16-19 位纯数字 staffId 会命中 bank_card 规则
+    （pii_patterns \\d{16,19}）→ 整段变「[银行卡号已脱敏]」。写侧掩码后消息里只剩
+    两个 4 位数字段，不触发任何号码规则。分隔符必须是 '…'——它不在 masked_id 规则的
+    掩码字符类 [\\*＊✱•·∗●] 内（pii_patterns.ENTITY_PATTERNS）；用 '****' 则命中
+    masked_id 被二次吞成「[标识已脱敏]」。
+    ≤8 字符的 id（撞不到 16 位规则）原样保留，保全审计可读性。
+    完整 staffId 的权威记录在 user_role/dept_admin_*_grant 表，message 只是摘要。
+    """
+    s = str(sid or "")
+    if len(s) <= 8:
+        return s
+    return s[:4] + "…" + s[-4:]
+
+
 def _audit_params(*, doc_id: Optional[str], version_no: Optional[int],
                   action_type: str, action_result: str = "SUCCESS",
                   trace_id: Optional[str] = None, message: Optional[str] = None,

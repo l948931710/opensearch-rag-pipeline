@@ -164,6 +164,40 @@ def test_write_audit_no_acl_stamp_on_lifecycle_action(monkeypatch):
     assert captured["params"][8] == "retired"
 
 
+# ── staffId 掩码（2026-08-04：approval-history bank_card 误伤修复）──────────
+
+def test_mask_staff_id_long_numeric():
+    """16+ 位钉钉 staffId → 首4…尾4（不再落入展示侧 bank_card 规则区间）。"""
+    from opensearch_pipeline.audit_log import mask_staff_id
+    assert mask_staff_id("999900001111222233") == "9999…2233"
+    assert mask_staff_id("99990000111122223333") == "9999…3333"   # 20 位也掩（格式无关）
+
+
+def test_mask_staff_id_short_passthrough():
+    """≤8 字符（测试桩/短 id）撞不到 16 位规则 → 原样保留审计可读性。"""
+    from opensearch_pipeline.audit_log import mask_staff_id
+    assert mask_staff_id("u9") == "u9"
+    assert mask_staff_id("mgr002") == "mgr002"
+    assert mask_staff_id("") == ""
+    assert mask_staff_id(None) == ""
+
+
+def test_masked_grant_message_survives_display_redaction():
+    """掩码后的 KB_ADMIN_GRANT 模板消息过展示侧 redact_text 零替换（本 bug 的回归锚）。
+
+    对照组钉住两个设计依据：完整 18 位 staffId 被 bank_card 吞成占位符（原 bug 复现）；
+    '****' 分隔的掩码被 masked_id 吞（分隔符必须 '…' 的原因）。
+    """
+    from opensearch_pipeline.audit_log import mask_staff_id
+    from opensearch_pipeline.redaction import redact_text
+    msg = (f"[acl_policy=ab12cd34] grant dept_admin {mask_staff_id('999900001111222233')} "
+           "→ depts=- nodes=34265162")
+    out, counts = redact_text(msg)
+    assert out == msg and counts == {}
+    assert "[银行卡号已脱敏]" in redact_text("grant dept_admin 999900001111222233 → depts=-")[0]
+    assert "[标识已脱敏]" in redact_text("grant dept_admin 1013****1320 → depts=-")[0]
+
+
 def test_deactivate_wires_audit_write():
     """node_deactivate_old_chunks must emit a DEACTIVATE audit on the irreversible retirement.
 

@@ -849,17 +849,38 @@ _APPROVAL_HISTORY_LIMIT = 200
 _TZ_PACIFIC_TO_BJ = "'America/Los_Angeles','Asia/Shanghai'"
 
 
+def _mask_legacy_target(tok: str) -> str:
+    """存量未掩码行的展示兜底：token 开头 ≥9 位连续数字段照写侧同款首4…尾4呈现。
+
+    写侧掩码（audit_log.mask_staff_id）2026-08-04 才上线，之前写入的行 message 里是
+    完整 staffId——若照原样返回，剥前缀修复会让它首次出现在 title/subject。新行
+    （'9999…2233'）开头数字段只有 4 位不受影响；seed 行 '8888…2277(张三)' 保留括注。
+    """
+    import re as _re
+    m = _re.match(r"\d{9,}", tok)
+    if not m:
+        return tok
+    from opensearch_pipeline.audit_log import mask_staff_id
+    return mask_staff_id(m.group(0)) + tok[m.end():]
+
+
 def _parse_admin_target(msg: str) -> str:
     """从 KB_ADMIN_GRANT/REVOKE 审计 message 抽目标用户 id（best-effort，格式由我方代码固定）。
 
     grant：'grant dept_admin <uid> → <depts>'；revoke：'revoke <uid> owner=<..> demoted=..'。
+    端点写的行经 _audit_params 盖了 '[acl_policy=<ver>] ' 前缀（KB_ADMIN_* 在
+    _ACL_AUDIT_ACTIONS 内），先剥掉再解析；seed 脚本裸 SQL 写的行无前缀。
+    uid 自 2026-08-04 起为首4…尾4掩码（写侧 mask_staff_id）；更早的存量行经
+    _mask_legacy_target 兜底，任何一代格式都不把完整 staffId 送进 title/subject。
     """
     try:
         parts = (msg or "").split()
+        if parts and parts[0].startswith("[acl_policy="):
+            parts = parts[1:]
         if len(parts) >= 3 and parts[0] == "grant":
-            return parts[2]
+            return _mask_legacy_target(parts[2])
         if len(parts) >= 2 and parts[0] == "revoke":
-            return parts[1]
+            return _mask_legacy_target(parts[1])
     except Exception:
         pass
     return ""
@@ -1395,7 +1416,7 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
     kb = _require_kb_admin(identity)
     from opensearch_pipeline.kb_authz import sanitize_owner_depts, ROLE_DEPT_ADMIN, ROLE_KB_ADMIN
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
-    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.audit_log import mask_staff_id, write_audit
     uid = (req.user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="缺少 user_id（钉钉 staffId）")
@@ -1491,9 +1512,11 @@ def kb_admin_grant(req: KbAdminGrantRequest, request: Request,
                         cur.execute(f"UPDATE {_kb_db()}.dept_admin_node_grant SET is_active=0, updated_at=NOW() "
                                     "WHERE user_id=%s AND is_active=1", (uid,))
                 # 同事务审计（B1）：与角色/授权变更原子提交。
+                # staffId 掩码写入（首4…尾4）：展示侧 approval-history 对 message 无条件
+                # redact_text，完整 16-19 位 staffId 会撞 bank_card 规则整段变占位符。
                 write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_GRANT",
                             operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                            message=f"grant dept_admin {uid} → depts={','.join(depts) or '-'} "
+                            message=f"grant dept_admin {mask_staff_id(uid)} → depts={','.join(depts) or '-'} "
                                     f"nodes={','.join(str(r) for r in (roots or [])) if roots is not None else 'unchanged'}",
                             cursor=cur)
             conn.commit()
@@ -1517,7 +1540,7 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
     kb = _require_kb_admin(identity)
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, ROLE_EMPLOYEE
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
-    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.audit_log import mask_staff_id, write_audit
     uid = (req.user_id or "").strip()
     owner = (req.owner_dept or "").strip()
     if not uid:
@@ -1568,10 +1591,10 @@ def kb_admin_grant_revoke(req: KbAdminRevokeRequest, request: Request,
                     cur.execute(f"UPDATE {_kb_db()}.user_role SET role=%s, updated_at=NOW() "
                                 "WHERE user_id=%s", (ROLE_EMPLOYEE, uid))
                     demoted = True
-                # 同事务审计（B1）：与撤销/降级变更原子提交。
+                # 同事务审计（B1）：与撤销/降级变更原子提交。staffId 掩码同 grant 侧。
                 write_audit(doc_id=None, version_no=None, action_type="KB_ADMIN_REVOKE",
                             operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                            message=f"revoke {uid} owner={owner or '-'} node={node_root or '-'} "
+                            message=f"revoke {mask_staff_id(uid)} owner={owner or '-'} node={node_root or '-'} "
                                     f"demoted={demoted}", cursor=cur)
             conn.commit()
         finally:
@@ -1695,7 +1718,7 @@ def kb_node_candidate_decide(req: KbNodeCandidateDecideRequest, request: Request
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_admin(identity)
     from opensearch_pipeline.env_guard import assert_metadata_write_allowed
-    from opensearch_pipeline.audit_log import write_audit
+    from opensearch_pipeline.audit_log import mask_staff_id, write_audit
     cid = int(req.candidate_id or 0)
     action = (req.action or "").strip().lower()
     if not cid or action not in ("confirm", "reject"):
@@ -1721,7 +1744,8 @@ def kb_node_candidate_decide(req: KbNodeCandidateDecideRequest, request: Request
                                 "WHERE id=%s", (kb.user_id, cid))
                     write_audit(doc_id=None, version_no=None, action_type="KB_NODE_ROOT_REJECT",
                                 operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                                message=f"reject candidate#{cid} {uid} → node {root}", cursor=cur)
+                                message=f"reject candidate#{cid} {mask_staff_id(uid)} → node {root}",
+                                cursor=cur)
                     conn.commit()
                     return KbNodeCandidateDecideResponse(ok=True, status="rejected")
                 # ── confirm ──
@@ -1791,7 +1815,8 @@ def kb_node_candidate_decide(req: KbNodeCandidateDecideRequest, request: Request
                             "WHERE id=%s", (kb.user_id, cid))
                 write_audit(doc_id=None, version_no=None, action_type="KB_NODE_ROOT_CONFIRM",
                             operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
-                            message=f"confirm candidate#{cid} {uid} → node {root}", cursor=cur)
+                            message=f"confirm candidate#{cid} {mask_staff_id(uid)} → node {root}",
+                            cursor=cur)
             conn.commit()
         finally:
             conn.close()

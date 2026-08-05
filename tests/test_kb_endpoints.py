@@ -1025,6 +1025,42 @@ def test_admin_grant_creates_dept_admin(monkeypatch):
     assert sqls.count("INSERT INTO fuling_knowledge.dept_admin_grant") == 2  # 2 个净化后的组
 
 
+def test_admin_grant_audit_message_masks_staff_id(monkeypatch):
+    """审计 message 里 staffId 首4…尾4掩码：完整 16-19 位数字会撞展示侧 bank_card 规则,
+    approval-history 整段变「[银行卡号已脱敏]」（2026-08-04 现网 26 条 grant 全中）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [None])   # 目标用户当前 role 查询 → 无行
+    from opensearch_pipeline import api
+    resp = api.kb_admin_grant(
+        api.KbAdminGrantRequest(user_id="999900001111222233", owner_depts=["marketing"]),
+        request=None, identity=api.Identity(user_id="kbadmin"))
+    assert resp.ok
+    audit_sql, audit_params = next(c for c in sink["calls"] if "kb_audit_log" in c[0])
+    msg = audit_params[8]   # _audit_params 元组序：message 恒在末位
+    assert "9999…2233" in msg and "999900001111222233" not in msg
+    assert msg.startswith("[acl_policy=")   # 掩码不影响 ACL 盖戳
+
+
+def test_parse_admin_target_stamped_and_legacy():
+    """_parse_admin_target 各代格式：盖戳+掩码（新端点写）/legacy 未盖戳短 id（测试桩）/
+    revoke/存量未掩码行（盖戳与 seed 括注两形态）——完整 staffId 一律兜底成首4…尾4。"""
+    from opensearch_pipeline.routes.kb_access import _parse_admin_target
+    assert _parse_admin_target(
+        "[acl_policy=ab12cd34] grant dept_admin 9999…2233 → depts=marketing nodes=unchanged") == "9999…2233"
+    assert _parse_admin_target("grant dept_admin mgr002 → quality,production") == "mgr002"
+    assert _parse_admin_target(
+        "[acl_policy=ab12cd34] revoke 9999…2233 owner=- node=5 demoted=False") == "9999…2233"
+    # 存量未掩码行（写侧掩码上线前）：完整 staffId 不得进 title/subject
+    assert _parse_admin_target(
+        "[acl_policy=ab12cd34] grant dept_admin 999900001111222233 → depts=marketing "
+        "nodes=unchanged") == "9999…2233"
+    assert _parse_admin_target(
+        "grant dept_admin 888800001111222277(张三) → nodes=149975081(国内营销部) "
+        "via seed_20260804") == "8888…2277(张三)"
+    assert _parse_admin_target("") == ""
+
+
 def test_admin_grant_invalid_depts_400(monkeypatch):
     """owner_depts 全非白名单 → 400（不写库）。"""
     _skip_if_not_sim()
