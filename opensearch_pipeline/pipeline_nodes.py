@@ -295,8 +295,19 @@ def node_scan_raw_files(ctx: dict):
                 try:
                     conn = _get_db_conn(select_db=True)
                     with conn.cursor() as cursor:
+                        # skip-gate 残留行撞号（2026-08-04，同族 console 修复=901433b）：取号
+                        # 不能只看 current_version_no——skip-gate 命中同正文重传时回退指针但
+                        # 保留 SKIPPED_DUPLICATE 的 dv 行（旧+1），current+1 必与残留行同号。
+                        # GREATEST 一并纳入 dv 侧最大号。必须单条 SQL（相关子查询）而非再发
+                        # 一条 MAX 查询：第二条查询若单独失败，version_no 落空会走下方
+                        # "version_no=1" 兜底，给已有文档取 v1 反而必撞——失败面必须与原
+                        # 单查询一致。advisory 取号无需锁定读，真正防线在 register 的身份守卫。
                         cursor.execute(
-                            "SELECT doc_id, current_version_no FROM document_meta WHERE original_filename = %s AND owner_dept = %s LIMIT 1",
+                            "SELECT dm.doc_id, GREATEST(COALESCE(dm.current_version_no, 0), "
+                            "COALESCE((SELECT MAX(dv.version_no) FROM document_version dv "
+                            "WHERE dv.doc_id = dm.doc_id), 0)) "
+                            "FROM document_meta dm "
+                            "WHERE dm.original_filename = %s AND dm.owner_dept = %s LIMIT 1",
                             (filename, dept)
                         )
                         row = cursor.fetchone()
@@ -391,25 +402,48 @@ def node_register_metadata(ctx: dict):
                          "node" if _is_node else "legacy", task.get("owner_dept_id"), version_no),
                         (doc_id, title, title, owner_dept or "unknown", version_no))
                     
-                    # 2. document_version：先 UPDATE（已存在的记录），无匹配再 INSERT
+                    # 2. document_version：先 UPDATE（已存在的记录），无匹配再 INSERT。
+                    # 防收养（2026-08-04，同族 console 修复=901433b）：UPDATE 谓词带 raw_key
+                    # 身份（<=> 为 NULL-safe——raw_key 列 DEFAULT NULL）。(doc_id, version_no)
+                    # 相同但 raw_key 不同的行（典型=skip-gate 回退指针后残留的 SKIPPED_DUPLICATE
+                    # 行）绝不"收养"——旧写法只刷 file_ext/status，新文件顶着旧 raw_key 且状态
+                    # 不在 stage-1 扫描/认领谓词（NOT_STARTED/LOADING/FAILED）内，内容永不入
+                    # 索引。撞号 fail-loud 整批回滚，重跑经 scanner 的 GREATEST 取号自愈。
+                    _task_rk = task.get("raw_key", "")
                     cursor.execute("""
                         UPDATE document_version
                         SET file_ext = %s, status = 'active', updated_at = NOW()
-                        WHERE doc_id = %s AND version_no = %s
-                    """, (task.get("file_ext", ""), doc_id, version_no))
+                        WHERE doc_id = %s AND version_no = %s AND raw_key <=> %s
+                    """, (task.get("file_ext", ""), doc_id, version_no, _task_rk))
                     if cursor.rowcount == 0:
-                        # 新文档，需要 INSERT 全部必填字段
-                        import hashlib as _hl
-                        raw_key = task.get("raw_key", "")
-                        raw_key_hash = _hl.sha256(raw_key.encode()).hexdigest() if raw_key else ""
-                        cursor.execute(f"""
-                            INSERT INTO document_version
-                            (doc_id, version_no, bucket_name, raw_key, raw_key_hash, file_ext,
-                             gate_status, content_process_status, chunk_status, index_status, status)
-                            VALUES (%s, %s, %s, %s, %s, %s,
-                                    'pending_clean', 'NOT_STARTED', 'NOT_STARTED', '{DocVersionIndexStatus.NOT_INDEXED}', 'active')
-                        """, (doc_id, version_no, task.get("bucket_name", ""),
-                              raw_key, raw_key_hash, task.get("file_ext", "")))
+                        # pymysql 默认 rowcount=changed rows：同秒重跑值全同也报 0——必须
+                        # 回读区分三态，直接 INSERT 会把幂等重跑变成 1062 撞 uk_doc_version。
+                        cursor.execute(
+                            "SELECT raw_key FROM document_version "
+                            "WHERE doc_id = %s AND version_no = %s",
+                            (doc_id, version_no))
+                        _vrow = cursor.fetchone()
+                        if _vrow is not None and _vrow[0] == _task_rk:
+                            pass    # 同身份行已在（同秒无变化重跑）→ 幂等命中，无需再写
+                        elif _vrow is not None:
+                            raise RuntimeError(
+                                f"document_version 撞号拒收养: doc={doc_id} v{version_no} "
+                                f"既有行 raw_key={_vrow[0]!r} ≠ 任务 raw_key={_task_rk!r}"
+                                "（疑 skip-gate 残留 SKIPPED_DUPLICATE 行）；整批回滚，"
+                                "重跑将按 dv 侧最大号另取新号")
+                        else:
+                            # 新文档，需要 INSERT 全部必填字段
+                            import hashlib as _hl
+                            raw_key_hash = (_hl.sha256(_task_rk.encode()).hexdigest()
+                                            if _task_rk else "")
+                            cursor.execute(f"""
+                                INSERT INTO document_version
+                                (doc_id, version_no, bucket_name, raw_key, raw_key_hash, file_ext,
+                                 gate_status, content_process_status, chunk_status, index_status, status)
+                                VALUES (%s, %s, %s, %s, %s, %s,
+                                        'pending_clean', 'NOT_STARTED', 'NOT_STARTED', '{DocVersionIndexStatus.NOT_INDEXED}', 'active')
+                            """, (doc_id, version_no, task.get("bucket_name", ""),
+                                  _task_rk, raw_key_hash, task.get("file_ext", "")))
                 conn.commit()
             print("    └─ Saved registered metadata to RDS (document_meta, document_version)")
         except Exception as e:
