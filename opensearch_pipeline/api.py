@@ -2026,12 +2026,15 @@ def _resign_visible_doc_ids(doc_ids: set, identity: Optional[Identity]) -> set:
                 try:
                     from opensearch_pipeline.access_grants import resolve_doc_acl
                     from opensearch_pipeline.acl_policy import can_read_doc
+                    _grant, _enforce = _R._node_acl_flags()
                     _acls = resolve_doc_acl(_node_ids, cur, strict=True)
                     _ctx = _build_acl_ctx(identity)
                     if _ctx is not None:
                         for d in _node_ids:
                             _acl = _acls.get(d)
-                            if _acl is not None and can_read_doc(_ctx, _acl):
+                            if _acl is not None and can_read_doc(
+                                    _ctx, _acl,
+                                    grant_enabled=_grant, enforce_enabled=_enforce):
                                 _node_ok.add(d)
                 except Exception as _ne:   # noqa: BLE001 — 权威不可达 ⇒ 该批 node 全拒
                     logger.warning("resign-images node 判定失败（node 文档全拒）: %s", _ne)

@@ -177,3 +177,85 @@ def test_access_submit_rejected_on_node_doc(client, monkeypatch):
     _wire(monkeypatch, _Cur(doc_mode="node", doc_owner=None))
     r = client.post("/api/kb/access-requests", json={"doc_id": "D1", "reason": "x"})
     assert r.status_code == 400 and "组织树" in r.json()["detail"]
+
+
+# ── resign-images:node 文档走真 can_read_doc(调用签名回归钉,2026-08-04 红队)──
+# 刻意不 mock can_read_doc:被钉的缝隙正是 api ↔ acl_policy 的调用契约
+# (keyword-only grant/enforce 少传 ⇒ 恒 TypeError 被 except 兜住 ⇒ node 批全拒)。
+# 脚手架独立于上方 _Cur/_Conn(其 document_meta 分支匹配不上 resign 的三列查询)。
+
+class _MetaCur:
+    """只应答 resign 的 document_meta 三列查询(doc_id, permission_level, owner_dept)。"""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        pass
+
+    def fetchall(self):
+        return self._rows
+
+
+class _MetaConn:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def cursor(self):
+        return _MetaCur(self._rows)
+
+    def close(self):
+        pass
+
+
+def _wire_resign(monkeypatch, *, flags):
+    """resign node 分支的全部缝隙:DB 连接 / 模式批查 / 权威解析 / 身份 / 姿态旗。"""
+    from opensearch_pipeline import access_grants, api, retriever
+    from opensearch_pipeline.acl_policy import AclContext, DocAcl
+
+    rows = [("DOC_NODE_OK", "dept_internal", None),
+            ("DOC_NODE_OTHER", "dept_internal", None)]
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn",
+                        lambda *a, **k: _MetaConn(rows))
+    monkeypatch.setattr(access_grants, "resolve_acl_modes",
+                        lambda ids, cur: {d: "node" for d in ids})
+    acls = {
+        "DOC_NODE_OK": DocAcl(mode="node", permission_level="dept_internal",
+                              node_ids=(110,)),
+        "DOC_NODE_OTHER": DocAcl(mode="node", permission_level="dept_internal",
+                                 node_ids=(999,)),
+    }
+    monkeypatch.setattr(access_grants, "resolve_doc_acl",
+                        lambda ids, cur, strict=False: {d: acls[d] for d in ids})
+    ctx = AclContext(groups=("hr",), ancestor_dept_ids=(1, 110),
+                     direct_dept_ids=(110,), node_channel_ok=True)
+    monkeypatch.setattr(api, "_build_acl_ctx", lambda identity, user_id=None: ctx)
+    monkeypatch.setattr(retriever, "_node_acl_flags", lambda: flags)
+    return api
+
+
+def test_resign_node_doc_grant_hit_not_all_denied(monkeypatch):
+    """授权节点命中的 node 文档必须可签——缺陷态(TypeError 兜底)会全拒,本测试即红。"""
+    api = _wire_resign(monkeypatch, flags=(True, True))
+    ident = api.Identity(user_id="u1", acl_groups=["hr"])
+    visible = api._resign_visible_doc_ids({"DOC_NODE_OK", "DOC_NODE_OTHER"}, ident)
+    assert visible == {"DOC_NODE_OK"}   # 未授权篇不可见:防过修成 fail-open
+
+
+def test_resign_node_doc_denied_when_grant_off(monkeypatch, caplog):
+    """GRANT 关 ⇒ 真值表无条件 DENY,且必须是裁决而非异常兜底(无兜底告警)——
+    钉住姿态旗真从 config 通到判定点(防硬编码 True/True 或实参对调)。"""
+    import logging
+
+    api = _wire_resign(monkeypatch, flags=(False, True))
+    ident = api.Identity(user_id="u1", acl_groups=["hr"])
+    with caplog.at_level(logging.WARNING):
+        visible = api._resign_visible_doc_ids({"DOC_NODE_OK", "DOC_NODE_OTHER"}, ident)
+    assert visible == set()
+    assert "resign-images node 判定失败" not in caplog.text
