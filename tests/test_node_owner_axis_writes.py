@@ -148,3 +148,91 @@ def test_complete_meta_projection_empty_noop(monkeypatch):
 
     monkeypatch.setattr(db, "_get_db_conn", _boom)
     assert complete_meta_projection([]) == {"completed": 0, "superseded": 0, "errors": []}
+
+
+# ── 摄取侧 node 默认可见授权：语句真的被发出（2026-08-05）────────────────────────
+# 与 tests/test_kb_db_integration.py 的真库用例是**两半**：那边证「SQL 语义在真表上成立」
+# （唯一键幂等 / 撤销不复活），这边证「node_register_metadata 真的会发这条语句」。缺任一半，
+# 把生产代码删掉都还能全绿。
+class _RegCur:
+    """记录全部 execute 的桩游标（登记路径只需要 rowcount 与 execute 轨迹）。"""
+
+    def __init__(self):
+        self.sqls = []
+        self.rowcount = 1          # 恒当作"真插入"，好让 epoch bump 分支也被走到
+
+    def execute(self, sql, args=()):
+        self.sqls.append((" ".join(sql.split()), args))
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _RegConn:
+    def __init__(self, cur):
+        self._c = cur
+
+    def cursor(self, *a, **k):
+        return self._c
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _run_register(monkeypatch, task):
+    from opensearch_pipeline import pipeline_nodes as pn
+    cur = _RegCur()
+    # _get_db_conn 是 `from ... import` 进 pipeline_nodes 命名空间的 ⇒ 必须打这个名字。
+    monkeypatch.setattr(pn, "_get_db_conn", lambda *a, **k: _RegConn(cur))
+    # 破坏性写守卫在打开连接前跑（本地 host，桩掉以免依赖环境）。
+    monkeypatch.setattr("opensearch_pipeline.env_guard.assert_destructive_write_allowed",
+                        lambda *a, **k: None)
+    try:
+        pn.node_register_metadata({"tasks": [task], "simulate_db": False})
+    except Exception:
+        pass                        # 只关心是否发出了授权语句，后续步骤缺桩可失败
+    return [s for s, _ in cur.sqls], cur.sqls
+
+
+def _grant_stmts(sqls):
+    return [(s, a) for s, a in sqls if "INSERT INTO kb_doc_node_grant" in s]
+
+
+def test_ingest_node_task_emits_default_subtree_grant(monkeypatch):
+    """node 任务必须发出归属节点的 subtree 默认授权——否则重灌出的文档对所有人不可见。"""
+    _, sqls = _run_register(monkeypatch, {
+        "doc_id": "DOC_UT_NODE", "version_no": 1, "filename": "a.pdf",
+        "acl_mode": "node", "owner_dept_id": 34265162, "raw_key": "raw/node-34265162/x/a.pdf",
+    })
+    g = _grant_stmts(sqls)
+    assert g, "node 登记未发出 kb_doc_node_grant 授权语句 ⇒ allowed_depts=[]，全员不可见"
+    sql, args = g[0]
+    assert "'subtree'" in sql, "默认档必须是 subtree（对齐 console「仅本部门」语义）"
+    assert 34265162 in args, "授权目标必须是归属节点"
+    assert "ON DUPLICATE KEY UPDATE id = id" in sql, (
+        "必须是 no-op 复活防线：照抄 console 的 revoked_at=NULL 会让管理员撤销过的授权"
+        "在下次重灌被静默还原")
+
+
+def test_ingest_legacy_task_emits_no_node_grant(monkeypatch):
+    """legacy 任务绝不能写节点授权（模式互斥，写了就是把组码文档拉进 node 语义）。"""
+    _, sqls = _run_register(monkeypatch, {
+        "doc_id": "DOC_UT_LEGACY", "version_no": 1, "filename": "b.pdf",
+        "dept": "hr", "raw_key": "raw/hr/x/b.pdf",
+    })
+    assert not _grant_stmts(sqls), "legacy 任务不得写 kb_doc_node_grant"

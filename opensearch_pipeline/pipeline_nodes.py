@@ -402,6 +402,42 @@ def node_register_metadata(ctx: dict):
                          "node" if _is_node else "legacy", task.get("owner_dept_id"), version_no),
                         (doc_id, title, title, owner_dept or "unknown", version_no))
                     
+                    # 1b. node 任务的**默认可见授权**（2026-08-05）：归属节点 subtree 一行。
+                    #
+                    # ⚠️ 为什么必须有：node 文档的可见性【完全】来自 kb_doc_node_grant ——
+                    # `acl_policy.project_doc_acl` 的 node 分支只从 node_ids/exact_node_ids 产出
+                    # allowed_depts，**归属列 owner_dept_id 不隐含任何可见性**（它是管理轴不是
+                    # 可见轴，`access_grants.resolve_doc_acl` 也只读 revoked_at IS NULL 的授权行）。
+                    # 而写授权行的此前只有 console 两条路由（上传登记 / 跨部门授权），摄取侧一行不写
+                    # ⇒ 按组织树重灌出来的文档 allowed_depts=[]，**对所有人不可见，且检索静默返回空、
+                    # 与「没检索到」长得一模一样**。语义对齐 console 上传的「仅本部门」档（同为 subtree）。
+                    #
+                    # ⚠️ `ON DUPLICATE KEY UPDATE id=id` 是**有意的 no-op**，不是偷懒：console 侧
+                    # 那条 ON DUPLICATE 会 `revoked_at=NULL` 复活，因为它是人主动带着 visible_nodes
+                    # 上传。摄取是自动的、每个版本都会跑——若也复活，管理员**撤销过**的归属授权会在
+                    # 下一次重灌时被静默还原（ACL 回归，且无人察觉）。故：缺则补、有则一概不动。
+                    if _is_node and task.get("owner_dept_id"):
+                        try:
+                            cursor.execute(
+                                "INSERT INTO kb_doc_node_grant "
+                                "(doc_id, dept_id, scope, granted_by, note) VALUES (%s,%s,'subtree',%s,%s) "
+                                "ON DUPLICATE KEY UPDATE id = id",
+                                (doc_id, int(task["owner_dept_id"]), "__ingest__", "ingest_default"))
+                            # rowcount==1 = 真插入；==0 = 已存在（含已撤销）⇒ 不 bump，避免每次
+                            # 重灌都给全量文档刷 outbox（投影 drain 是有成本的批处理）。
+                            if cursor.rowcount == 1:
+                                from opensearch_pipeline.access_grants import (
+                                    record_acl_projection_invalidation,
+                                )
+                                record_acl_projection_invalidation(
+                                    cursor, doc_id, reason="ingest_node_default")
+                        except Exception as _ge:   # noqa: BLE001
+                            # 不中止摄取（文档本身已登记），但**必须响亮**——静默失败的表现形式
+                            # 正是"文档在库里但谁都搜不到"，是最难归因的一类。
+                            print(f"    ⚠️ node 默认可见授权写入失败 doc={doc_id} "
+                                  f"node={task.get('owner_dept_id')}：该文档将对所有人不可见，"
+                                  f"需人工在控制台补授权 —— {_ge}")
+
                     # 2. document_version：先 UPDATE（已存在的记录），无匹配再 INSERT。
                     # 防收养（2026-08-04，同族 console 修复=901433b）：UPDATE 谓词带 raw_key
                     # 身份（<=> 为 NULL-safe——raw_key 列 DEFAULT NULL）。(doc_id, version_no)

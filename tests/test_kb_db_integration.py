@@ -313,3 +313,84 @@ def test_feedback_review_executes_on_real_schema(monkeypatch):
             _cleanup(conn)
         finally:
             conn.close()
+
+
+# ── 摄取侧 node 默认可见授权（2026-08-05）──────────────────────────────────────
+# 为什么必须在**真库**：node 文档的可见性完全来自 kb_doc_node_grant，摄取此前一行不写
+# ⇒ 按组织树重灌出来的文档 allowed_depts=[]，对所有人不可见，且检索静默返回空。
+# 桩游标不校验唯一键、也不给 rowcount 语义，"缺则补/有则不动"这条只有真表能证。
+_NG_DOC = "DOC_ITEST_NODEGRANT"
+_NG_NODE = 999000111
+
+
+def _ng_cleanup(cur):
+    cur.execute("DELETE FROM kb_doc_node_grant WHERE doc_id=%s", (_NG_DOC,))
+    cur.execute("DELETE FROM document_meta WHERE doc_id=%s", (_NG_DOC,))
+    cur.execute("DELETE FROM kb_acl_projection_outbox WHERE doc_id=%s", (_NG_DOC,))
+
+
+def _ng_register(cur, doc_id=_NG_DOC, node_id=_NG_NODE):
+    """复刻 pipeline_nodes 摄取登记里 node 分支的两句（document_meta + 默认授权）。"""
+    from opensearch_pipeline.access_grants import record_acl_projection_invalidation
+    cur.execute(
+        "INSERT INTO document_meta (doc_id,title,original_filename,owner_dept,acl_mode,"
+        "owner_dept_id,status,current_version_no) VALUES (%s,'t','t.pdf',NULL,'node',%s,'active',1) "
+        "ON DUPLICATE KEY UPDATE current_version_no=GREATEST(current_version_no,1)",
+        (doc_id, node_id))
+    cur.execute(
+        "INSERT INTO kb_doc_node_grant (doc_id, dept_id, scope, granted_by, note) "
+        "VALUES (%s,%s,'subtree',%s,%s) ON DUPLICATE KEY UPDATE id = id",
+        (doc_id, node_id, "__ingest__", "ingest_default"))
+    inserted = cur.rowcount == 1
+    if inserted:
+        record_acl_projection_invalidation(cur, doc_id, reason="ingest_node_default")
+    return inserted
+
+
+@requires_local_db
+def test_ingest_node_default_grant_created_and_never_revives_revoked():
+    """① 首次登记建 subtree 授权 ② 重灌幂等不重复 ③ **撤销后重灌绝不复活**。
+
+    ③ 是本用例的重点：console 侧那条 ON DUPLICATE 会 `revoked_at=NULL` 复活（人主动带
+    visible_nodes 上传），摄取若照抄，管理员撤销过的归属授权会在下次重灌被静默还原 ——
+    ACL 回归且无人察觉。故摄取用 `ON DUPLICATE KEY UPDATE id=id` 的 no-op。
+    """
+    from opensearch_pipeline.db import _get_db_conn
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _ng_cleanup(cur)
+            conn.commit()
+
+            # ① 首次登记 → 建出 subtree 授权 + 投影入队
+            assert _ng_register(cur) is True, "首次登记应真插入授权行"
+            conn.commit()
+            cur.execute("SELECT scope, revoked_at, note FROM kb_doc_node_grant "
+                        "WHERE doc_id=%s AND dept_id=%s", (_NG_DOC, _NG_NODE))
+            row = cur.fetchone()
+            assert row is not None, "摄取未写默认授权 ⇒ 该文档对所有人不可见"
+            assert row[0] == "subtree" and row[1] is None
+            cur.execute("SELECT COUNT(*) FROM kb_acl_projection_outbox WHERE doc_id=%s", (_NG_DOC,))
+            assert cur.fetchone()[0] == 1, "首次建授权必须入队投影，否则 HA3 侧永不收敛"
+
+            # ② 重灌（同 doc 同节点）→ 幂等，不重复建、不重复入队
+            assert _ng_register(cur) is False, "重灌不应再次插入（rowcount 必须为 0）"
+            conn.commit()
+            cur.execute("SELECT COUNT(*) FROM kb_doc_node_grant WHERE doc_id=%s", (_NG_DOC,))
+            assert cur.fetchone()[0] == 1
+
+            # ③ 管理员撤销 → 重灌**不得**复活
+            cur.execute("UPDATE kb_doc_node_grant SET revoked_at=NOW(), revoked_by='admin' "
+                        "WHERE doc_id=%s AND dept_id=%s", (_NG_DOC, _NG_NODE))
+            conn.commit()
+            _ng_register(cur)
+            conn.commit()
+            cur.execute("SELECT revoked_at FROM kb_doc_node_grant "
+                        "WHERE doc_id=%s AND dept_id=%s", (_NG_DOC, _NG_NODE))
+            assert cur.fetchone()[0] is not None, (
+                "撤销过的归属授权被重灌静默复活 —— ACL 回归（console 的复活语义不可照抄到摄取侧）")
+        with conn.cursor() as cur:
+            _ng_cleanup(cur)
+            conn.commit()
+    finally:
+        conn.close()
