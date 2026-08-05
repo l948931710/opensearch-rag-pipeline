@@ -19,8 +19,15 @@ doc_status × publish_status × chunk_status × index_status × content_process_
 依赖本地 MySQL（conftest 串行组成员）。无本地栈则 skip。
 """
 import itertools
+import os
 
 import pytest
+
+# 库名带 pid：固定名 + `CREATE/DROP DATABASE` 在两个 pytest 进程同时跑时会互相端掉对方的库
+# （对面一句 DROP 落在本侧灌 12.9 万行与自连接查询之间 ⇒ 1049/1146 硬红，且本模块没有任何
+# 兜底判据，报错完全指不到真因）。pid 后缀是**单边**兜底：不依赖对面进程是否带 conftest 的
+# 跨进程锁——本机 10 个老 worktree 都带着固定库名版本在跑。窗口是组内最长的 4.51s × 2 条。
+_DB = f"badge_parity_test_{os.getpid()}"
 
 
 def _conn():
@@ -69,8 +76,8 @@ def test_badge_python_sql_parity_full_cross_product(_rows):
     conn = _conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("CREATE DATABASE IF NOT EXISTS badge_parity_test")
-            cur.execute("USE badge_parity_test")
+            cur.execute(f"CREATE DATABASE IF NOT EXISTS {_DB}")
+            cur.execute(f"USE {_DB}")
             cur.execute("DROP TABLE IF EXISTS t")
             cols = ", ".join(f"{c} VARCHAR(32)" for c in _COLS)
             cur.execute(f"CREATE TABLE t (i INT PRIMARY KEY, {cols}) DEFAULT CHARSET utf8mb4")
@@ -94,7 +101,7 @@ def test_badge_python_sql_parity_full_cross_product(_rows):
             + "; ".join(f"{v} → py={p!r} sql={s!r}" for v, p, s in bad[:3]))
     finally:
         with conn.cursor() as cur:
-            cur.execute("DROP DATABASE IF EXISTS badge_parity_test")
+            cur.execute(f"DROP DATABASE IF EXISTS {_DB}")
         conn.close()
 
 
@@ -105,8 +112,8 @@ def test_sql_mirror_never_emits_outside_vocab(_rows):
     conn = _conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("CREATE DATABASE IF NOT EXISTS badge_parity_test")
-            cur.execute("USE badge_parity_test")
+            cur.execute(f"CREATE DATABASE IF NOT EXISTS {_DB}")
+            cur.execute(f"USE {_DB}")
             cur.execute("DROP TABLE IF EXISTS t2")
             cols = ", ".join(f"{c} VARCHAR(32)" for c in _COLS)
             cur.execute(f"CREATE TABLE t2 (i INT PRIMARY KEY, {cols}) DEFAULT CHARSET utf8mb4")
@@ -118,7 +125,7 @@ def test_sql_mirror_never_emits_outside_vocab(_rows):
         assert got <= set(_KB_BADGE_VOCAB), f"SQL 镜像产出了词表外的徽章：{got - set(_KB_BADGE_VOCAB)}"
     finally:
         with conn.cursor() as cur:
-            cur.execute("DROP DATABASE IF EXISTS badge_parity_test")
+            cur.execute(f"DROP DATABASE IF EXISTS {_DB}")
         conn.close()
 
 

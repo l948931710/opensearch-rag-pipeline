@@ -239,10 +239,13 @@ def _local_stack_xproc_lock(request):
     if base not in _LOCAL_STACK_SERIAL_MODULES:
         yield
         return
-    from tests.local_stack import ensure_local_db_wired, local_stack_exclusive
+    from tests.local_stack import (
+        ensure_local_db_wired, local_stack_exclusive, sweep_stale_scratch_schemas,
+    )
     if not ensure_local_db_wired():      # 无本地栈（CI 普通 test job）⇒ 零成本 no-op
         yield
         return
+    sweep_stale_scratch_schemas()        # 每进程一次；回收崩溃遗留的 <前缀><pid> 探针库
     with local_stack_exclusive():
         yield
 

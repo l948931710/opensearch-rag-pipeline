@@ -216,13 +216,30 @@ def test_xproc_lock_is_actually_engaged():
     没降级却也没持锁 ⇒ **红**（那是接线坏了，正是本测试要守的东西）。
     """
     from tests import local_stack
+    from tests.conftest import _LOCAL_STACK_SERIAL_MODULES
+
+    # 加害者的组成员资格：元测试只守「本条测试的接线」是不够的——把真正执行无 WHERE
+    # `DELETE FROM document_meta|document_version` 的 test_classification 从组里删掉，
+    # 保护会静默归零而本测试照绿。纯 Python 断言，零 DB 成本。
+    assert {"test_classification.py", "test_pipeline.py"} <= _LOCAL_STACK_SERIAL_MODULES, (
+        "执行无 WHERE 整表 DML 的模块不在串行组里 ⇒ 它既不取锁、也不与本组串行，"
+        "跨进程保护静默归零")
 
     reason = local_stack.local_stack_lock_degraded_reason()
+    stats = local_stack.local_stack_lock_stats()
     if reason == "disabled":
         pytest.skip("RAG_TEST_XPROC_LOCK 显式关闭，跨进程锁不生效（逃生口）")
-    if reason in ("timeout", "error"):
-        pytest.skip(f"跨进程锁本次降级（{reason}）——另一个 pytest 进程占着锁或连接异常，"
-                    "属环境争用，本 run 全程无跨进程保护")
+    if reason == "error" and not (stats.keys() - {"error"}):
+        # 连不上库：整组本来就跑不动，skip 才是如实的（不是「锁坏了」）
+        pytest.skip(f"跨进程锁连接异常（{stats}）——本地栈不可达，本 run 无跨进程保护")
+    # ⚠️ timeout/null **判红不判 skip**：等满 120s 意味着确有另一进程在撞（组内最长单测
+    # 才 4.51s，正常争用根本等不到超时），此时本 run 的所有绿灯在跨进程维度上都不作数。
+    # 早先这里 skip 自己，评审实跑出「exit=0 + 零保护 + 零痕迹」——警报器在最该响的时候闭嘴。
+    bad = {k: v for k, v in stats.items() if k in ("timeout", "null", "unwired")}
+    assert not bad, (
+        f"本 run 出现过跨进程锁降级 {bad} ⇒ 期间**没有**跨进程保护，那些用例的绿灯在"
+        "跨进程维度上不作数。常见成因：另一个 pytest 进程长时间占锁（含不带本 fixture 的"
+        "老 worktree 把锁攥死）、或 MySQL 侧 GET_LOCK 返回异常值。")
     assert local_stack.local_stack_lock_held(), (
         "跨进程锁没有生效，且没有任何降级原因 ⇒ 接线坏了（fixture 未挂上／模块不在 "
         "_LOCAL_STACK_SERIAL_MODULES ／锁名或专用连接构造有误）。"

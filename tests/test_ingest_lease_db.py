@@ -92,7 +92,23 @@ def _row(conn, doc_id, ver=1):
             "SELECT content_process_status, index_status, lease_holder, lease_expires_at,"
             " lease_epoch FROM document_version WHERE doc_id=%s AND version_no=%s",
             (doc_id, ver))
-        return cur.fetchone()
+        row = cur.fetchone()
+    if row is None:
+        # 本模块是跨进程互踩的**头号受害者**（实测：另一个 pytest 进程循环跑
+        # test_classification 时 25/25 红，9 个用例中招）。加害者是它 clean_db 里那句
+        # **无 WHERE** `DELETE FROM document_version`：本测试 seed 的行被整表清掉。
+        # 不点破的话，调用方拿到 None 后炸在 `_row(...)[0]` 上（`cannot unpack
+        # non-iterable NoneType`），报错**指向产品**、而终端上看不出锁根本没生效。
+        from tests.local_stack import local_stack_lock_degraded_reason, local_stack_lock_held
+        status = ("持有跨进程锁（对面若是不带该 fixture 的老 worktree 仍拦不住）"
+                  if local_stack_lock_held()
+                  else f"**未持有**跨进程锁（降级原因={local_stack_lock_degraded_reason()!r}）")
+        raise AssertionError(
+            f"document_version 里 doc_id={doc_id!r} version={ver} 的 seed 行不见了——"
+            f"本进程只按自己的 doc_id 前缀写删，故只可能是**外部进程的整表 DML**"
+            f"（本次{status}）。本机是否同时在跑第二个 pytest？"
+            "这不是产品缺陷，别照着 lease 逻辑查。")
+    return row
 
 
 def _claim_stage2(conn, ls, doc_id, ver=1):

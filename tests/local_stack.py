@@ -176,12 +176,19 @@ def local_opensearch_unavailable_reason() -> str:
 # 安全边界）；这边 fail-open 降级（测试互斥只是防串数据，取不到锁而让 119 个用例
 # 集体 ERROR 是更坏的结果）。锁名前缀也刻意避开它的 `rag_ingest:`，两套锁互不干扰。
 _XPROC_LOCK_TIMEOUT_S = 120   # 实测组内最长单测 4.51s；代码级上限约 30s（线程 join）⇒ 约 4× 余量
+_XPROC_LOCK_ERROR_GIVEUP = 3  # 连败 N 次（每次 connect_timeout=5s）就不再尝试，避免 125×5s 空等
 _xproc_lock_conn = None
+_xproc_lock_name_cached = None
 _xproc_lock_held = False
-_xproc_lock_gave_up = False   # 超时过一次就不再等（否则 119 个用例 × 120s ≈ 4 小时空转）
-# 降级原因：None=没降级。区分「环境争用」（timeout/异常，属实况）与「机制没生效」
-# （没降级却也没持锁 = 接线坏了），元测试据此决定 skip 还是红。
+# 超时过一次后改用**非阻塞**探测（GET_LOCK(name,0)）而不是彻底放弃：成本≈0，
+# 对面一空出来立刻恢复保护。⚠️ 早先写成「一次性永久放弃」是错的——评审实跑证明它会在
+# 「锁真的失效」那一刻把保护全程关掉，同时让元测试 skip 自己 ⇒ exit=0 且零痕迹。
+_xproc_lock_nonblocking = False
+_xproc_lock_errors = 0
+# 降级原因：None=没降级。区分「环境」（disabled/error）与「机制没生效」（timeout/null/unwired），
+# 元测试据此决定 skip 还是红。计数按原因累计，供元测试做**run 级**判定（不只看自己那一次）。
 _xproc_lock_degraded = None
+_xproc_lock_degraded_counts = {}
 
 
 def _xproc_lock_enabled() -> bool:
@@ -190,11 +197,40 @@ def _xproc_lock_enabled() -> bool:
         not in ("0", "false", "no", "off")
 
 
+def local_stack_lock_stats() -> dict:
+    """本 worker 迄今各降级原因的次数（供元测试做 run 级判定）。空 = 全程都握着锁。"""
+    return dict(_xproc_lock_degraded_counts)
+
+
 def _xproc_lock_name() -> str:
-    """锁名 = 实例级标识。**不带库名**：受保护面横跨 fuling_knowledge + fuling_operation
-    + 各测试自建的探针库，锁保护的是「这台 MySQL」。MySQL 锁名上限 64 字符、大小写不敏感。"""
-    host, port = _wired_dsn[0], _wired_dsn[1]
-    return f"rag_test_xproc:{host}:{port}"[:64]
+    """锁名 = **服务端身份**（`@@server_uuid`），不是客户端对 host 的拼法。
+
+    为什么不用 host:port：`_LOCAL_HOSTS` 同时接受 `localhost` 与 `127.0.0.1`，两个
+    worktree 各写一个就会算出**两把不同的锁** ⇒ 零互斥，而两边的元测试都照绿
+    （各自持有各自的名字）。评审实测：两种拼法的 `@@server_uuid` 相同、而两个名字
+    可被同时持有。用 server_uuid 顺带把「同机多套栈/不同端口」也一并解对。
+    每进程只多一次 round-trip（结果缓存）。
+    """
+    global _xproc_lock_name_cached
+    if _xproc_lock_name_cached is None:
+        with _xproc_lock_connection().cursor() as cur:
+            cur.execute("SELECT @@server_uuid")
+            uuid = cur.fetchone()[0]
+        name = f"rag_test_xproc:{uuid}"
+        if len(name) > 64:   # MySQL 用户锁名上限；静默截断=两边各锁各的，宁可炸
+            raise RuntimeError(f"跨进程锁名超 64 字符，会被 MySQL 拒绝：{name!r}")
+        _xproc_lock_name_cached = name
+    return _xproc_lock_name_cached
+
+
+def _close_xproc_lock_conn():
+    """丢弃专用连接前**显式 close**：否则锁的释放要靠 CPython 引用计数及时归零
+    （traceback / warning 栈帧都可能多攥一会儿），旧会话攥着锁 ⇒ 新连接与自己抢锁。"""
+    global _xproc_lock_conn
+    conn, _xproc_lock_conn = _xproc_lock_conn, None
+    if conn is not None:
+        with contextlib.suppress(Exception):
+            conn.close()
 
 
 def _xproc_lock_connection():
@@ -221,6 +257,44 @@ def _xproc_lock_connection():
     return _xproc_lock_conn
 
 
+_SCRATCH_SCHEMA_PREFIXES = ("pg_probe_pytest_", "badge_parity_test_")
+_swept = False
+
+
+def sweep_stale_scratch_schemas():
+    """回收崩溃遗留的探针库（`<前缀><pid>`）。幂等，每进程只跑一次。
+
+    背景：这些库改带 pid 后缀是为了**单边免疫**（不依赖对面进程带锁），代价是丢掉了
+    「固定名 + 开跑先 DROP」自带的自愈——被 Ctrl-C/SIGKILL 打断就永远没人清。
+    🔴 判据必须是「**pid 已不存在**」而不是「名字对得上」：按前缀一刀切会删掉**正在跑**的
+    另一个 pytest 进程的库，等于把刚修掉的跨进程互踩原样造回来。
+    """
+    global _swept
+    if _swept or _wired_dsn is None:
+        return
+    _swept = True
+    try:
+        with _xproc_lock_connection().cursor() as cur:
+            cur.execute("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA")
+            names = [r[0] for r in cur.fetchall()]
+            for name in names:
+                for pfx in _SCRATCH_SCHEMA_PREFIXES:
+                    if not name.startswith(pfx):
+                        continue
+                    tail = name[len(pfx):]
+                    if not tail.isdigit():
+                        continue
+                    try:
+                        os.kill(int(tail), 0)      # 进程还在 ⇒ 别碰（可能正是对面在跑）
+                    except ProcessLookupError:
+                        cur.execute(f"DROP DATABASE IF EXISTS `{name}`")
+                    except PermissionError:
+                        pass                        # 存在但不属本用户 ⇒ 同样别碰
+    except Exception as e:   # noqa: BLE001 — 清理是尽力而为，绝不阻断测试
+        warnings.warn(f"[local_stack] 陈旧探针库清理失败（不阻断）：{type(e).__name__}: {e}",
+                      stacklevel=2)
+
+
 def local_stack_lock_held() -> bool:
     """当前测试是否**真的**握着跨进程锁——供测试在失败/skip 文案里如实交代
     「刚才有没有锁」。降级是静默的，不写进文案就没人能发现锁从未生效。"""
@@ -240,34 +314,63 @@ def local_stack_exclusive():
     走的是 pymysql **异常**（OperationalError 2013/2006/3058）——所以整段必须 try 起来，
     只判返回值会让 autouse fixture 在 setup 期抛未捕获异常 ⇒ 组内 119 个用例集体 ERROR。
     """
-    global _xproc_lock_held, _xproc_lock_gave_up, _xproc_lock_conn, _xproc_lock_degraded
-    if not _xproc_lock_enabled() or _wired_dsn is None or _xproc_lock_gave_up:
+    global _xproc_lock_held, _xproc_lock_degraded
+    global _xproc_lock_nonblocking, _xproc_lock_errors
+
+    def _degrade(reason, msg=None):
+        global _xproc_lock_held, _xproc_lock_degraded
         _xproc_lock_held = False
-        _xproc_lock_degraded = "disabled" if not _xproc_lock_enabled() else (
-            "timeout" if _xproc_lock_gave_up else "unwired")
+        _xproc_lock_degraded = reason
+        _xproc_lock_degraded_counts[reason] = _xproc_lock_degraded_counts.get(reason, 0) + 1
+        if msg:
+            warnings.warn(f"[local_stack] {msg}", stacklevel=3)
+
+    if not _xproc_lock_enabled():
+        _degrade("disabled")
+        yield
+        return
+    if _wired_dsn is None:
+        _degrade("unwired")
+        yield
+        return
+    if _xproc_lock_errors >= _XPROC_LOCK_ERROR_GIVEUP:
+        _degrade("error")          # 已连败到上限，不再每个用例白付 connect_timeout
         yield
         return
 
-    name = _xproc_lock_name()
+    conn = name = None
     got = None
     try:
-        with _xproc_lock_connection().cursor() as cur:
-            cur.execute("SELECT GET_LOCK(%s, %s)", (name, _XPROC_LOCK_TIMEOUT_S))
+        conn = _xproc_lock_connection()
+        name = _xproc_lock_name()
+        wait = 0 if _xproc_lock_nonblocking else _XPROC_LOCK_TIMEOUT_S
+        with conn.cursor() as cur:
+            cur.execute("SELECT GET_LOCK(%s, %s)", (name, wait))
             got = cur.fetchone()[0]
+        _xproc_lock_errors = 0
     except Exception as e:   # noqa: BLE001 — 连接失效等；降级放行，绝不把整组打成 ERROR
-        _xproc_lock_conn = None
-        _xproc_lock_degraded = "error"
-        warnings.warn(f"[local_stack] 跨进程锁取锁异常，本次降级无保护：{type(e).__name__}: {e}",
-                      stacklevel=2)
+        _xproc_lock_errors += 1
+        _close_xproc_lock_conn()
+        _degrade("error", f"跨进程锁取锁异常（连败第 {_xproc_lock_errors} 次），"
+                          f"本次降级无保护：{type(e).__name__}: {e}")
+        yield
+        return
+
+    if got == 0:
+        if not _xproc_lock_nonblocking:
+            _xproc_lock_nonblocking = True
+            _degrade("timeout",
+                     f"跨进程锁等待 {_XPROC_LOCK_TIMEOUT_S}s 超时（另一个 pytest 进程占着，"
+                     "或它是不带本 fixture 的老 worktree）——后续改用非阻塞探测，"
+                     "对面一空出来即恢复保护。本次无保护。")
+        else:
+            _degrade("timeout")
+        yield
+        return
     if got != 1:
-        if got == 0:
-            _xproc_lock_gave_up = True     # 只等这一次
-            _xproc_lock_degraded = "timeout"
-            warnings.warn(
-                f"[local_stack] 跨进程锁等待 {_XPROC_LOCK_TIMEOUT_S}s 超时（另一个 pytest "
-                "进程占着，或它是不带本 fixture 的老 worktree）——本进程后续不再等待，"
-                "全程降级无保护。", stacklevel=2)
-        _xproc_lock_held = False
+        # SQL NULL 等：MySQL 侧出错。不补这一档就会「没持锁 + 没降级原因 + 没告警」，
+        # 元测试反而会把它误判成「接线坏了」并红在下一条用例上。
+        _degrade("null", f"GET_LOCK 返回 {got!r}（既非 1 也非 0，MySQL 侧发生错误）——本次无保护")
         yield
         return
 
@@ -278,7 +381,7 @@ def local_stack_exclusive():
     finally:
         _xproc_lock_held = False
         try:
-            with _xproc_lock_connection().cursor() as cur:
+            with conn.cursor() as cur:      # 复用 acquire 那条连接，不重新解析全局
                 cur.execute("SELECT RELEASE_LOCK(%s)", (name,))
                 released = cur.fetchone()[0]
             if released != 1:
@@ -288,7 +391,7 @@ def local_stack_exclusive():
                               "（应为 1）——锁可能没放干净，另一进程会被拖住。",
                               stacklevel=2)
         except Exception as e:   # noqa: BLE001
-            _xproc_lock_conn = None
+            _close_xproc_lock_conn()
             warnings.warn(f"[local_stack] 跨进程锁释放失败：{type(e).__name__}: {e}",
                           stacklevel=2)
 
