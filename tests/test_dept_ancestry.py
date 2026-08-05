@@ -542,3 +542,41 @@ def test_0804_every_anchor_exists_in_tree(snapshot_0804):
     missing = set(ANCHOR_GROUPS_BY_DEPT_ID) - tree_ids
     assert missing == _KNOWN_DEAD_ANCHORS
 
+# ══ 第五部分：外部组码防投毒（2026-08-04 扩面：从只挡 "*" 到挡全部组码） ══
+def test_guard_drops_external_dept_named_like_group_code(monkeypatch):
+    """一个字面命名为 'production' 的钉钉部门不得让其成员拿到生产伞组。
+    dept_name 列是名字域与组码域同居的：名字表未命中即原样透传给组码白名单，
+    因此外部可控的部门名能直接冒充组码——必须在入口丢弃（fail-closed）。"""
+    monkeypatch.delenv("RAG_ACL_ANCESTRY", raising=False)
+    conn = _FakeConn(cache_row=None)
+    _wire(monkeypatch, conn, {"user_name": "李四", "dept_name": "production,财务部",
+                              "is_partial": False, "dept_ids": [777]}, {})
+    codes, cacheable = di._resolve_user_dept_live("u_forge")
+    assert codes == ["finance"]                     # 冒充项被丢，正常部门不受影响
+    assert "production" not in _insert_params(conn)[2]
+
+
+def test_guard_still_drops_star_sentinel(monkeypatch):
+    """原「星号防投毒」（2026-07-17 ultra P2）语义不得回退。"""
+    monkeypatch.delenv("RAG_ACL_ANCESTRY", raising=False)
+    conn = _FakeConn(cache_row=None)
+    _wire(monkeypatch, conn, {"user_name": "王五", "dept_name": "*,行政部",
+                              "is_partial": False, "dept_ids": [888]}, {})
+    codes, _ = di._resolve_user_dept_live("u_star")
+    assert codes == ["admin"]                       # 不是全量白名单
+
+
+def test_guard_does_not_touch_normal_chinese_dept_names(monkeypatch):
+    """反证：正常中文部门名一个都不能被误伤（线上 119 个活跃部门无一撞组码）。"""
+    monkeypatch.delenv("RAG_ACL_ANCESTRY", raising=False)
+    conn = _FakeConn(cache_row=None)
+    _wire(monkeypatch, conn, {"user_name": "赵六", "dept_name": "财务部,人力资源部",
+                              "is_partial": False, "dept_ids": [999]}, {})
+    codes, _ = di._resolve_user_dept_live("u_ok")
+    assert codes == ["finance", "hr"]
+
+
+def test_guard_never_hardcodes_group_list():
+    """守卫必须以 retriever._VALID_ACL_GROUPS 为单一真值来源——加新组时自动跟上。"""
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+    assert di._VALID_ACL_GROUPS_FOR_GUARD() is _VALID_ACL_GROUPS
