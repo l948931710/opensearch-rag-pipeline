@@ -11,6 +11,7 @@
     有 tiebreaker：并集 **12/12**
 下面 `test_offset_pagination_covers_every_row_exactly_once` 就是这段实测的固化。
 """
+import os
 import pathlib
 import re
 
@@ -129,7 +130,10 @@ def test_offset_pagination_covers_every_row_exactly_once():
     cfg = get_config()
     conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
                            password=cfg.rds.password, connect_timeout=5)
-    db = "pg_probe_pytest"
+    # 库名带 pid：固定名 + `DROP DATABASE` 在两个 pytest 进程同时跑时会互相端掉对方的库
+    # （A 建表灌数 / B 一句 DROP ⇒ A 得 1049/1146 硬红）。pid 后缀是**单边**兜底，
+    # 不依赖对面进程是否带 conftest 的跨进程锁。
+    db = f"pg_probe_pytest_{os.getpid()}"
     try:
         with conn.cursor() as cur:
             cur.execute(f"DROP DATABASE IF EXISTS {db}")

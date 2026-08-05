@@ -24,7 +24,9 @@ pytest 默认不带 RAG_ENV（保持全局 simulate，避免 .env.local 的 RAG_
 写入测试索引。本地库如导入过需要保留的镜像数据，请先备份或换库再跑 `make test`。
 """
 
+import contextlib
 import os
+import warnings
 
 import pytest
 
@@ -37,6 +39,12 @@ _db_available = None
 _db_reason = ""
 _os_available = None
 _os_reason = ""
+
+# 探测成功那一刻的连接四元组，**冻结**下来给跨进程锁用（见 local_stack_exclusive）。
+# 为什么不 lazy 读 config：串行组成员 test_simulate_prod_guard.py 会 monkeypatch
+# `cfg.rds.host` 成假生产指纹；锁名与连接参数若在 acquire/release 两侧各算一次，
+# 就可能算出不同的名字 → RELEASE 放不掉自己的锁 → 会话级自锁。
+_wired_dsn = None
 
 
 def _try_connect_mysql(host, port, user, password, database):
@@ -65,8 +73,10 @@ def ensure_local_db_wired() -> bool:
         )
         return False
 
+    global _wired_dsn
     try:
         _try_connect_mysql(rds.host, rds.port, rds.user, rds.password, rds.database)
+        _wired_dsn = (rds.host, int(rds.port), rds.user, rds.password)
         _db_available = True
         return True
     except Exception:
@@ -79,6 +89,8 @@ def ensure_local_db_wired() -> bool:
         _db_reason = f"Local MySQL not available: {e}"
         return False
 
+    _wired_dsn = (rds.host, int(rds.port),
+                  _COMPOSE_DB_CREDS["user"], _COMPOSE_DB_CREDS["password"])
     os.environ["RAG_RDS_USER"] = _COMPOSE_DB_CREDS["user"]
     os.environ["RAG_RDS_PASSWORD"] = _COMPOSE_DB_CREDS["password"]
     os.environ["RAG_RDS_DATABASE"] = _COMPOSE_DB_CREDS["database"]
@@ -143,6 +155,142 @@ def local_db_unavailable_reason() -> str:
 
 def local_opensearch_unavailable_reason() -> str:
     return _os_reason or "Local OpenSearch not available"
+
+
+# ── 跨 pytest 进程互斥（2026-08-05，对抗评审 R1/R2 后定稿）────────────────────
+# conftest 的 `_LOCAL_STACK_SERIAL_MODULES` 声明了「这些模块不得并发」，但 xdist 分组
+# 只在**单个 pytest 进程内**成立。两个 pytest 同时跑（多 worktree / 多会话），
+# test_classification::clean_db 的**无 WHERE** `DELETE FROM document_meta|document_version`
+# 会清掉另一进程在飞的 seed 行。实测（同机、噪声进程=循环跑 test_classification）：
+# test_ingest_lease_db 25/25 红（9 个不同用例）、test_kb_db_integration 7/30 红；
+# 干净单进程则 12/12 全绿。故用 MySQL 命名锁把该组的跨进程并发也串起来。
+#
+# ⚠️ **这是双边协议**：只有双方都取锁才有效。本机 17 个 worktree 钉在约 12 个不同
+# commit 上，老 worktree 不带本 fixture ⇒ 锁对它们无效。因此受害测试**必须保留**
+# 自己的兜底判据（见 tests/test_kb_db_integration.py），不能因为有锁就删。
+#
+# 选 GET_LOCK 而非文件锁：受保护资源就是这台 MySQL 实例，锁与资源同生命周期，
+# **连接断开自动释放** ⇒ 进程崩溃不留死锁（实测 8.0.46 确认）。
+# 与生产侧 `opensearch_pipeline/dataworks_orchestrator.py:1008 _acquire_stage_lock`
+# 同款原语但**刻意相反的失败语义**：那边取不到锁 fail-closed 退出（互斥是生产并发
+# 安全边界）；这边 fail-open 降级（测试互斥只是防串数据，取不到锁而让 119 个用例
+# 集体 ERROR 是更坏的结果）。锁名前缀也刻意避开它的 `rag_ingest:`，两套锁互不干扰。
+_XPROC_LOCK_TIMEOUT_S = 120   # 实测组内最长单测 4.51s；代码级上限约 30s（线程 join）⇒ 约 4× 余量
+_xproc_lock_conn = None
+_xproc_lock_held = False
+_xproc_lock_gave_up = False   # 超时过一次就不再等（否则 119 个用例 × 120s ≈ 4 小时空转）
+# 降级原因：None=没降级。区分「环境争用」（timeout/异常，属实况）与「机制没生效」
+# （没降级却也没持锁 = 接线坏了），元测试据此决定 skip 还是红。
+_xproc_lock_degraded = None
+
+
+def _xproc_lock_enabled() -> bool:
+    """逃生口：RAG_TEST_XPROC_LOCK=false 整体退回加锁前的行为。"""
+    return os.environ.get("RAG_TEST_XPROC_LOCK", "true").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _xproc_lock_name() -> str:
+    """锁名 = 实例级标识。**不带库名**：受保护面横跨 fuling_knowledge + fuling_operation
+    + 各测试自建的探针库，锁保护的是「这台 MySQL」。MySQL 锁名上限 64 字符、大小写不敏感。"""
+    host, port = _wired_dsn[0], _wired_dsn[1]
+    return f"rag_test_xproc:{host}:{port}"[:64]
+
+
+def _xproc_lock_connection():
+    """锁专用连接（进程内单例，autocommit）。
+
+    🔴 **绝不能用 `opensearch_pipeline.db._get_db_conn()` 的池连接**——实测过两条独立理由：
+      1. 池连接一取即 `_begin_txn()` 开显式事务（db.py:54）。整个测试持有它 = 钉死一个
+         REPEATABLE READ 读视图，正好毒化 test_kb_db_integration `_seed_row_counts` 的
+         「先 commit 再回查」判据（把「已被别人删掉」读成「还在」，判据反向）；
+      2. 锁会**泄漏**：实测在池连接上取锁后 `conn.close()` 归还池、再 `_reset_db_pool()`，
+         `IS_USED_LOCK` 仍返回该连接 id（PooledDB.close() 只关 idle 连接，碰不到已借出的）。
+         锁活过测试边界，还会随连接被复用给任意其它调用方。
+    """
+    global _xproc_lock_conn
+    if _xproc_lock_conn is None:
+        import pymysql
+        host, port, user, password = _wired_dsn
+        # 本地 dev 栈明文连接（与本文件 _try_connect_mysql 同款；ssl 语义扫描门
+        # tests/test_rds_ssl_wiring.py 的 SCAN_ROOTS 不含 tests/）
+        _xproc_lock_conn = pymysql.connect(
+            host=host, port=port, user=user, password=password,
+            connect_timeout=5, autocommit=True,
+        )
+    return _xproc_lock_conn
+
+
+def local_stack_lock_held() -> bool:
+    """当前测试是否**真的**握着跨进程锁——供测试在失败/skip 文案里如实交代
+    「刚才有没有锁」。降级是静默的，不写进文案就没人能发现锁从未生效。"""
+    return _xproc_lock_held
+
+
+def local_stack_lock_degraded_reason():
+    """本次降级的原因（None=没降级）。'timeout'/'error' 属环境争用，'disabled' 是显式关闭。"""
+    return _xproc_lock_degraded
+
+
+@contextlib.contextmanager
+def local_stack_exclusive():
+    """把一段真库操作与**其它 pytest 进程**的同组操作互斥开。取不到锁则降级放行。
+
+    失败形态按实测处理：`GET_LOCK` 超时返回 **0**（不是异常）；而连接失效/用户锁死锁
+    走的是 pymysql **异常**（OperationalError 2013/2006/3058）——所以整段必须 try 起来，
+    只判返回值会让 autouse fixture 在 setup 期抛未捕获异常 ⇒ 组内 119 个用例集体 ERROR。
+    """
+    global _xproc_lock_held, _xproc_lock_gave_up, _xproc_lock_conn, _xproc_lock_degraded
+    if not _xproc_lock_enabled() or _wired_dsn is None or _xproc_lock_gave_up:
+        _xproc_lock_held = False
+        _xproc_lock_degraded = "disabled" if not _xproc_lock_enabled() else (
+            "timeout" if _xproc_lock_gave_up else "unwired")
+        yield
+        return
+
+    name = _xproc_lock_name()
+    got = None
+    try:
+        with _xproc_lock_connection().cursor() as cur:
+            cur.execute("SELECT GET_LOCK(%s, %s)", (name, _XPROC_LOCK_TIMEOUT_S))
+            got = cur.fetchone()[0]
+    except Exception as e:   # noqa: BLE001 — 连接失效等；降级放行，绝不把整组打成 ERROR
+        _xproc_lock_conn = None
+        _xproc_lock_degraded = "error"
+        warnings.warn(f"[local_stack] 跨进程锁取锁异常，本次降级无保护：{type(e).__name__}: {e}",
+                      stacklevel=2)
+    if got != 1:
+        if got == 0:
+            _xproc_lock_gave_up = True     # 只等这一次
+            _xproc_lock_degraded = "timeout"
+            warnings.warn(
+                f"[local_stack] 跨进程锁等待 {_XPROC_LOCK_TIMEOUT_S}s 超时（另一个 pytest "
+                "进程占着，或它是不带本 fixture 的老 worktree）——本进程后续不再等待，"
+                "全程降级无保护。", stacklevel=2)
+        _xproc_lock_held = False
+        yield
+        return
+
+    _xproc_lock_held = True
+    _xproc_lock_degraded = None
+    try:
+        yield
+    finally:
+        _xproc_lock_held = False
+        try:
+            with _xproc_lock_connection().cursor() as cur:
+                cur.execute("SELECT RELEASE_LOCK(%s)", (name,))
+                released = cur.fetchone()[0]
+            if released != 1:
+                # GET_LOCK 是**可重入计数**锁：漏放一次，计数永不归零 ⇒ 本进程后续
+                # 照常拿到锁（看不出异常），而对面每个测试都要等满超时。必须响亮。
+                warnings.warn(f"[local_stack] 跨进程锁 RELEASE_LOCK 返回 {released!r}"
+                              "（应为 1）——锁可能没放干净，另一进程会被拖住。",
+                              stacklevel=2)
+        except Exception as e:   # noqa: BLE001
+            _xproc_lock_conn = None
+            warnings.warn(f"[local_stack] 跨进程锁释放失败：{type(e).__name__}: {e}",
+                          stacklevel=2)
 
 
 requires_local_db = pytest.mark.skipif(

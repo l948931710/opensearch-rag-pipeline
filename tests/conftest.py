@@ -189,6 +189,9 @@ _LOCAL_STACK_SERIAL_MODULES = {
     # test_pipeline（整表清空）/test_concurrency（行锁语义）同表，必须同组串行
     "test_ingest_lease_db.py",
     "test_kb_badge_parity_db.py",
+    # 2026-08-05：真连本地栈且 `DROP DATABASE` 固定库名（比无 WHERE DELETE 更烈——整库没了）。
+    # 与同形态的 test_kb_badge_parity_db 一致处置；库名另加 pid 后缀做单边兜底（锁是双边协议）。
+    "test_pagination_stability.py",
 }
 
 
@@ -210,6 +213,38 @@ def pytest_collection_modifyitems(config, items):
         base = _os.path.basename(mod)
         group = "local-db-stack" if base in _LOCAL_STACK_SERIAL_MODULES else mod
         item.add_marker(pytest.mark.xdist_group(group))
+
+
+@pytest.fixture(autouse=True)
+def _local_stack_xproc_lock(request):
+    """串行组成员在**跨 pytest 进程**维度也互斥（2026-08-05）。
+
+    `_LOCAL_STACK_SERIAL_MODULES` 声明的是「这些模块不得并发」，但上面那个 xdist 分组
+    钩子只能保证**单个 pytest 进程内**同 worker 串行。两个 pytest 同时跑（多 worktree /
+    多会话并行开发）时该保证完全失效，本组的无 WHERE 整表 DML 会清掉对方在飞的 seed 行
+    （实测：test_ingest_lease_db 25/25 红、test_kb_db_integration 7/30 红；干净单进程 12/12 绿）。
+    这里补上进程级互斥，锁语义与降级行为见 tests/local_stack.local_stack_exclusive。
+
+    ⚠️ 两条**边界**，别误读成结构性保证：
+      · **双边协议**——只对同样带本 fixture 的进程有效；老 worktree 不带，照样能撞。
+        故受害测试必须保留自己的兜底判据，不能因为有锁就删。
+      · 本 fixture 是 **function scope**，只罩得住同为 function scope 的 fixture 与测试体
+        （实测：conftest autouse 的 setup 早于模块级 autouse `clean_db`、teardown 晚于它）。
+        **module/class/session scope 的 fixture 天生在锁外**（高 scope 先 setup、后 teardown）。
+        今天组内没有高 scope 的真库 seed fixture（test_pipeline `dag2_ctx` 走 simulate、
+        test_kb_badge_parity_db `_rows` 是纯内存），将来加则会静默逃逸——不做收集期硬门是因为
+        「哪个 fixture 碰库」不可判定，一刀切会误伤上述两个无害 fixture。
+    """
+    base = os.path.basename(request.node.nodeid.split("::", 1)[0])
+    if base not in _LOCAL_STACK_SERIAL_MODULES:
+        yield
+        return
+    from tests.local_stack import ensure_local_db_wired, local_stack_exclusive
+    if not ensure_local_db_wired():      # 无本地栈（CI 普通 test job）⇒ 零成本 no-op
+        yield
+        return
+    with local_stack_exclusive():
+        yield
 
 
 @pytest.fixture(autouse=True)
