@@ -115,6 +115,38 @@ Sam 要求「验证到 100% 确认为止」。逐条实测结论：
 B6 的告警标题）都是**我自己写的代码**里的，同一个人复查同一批代码有系统性盲区。
 08-07 仍须送 codex。
 
+## C-ter. 2026-08-04 六员对抗性核验（codex 额度未复，Sam 授权的替代深核）
+
+方法：6 个互相独立的全新上下文核验员（B1/B2/B3/B4B5B7B8/B6/交叉面），对抗性框架
+（以推翻为目标）+ 变异测试（修复改回必红）+ 反锚定（结论落定后才准读 §C-bis 并报分歧）。
+**总裁决：8 条修复的行为性主张全部立住、0 条被推翻**；但挖出 **12 处新缺陷/宣称失实**，
+已全部修复并逐条过反证（5 个提交）：
+
+| 修复提交 | 内容 |
+|---|---|
+| `cc7ceaf` | B6 族两缺陷：qa_rollup 探针失败误顶「SLO breach」标题（本机 14 条被抑制 CRITICAL 实证）；reconcile `complete=False` 无-error 家族误顶「drift」标题/占真 drift 去重槽（含 ok=True+enum_invisible 的 07-21 历史形态）→ 三态分流（missing_confirmed>0 例外仍按 drift）。AST 守卫闭三旁路（关键字/属性调用/命名域扩 qa_rollup），raw/ha3/qa_rollup 补双向行为测试 |
+| `307f98d` | B2 族三尾巴：my-docs/browse/contribution **渲染侧**补 gate 轴（此前筛选认 gate、渲染不认，gate-only 行自相矛盾）；reset_for_rechunk 隔离行硬拒（掐断 gate-only 铸造残余链）；不可达守卫从 3 文件+单引号拓宽到全仓+引号两态 |
+| `df4580a` | B3 族三尾巴：方向守卫查窗口内**全部** ORDER BY 臂（分支构造此前只查最后一臂，变异实证 22 绿）；UNIQUE_COLS 去 message_id（非唯一键）；kb_gaps 终排序补 hash tiebreaker（切片分页潜伏面） |
+| `1b662ae` | B1 族三处守卫缺失补钉（整删 4b 曾 4181 全绿；strict 出口②③改回 fail-open 曾全绿）+ 订正靠巧合续绿的过期测试文档 |
+| `f8334dc` | B8×视图交叉缺陷（**两名核验员独立撞出同一条**）：筛选视图丢截断标志→静默截断复活+误报横幅，已接线；「收窄时间窗」死胡同文案（端点无时间窗参数）改真实出路；「加载更多」双击重复追加补追加对追加闸（第一版全路径置忙被既有契约测试抓出，收窄后落地） |
+
+（`fd516e3` 跟改 contribution 徽章桩 7 列——307f98d 落地时漏跑该测试面的补课。）
+
+**§C-bis 需更正的陈述**（账本错、代码对/已修）：
+- **B5 行已过时**：c5c7d59 原文有一条把「省略 version_no 放行全部 pending」钉成规范的断言，3 小时后被 a951b9b 以安全理由反转（其 docstring 自认"把漏洞写成了规范"）。「✅ 不改」判定不再成立——现树行为正确，本行是陈旧结论。
+- **数字更正**：B4「19 个调用点」算术不可复现（实为 7 promptText + 9 confirm = 16，notice 27 处全 fire-and-forget）；B2「20160 组」不可复现（入库测试自始是六轴 105,840，a951b9b 后 129,360；"0 不一致"本身属实）；「三个写方」实为四个（register_new_files.py:434 + DDL 默认值）；被抑制 CRITICAL 全机 **38** 条（ops-monitor 24 + qa-rollup 14），非 24。
+- **fecf060 提交信息**「此前这类失败会静默 exit 0」对 launchd 排程作业失实（`_job_exit` error→3 自初版即有；其修的两个作业不在任何调度里）。
+- **守卫≠不会再犯**：各守卫的词法边界已在对应测试注释里写明（B4 反转门/跨行赋值不可见、B7 cache 守卫认"offset"字面量、徽章类文本守卫抓删除不抓等价改写）。
+
+**核验后仍开着的**（未随手修，各有原因）：
+- 🔴 **B1 现网一验**（最便宜路径已找到：查一条 `qa_session_log.retrieved_docs_json` 的 version_no ——RDS prod-ro 即可，不碰 HA3；qa_logger 自 c605761 就在消费该字段，比 stitch 更早）——待 Sam 放行 live。
+- chunk_active 轴分叉（doc-status 传真值、其余四处传 None，升版残留 SUCCESS 场景两端点同行不同徽章；锁测试 counts=(5,5,5) 测不到）——修向需裁决（哪边语义为准），记设计题。
+- 主命中图无版本轴（图直接命中 top-k 时 4c 不比版本，双活窗口可投旧版图）——在 B1 两 commit 声明范围外，属独立改进项。
+- B7 include_closed 做对（keyset/去 open-first）仍属设计变更；后端 include_closed 分支仍收 offset（前端已收口）。
+- SIM 模式 mock 行不带 version_no 时补图全拦（仅影响演示观感）。
+
+**08-07 codex 交接物**：本节 + 六份核验报告结论 + 上表 5 提交的 diff。codex 复核重点可收窄到：三态分流的语义边界（incomplete vs drift 的判据）、渲染侧 gate 轴的列序改动、两个在途闸的收窄语义。
+
 ## D. 状态
 
 - 附录B「值得优先自查的 7 条」——**全部完成**（其余 43 条正文没给，在工作流原始输出里，
