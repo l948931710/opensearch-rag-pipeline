@@ -9,6 +9,8 @@ import { useAsk } from '@/composables/useAsk'
 import { useDialog } from '@/composables/useDialog'
 import { useKb } from '@/composables/useKb'
 import { useContribute } from '@/composables/useContribute'
+import NoticeBell from './NoticeBell.vue'
+import { useNotices } from '@/composables/useNotices'
 import { ROLE_LABEL } from '@/lib/kb'
 
 // Atlas 式侧栏：默认 56px 图标轨，悬停/聚焦展开成 272px 浮层（覆盖内容、不挤压重排）。
@@ -23,6 +25,8 @@ const { activeId, conversations, newConversation, switchTo, removeConversation, 
 const { confirm } = useDialog()
 const { reviewCount } = useKb()   // 待你审核数（红点/角标）；App.vue 在 ready 后已预加载，故入口红点即时可见
 const { reviewCount: contribReviewCount } = useContribute()   // 待审核的知识贡献数（管理员）
+// 站内通知（文档升版提醒）：无未读时零装饰，故不影响既有视觉密度。切路由时按 ≥60s 节流现拉。
+const { load: loadNotices } = useNotices()
 const route = useRoute()
 const router = useRouter()
 
@@ -38,6 +42,10 @@ watch(q, (v) => {
 })
 onUnmounted(() => { if (qTimer) { clearTimeout(qTimer); qTimer = null } })
 const convs = computed(() => searchConversations(qDebounced.value))
+// 通知轮询：只在【导航切换】时触发，且 useNotices 内部 ≥60s 节流。
+// 刻意不用 setInterval —— 通知是日调批产物，秒级新鲜度无意义，而未读计数在服务端要
+// 逐行过 ACL 复核。immediate 让 ready 后首次进入即取一次（红点若该亮就即时亮）。
+watch(() => route?.path, () => { void loadNotices() }, { immediate: true })
 const onManage = computed(() => route?.path === '/manage')
 const onContribute = computed(() => route?.path === '/contribute')
 function isActiveConv(id: string) { return route?.path === '/' && id === activeId.value }
@@ -175,6 +183,7 @@ const reveal = 'opacity-0 transition-opacity duration-200 group-hover/sb:opacity
             :class="reveal" :aria-label="`待审核 ${reviewCount} 项`"
           >{{ reviewCount }}</span>
         </RouterLink>
+        <NoticeBell :reveal="reveal" />
         <button
           type="button"
           class="flex h-10 w-full items-center rounded-lg text-muted-foreground transition hover:text-foreground group-hover/sb:hover:bg-accent-soft"
