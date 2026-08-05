@@ -57,9 +57,13 @@
 
 ## 3. push 前 PII 自查（本次有实弹）
 
-按纪律扫 `git diff origin/main..main`，**命中真值**：3 个真 staffId + 真名「〈已脱敏〉」配
-staffId 配部门，落在 `tests/test_audit_log.py`、`tests/test_kb_endpoints.py`、
-`routes/kb_access.py` docstring，引入者 `76d6111`（上游会话拿生产真值当测试夹具）。
+按纪律扫 `git diff origin/main..main`，**命中真值**：3 个真 staffId + 1 个真实员工姓名
+（与其 staffId、部门三者同行出现），落在 `tests/test_audit_log.py`、
+`tests/test_kb_endpoints.py`、`routes/kb_access.py` docstring，引入者 `76d6111`
+（上游会话拿生产真值当测试夹具）。
+⚠️ **本节刻意不复述被泄露的具体值** —— 本文件本身就在这个 public 仓库里，
+把真名/真 staffId 写进事故记录等于二次泄露。这条在写初稿时踩中过一次
+（真名原样落进本节，push 前扫描抓到后改成现在这样）。
 
 处置：`git filter-repo --replace-text --refs origin/main..main --partial` 清洗后再推；
 替换值**保持 18/20 位**以免 `mask_staff_id` 的 first4…last4 路径失去覆盖。
