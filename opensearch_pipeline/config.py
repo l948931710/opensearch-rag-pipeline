@@ -478,6 +478,23 @@ class RAGConfig:
     # 🔴 开之前必须先 apply schema/064，且确认生产 OSS **versioning=Enabled**（非 Suspended）
     # 以及生命周期规则**不会删历史版本**——否则被绑定的对象会在保留期后消失、fail-closed 把老文档卡死。
     content_binding: bool = False         # RAG_CONTENT_BINDING
+    # ── 文档升版可见范围提醒（doc-update-notify，2026-08-04）──────────────
+    # 设计稿 docs/doc_update_notify_design_2026-08-04_DRAFT.md（rev3 + §11 Sam 拍板）。
+    # 总闸默认 **off**，且**刻意不复用 RAG_ADMIN_NOTIFY**（retention/purge 同款双闸纪律：
+    # 开审批类通知不应连带开升版群发——受众规模差两个量级）。
+    doc_notify: bool = False              # RAG_DOC_NOTIFY（发现+解析+落表总闸）
+    doc_notify_dingtalk: bool = False     # RAG_DOC_NOTIFY_DINGTALK（钉钉投递子闸；console 站内先行）
+    # public 文档是否通知：Sam 2026-08-04 拍板 **通知**（受众=全员是 public 的定义态，
+    # 故 public 事件**不受 max_audience 约束**；防骚扰靠每人每日 ≤1 条摘要归并 + bulk_guard）。
+    doc_notify_include_public: bool = True   # RAG_DOC_NOTIFY_INCLUDE_PUBLIC
+    # 单事件受众上限（超限 ⇒ 事件 HOLD(audience_cap)，可 --requeue 回放，**不是**终态）。
+    # 1000 = 2026-08-04 prod-RO 实测定值：production 伞形受众 808/1167 活跃员工，
+    # 原拟 300 会把 66% 语料（production 属主 709/1067 篇 dept_internal）全部 HOLD 死。
+    doc_notify_max_audience: int = 1000      # RAG_DOC_NOTIFY_MAX_AUDIENCE
+    # 单轮进入 resolve 的事件数上限（含回放；超出部分 HOLD(bulk_guard)）。
+    # 实测切换是突发批量型（有机升版率≈0，维护波一次数百篇）⇒ 50 对有机流量宽裕，
+    # 对重灌波整批 HOLD 正是设计意图（Sam 拍板：重传波 --suppress 整批压掉）。
+    doc_notify_max_events_per_run: int = 50  # RAG_DOC_NOTIFY_MAX_EVENTS_PER_RUN
     # ── 纯文本生成开关（pure-text mode） ─────────────────────────
     # True  → 生成纯文字回答：system prompt 去掉 <<IMG:N>> 图片插入规则，
     #         context 不再注入 <<IMG:N>> 标记，卡片只展示文字（图片语义仍以
@@ -1073,6 +1090,11 @@ def load_config() -> PipelineConfig:
             sensitive_prompt_guard=_env_bool("SENSITIVE_PROMPT_GUARD", False),  # RAG_SENSITIVE_PROMPT_GUARD
             search_endpoint_enable=_env_bool("SEARCH_ENDPOINT_ENABLE", False),  # RAG_SEARCH_ENDPOINT_ENABLE
             content_binding=_env_bool("CONTENT_BINDING", False),                # RAG_CONTENT_BINDING
+            doc_notify=_env_bool("DOC_NOTIFY", False),                          # RAG_DOC_NOTIFY
+            doc_notify_dingtalk=_env_bool("DOC_NOTIFY_DINGTALK", False),        # RAG_DOC_NOTIFY_DINGTALK
+            doc_notify_include_public=_env_bool("DOC_NOTIFY_INCLUDE_PUBLIC", True),        # RAG_DOC_NOTIFY_INCLUDE_PUBLIC
+            doc_notify_max_audience=_env_int("DOC_NOTIFY_MAX_AUDIENCE", 1000),             # RAG_DOC_NOTIFY_MAX_AUDIENCE
+            doc_notify_max_events_per_run=_env_int("DOC_NOTIFY_MAX_EVENTS_PER_RUN", 50),   # RAG_DOC_NOTIFY_MAX_EVENTS_PER_RUN
             dingtalk_streaming=_env_bool("DINGTALK_STREAMING", False),          # RAG_DINGTALK_STREAMING
             dingtalk_stream_interval_ms=_env_int("DINGTALK_STREAM_INTERVAL_MS", 500),  # RAG_DINGTALK_STREAM_INTERVAL_MS
             image_cosurface=_env_bool("IMAGE_COSURFACE", True),                 # RAG_IMAGE_COSURFACE

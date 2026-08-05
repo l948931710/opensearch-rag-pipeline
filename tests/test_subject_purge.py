@@ -146,8 +146,12 @@ def test_dry_run_counts_without_deleting(monkeypatch, live_db, oss_archive):
     assert rep["ok"] and rep["dry_run"]
     # C5=方案A 后多出 `oss_archive` 一面：RDS 行删干净 ≠ 主体数据清干净，
     # qa_session_log 的到期行早已 gzip-JSONL 落进 OSS，报告必须**分面如实**。
-    assert set(rep["tables"]) == {"qa_retrieved_doc", "user_feedback", "escalation_ticket",
-                                  "qa_conversation", "qa_session_log", "oss_archive"}
+    # doc_update_notice（schema/065，2026-08-04）：升版提醒投递行按 user_id 键控，
+    # 物化了"此人当时可见哪些文档"，必须随主体擦除一起删（对应的 doc_update_event
+    # 不含个人标识、且是防重放台账，**刻意不在本清单**）。
+    assert set(rep["tables"]) == {"qa_retrieved_doc", "user_feedback", "doc_update_notice",
+                                  "escalation_ticket", "qa_conversation", "qa_session_log",
+                                  "oss_archive"}
     # RDS 五张表同源（桩 conn 恒回 42）；归档面是**另一层数据源**（本例空桶=0），
     # 不能把它硬凑成 42——那是编数字。分面断言。
     _rds = {k: v for k, v in rep["tables"].items() if k != "oss_archive"}
@@ -165,14 +169,17 @@ def test_commit_requires_enable_flag(monkeypatch, live_db):
 
 def test_commit_deletes_fact_rows_before_session_log(monkeypatch, live_db, oss_archive):
     monkeypatch.setenv("RAG_SUBJECT_PURGE_ENABLE", "true")
-    conn = _Conn(affected=3, act_rowcounts=[3, 0, 0, 0, 3])
+    # act_rowcounts 按 _purge_jobs 顺序逐个 pop：
+    # qa_retrieved_doc / user_feedback / doc_update_notice / escalation_ticket /
+    # qa_conversation / qa_session_log
+    conn = _Conn(affected=3, act_rowcounts=[3, 0, 0, 0, 0, 3])
     monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: conn)
     rep = retention.purge_subject("u1", commit=True, batch=100)
     assert rep["ok"]
     assert rep["tables"]["qa_retrieved_doc"]["deleted"] == 3
     assert rep["tables"]["qa_session_log"]["deleted"] == 3
     deletes = [s for s, _ in conn.executed if s.strip().startswith("DELETE")]
-    assert len(deletes) == 5
+    assert len(deletes) == 6
     # ⚠️ 顺序不可倒：事实表（经 message_id 关联）必须先于 qa_session_log 本体
     idx_fact = next(i for i, s in enumerate(deletes) if "qa_retrieved_doc" in s)
     idx_log = next(i for i, s in enumerate(deletes)

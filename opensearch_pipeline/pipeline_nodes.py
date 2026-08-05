@@ -7647,9 +7647,19 @@ def node_deactivate_old_chunks(ctx: dict):
                         # UPDATE 会把握手令牌覆盖成 SUCCESS——受限文档带旧 permission 永久留在
                         # HA3 被越权投放。CAS 跳过即保住 PENDING_DELETE，下轮 reconcile 把刚推
                         # 的旧权限行删掉，最终一致。
+                        #
+                        # activated_at（doc-update-notify 2026-08-04）：**只在 SUCCESS 分组**写，
+                        # 即「该版本真正在检索侧生效」的那一刻。为什么不能复用 updated_at 当切换
+                        # 时点——它是 ON UPDATE CURRENT_TIMESTAMP，ACL 投影 / acl_epoch / 隔离等
+                        # 任何无关写都会把它刷新，拿它判「多久前切换的」会把一年前的旧文档判成新切换。
+                        # 本列此前是死列（schema/001 建了、全仓零写方）；这里是它唯一的写入点之一
+                        # （另一处=spot_checker 的搁浅收敛）。纯增列写、无读方依赖顺序、
+                        # 与 index_status 同事务同 CAS 谓词 ⇒ 失败不改变既有语义。
+                        _act_set = (", activated_at = NOW()"
+                                    if final_status == DocVersionIndexStatus.SUCCESS else "")
                         cursor.execute(f"""
                             UPDATE document_version
-                            SET index_status = %s{ingest_lease.clear_set_sql()}
+                            SET index_status = %s{_act_set}{ingest_lease.clear_set_sql()}
                             WHERE ({_st_clause})
                               AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                         """, _st_params)

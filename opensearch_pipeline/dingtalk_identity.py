@@ -264,6 +264,49 @@ def _normalize_dept_to_codes(raw: Union[str, List[str], None]) -> List[str]:
     return out
 
 
+def offline_groups_for_staff(role_row, dept_names, *, ttl_seconds: Optional[int] = None
+                             ) -> List[str]:
+    """**离线镜像**在线组解析的优先级（doc-update-notify 受众枚举用；纯函数、零 I/O）。
+
+    在线判定（`_resolve_user_dept`，本文件 :340-380）会调钉钉 API，离线批处理不能也不该
+    调（1000+ 人 × 每日）。但"通知面 ⊆ 检索面"要求两侧口径逐条对齐 —— 差一条就是超发或
+    漏发。本函数把在线的**取值优先级**原样复刻，数据源换成离线可得的两张快照表：
+
+      1. `user_role` 墓碑（is_active=0）→ **权威空组**（显式撤读权，在线 :358-360 同款；
+         按钉钉部门重新授组 = 给一个线上恒拒的人发通知）；
+      2. seeded 行（role≠employee）→ **不论年龄恒权威**（在线 H3：seeded 永远缓存优先）；
+      3. 自动缓存的 employee 行 → **仅 TTL 内权威**；超 TTL 在线会穿透钉钉 API 重查
+         （:368-379），离线无法穿透 ⇒ **弃行**落第 4 条（近似穿透后的结果）。
+         ⚠️ 若在这里采信过期行，调岗员工会被按**任意陈旧**的旧部门算进受众，且陈旧度
+         不受 TTL 约束 —— 这正是 TTL 窗外两侧分叉最大的那一支；
+      4. 无行 / 弃行 → 组织快照:`staff_dim.dept_ids`（一人多部门取**并集**，与在线
+         遍历完整 dept_id_list 同语义）→ `dept_dim.name` → 本模块名字表。
+
+    Args:
+        role_row: `user_role` 行 `(dept_code, role, age_seconds, is_active)`；None=无行。
+                  字段序与在线 SELECT（:341-347）一致，便于两侧共用同一查询形状。
+        dept_names: 该员工全部直属部门的中文名（来自 dept_dim；缺名的 id 直接略过）。
+        ttl_seconds: 缺省取 `_acl_cache_ttl_seconds()`；批处理应传**姿态见证**里的 ttl，
+                     确保与线上同参（见 runtime_contract.read_acl_posture）。
+
+    Returns:
+        权限组代码列表（已过白名单去重）；`[]` = 仅 public 可见（fail-closed）。
+    """
+    if ttl_seconds is None:
+        ttl_seconds = _acl_cache_ttl_seconds()
+    if role_row:
+        dept_code, role, age, is_active = (list(role_row) + [None] * 4)[:4]
+        if not is_active:                      # 1. 墓碑 = 权威空组
+            return []
+        if dept_code:
+            seeded = (role or "employee") != "employee"
+            fresh = not (ttl_seconds > 0 and age is not None and age > ttl_seconds)
+            if seeded or fresh:                # 2./3. 行有效 → 按读回口径归一
+                return _normalize_dept_to_codes(dept_code)
+            # 3'. 过期 employee 行：弃行，落第 4 条（在线此处会穿透 API）
+    return _normalize_dept_to_codes(list(dept_names or []))   # 4. 组织快照并集
+
+
 # ═══════════════════════════════════════════════════════════════
 # 用户部门解析（机器人 + 小程序共用）
 # ═══════════════════════════════════════════════════════════════

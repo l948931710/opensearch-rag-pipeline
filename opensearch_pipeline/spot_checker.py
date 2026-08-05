@@ -652,9 +652,12 @@ def reconcile_stranded_versions() -> dict:
                         _cur = cursor.fetchone()
                         finalized = bool(_cur) and _cur[0] == DocVersionIndexStatus.SUCCESS
                     elif observed_status == DocVersionIndexStatus.PROCESSING:
+                        # activated_at（doc-update-notify 2026-08-04）：与 stage-3 收尾同语义——
+                        # 这是搁浅版本真正在检索侧生效的时刻。切换时点不能用 updated_at
+                        # （ON UPDATE 会被 ACL 投影等无关写刷新），故写入这个专列。
                         cursor.execute(f"""
                             UPDATE document_version
-                            SET index_status = '{DocVersionIndexStatus.SUCCESS}'
+                            SET index_status = '{DocVersionIndexStatus.SUCCESS}', activated_at = NOW()
                             WHERE doc_id = %s AND version_no = %s
                               AND index_status = '{DocVersionIndexStatus.PROCESSING}'
                               AND updated_at = %s
@@ -663,7 +666,7 @@ def reconcile_stranded_versions() -> dict:
                     else:
                         cursor.execute(f"""
                             UPDATE document_version
-                            SET index_status = '{DocVersionIndexStatus.SUCCESS}'
+                            SET index_status = '{DocVersionIndexStatus.SUCCESS}', activated_at = NOW()
                             WHERE doc_id = %s AND version_no = %s
                               AND index_status = %s
                         """, (doc_id, version_no, observed_status))

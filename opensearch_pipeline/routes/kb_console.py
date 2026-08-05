@@ -18,6 +18,7 @@ from typing import Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from opensearch_pipeline import doc_state
 from opensearch_pipeline.config import get_config
 from opensearch_pipeline.qa_logger import _op_db
 from opensearch_pipeline.reindex_states import ChunkIndexStatus, DocVersionIndexStatus, sql_in_list
@@ -3308,9 +3309,12 @@ def _kb_content_binding_columns(cursor) -> bool:
 def _kb_version_quarantined(publish_status, gate_status) -> bool:
     """隔离判定唯一权威（codex 共识 2026-08-02）：publish_status='QUARANTINED' OR
     gate_status='quarantined'，两字段任一命中即隔离。preview 软拒、版本列表徽章、
-    restore/set-visibility 409 三处共用，避免 OR 语义三份漂移。"""
-    return (str(publish_status or "").upper() == "QUARANTINED"
-            or str(gate_status or "").lower() == "quarantined")
+    restore/set-visibility 409 三处共用，避免 OR 语义三份漂移。
+
+    ⚠️ 实现已下沉 `opensearch_pipeline/doc_state.py`（2026-08-04）：DataWorks 批处理侧
+    （doc-update-notify 日调节点）也要这条判定，而节点不能 import routes（拖 FastAPI）。
+    本名保留为 re-export，既有 import 面与调用点逐字不变。"""
+    return doc_state.version_quarantined(publish_status, gate_status)
 
 
 def _assert_version_not_quarantined(cur, doc_id: str, version_no: int) -> None:

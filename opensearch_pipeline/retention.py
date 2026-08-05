@@ -72,7 +72,8 @@ DEFAULT_BATCH = 5000
 MAX_BATCHES_PER_JOB = 400
 SLEEP_BETWEEN_BATCHES = 0.2
 
-_JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings", "qa_facts")
+_JOB_NAMES = ("qa_blobs", "qa_rows", "audit", "pipeline_run", "findings", "qa_facts",
+              "doc_notices")
 
 
 def _kb_db() -> str:
@@ -100,6 +101,10 @@ def _retention_windows() -> Dict[str, int]:
         "findings": _months("RAG_RETENTION_FINDING_MONTHS", 24),
         # perf#3 事实表（schema/013）：与 qa_rows 同窗——瘦行只服务 30 天级看板，跟主日志同期退役
         "qa_facts": _months("RAG_RETENTION_QA_FACTS_MONTHS", 18),
+        # 升版提醒投递行（schema/065）：user_id 键控个人数据 ⇒ 有窗 + 进主体擦除。
+        # ⚠️ **只清 notice，绝不清 doc_update_event** —— 事件表是防重放台账，discover 的
+        # 「无事件行」反连接依赖行存在，清掉 = 远古升版被重新发现并群发（评审 R2-B M-1）。
+        "doc_notices": _months("RAG_RETENTION_DOC_NOTICE_MONTHS", 6),
     }
 
 
@@ -131,6 +136,11 @@ def _job_sqls(job: str) -> Dict[str, str]:
     if job == "qa_facts":
         # qa_retrieved_doc（schema/013，可选迁移）：表未建的环境由 run_retention 按 1146 静默 skip
         pred = ("FROM {op}.qa_retrieved_doc "
+                "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
+        return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
+    if job == "doc_notices":
+        # schema/065 可选迁移：表未建的环境由 run_retention 按 1146 静默 skip。
+        pred = ("FROM {op}.doc_update_notice "
                 "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s MONTH)").format(op=op)
         return {"count": f"SELECT COUNT(*) {pred}", "act": f"DELETE {pred} LIMIT %s"}
     if job == "pipeline_run":
@@ -351,12 +361,14 @@ def run_retention(*, commit: bool = False, only: Optional[List[str]] = None,
                 conn.close()
         except Exception as e:
             errno = e.args[0] if getattr(e, "args", None) and isinstance(e.args[0], int) else None
-            if job == "qa_facts" and errno == 1146:
-                # schema/013 是可选迁移：未 apply 的环境（staging/本地）表不存在不算失败——
-                # 其余作业的 1146 仍按事故上报（基础表缺失=部署错库）。
+            if job in ("qa_facts", "doc_notices") and errno == 1146:
+                # schema/013 与 065 均为可选迁移：未 apply 的环境（staging/本地）表不存在不算
+                # 失败——其余作业的 1146 仍按事故上报（基础表缺失=部署错库）。
                 rep["ok"] = True
-                rep["skipped"] = "qa_retrieved_doc 不存在（schema/013 未应用）"
-                print(f"[retention] {job}: skip（事实表未建）")
+                rep["skipped"] = ("qa_retrieved_doc 不存在（schema/013 未应用）"
+                                  if job == "qa_facts"
+                                  else "doc_update_notice 不存在（schema/065 未应用）")
+                print(f"[retention] {job}: skip（表未建）")
             else:
                 rep["error"] = str(e)
                 print(f"[retention] {job}: ✗ {e}")
@@ -388,6 +400,12 @@ def _purge_jobs(user_id: str) -> List[dict]:
         {"table": "user_feedback", "optional": False,
          "count": f"SELECT COUNT(*) FROM {op}.user_feedback WHERE user_id = %s",
          "act": f"DELETE FROM {op}.user_feedback WHERE user_id = %s LIMIT %s"},
+        # 升版提醒投递行（schema/065，可选迁移 ⇒ optional）：user_id 是钉钉 staffId，
+        # 行本身物化了"这个人当时可见哪些文档"，比 qa 行更该随主体擦除一起删。
+        # 对应的 doc_update_event 不含任何个人标识，且是防重放台账 ⇒ **不进本清单**。
+        {"table": "doc_update_notice", "optional": True,
+         "count": f"SELECT COUNT(*) FROM {op}.doc_update_notice WHERE user_id = %s",
+         "act": f"DELETE FROM {op}.doc_update_notice WHERE user_id = %s LIMIT %s"},
         # 仅删该用户【提出】的工单；user 仅作为 assigned_user_id（处理人）出现的行
         # 承载的是提单人的主体数据，不删。
         {"table": "escalation_ticket", "optional": False,

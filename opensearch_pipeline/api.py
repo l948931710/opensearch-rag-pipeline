@@ -173,6 +173,13 @@ async def _lifespan(_app: FastAPI):
             )
     except Exception:
         logger.warning("embedding 契约比对失败（忽略，不影响启动）", exc_info=True)
+    # ACL 姿态见证首章（doc-update-notify）：启动即盖一次（force），让新部署的姿态立刻对
+    # 离线通知节点可见，不必等第一次 readiness 探针。fail-open，绝不阻断启动。
+    try:
+        from opensearch_pipeline.runtime_contract import stamp_acl_posture
+        stamp_acl_posture(force=True)
+    except Exception:
+        logger.warning("ACL 姿态见证首章失败（忽略，不影响启动）", exc_info=True)
     # B3（生产级外审 2026-07-17 RB-02，摘自 ontology-p0）：TLS 接线自检——配了 CA 却
     # 明文=接线缺陷，production/staging fail-fast（未配 CA 维持 P0-02 告警拍板；
     # 探针 error 只告警）
@@ -794,6 +801,15 @@ def _probe_operation_schema(conn, trace_id) -> str:
 
 def _compute_readiness(cfg):
     """真实探针全文（原 readiness_check 主体）。返回 (body, critical_ok)。"""
+    # ACL 姿态见证保鲜（doc-update-notify）：把 serving **当前生效**的 ACL flag 姿态盖章到
+    # rag_runtime_contract，供离线通知节点断言"判定口径与线上一致"（见 runtime_contract
+    # 模块内的脱钩分析）。挂在探针的 cache-miss 路径上 = 借平台的秒级探活当心跳，无需自建
+    # 定时器；真实写入由模块内 1h 节流兜底，探针洪泛也不会放大 DB 写。全程 fail-open。
+    try:
+        from opensearch_pipeline.runtime_contract import stamp_acl_posture
+        stamp_acl_posture(cfg)
+    except Exception:   # noqa: BLE001 — 见证是治理设施，绝不影响探针判定
+        logger.debug("ACL 姿态见证盖章跳过（非致命）", exc_info=True)
     # P2-05：对外只报组件 up/down（ok/error/skipped），绝不回灌异常原文（DB host / 驱动错误 /
     # 索引错误经 str(e) 泄露内部拓扑）。完整异常写内部日志，响应带 trace_id 供运维对账。
     trace_id = get_request_id()
@@ -3148,12 +3164,14 @@ from opensearch_pipeline.routes import console as _routes_console  # noqa: E402
 from opensearch_pipeline.routes import contribution as _routes_contribution  # noqa: E402
 from opensearch_pipeline.routes import kb_access as _routes_kb_access  # noqa: E402
 from opensearch_pipeline.routes import kb_console as _routes_kb_console  # noqa: E402
+from opensearch_pipeline.routes import notices as _routes_notices  # noqa: E402
 
 # 注册顺序 = 原文件内出现顺序（路径无重叠，仅求 diff 稳定）。
 app.include_router(_routes_kb_console.router)
 app.include_router(_routes_kb_access.router)
 app.include_router(_routes_contribution.router)
 app.include_router(_routes_console.router)
+app.include_router(_routes_notices.router)
 
 # re-export：tests 直接调用 api.<endpoint>(...) / 引用 api.Kb* 模型与域内常量。
 # —— routes/kb_console.py ——
@@ -3305,3 +3323,9 @@ kb_console_spa = _routes_console.kb_console_spa
 kb_console_legacy = _routes_console.kb_console_legacy
 kb_console_next_root = _routes_console.kb_console_next_root
 kb_console_next_redirect = _routes_console.kb_console_next_redirect
+# —— routes/notices.py ——
+NoticeItem = _routes_notices.NoticeItem
+NoticesResponse = _routes_notices.NoticesResponse
+NoticesReadRequest = _routes_notices.NoticesReadRequest
+kb_notices = _routes_notices.kb_notices
+kb_notices_read = _routes_notices.kb_notices_read
