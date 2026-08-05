@@ -20,6 +20,11 @@ const { toast, clearToasts } = useToast()
 
 export interface DocItem {
   doc_id: string; title: string; original_filename: string; owner_dept: string
+  // 阶段 B 归属 DTO（后端 KbDocItem 自 node-ACL 起就在回）：node 文档 owner_dept 按契约为空串，
+  // 归属只能从这两个字段读。owner_key = `legacy:<code>` | `node:<id>`（稳定键，不拿中文名当键）；
+  // owner_label = 展示名（node 由后端 JOIN dept_dim 直给现名 ⇒ 部门改名免疫）。
+  // 可选是为了兼容 browse/mock 等尚未带该 DTO 的来源——渲染一律走 lib/orgTree.resolveDocOwner。
+  acl_mode?: string; owner_key?: string; owner_label?: string
   permission_level: string; current_version_no: number; status: string
   status_badge: string; updated_at: string
   can_manage?: boolean   // 可操作（写作用域）；my-docs 恒 true，browse 全部门时外部门为 false
@@ -1146,7 +1151,9 @@ async function uploadSingle(file: File) {
     if (!r.requires_kb_admin_approval) trackStatus(r.doc_id, r.version_no)   // 待审批不轮询
   } catch (e: any) {
     if (principalChangedSince(epoch0)) return       // 旧身份的失败不写新身份 UI
-    uploadErr.value = uploadErrText(e); uploadMsg.value = ''
+    // detail:true —— 管理台（受 _require_kb_console 保护）要看得到后端原因与 trace 号；
+    // 员工侧的贡献页仍走默认档不外泄。2026-08-04 全员上传中断即因这里吞掉了 500 的 detail。
+    uploadErr.value = uploadErrText(e, { detail: true }); uploadMsg.value = ''
   } finally { uploadBusy.value = false; uploadPct.value = null }   // 任何退出路径都撤条，含 PUT 中途失败
 }
 
@@ -1211,7 +1218,7 @@ async function uploadBatch(files: File[]) {
     } catch (e: any) {
       row.pct = null                                // PUT 中途失败也要撤条，否则冻在原值不消失
       if (principalChangedSince(epoch0)) return     // 旧身份的失败不写新身份 UI
-      row.status = '失败'; row.msg = uploadErrText(e); badN++
+      row.status = '失败'; row.msg = uploadErrText(e, { detail: true }); badN++   // 同上：批量行也要能看见真原因
     }
   }
   // 小并发池：worker 共享游标领任务，按队列顺序开工（uploadOne 自吞异常，Promise.all 不会中途 reject）。

@@ -74,6 +74,29 @@ export function resolveOwnerBucket(
   return { label: `#${id} ⚠️`, kind: 'node_missing', nodeId: id }
 }
 
+/** 文档归属 DTO → 展示名（台账/队列用；与看板 `resolveOwnerBucket` **同一口径**）。
+ *
+ *  ⚠️ 两处的稳定键形状**刻意不同**，别把它们合并：
+ *    · 看板覆盖行 `KbDeptCoverageItem.owner_dept` = 裸组码 | `node:<id>`
+ *    · 文档行     `KbDocItem.owner_key`          = `legacy:<code>` | `node:<id>`
+ *  故这里只做键形归一再委托，不去放宽 resolveOwnerBucket 的正则（放宽会让
+ *  `legacy:hr` 这种串在看板侧也被当成合法裸组码喂给 deptLabel，显示成 'legacy:hr'）。
+ *
+ *  `byId` 传空 Map 是**正常用法**：node 节点名后端已 JOIN dept_dim 直给（owner_label），
+ *  台账无须为了显示再拉一次组织快照。快照只在看板侧有额外价值（做中心卷积）。
+ *
+ *  兼容旧响应：`owner_key` 缺失时回落裸 `owner_dept`（legacy 文档恒有值；
+ *  node 文档该字段按后端契约为空 ⇒ 落「未归属」，如实反映"这个前端版本读不懂它"）。 */
+export function resolveDocOwner(
+  ownerKey: string | undefined, ownerDept: string | undefined,
+  ownerLabel: string | undefined, byId: Map<number, OrgNode>,
+  legacyLabel: (code: string) => string,
+): { label: string; kind: OwnerBucketKind; nodeId: number | null } {
+  const k = (ownerKey || '').trim()
+  const norm = k.startsWith('legacy:') ? k.slice('legacy:'.length) : (k || (ownerDept || '').trim())
+  return resolveOwnerBucket(norm, ownerLabel, byId, legacyLabel)
+}
+
 /** 节点 → 最近 depth<=1 祖先（=中心,org_sync 契约:中心 depth=1、无公司根行）。
  *  自身 depth<=1 即自身;快照缺链/超 20 跳 → null（调用方按顶层独立行处理,不猜中心）。 */
 export function centerOf(id: number, byId: Map<number, OrgNode>): number | null {

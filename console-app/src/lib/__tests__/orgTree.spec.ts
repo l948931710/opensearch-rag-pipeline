@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { centerOf, resolveOwnerBucket, rollupCoverageRows, type CoverageBucket } from '@/lib/orgTree'
+import { centerOf, resolveDocOwner, resolveOwnerBucket, rollupCoverageRows, type CoverageBucket } from '@/lib/orgTree'
+import { deptLabel } from '@/lib/kb'
 import type { OrgNode } from '@/composables/useOrgSnapshot'
 
 /** 生产形状（org_sync 契约：中心=depth 1、无公司根行）。 */
@@ -25,6 +26,28 @@ describe('resolveOwnerBucket — kind-aware 名称契约（codex 终稿）', () 
     expect(resolveOwnerBucket('node:99', '纸箱事业部', byId, legacy).label).toBe('纸箱事业部')
     expect(resolveOwnerBucket('node:99', 'node:99', byId, legacy).label).toBe('#99 ⚠️')
     expect(resolveOwnerBucket('node:99', '', byId, legacy).label).toBe('#99 ⚠️')
+  })
+  it('resolveDocOwner：文档 DTO 的 legacy:<code> 键形归一后仍走 deptLabel', () => {
+    // 台账/队列的 owner_key 带 `legacy:` 前缀，看板覆盖行的桶键是裸组码——两处刻意不同源。
+    // 若直接把 owner_key 喂给 resolveOwnerBucket，会显示成字面量 'legacy:hr'。
+    expect(resolveDocOwner('legacy:hr', 'hr', '', new Map(), deptLabel).label).toBe('人力资源')
+    expect(resolveDocOwner('legacy:hr', 'hr', '', new Map(), deptLabel).kind).toBe('legacy')
+  })
+  it('resolveDocOwner：node 文档 owner_dept 为空 → 用 owner_label（后端 JOIN dept_dim 直给）', () => {
+    // 这正是 2026-08-04 首篇 node 文档在台账「归属」列显示为空格子的那一格。
+    const r = resolveDocOwner('node:34265162', '', '人力资源部', new Map(), deptLabel)
+    expect(r.label).toBe('人力资源部')
+    expect(r.kind).toBe('node')
+    expect(r.nodeId).toBe(34265162)
+  })
+  it('resolveDocOwner：owner_key 缺失（旧响应）→ 回落裸 owner_dept；两者皆空 → 未归属', () => {
+    expect(resolveDocOwner(undefined, 'marketing', '', new Map(), deptLabel).label).toBe('营销')
+    expect(resolveDocOwner(undefined, '', '', new Map(), deptLabel).label).toBe('未归属')
+  })
+  it('resolveDocOwner：node 但 label 退化成裸 id 且无快照 → #id ⚠️（不假装知道名字）', () => {
+    const r = resolveDocOwner('node:99', '', '99', new Map(), deptLabel)
+    expect(r.label).toBe('#99 ⚠️')
+    expect(r.kind).toBe('node_missing')
   })
   it('legacy → deptLabel；unknown/空串 → 未归属（忽略 owner_label）', () => {
     expect(resolveOwnerBucket('production', 'production', byId, legacy).label).toBe('生产')

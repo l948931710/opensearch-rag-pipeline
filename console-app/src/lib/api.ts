@@ -3,12 +3,31 @@ import { useSession } from '@/stores/session'
 export class ApiError extends Error {
   status: number
   detail: string
-  constructor(message: string, status: number) {
+  /** 秒；0 = 响应未带 Retry-After。后端限流拒绝（rate_limiter.Denial）恒带该头，
+   *  上传/贡献侧据此出「请等 N 秒」而不是含糊的「稍后重试」。 */
+  retryAfter: number
+  constructor(message: string, status: number, retryAfter = 0) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.detail = message
+    this.retryAfter = retryAfter
   }
+}
+
+/** `Retry-After` 头 → 秒（只认 delta-seconds 形态；HTTP-date 形态与缺失均回 0）。
+ *
+ *  ⚠️ **全程 fail-safe，绝不抛**：本函数在 `apiJson` 的抛错路径上被调用，一旦它自己抛异常，
+ *  非 2xx 就会变成 `TypeError` 而不是 `ApiError` —— 下游所有 `e.status === 403/404` 的
+ *  分支会一起失效（404 静默兜底变成显错、403 文案退化成通用兜底）。加这层守卫时被
+ *  既有单测当场抓住（mock 的 Response 没有 headers），这里留个记号别再摘掉。 */
+function parseRetryAfter(res: Response): number {
+  try {
+    const raw = (res?.headers?.get?.('Retry-After') || '').trim()
+    if (!/^\d+$/.test(raw)) return 0
+    const n = Number(raw)
+    return Number.isFinite(n) && n > 0 ? Math.min(n, 3600) : 0
+  } catch { return 0 }
 }
 
 // 401 重登回调由 useAuth 在启动时注入（避免 api ↔ useAuth 循环依赖）。
@@ -58,6 +77,6 @@ export async function apiJson<T = any>(path: string, opts: ApiOpts = {}): Promis
   const res = await apiFetch(path, opts)
   let data: any = null
   try { data = await res.json() } catch { /* 非 JSON 响应 */ }
-  if (!res.ok) throw new ApiError((data && data.detail) || `HTTP ${res.status}`, res.status)
+  if (!res.ok) throw new ApiError((data && data.detail) || `HTTP ${res.status}`, res.status, parseRetryAfter(res))
   return data as T
 }

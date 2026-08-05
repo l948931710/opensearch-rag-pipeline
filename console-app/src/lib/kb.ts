@@ -143,16 +143,47 @@ export function putWithProgress(url: string, file: File, onProg?: (pct: number) 
   })
 }
 
-/** 把 OSS/CORS/413/trace 等技术错误转成管理员可操作的人话（绝不暴露原始 HTTP/trace 串）。 */
-export function uploadErrText(e: any): string {
+/** 后端 detail 的展示净化：剥掉裸 `HTTP <code>`、压平空白、限长。
+ *  **保留中文原因与 trace 号** —— trace 正是报障凭据，且只有 `detail:true` 的调用方才走到这里。 */
+function safeDetail(msg: string): string {
+  return msg.replace(/\bHTTP \d{3}\b/g, '').replace(/\s+/g, ' ').trim().slice(0, 140)
+}
+
+/**
+ * 把 OSS/CORS/413/5xx 等技术错误转成可操作的人话。
+ *
+ * ⚠️ **默认不外泄 trace/HTTP 串**：本函数**员工侧的知识贡献页也在用**（useContribute），
+ * 不是管理台专用。只有显式传 `{ detail: true }`（管理台，受 _require_kb_console 保护）
+ * 才附上后端 detail。这条分级是原「绝不暴露」约束的收紧版，不是放弃它。
+ *
+ * 2026-08-04 的教训：一次**全员上传中断**（node 归属登记撞生产 owner_dept NOT NULL 漂移
+ * → 1048 → 500）被这里的兜底档压成一句「请稍后重试」，排查成本几乎全花在「看不见后端
+ * 到底说了什么」上。故新增两档，并且无论哪一档都把原始 status/detail 打进 console：
+ *   · 429 —— 此前掉进兜底，长得和真故障一模一样（当晚为此查了一轮限流台账才排除）
+ *   · 5xx —— 「服务端的锅」和「你再试试」必须可区分，否则用户会一直连点
+ */
+export function uploadErrText(e: any, opts?: { detail?: boolean }): string {
   const msg = (e && e.message) || String(e || '')
-  const status = e && e.status
+  const status = Number(e && e.status) || 0
+  const retryAfter = Number(e && e.retryAfter) || 0
+  // 原始信息恒进 devtools（不进 UI）——员工侧也能让管理员远程问一句"控制台报了什么"。
+  try { console.warn('[upload] 失败', { status, detail: msg, retryAfter }) } catch { /* 无 console 环境 */ }
+
   if (status === 413 || /超过大小上限|too large|413/i.test(msg)) return `文件超过上限 ${MAX_UPLOAD_MB}MB，请压缩或拆分后重传。`
   if (status === 403 || /无权|权限|forbidden/i.test(msg)) return '你没有该操作的权限，请联系知识库管理员。'
+  if (status === 429) return `操作太频繁，请等 ${retryAfter > 0 ? retryAfter : 60} 秒后再传（同时开着多个管理台页面也会占用额度）。`
   if (/OSS PUT|CORS|网络错误|超时|timeout/i.test(msg)) return '文件上传通道异常，请稍后重试；若持续失败请联系知识库管理员（可能是 OSS 跨域未放行）。'
   if (/未检测到已上传|请先完成直传|过期/i.test(msg)) return '上传未完成或链接已过期，请重新选择文件上传。'
   if (/空/.test(msg)) return '所选文件为空，请检查后重传。'
-  return '上传失败，请稍后重试；若持续失败请联系知识库管理员。'
+  if (/Failed to fetch|NetworkError|Load failed/i.test(msg)) return '网络中断，没能连上服务器；请检查网络后重试。'
+  if (status >= 500) {
+    return opts?.detail
+      ? `服务端处理失败：${safeDetail(msg)}。不是你文件的问题——请把这句话原样发给知识库管理员。`
+      : '服务端处理失败（不是你文件的问题），请把出错时间告知知识库管理员。'
+  }
+  return opts?.detail && msg && !/^HTTP \d+$/.test(msg)
+    ? `上传失败：${safeDetail(msg)}；若持续失败请把这句话原样发给知识库管理员。`
+    : '上传失败，请稍后重试；若持续失败请联系知识库管理员。'
 }
 
 export interface DupDoc { doc_id: string; title: string; owner_dept: string }

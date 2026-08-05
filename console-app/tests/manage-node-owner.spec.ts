@@ -123,6 +123,17 @@ test.describe('硬门 — 折叠式组织树选择器 + 归属自动化', () => 
     await expect(upload.getByText('组织数据可能已过期').first()).toBeVisible();
   });
 
+  // 2026-08-05 回归门：首篇 node 文档上线后，台账「归属」列是**空格子**——DocTable 还在渲染
+  // 旧字段 owner_dept（node 文档按后端契约恒为空串），而归属只在 owner_key/owner_label 上。
+  // 这条把「node 文档在台账里能看见归属」钉死；名字来自后端 JOIN dept_dim ⇒ 部门改名免疫。
+  test('台账归属列：node 文档显示节点名而非空格子', async ({ page }) => {
+    await gotoNodeUpload(page);
+    const ownerCell = page.locator('[data-label="归属"]').first();
+    await expect(ownerCell).toHaveText(/注塑事业部/);
+    await expect(ownerCell).not.toHaveText(/^\s*$/);
+    await expect(ownerCell).not.toHaveText(/未归属|node:|legacy:/);
+  });
+
   test('编辑信息弹窗：双折叠选择器预填、无整树、保存按钮免滚动可达', async ({ page }) => {
     await gotoNodeUpload(page);
     await page.getByTestId('doc-more').first().click();

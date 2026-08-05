@@ -77,9 +77,13 @@ export interface NodeModeOpts {
   fbStats409?: boolean;
 }
 
+// ⚠️ 2026-08-05：本 fixture 此前只有 `owner_dept: ''`，**缺 owner DTO 三字段**——正好复刻了
+// 后端契约（node 文档 owner_dept 恒空、归属只在 owner_key/owner_label 上），却没有任何用例
+// 断言台账「归属」列，于是首篇 node 文档上线后那一格显示为空谁也没发现。补齐并加断言。
 export const NODE_DOC = {
   doc_id: 'nd1', title: '注塑机保养作业指导书', original_filename: 'sop_injection.docx',
-  owner_dept: '', permission_level: 'dept_internal',
+  owner_dept: '', acl_mode: 'node', owner_key: 'node:3', owner_label: '注塑事业部',
+  permission_level: 'dept_internal',
   current_version_no: 3, status: 'active', status_badge: '已上线',
   updated_at: '2026-08-01 10:00',
 };

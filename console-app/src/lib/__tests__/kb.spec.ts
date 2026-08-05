@@ -16,6 +16,43 @@ describe('uploadErrText（技术错误 → 人话，绝不暴露 trace/HTTP）',
   it('未含原始 trace 串', () => {
     expect(uploadErrText(new Error('登记失败 (trace: abcd1234)'))).not.toContain('trace')
   })
+
+  // ── 2026-08-04 全员上传中断的回归面 ──────────────────────────────────────
+  // 那次 node 归属登记撞生产 owner_dept NOT NULL 漂移（1048 → 500），被兜底档压成
+  // 「请稍后重试」，与"限流""网络抖动"完全不可区分。以下三档就是为了让它们分开。
+  it('429 → 「太频繁」且带 Retry-After 秒数（此前掉进兜底，长得像真故障）', () => {
+    const s = uploadErrText({ status: 429, message: '操作太频繁，请稍后再试', retryAfter: 37 })
+    expect(s).toContain('太频繁')
+    expect(s).toContain('37')
+    expect(s).not.toContain('上传失败，请稍后重试')
+  })
+  it('429 无 Retry-After → 回落 60 秒，不出现 NaN/undefined', () => {
+    const s = uploadErrText({ status: 429, message: '操作太频繁，请稍后再试' })
+    expect(s).toContain('60')
+    expect(s).not.toMatch(/NaN|undefined/)
+  })
+  it('5xx → 明说「服务端处理失败」，与「稍后重试」可区分', () => {
+    const s = uploadErrText({ status: 500, message: '登记失败 (trace: abcd1234)' })
+    expect(s).toContain('服务端处理失败')
+    expect(s).not.toContain('trace')          // 默认档（员工侧）仍不外泄
+  })
+  it('5xx + detail:true（管理台）→ 附后端原因与 trace，供报障', () => {
+    const s = uploadErrText({ status: 500, message: '登记失败 (trace: abcd1234)' }, { detail: true })
+    expect(s).toContain('登记失败')
+    expect(s).toContain('abcd1234')
+  })
+  it('detail:true 仍剥掉裸 HTTP 码，且不把 `HTTP 502` 当原因直出', () => {
+    expect(uploadErrText({ status: 502, message: 'HTTP 502' }, { detail: true })).toContain('服务端处理失败')
+    expect(uploadErrText({ status: 400, message: 'HTTP 400' }, { detail: true }))
+      .toBe('上传失败，请稍后重试；若持续失败请联系知识库管理员。')
+  })
+  it('fetch 层网络中断 → 网络文案，不再伪装成通用失败', () => {
+    expect(uploadErrText(new TypeError('Failed to fetch'))).toContain('网络中断')
+  })
+  it('优先级：413/403 仍先于 5xx 命中', () => {
+    expect(uploadErrText({ status: 413, message: '文件超过大小上限' })).toContain('50MB')
+    expect(uploadErrText({ status: 403, message: '无权上传：owner_dept_not_managed' })).toContain('权限')
+  })
 })
 
 describe('buildDupMsg（ETag 内容查重提示，advisory）', () => {

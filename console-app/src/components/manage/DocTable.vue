@@ -3,6 +3,8 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye, Download, Settings, Loader2 } from '@lucide/vue'
 import { deptLabel, permLabel, PERM_LABEL } from '@/lib/kb'
+import { resolveDocOwner } from '@/lib/orgTree'
+import type { OrgNode } from '@/composables/useOrgSnapshot'
 import { useKb, type DocItem, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 import AccessSyncPill from './AccessSyncPill.vue'
@@ -53,6 +55,14 @@ function canManagePerm(d: DocItem): boolean {
 // 共享部门名（去 count，直接列名字，>2 个折 +N）——回答"文档共享给了哪些部门"。
 // O(1)：useKb 侧 computed Map（grants 变更才重算），模板每行 4 次调用不再各自全量扫。
 function sharedLabels(docId: string): string[] { return grantedLabelsByDoc.value.get(docId) || [] }
+
+// 归属列：node 文档的 owner_dept 按后端契约为空串（归属在 owner_dept_id 上），直接渲染旧字段
+// 会得到一个空格子——2026-08-04 首篇 node 文档入库后实地暴露。统一走 resolveDocOwner，
+// 与看板 OrgCoverageTable 同一口径（未归属/组码/节点名/失联节点四态）。
+// 空快照是有意的：node 名后端 JOIN dept_dim 直给，台账不为了显示多拉一次组织树。
+const NO_ORG_SNAPSHOT = new Map<number, OrgNode>()
+const ownerText = (d: DocItem): string =>
+  resolveDocOwner(d.owner_key, d.owner_dept, d.owner_label, NO_ORG_SNAPSHOT, deptLabel).label
 
 // 利用度副行文案：0=真·从未被引用（退役候选，amber 提示）；>0=引用 N 次；null/undefined=数据不可用不显示。
 function usageText(d: DocItem): string {
@@ -406,7 +416,7 @@ async function onRestore(d: DocItem) {
           </div>
         </div>
         <div class="led-cell text-sm text-muted-foreground" data-label="归属">
-          {{ deptLabel(d.owner_dept) }}
+          {{ ownerText(d) }}
           <span v-if="d.can_manage === false" class="ml-1.5 whitespace-nowrap rounded border border-border bg-panel px-1.5 py-px text-[10px] font-medium text-faint">其他部门</span>
         </div>
         <div class="led-cell font-mono text-xs text-muted-foreground" data-label="版本">v{{ d.current_version_no || 1 }}</div>
