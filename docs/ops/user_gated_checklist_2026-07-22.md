@@ -103,7 +103,8 @@ prod 走 prod_access 当日 RW token。每次 apply 同会话进 `schema_migrati
 |---|---|---|---|
 | H1 | 现网姿态复核 | SAE 控制台现查 `RAG_ACL_ANCESTRY`（引证的 OFF 是 Sam 2026-07-28 口径）、`RAG_LIVE_ACL_REREAD`（默认 true，**未取证**）、`RAG_ACL_CACHE_TTL`（默认 21600）、`RAG_BOT_DEPT_CACHE_TTL_SECONDS`（默认 90） | 三个 TTL 决定翻闸后的收敛速度；引的是代码默认值，**现网 env 可能覆盖** |
 | H2 | 翻闸前基线 | 跑 `python3 scripts/verify_acl_coverage.py --ancestry` 存档 | 期望：`name_path` 侧 supply 触发零受众告警（exit=2）；`ancestry` 侧不告警 |
-| H3 | 翻闸 | SAE env 加 `RAG_ACL_ANCESTRY=true` | **落地窗口最佳**：语料真空期现网零 active 文档（2026-08-04 实测），此刻放权面为 0 |
+| H0 | **部署前置（硬门）** | 确认现网镜像**已含** commit `3442050`+`f3b55a3`+`<rev4 锚>`：`GET /api/version` 的 `git_commit` 与之对上 | ⚠️ **现网 `rag-serving:8eaef983d776` = main@8eaef98,不含本批**。在旧镜像上翻闸 = 用**旧锚表**跑：采购部/薄膜/综合管理中心等能修，但**海外系三树仍 undecided**（获胜/印尼/墨西哥 无锚），且 partial 无日志、指纹不含 flag 态 ⇒ **先发布再翻闸** |
+| H3 | 翻闸 | SAE env 加 `RAG_ACL_ANCESTRY=true`（H0 通过后） | **落地窗口最佳**：语料真空期现网零 active 文档（2026-08-04 实测），此刻放权面为 0 |
 | H4 | 收敛 | 等待或加速。**收敛是活动触发不是墙钟**：employee 行 6h TTL 只在该用户再走写路径（机器人提问 / `/api/auth/dingtalk` 发令牌）时才穿透；只读令牌持有者可无限期不收敛 | 加速**首选**临时 `RAG_ACL_CACHE_TTL=300`（纯 env、可逆、零数据损失）。⚠️ 慎用 `DELETE FROM user_role WHERE role='employee'`：会**误删人工墓碑**（`is_active=0`=撤销读权；2026-08-04 实测现网墓碑数=0，但该表随时可能被手工写入），且全员 cache-miss 会打出钉钉 API 风暴 |
 | H5 | 验证 | 复跑 H2 脚本对照；SLS 检索 `ACL 祖先制 partial` 关键字 | partial 日志 2026-08-04 才补（此前全链无信号）；见 H6 |
 | H6 | 盯 partial 窗 | 祖先制 partial（任一跳 `department/get` 超时）→ **整体退回名字口径并照常缓存 6h**。后果：显式 `[]` 锚的权威 deny 可被一次抖动击穿成名字口径授权 | 既有机制、非本次引入，但 flag ON 后才带电。partial 率高 = 钉钉 API 不稳，应先压住再翻闸 |

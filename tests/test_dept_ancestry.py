@@ -416,6 +416,7 @@ _DIVERGE_0804 = {
     "墨西哥富岭": {"overseas", "production"},
     "获胜包装/获胜生产中心": {"overseas", "production"},
     "获胜包装/获胜生产中心/纸浆模塑事业部": {"overseas", "production"},
+    "获胜包装/获胜行政中心": {"admin"},        # 2026-08-04 拍板：行政线给 admin，不叠生产伞组
     "海外中心/海外服务部": {"overseas", "production"},
     "法务部": {"legal"},
     "财务中心/信息部": {"it"},
@@ -448,8 +449,8 @@ _EMPTY_DENY_0804 = {68112184}                       # 「其他」：显式 [] �
 _EMPTY_UNDECIDED_0804 = {                           # 真·未决定（锚表覆盖缺口，fail-closed）
     417762615,          # lzdqr（0 人）
     920067054,          # 实习生（0 人）
-    1068136163,         # 获胜包装（树根，直挂 11 人）——刻意不设锚，见 dept_ancestry 注释
-    1091358296,         # 获胜包装/获胜行政中心（8 人）——待拍板是否给 admin
+    1068136163,         # 获胜包装（树根，直挂 11 人）——刻意不设锚：树根是「公司」语义、
+    #                     职能不明，两条职能线各自有锚（生产/行政），树根宁缺勿错
 }
 # 锚 id 在 08-04 活跃树中已不存在者（组织撤销）。保留锚 = dept_id 若被钉钉回收则误授（理论
 # 风险）；删除 = 该部门恢复时静默失权。当前选择保留并在此显式登记，防"悄悄多出一个"。
@@ -525,14 +526,19 @@ def test_0804_child_inherits_new_overseas_anchor(snapshot_0804):
     assert set(anc) == {"overseas", "production"}
 
 
-def test_0804_huosheng_root_and_admin_stay_failclosed(snapshot_0804):
-    """获胜包装树根与获胜行政中心刻意【不设锚】：07-03 拍板对象是无子女叶子，
-    今天树根下辖生产+行政双职能，在根设锚会让海外子公司行政/HR 人员拿到大陆生产伞组。
-    维持 fail-closed（与现状一致），是否补锚待拍板。"""
+def test_0804_huosheng_root_stays_failclosed_while_branches_anchored(snapshot_0804):
+    """获胜树：两条职能线各自设锚，【树根不设锚】。
+    根设锚会让行政线拿到大陆生产伞组（07-03 拍板对象只是个无子女叶子）；反过来，
+    行政线的 admin 也绝不能漏到生产线上去。树根语义是「公司」而非职能 ⇒ fail-closed。"""
     rows, get = snapshot_0804
-    for dept_id in (1068136163, 1091358296):
-        anc, partial, undecided = resolve_dept_ids([dept_id], get)
-        assert partial is False and anc == [] and undecided is True
+    root, partial, undecided = resolve_dept_ids([1068136163], get)
+    assert partial is False and root == [] and undecided is True
+
+    prod, _, _ = resolve_dept_ids([1091525269], get)
+    adm, _, _ = resolve_dept_ids([1091358296], get)
+    assert set(prod) == {"overseas", "production"}
+    assert set(adm) == {"admin"}                 # 行政线不叠生产伞组
+    assert "production" not in adm and "overseas" not in adm
 
 
 def test_0804_every_anchor_exists_in_tree(snapshot_0804):
