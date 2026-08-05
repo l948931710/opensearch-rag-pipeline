@@ -68,6 +68,20 @@ describe('MemberRoleManager 渲染', () => {
     const { w } = mountIt([ADMINS[1]])   // 只有 kb_admin
     expect(w.text()).toContain('暂无部门管理员')
   })
+
+  it('nodeAclGrant 晚到（config 异步回填）→ 补拉候选队列 + 表单出组织树块', async () => {
+    // 2026-08-04 现网复现钉子：直进成员管理时 /api/kb/config 未回，原 onMounted 一次性
+    // 判断永远错过——候选队列不拉、授予表单只剩 legacy 组码 chips（"只有老的 nodes"）。
+    const { w, kb } = mountIt(ADMINS)
+    ;(apiJson as any).mockResolvedValue({ items: [] })
+    expect(apiJson).not.toHaveBeenCalledWith('/api/kb/admin-node-candidates', { auth: true })
+    await w.find('button').trigger('click')          // 打开授予表单（首个按钮=授予）
+    expect(w.text()).not.toContain('管辖节点')        // flag 未回 → 组织树块隐藏
+    ;(kb as any).nodeAclGrant.value = true           // config 迟到回填
+    await w.vm.$nextTick()
+    expect(apiJson).toHaveBeenCalledWith('/api/kb/admin-node-candidates', { auth: true })
+    expect(w.text()).toContain('管辖节点')            // 组织树块随 flag 出现
+  })
 })
 
 describe('grant/revoke 组合式逻辑（DEV preview）', () => {

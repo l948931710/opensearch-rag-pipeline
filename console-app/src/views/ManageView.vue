@@ -136,7 +136,10 @@ function ensureTabLoaded(t: Tab): Promise<unknown> {
   } else if (t === 'ops') {
     if (isKbAdmin.value) jobs.push(loadOpsMetrics())
   } else if (t === 'members') {
-    if (isKbAdmin.value) jobs.push(loadAdminGrants())
+    // loadConfig 不只服务上传上限：nodeAclGrant（授予表单的组织树块 + 候选队列）也从
+    // 它回填。原先只挂在 docs tab——直进成员管理时 flag 恒 false，组织树整场隐身
+    // （2026-08-04 现网复现：kb_admin 直进本 tab 授权，新管理员只落到 legacy 轴）。
+    if (isKbAdmin.value) jobs.push(loadAdminGrants(), loadConfig())
   }
   // （main 版无 ontology/agent_gov tab）
   const all = Promise.allSettled(jobs.map((j) => Promise.resolve(j)))

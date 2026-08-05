@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { UserCog, ShieldCheck, Plus, X, GitBranch, Loader2 } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
 import { useKb, type AdminItem } from '@/composables/useKb'
@@ -35,7 +35,11 @@ const candErr = ref('')
 async function onDecide(id: number, action: 'confirm' | 'reject') {
   candErr.value = (await decideNodeCandidate(id, action)) || ''
 }
-onMounted(() => { if (nodeAclGrant.value) void loadNodeCandidates() })
+// nodeAclGrant 由 /api/kb/config 异步置位（members tab 的 ensureTabLoaded 也会拉 config）。
+// 原 onMounted 一次性判断在「直进成员管理、config 未回」时恒 false：候选队列漏加载、
+// 授予表单的组织树块整场隐身（2026-08-04 现网复现：只剩 legacy 组码 chips）。
+// watch immediate 让 flag 何时翻真都补拉一次，翻假不清空（读侧姿态不回退）。
+watch(nodeAclGrant, (v) => { if (v) void loadNodeCandidates() }, { immediate: true })
 
 const deptAdmins = computed(() => adminGrants.value.filter((a) => a.role === 'dept_admin'))
 const kbAdmins = computed(() => adminGrants.value.filter((a) => a.role === 'kb_admin'))
