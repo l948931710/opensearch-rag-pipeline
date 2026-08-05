@@ -108,14 +108,15 @@ def test_same_version_image_is_kept(monkeypatch):
     assert _images_of(out) == ["c_now"]
 
 
-def test_unknown_version_falls_through_to_authority(monkeypatch):
-    """version_no 缺失（parse 缺省 0）⇒ 版本轴放行，但 4c 照样按 is_active 拦下。
+def test_unknown_version_dropped_by_version_axis_even_when_authority_active(monkeypatch):
+    """f9e59ea（fail-closed 改回）后：version_no 缺失（parse 缺省 0）由**版本轴**丢弃。
 
-    这条同时钉住两件事：不拿一个可用性未经证实的字段做 fail-closed；
-    以及放行的代价为零——权威轴仍然生效。
-    """
+    RDS 行刻意置 is_active=1（权威侧判活），故这次丢弃只能由版本轴解释——与
+    test_image_cosurface 的 fail-closed 钉子互为犄角。
+    （订正 2026-08-04 独立核验点名的过期测试：旧名字/docstring 仍在宣传被 f9e59ea
+    推翻的 fail-open 论证「版本轴放行、4c 拦下」，且靠 is_active=0 的巧合续绿。）"""
     out = _run(monkeypatch, [_text("A", 3)], [_img("A", 0, cid="c_unk", pk=11)],
-               [_row("c_unk", 0, 11)])          # is_active=0
+               [_row("c_unk", 1, 11)])          # is_active=1：权威侧放行，版本轴独自承重
     assert _images_of(out) == []
 
 
@@ -205,3 +206,42 @@ def test_cosurface_overfetches_to_leave_room_for_drops():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── 守卫缺失补钉（2026-08-04 独立核验 B1：M6 整删 4b、M3b/M3c strict 出口全绿）──────
+
+def test_cosurface_4b_revocation_hook_is_load_bearing(monkeypatch):
+    """4b 调用点钉扎：整删 `_deny_revoked_cross_dept` 调用曾全量 4181 绿（零测试钉住）。
+
+    真实撤销语义由 ACL 套件覆盖；本条只钉「cosurface 链上 4b 必须在场且其输出承重」
+    ——哨兵过滤标记行，删掉调用点即红。"""
+    calls = []
+
+    def _sentinel(rows, *a, **k):
+        calls.append(True)
+        return [r for r in rows if r.get("chunk_id") != "c_revoked"]
+
+    monkeypatch.setattr(retriever, "_deny_revoked_cross_dept", _sentinel)
+    out = _run(monkeypatch, [_text("A", 3)],
+               [_img("A", 3, cid="c_revoked", pk=11), _img("A", 3, cid="c_ok", pk=12)],
+               [_row("c_revoked", 1, 11), _row("c_ok", 1, 12)])
+    assert calls, "4b(_deny_revoked_cross_dept) 不在 cosurface 链上"
+    assert _images_of(out) == ["c_ok"], "4b 的输出必须承重（丢弃行不得复活）"
+
+
+def test_strict_empty_authority_rowset_drops_all(monkeypatch):
+    """strict 出口②（:831 `if not rows`）：复核返回空集=权威不可用 ⇒ 补图全弃。
+    （M3b 曾把该出口改回 fail-open 而全套件绿——本条即其钉子。）"""
+    out = _run(monkeypatch, [_text("A", 3)], [_img("A", 3, cid="c1", pk=11)],
+               rows=[])
+    assert _images_of(out) == []
+
+
+def test_strict_keyless_rows_drop_all(monkeypatch):
+    """strict 出口③（:801 两轴无键）：chunk_id 与 id 双缺 ⇒ 无从复核，strict 全弃。
+    （M3c 曾把该出口改回 fail-open 而 143 绿——本条即其钉子。）"""
+    ghost = {"doc_id": "A", "version_no": 3, "chunk_index": 9, "chunk_type": "image",
+             "source_image": "oss/ghost.png", "visual_summary": "ghost",
+             "chunk_id": "", "id": "", "permission_level": "public", "owner_dept": ""}
+    out = _run(monkeypatch, [_text("A", 3)], [ghost], [_row("cX", 1, 99)])
+    assert _images_of(out) == []
