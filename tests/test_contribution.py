@@ -1253,16 +1253,19 @@ def test_mine_doc_badge_three_way_distinguishable(monkeypatch):
     _kb_status_badge 台账词表，勿重造窄谓词；此前全部折叠成同一个「已采纳·待入库」）。"""
     _skip_if_not_sim()
     _employee(monkeypatch)
-    rows = [_reg_row("C1", "D1"), _reg_row("C2", "D2"), _reg_row("C3", "D3"), _reg_row("C4", "D4")]
+    rows = [_reg_row("C1", "D1"), _reg_row("C2", "D2"), _reg_row("C3", "D3"),
+            _reg_row("C4", "D4"), _reg_row("C5", "D5")]
+    # 第 7 列 = dv.gate_status（渲染侧 gate 轴，2026-08-04 独立核验 B2）；D5 = gate-only 隔离
     conn = _install_conn(monkeypatch, _FakeConn(list_rows=rows, dv_badge_rows=[
-        ("D1", "PENDING_APPROVAL", "NOT_INDEXED", None, None, "active"),
-        ("D2", "DONE", "SUCCESS", "QUARANTINED", None, "active"),
-        ("D3", "DONE", "NOT_INDEXED", "SKIPPED_EXPLOSION", "EMPTY", "active"),
-        ("D4", "NOT_STARTED", "NOT_INDEXED", None, None, "active"),
+        ("D1", "PENDING_APPROVAL", "NOT_INDEXED", None, None, "active", None),
+        ("D2", "DONE", "SUCCESS", "QUARANTINED", None, "active", None),
+        ("D3", "DONE", "NOT_INDEXED", "SKIPPED_EXPLOSION", "EMPTY", "active", None),
+        ("D4", "NOT_STARTED", "NOT_INDEXED", None, None, "active", None),
+        ("D5", "DONE", "SUCCESS", None, None, "active", "quarantined"),
     ]))
     from opensearch_pipeline import api
     resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
-    assert [i.doc_badge for i in resp.items] == ["待审核", "已隔离", "未入索引", "排队中"]
+    assert [i.doc_badge for i in resp.items] == ["待审核", "已隔离", "未入索引", "排队中", "已隔离"]
     sql = next(s for s, _ in conn.calls if "document_version dv" in s and "document_meta dm" in s)
     assert "IN (" in sql and "dv.version_no=1" in sql
     assert "COLLATE" not in sql   # IN 绑定参数，非跨库列对列 JOIN，无 1267 面
