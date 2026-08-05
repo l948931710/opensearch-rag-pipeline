@@ -187,11 +187,18 @@ console:GET /api/kb/notices(读复核+退役隔离排除+限频)     (①②③=
 ## 11. 尚未确定(Sam 拍板项)
 
 1. public 文档是否通知(默认不)。2. 总经办是否收(默认不)。
-3. MAX_AUDIENCE 默认值 vs production 伞形(默认 300 恐 HOLD 最大部门;分层上限备选)——**数据附件**:(a) 前版 sha NULL 占比 (b) 首启命中数 (c) 按 owner 受众分布 (d) 近 30-60 天切换时点直方图(基线损失量化)。
+3. MAX_AUDIENCE 默认值 —— **数据附件已实测(见 §11a),建议默认改 1000**(production 受众实测 808,默认 300 会 HOLD 掉 66% 语料;真正的防骚扰是"每人每日 ≤1 条摘要 + public 排除 + bulk_guard",上限只当失控护栏)。
 4. 钉钉通道节奏/调度时刻(建议 07:30)。5. 文案与深链(待确认文档详情路由)。
 6. 重传波期间姿态(bulk_guard HOLD 后人工 --requeue --limit 分批 or --suppress)。
 7. **小程序触达面**:v1 移动端靠钉钉工作通知(开闸后);console-only 观察窗内多数员工零触达——窗长与是否接受,Sam 定;miniapp 站内 inbox 列 v2。
 8. **与 C3′ 版本轴方案的共同依赖声明**:两稿都写 document_version(C3′ 触碰 updated_at 正是 D1c 弃用它的原因);8/7 codex 同批审时互相引用。
+
+## 11a. 数据附件(2026-08-04 prod-RO 实测;脚本=scratch/notify_data_annex_20260804.py,Sam 亲跑 exit=0;真空期语料=退役存量)
+
+- **(a) sha NULL 面**:document_version 3070 行,canonical_sha256 与 checksum_sha256 各 NULL 1471(47.9%,同批旧行);**etag 仅缺 281(9.2%)** ⇒ 双指纹的字节轴取 `checksum_sha256 → etag` 回退序。current>1 的 942 篇中 483 篇(51%)无非 NULL 前版 ⇒ missing_sha 杀伤面**基本是存量专属**(反正被 baseline 盖住);重传后新语料双列即写,门正常工作。activated_at 非空=0(死列坐实,可安全复活)。
+- **(b) 首启命中=0**(active 文档为 0:inactive 307/retired 1562/superseded 69)⇒ 谓词在真空期行为正确;开闸前基线的规模≈届时重传语料的存量升版数。
+- **(c) 受众分布**(staff_dim 活跃 1167;名字口径镜像,**未叠加 user_role 75 行 seeded 加成,数字是下界**):**production 808** / marketing 63 / finance 24 / rd 16 / hr 13 / pmc 9 / quality 8 / admin 5 / **supply 0**。dept_internal 文档按 owner:production 709(66%)/rd 147/marketing 121/…。两个连带发现:①**279 人(23.9%)名字口径映射不到任何组**——与 node-ACL 档案已知的现网缺陷(名字表漂移 281/1175)同族,通知面如实镜像检索面的这个洞,修复归 ancestry/dept_dim 线,不归本设计;②**supply 受众=0**(资材部名字疑漂移)→ 4 篇 supply 文档现网可能无人可读,独立线索移交。
+- **(d) 切换直方图(kb_audit_log DEACTIVATE,近 90 天)**:仅一个桶——202627 周 449 docs/9923 chunk 行(=07-06/07 wave-v2 批量重服),近 14 天 0 ⇒ 切换是**突发批量型**而非匀速:有机升版率≈0,维护波一次数百篇。含义:基线 ≤7 天损失窗实际≈0 篇;bulk_guard(50/轮)对有机流量宽裕,对维护波会整批 HOLD——正是设计意图,重灌日与 --requeue --limit 配合。
 
 ## 12. 评审记录
 
