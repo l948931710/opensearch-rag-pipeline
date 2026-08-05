@@ -2857,12 +2857,21 @@ def node_classify_and_risk_assess(ctx: dict):
                 try:
                     success = future.result()
                 except Exception:
-                    # 意外/DB 写失败：取消未启动 futures、快速关闭线程池（不等在飞任务，各自 finally
-                    # 关连接无泄漏）、抛出原异常 abort 节点。cancel_futures 需 Python≥3.9（本仓满足）。
+                    # 意外/DB 写失败：取消未启动 futures、标记线程池停工、抛出原异常 abort 节点
+                    # （各自 finally 关连接无泄漏）。注意语义：已在运行的任务仍会在 with 退出时
+                    # 被 Executor.__exit__ 的 shutdown(wait=True) 等待——这里的 wait=False 只是
+                    # 提前置 _shutdown 阻止后续 submit，不是「不等在飞任务」。
+                    # ⚠️ py3.7 铁律：绝不写 shutdown(cancel_futures=...)。该形参 Python≥3.9 才有
+                    # （bpo-39349），而 DataWorks 执行器是 py3.7（dataworks_nodes/stage3_node.py:15），
+                    # 在 py3.7 上此调用抛 TypeError 顶掉下面要 re-raise 的原异常，导致
+                    # dataworks_orchestrator.py 的 run_finish(FAILED, error_message=) 与钉钉
+                    # send_ops_alert 双双记成 TypeError 而非真实 RDS 故障（只有 stderr traceback
+                    # 还留 __context__）。上面逐个 .cancel() 已等价完成「取消未启动任务」。
+                    # 守卫：tests/test_dataworks_supply_chain.py::test_no_cancel_futures_kwarg_in_dataworks_surface
                     print(f"    ❌ Abort: DB/unexpected failure classifying {doc['doc_id']}")
                     for _f in future_to_doc:
                         _f.cancel()
-                    pool.shutdown(wait=False, cancel_futures=True)
+                    pool.shutdown(wait=False)
                     raise
                 if not success:
                     failed_doc_ids.add(doc["doc_id"])

@@ -7,6 +7,8 @@
 ④ _verify_zip_integrity sidecar 语义（缺失过渡放行/匹配过/不匹配拒）；
 ⑤ 全部节点 py3.7 分支依赖锁版（AST 定位 sys.version_info 分支）；
 ⑥ workflows 全部 uses 按 40-hex SHA 钉死（与 trivy/Dockerfile 同纪律）。
+⑦ py3.7 **源码构造**守卫（2026-07-25 补）：交付面语法门 + cancel_futures 窄规则
+   —— ⑤ 与 CI pip-audit 只守依赖，ruff target=py39 也不守，此前是空白面。
 """
 import ast
 import hashlib
@@ -359,3 +361,86 @@ def test_audit_baseline_file_shape():
     assert len(ids) >= 50                      # 快照基线量级 sanity
     bad = [i for i in ids if not re.fullmatch(r"[A-Z]+-[A-Za-z0-9-]+", i)]
     assert not bad, f"基线含非 ID 行（会拼进 --ignore-vuln 弄坏命令）: {bad}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ⑦ py3.7 源码构造守卫（2026-07-25，A 级评审 cancel_futures 逃逸后补）
+#
+# 背景：DataWorks 执行器 = py3.7（dataworks_nodes/stage3_node.py:15），而
+# deploy/build_dataworks_zip.sh:44 的 `git archive HEAD opensearch_pipeline`
+# 把**整个包**打进 zip 在该解释器上落地。既有 py3.7 守护（上面 ⑤/CI pip-audit）
+# 只覆盖**依赖**，不覆盖**源码构造**；`make lint` 的 ruff target-version=py39
+# （pyproject.toml:65）同样抓不到——实测即使显式 `ruff --target-version py37`
+# 也不检查标准库 API 可用性。逃逸实例：pipeline_nodes 并发 abort 路径曾用
+# `shutdown(cancel_futures=)`（3.9+ 形参），在 py3.7 抛 TypeError 顶掉待
+# re-raise 的原异常，污染 run_finish 的结构化错误与钉钉告警。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# py3.7 交付面 = 随 zip 落到 py3.7 执行器上的全部源码 + 下载/解压它的粘贴脚本。
+# 注意这是**交付面**不是**执行闭包**：包内纯服务模块（api.py / routes/*）也随
+# zip 落盘但只在 SAE py3.10 执行。刻意保守——真实执行闭包含大量函数内 import，
+# 无法廉价且可复现地静态算出（曾试算得 64 与 76 两个不自洽的数），而下面两条规则
+# 对服务面的约束成本≈0（语法门当前 0 违规；cancel_futures 有零成本等价写法）。
+_PY37_SURFACE_DIRS = ["opensearch_pipeline", "dataworks_nodes"]
+_PY37_SURFACE_EXTRA = ["scripts/dataworks_stage3_with_cleanup.py"]   # py3.7 执行，:4/:263
+
+
+def _py37_surface_files():
+    """交付面全部 .py（排序稳定，供两条规则共用）。"""
+    out = []
+    for d in _PY37_SURFACE_DIRS:
+        out += [p for p in sorted((REPO / d).rglob("*.py")) if "__pycache__" not in str(p)]
+    out += [REPO / rel for rel in _PY37_SURFACE_EXTRA]
+    return out
+
+
+def test_dataworks_surface_parses_as_py37():
+    """交付面全部 .py 必须能按 py3.7 语法解析。
+
+    `ast.parse(feature_version=(3, 7))` 覆盖：海象 := / 仅位置参数 / f-string `=` /
+    match-case —— 这些一旦合入就随 zip 上线并在 py3.7 当场 SyntaxError。
+    ⚠️ 已知盲区（实测确认抓不到，勿据此产生虚假安全感）：`dict | dict`、内建泛型
+    `list[int]` 的运行时求值、以及**一切纯运行时 stdlib API**（如 str.removeprefix
+    /math.prod/zoneinfo）。运行时 API 面由下面的窄规则 + 人工纪律覆盖
+    （既有人工纪律实例：config.py:134 刻意不用 removeprefix）。
+    """
+    files = _py37_surface_files()
+    bad = []
+    for p in files:
+        try:
+            ast.parse(p.read_text(encoding="utf-8"), feature_version=(3, 7))
+        except SyntaxError as e:
+            bad.append(f"{p.relative_to(REPO)}:{e.lineno} {e.msg}")
+    assert not bad, (
+        "以下文件含 py3.8+ 语法，但会随 DataWorks zip 落到 py3.7 执行器上：\n  "
+        + "\n  ".join(bad)
+        + "\n改写成 py3.7 兼容写法，或先完成 DataWorks 运行时升级再放行。")
+    # 防假绿：glob 失效/目录改名会让上面空跑（本文件既有 `>= 9` 同纪律）
+    assert len(files) >= 95, f"交付面扫描文件数异常（{len(files)}），glob 可能失效"
+
+
+def test_no_cancel_futures_kwarg_in_dataworks_surface():
+    """窄规则：交付面禁止 `*.shutdown(..., cancel_futures=...)`。
+
+    `cancel_futures` 是 bpo-39349 在 Python 3.9 才加入 `Executor.shutdown` 的形参，
+    py3.7 上抛 TypeError。它出现在 except 块里时尤其毒：会顶掉待 re-raise 的原异常
+    （见 pipeline_nodes.py 并发分类 abort 路径的 ⚠️ 注释）。
+    py3.7 等价写法：对 futures 逐个 `.cancel()` 后 `shutdown(wait=False)`。
+
+    按 AST 关键字实参匹配而非文本匹配——注释里写 `cancel_futures` 是允许的
+    （被修复处的告诫注释本身就含该词）。
+    """
+    offenders = []
+    for p in _py37_surface_files():
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Attribute) and node.func.attr == "shutdown"):
+                continue
+            if any(kw.arg == "cancel_futures" for kw in node.keywords):
+                offenders.append(f"{p.relative_to(REPO)}:{node.lineno}")
+    assert not offenders, (
+        "shutdown(cancel_futures=) 需 Python≥3.9，但 DataWorks 执行器是 py3.7：\n  "
+        + "\n  ".join(offenders)
+        + "\n改用：先对 futures 逐个 .cancel()，再 shutdown(wait=False)。")

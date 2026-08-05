@@ -799,6 +799,62 @@ class TestDatabaseExceptionPropagation:
         with pytest.raises(RuntimeError, match="Database write failure in node_update_index_status: Mock RDS update index status failed"):
             node_update_index_status(ctx)
 
+    def test_classify_concurrent_abort_survives_py37_executor(self, monkeypatch):
+        """py3.7 回归：并发 abort 路径不得依赖 shutdown(cancel_futures=)。
+
+        DataWorks 执行器 = py3.7（dataworks_nodes/stage3_node.py:15），其
+        `Executor.shutdown` 签名只有 `(wait=)`——`cancel_futures` 是 bpo-39349
+        在 3.9 才加的形参。旧代码 `pool.shutdown(wait=False, cancel_futures=True)`
+        在 py3.7 抛 TypeError，顶掉紧随其后要 re-raise 的原异常，使
+        dataworks_orchestrator 的 run_finish(FAILED, error_message=) 与钉钉
+        send_ops_alert 都记成 TypeError 而非真实故障。
+
+        本用例注入 py3.7 签名的 executor stub：修复前 TypeError，修复后原异常逃出。
+        ⚠️ ThreadPoolExecutor 是函数内 import（pipeline_nodes.py:1781），故必须 patch
+        `concurrent.futures.ThreadPoolExecutor` 本身，patch 模块属性无效。
+        ⚠️ 必须 ≥2 篇 canonicals——单篇走的是非并发分支（len(...) <= 1）。
+        worker 异常源用 resolve_permission_level 注入（worker 第一步，pipeline_nodes.py:1806）：
+        本不变量与异常来源无关，只关心「原异常必须逃出」。
+        """
+        import concurrent.futures as _cf
+        import opensearch_pipeline.pipeline_nodes as _pn
+        from opensearch_pipeline.pipeline_nodes import node_classify_and_risk_assess
+
+        class _Py37Executor:
+            """最小 executor，shutdown 只接受 wait —— 复刻 py3.7 签名。"""
+            def __init__(self, max_workers=None): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): self.shutdown(wait=True); return False
+            def submit(self, fn, *args, **kwargs):
+                fut = _cf.Future()
+                try:
+                    fut.set_result(fn(*args, **kwargs))
+                except BaseException as exc:      # noqa: BLE001 —— 原样搬进 future
+                    fut.set_exception(exc)
+                return fut
+            def shutdown(self, wait=True): pass   # ← 无 cancel_futures，py3.7 语义
+
+        monkeypatch.setattr(_cf, "ThreadPoolExecutor", _Py37Executor)
+        monkeypatch.setattr(_pn, "resolve_permission_level",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                RuntimeError("Database write failure in node_classify_document (persist metadata): mock RDS down")))
+
+        ctx = {
+            "tasks": [],
+            "canonicals": [
+                {"doc_id": "doc1", "version_no": 1, "text": "dummy content", "filename": "a.txt",
+                 "dept": "HR", "file_ext": "txt", "source_key": "_quarantine/"},
+                {"doc_id": "doc2", "version_no": 1, "text": "dummy content", "filename": "b.txt",
+                 "dept": "HR", "file_ext": "txt", "source_key": "_quarantine/"},
+            ],
+            "simulate_db": True,
+            "simulate_api": True,
+        }
+
+        # 断言原始 RuntimeError 逃出；py3.7 上旧代码会是 TypeError(cancel_futures) 而失败
+        with pytest.raises(RuntimeError, match="Database write failure in node_classify_document"):
+            node_classify_and_risk_assess(ctx)
+
 
 class TestStage3ProductionLoaderRegression:
     """Stage 3 生产模式加载器的回归与字段映射测试。"""
