@@ -28,10 +28,13 @@
 - 独立核验修复批（B1-B8/P3 族）+ console UX 八提交 + C8（`a951b9b`，flag 默认
   off）+ R1（`45f7113`）。
 
-## 3. 待办（本文件写就时）
+## 3. 进度
 
-- [ ] push 触发的 CI/image/Frontend 三 workflow 绿（进行中）
-- [ ] `image.yml` workflow_dispatch + `push_acr=true`（dispatch 后 Sam 在
-      GitHub `acr-promotion` 环境 approve）
+- [x] CI/image/Frontend 三 workflow 绿（首推 test 假红=徽章 parity 缺本地栈 skip 门、
+      security 红=aiohttp/cryptography 两新 CVE——`7240784`/`65a3882` 修后 `8eaef98` 全绿）
+- [x] ACR 促升完成（run 30972380161，`acr-promotion` 门已批）：
+      tag `rag-serving:8eaef983d776`，manifest digest
+      `sha256:ff3a70db2060e6b50ed77418aa38999cfc96b88353a8e52e6b18b676ced56ef5`，
+      工件 attestation 链同 run 逐字节（artifact sha256 `d9ea36e8…`）
 - [ ] SAE 控制台切镜像（Sam）+ 冒烟四联
 - [ ] 正门补验：重灌收敛 → 金集重标 → baseline refreeze 后跑 `make release-gate`
