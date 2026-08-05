@@ -394,3 +394,195 @@ def test_descendants_cycle_and_diamond_defused_by_dedup():
 def test_descendants_oversize_fails_closed_not_truncated():
     """超上限 fail-closed 不截断——截断 = dept_admin 静默少管一片，比失效更难发现。"""
     assert resolve_descendant_ids(_IDX, [2], max_nodes=2) == (set(), False)
+
+
+# ══ 第四部分：2026-08-04 部门名漂移批（08-04 树精确值对照） ══════════
+# 背景：钉钉侧改名/重组把名字表打出 9 个死键（资材部→采购部 等），并把海外系三个单位
+# 升为顶层树 —— 07-03 锚表够不到。本节以 08-04 真实树锁死「补锚后每个部门解析成什么」。
+#
+# ⚠️ 为什么必须逐 path 锁【值】而不是断言「非空」：非空断言对越权变异 0 检出 ——
+#    把 92 人子树误配 ["*"] 全组哨兵、漏掉 overseas、错配 finance、删掉「其他」的 deny 锚，
+#    四种变异都能通过非空断言（2026-08-04 变异实测）。ACL 场景下那是不可接受的降级。
+# ⚠️ 本 fixture 锁的是【该快照树形态下锚表的正确性】，不等于运行时覆盖率：运行时 dept_ids
+#    来自钉钉 user/get、父链来自 department/get，fixture 只是 dept_dim 的日快照。
+#    它也【不能】发现"组织又漂移了"（静态快照永远绿）——那需要定时对 dept_dim 跑覆盖扫描。
+_FIXTURE_0804 = Path(__file__).parent / "fixtures" / "dingtalk_org_snapshot_20260804.json"
+
+# 名字口径 != 祖先制 的全部 path → 祖先制值。28 条 = 27 条「名字口径为空的缺口修复」
+# + 1 条「纸浆模塑事业部 production → overseas+production」（该部门 2026-08 随整建制迁移
+# 挂进了获胜子公司树，同 dept_id 921614009，非同名误授）。
+_DIVERGE_0804 = {
+    "印尼富岭": {"overseas", "production"},
+    "墨西哥富岭": {"overseas", "production"},
+    "获胜包装/获胜生产中心": {"overseas", "production"},
+    "获胜包装/获胜生产中心/纸浆模塑事业部": {"overseas", "production"},
+    "获胜包装/获胜行政中心": {"admin"},        # 2026-08-04 拍板：行政线给 admin，不叠生产伞组
+    "海外中心/海外服务部": {"overseas", "production"},
+    "法务部": {"legal"},
+    "财务中心/信息部": {"it"},
+    "生产中心/采购部": {"supply", "pmc", "production"},
+    "品技中心": {"quality"},
+    "品技中心/品质部/质量管理": {"quality"},
+    "生产中心/薄膜车间": {"production"},
+    "生产中心/薄膜车间/薄膜—仓管": {"production"},
+    "生产中心/薄膜车间/薄膜—其他": {"production"},
+    "生产中心/薄膜车间/薄膜—切袋": {"production"},
+    "生产中心/薄膜车间/薄膜—吹膜机修": {"production"},
+    "生产中心/薄膜车间/薄膜—机修": {"production"},
+    "综合管理中心": {"admin", "hr"},
+    "综合管理中心/办公室": {"admin", "hr"},
+    "综合管理中心/行政部/行政—保安": {"admin"},
+    "综合管理中心/行政部/行政—司机": {"admin"},
+    "综合管理中心/行政部/行政—后勤": {"admin"},
+    "综合管理中心/行政部/行政—松门保安": {"admin"},
+    "综合管理中心/行政部/行政—松门厨房": {"admin"},
+    "综合管理中心/行政部/行政—松门后勤": {"admin"},
+    "综合管理中心/行政部/行政—食堂": {"admin"},
+    "营销中心/国内营销部/内销监装": {"marketing", "production"},
+    "营销中心/国际贸易部/外贸监装": {"marketing", "production"},
+    "营销中心/电子商务部/杭州分公司": {"marketing", "production"},
+}
+
+# 解析为空的部门 —— 按 dept_id 键控而非名字（本次修复的立论就是「名字会漂移」，
+# 用名字做豁免名单等于把同一个坑再挖一遍）。
+_EMPTY_DENY_0804 = {68112184}                       # 「其他」：显式 [] 锚 = 权威仅 public
+_EMPTY_UNDECIDED_0804 = {                           # 真·未决定（锚表覆盖缺口，fail-closed）
+    417762615,          # lzdqr（0 人）
+    920067054,          # 实习生（0 人）
+    1068136163,         # 获胜包装（树根，直挂 11 人）——刻意不设锚：树根是「公司」语义、
+    #                     职能不明，两条职能线各自有锚（生产/行政），树根宁缺勿错
+}
+# 锚 id 在 08-04 活跃树中已不存在者（组织撤销）。保留锚 = dept_id 若被钉钉回收则误授（理论
+# 风险）；删除 = 该部门恢复时静默失权。当前选择保留并在此显式登记，防"悄悄多出一个"。
+_KNOWN_DEAD_ANCHORS = {842763367}                   # 工程 → engineering
+
+
+@pytest.fixture(scope="module")
+def snapshot_0804():
+    data = json.loads(_FIXTURE_0804.read_text(encoding="utf-8"))
+    rows = data["depts"]
+    return rows, parent_getter_from_index(build_parent_index(rows))
+
+
+def test_0804_divergences_are_exactly_as_designed(snapshot_0804):
+    """08-04 树上「名字口径 vs 祖先制」的每一处差异，逐 path 锁值（防意外放权/漏授）。"""
+    rows, get = snapshot_0804
+    diverge = {}
+    for r in rows:
+        cur = set(_normalize_dept_to_codes(r["name"]))
+        anc, partial, _ = resolve_dept_ids([r["dept_id"]], get)
+        assert partial is False, r["path"]
+        if set(anc) != cur:
+            diverge[r["path"]] = set(anc)
+    assert diverge == _DIVERGE_0804
+
+
+def test_0804_name_hits_otherwise_resolve_identically(snapshot_0804):
+    """铁律 1 的 08-04 版：名字口径命中的部门，除上表登记的差异外必须逐一全等。"""
+    rows, get = snapshot_0804
+    checked = 0
+    for r in rows:
+        cur = set(_normalize_dept_to_codes(r["name"]))
+        if not cur or r["path"] in _DIVERGE_0804:
+            continue
+        anc, partial, _ = resolve_dept_ids([r["dept_id"]], get)
+        assert partial is False and set(anc) == cur, r["path"]
+        checked += 1
+    assert checked >= 80        # 08-04 树 87 个命中部门、1 个登记差异；防 fixture 变形空转
+
+
+def test_0804_empty_results_split_deny_from_gap(snapshot_0804):
+    """空结果必须分成两类：显式 deny（decided）与覆盖缺口（undecided）——
+    两者都表现为空集但语义相反：前者是权威拒绝、压过名字撞名，后者会落回名字口径兜底。"""
+    rows, get = snapshot_0804
+    deny, gap = set(), set()
+    for r in rows:
+        anc, partial, undecided = resolve_dept_ids([r["dept_id"]], get)
+        assert partial is False, r["path"]
+        if anc:
+            continue
+        (gap if undecided else deny).add(r["dept_id"])
+    assert deny == _EMPTY_DENY_0804
+    assert gap == _EMPTY_UNDECIDED_0804
+
+
+def test_0804_rename_immunity_supply_anchor(snapshot_0804):
+    """改名免疫：资材部 2026-08 改名「采购部」，dept_id 728779788 不变 ⇒ 组不变。
+    这正是 dept_id 键控相对名字表的核心优势（名字表 key「资材部」已成死键）。"""
+    rows, get = snapshot_0804
+    row = next(r for r in rows if r["dept_id"] == 728779788)
+    assert row["name"] == "采购部"                       # fixture 自证现名已漂
+    assert _normalize_dept_to_codes("采购部") == []       # 名字口径确已失效
+    anc, partial, _ = resolve_dept_ids([728779788], get)
+    assert partial is False and set(anc) == {"supply", "pmc", "production"}
+
+
+def test_0804_child_inherits_new_overseas_anchor(snapshot_0804):
+    """新锚的价值在【子节点一跳继承】而非自锚（自锚在 walker 循环顶即命中、父链一次都不查）。
+    纸浆模塑事业部 → 获胜生产中心锚，跨的正是 2026-08 重组后的新父链。"""
+    rows, get = snapshot_0804
+    anc, partial, undecided = resolve_dept_ids([921614009], get)
+    assert partial is False and undecided is False
+    assert set(anc) == {"overseas", "production"}
+
+
+def test_0804_huosheng_root_stays_failclosed_while_branches_anchored(snapshot_0804):
+    """获胜树：两条职能线各自设锚，【树根不设锚】。
+    根设锚会让行政线拿到大陆生产伞组（07-03 拍板对象只是个无子女叶子）；反过来，
+    行政线的 admin 也绝不能漏到生产线上去。树根语义是「公司」而非职能 ⇒ fail-closed。"""
+    rows, get = snapshot_0804
+    root, partial, undecided = resolve_dept_ids([1068136163], get)
+    assert partial is False and root == [] and undecided is True
+
+    prod, _, _ = resolve_dept_ids([1091525269], get)
+    adm, _, _ = resolve_dept_ids([1091358296], get)
+    assert set(prod) == {"overseas", "production"}
+    assert set(adm) == {"admin"}                 # 行政线不叠生产伞组
+    assert "production" not in adm and "overseas" not in adm
+
+
+def test_0804_every_anchor_exists_in_tree(snapshot_0804):
+    """锚 id 打错/组织撤销都表现为「该子树整片掉空」。登记已知死锚，其余必须在树上存在。"""
+    rows, _ = snapshot_0804
+    tree_ids = {r["dept_id"] for r in rows}
+    missing = set(ANCHOR_GROUPS_BY_DEPT_ID) - tree_ids
+    assert missing == _KNOWN_DEAD_ANCHORS
+
+# ══ 第五部分：外部组码防投毒（2026-08-04 扩面：从只挡 "*" 到挡全部组码） ══
+def test_guard_drops_external_dept_named_like_group_code(monkeypatch):
+    """一个字面命名为 'production' 的钉钉部门不得让其成员拿到生产伞组。
+    dept_name 列是名字域与组码域同居的：名字表未命中即原样透传给组码白名单，
+    因此外部可控的部门名能直接冒充组码——必须在入口丢弃（fail-closed）。"""
+    monkeypatch.delenv("RAG_ACL_ANCESTRY", raising=False)
+    conn = _FakeConn(cache_row=None)
+    _wire(monkeypatch, conn, {"user_name": "李四", "dept_name": "production,财务部",
+                              "is_partial": False, "dept_ids": [777]}, {})
+    codes, cacheable = di._resolve_user_dept_live("u_forge")
+    assert codes == ["finance"]                     # 冒充项被丢，正常部门不受影响
+    assert "production" not in _insert_params(conn)[2]
+
+
+def test_guard_still_drops_star_sentinel(monkeypatch):
+    """原「星号防投毒」（2026-07-17 ultra P2）语义不得回退。"""
+    monkeypatch.delenv("RAG_ACL_ANCESTRY", raising=False)
+    conn = _FakeConn(cache_row=None)
+    _wire(monkeypatch, conn, {"user_name": "王五", "dept_name": "*,行政部",
+                              "is_partial": False, "dept_ids": [888]}, {})
+    codes, _ = di._resolve_user_dept_live("u_star")
+    assert codes == ["admin"]                       # 不是全量白名单
+
+
+def test_guard_does_not_touch_normal_chinese_dept_names(monkeypatch):
+    """反证：正常中文部门名一个都不能被误伤（线上 119 个活跃部门无一撞组码）。"""
+    monkeypatch.delenv("RAG_ACL_ANCESTRY", raising=False)
+    conn = _FakeConn(cache_row=None)
+    _wire(monkeypatch, conn, {"user_name": "赵六", "dept_name": "财务部,人力资源部",
+                              "is_partial": False, "dept_ids": [999]}, {})
+    codes, _ = di._resolve_user_dept_live("u_ok")
+    assert codes == ["finance", "hr"]
+
+
+def test_guard_never_hardcodes_group_list():
+    """守卫必须以 retriever._VALID_ACL_GROUPS 为单一真值来源——加新组时自动跟上。"""
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+    assert di._VALID_ACL_GROUPS_FOR_GUARD() is _VALID_ACL_GROUPS

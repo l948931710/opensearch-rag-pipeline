@@ -129,6 +129,28 @@ def test_acl_policy_version_changes_when_mapping_changes(monkeypatch):
     assert acl_policy_version() != before           # 映射改动 → 版本自动变（无需手动 bump）
 
 
+def test_acl_policy_version_changes_when_ancestry_anchors_change(monkeypatch):
+    """锚表也是活策略（RAG_ACL_ANCESTRY 开时它就是【唯一】的活策略）——改锚必须 bump。
+    没有这条，把 ancestry_anchors 从 payload 里删掉也没有测试会红。"""
+    import opensearch_pipeline.dept_ancestry as da
+    from opensearch_pipeline.versions import acl_policy_version
+    before = acl_policy_version()
+    patched = dict(da.ANCHOR_GROUPS_BY_DEPT_ID)
+    patched[999000111] = ["finance"]
+    monkeypatch.setattr(da, "ANCHOR_GROUPS_BY_DEPT_ID", patched)
+    assert acl_policy_version() != before
+
+
+def test_acl_policy_version_distinguishes_ancestry_flag_state(monkeypatch):
+    """flag ON/OFF 是【两套活策略】（对上百名员工给出不同的组）——指纹必须能分辨，
+    否则审计员看到版本号无从判断当时哪张表在活。"""
+    from opensearch_pipeline.versions import acl_policy_version
+    monkeypatch.delenv("RAG_ACL_ANCESTRY", raising=False)
+    off = acl_policy_version()
+    monkeypatch.setenv("RAG_ACL_ANCESTRY", "true")
+    assert acl_policy_version() != off
+
+
 def _capture_conn(monkeypatch, captured):
 
     class _Cur:

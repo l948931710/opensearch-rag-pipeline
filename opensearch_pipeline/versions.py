@@ -55,9 +55,14 @@ def embedding_regime_version() -> str:
 
 
 def acl_policy_version() -> str:
-    """dept→ACL组 映射策略的【内容指纹】（短 hash）。覆盖全部 5 个映射常量：
+    """dept→ACL组 映射策略的【内容指纹】（短 hash）。覆盖全部 6 个映射常量：
     dingtalk_identity._DEPT_NAME_TO_GROUPS / _PRODUCTION_WORKSHOP_DEPTS、
-    retriever._VALID_ACL_GROUPS / _PRODUCTION_UMBRELLA_OWNERS / _DEPT_OWNER_EXPANSION。
+    retriever._VALID_ACL_GROUPS / _PRODUCTION_UMBRELLA_OWNERS / _DEPT_OWNER_EXPANSION、
+    dept_ancestry.ANCHOR_GROUPS_BY_DEPT_ID（2026-08-04 补：RAG_ACL_ANCESTRY 开时它就是活策略）。
+
+    ⚠️ 还盖进 flag 现态（ancestry_enabled）：只收锚表的话，flag ON 与 OFF 会算出【同一个 hash】，
+    而两态对上百名员工给出不同的组 —— 审计员看到版本号无从分辨当时哪张表在活。代价是指纹随
+    进程 env 变化（同一份代码在两个环境指纹不同），这正是要暴露的事实而非缺陷。
 
     任一映射改动 → 版本自动变（内容 hash，无需手动 bump，杜绝忘记的失败模式）。per-doc 授权本就
     审计（kb_audit_log），缺的是「org 级 dept→组映射改动」这一维——本版本号盖进 ACL 审计行即补上。
@@ -67,6 +72,7 @@ def acl_policy_version() -> str:
     try:
         from opensearch_pipeline import dingtalk_identity as _di
         from opensearch_pipeline import retriever as _rt
+        from opensearch_pipeline import dept_ancestry as _da
         payload = json.dumps(
             {
                 "dept_to_groups": _di._DEPT_NAME_TO_GROUPS,
@@ -74,6 +80,9 @@ def acl_policy_version() -> str:
                 "valid_groups": sorted(_rt._VALID_ACL_GROUPS),
                 "umbrella_owners": sorted(_rt._PRODUCTION_UMBRELLA_OWNERS),
                 "owner_expansion": {k: sorted(v) for k, v in _rt._DEPT_OWNER_EXPANSION.items()},
+                # 锚值【保序不排序】：resolve_dept_ids 按首次出现顺序输出组码，顺序即语义的一部分。
+                "ancestry_anchors": {str(k): list(v) for k, v in _da.ANCHOR_GROUPS_BY_DEPT_ID.items()},
+                "ancestry_enabled": _di._acl_ancestry_enabled(),
             },
             ensure_ascii=False, sort_keys=True,
         )

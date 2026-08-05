@@ -59,6 +59,13 @@ def _acl_ancestry_enabled() -> bool:
 _ACL_PUBLIC_ONLY_SENTINEL = "__public_only__"
 
 
+def _VALID_ACL_GROUPS_FOR_GUARD() -> frozenset:
+    """组码白名单（惰性 import 避免 import 环）——外部组码防投毒守卫的单一真值来源。
+    绝不在本模块复制一份组码清单：加新组时守卫必须自动跟上。"""
+    from opensearch_pipeline.retriever import _VALID_ACL_GROUPS
+    return _VALID_ACL_GROUPS
+
+
 # ═══════════════════════════════════════════════════════════════
 # 钉钉部门名 → ACL 权限组 映射
 # ───────────────────────────────────────────────────────────────
@@ -381,14 +388,20 @@ def _resolve_user_dept_live(staff_id: str) -> "tuple[List[str], bool]":
             # 2. cache-miss 或 过期 employee 行穿透：调钉钉 API 获取（dept_name 为全部部门名 CSV）
             user_info = _fetch_dingtalk_user_info(staff_id)
             if user_info:
-                # 外部星号防投毒（2026-07-17 ultra P2）：恰好命名为 "*" 的钉钉部门会撞
-                # 全组哨兵——_normalize_dept_to_codes 展开为全量白名单，且随下方缓存写进
-                # user_role.dept_code 持久化。"*" 只允许两个内部来源（_DEPT_NAME_TO_GROUPS
-                # 映射表值 / 下方祖先压缩回写），API 名字口径的星号项按未知丢弃（fail-closed）。
+                # 外部组码防投毒（2026-07-17 ultra P2 起「星号」，2026-08-04 扩到全部组码）：
+                # dept_name 这一列是【名字域与组码域同居】的——_normalize_dept_to_codes 先查
+                # 名字表，未命中则把 token 原样透传给组码白名单。于是一个恰好命名为 "*"（撞全组
+                # 哨兵）或 "production"（撞组码）的钉钉部门，其成员会直接拿到对应权限，并随下方
+                # 缓存写进 user_role.dept_code 持久化。组码只允许内部来源（映射表值 / 祖先制
+                # 压缩回写），**API 名字口径里长得像组码的项一律按未知丢弃**（fail-closed）。
+                # 2026-08-04 实测：线上 119 个活跃部门无一撞组码，本守卫零误伤。
                 _names = [p.strip() for p in (user_info.get("dept_name") or "").split(",")]
-                if "*" in _names:
-                    user_info = dict(user_info, dept_name=",".join(
-                        s for s in _names if s and s != "*"))
+                _forged = {"*"} | {n for n in _names if n and n in _VALID_ACL_GROUPS_FOR_GUARD()}
+                if any(n in _forged for n in _names):
+                    _kept = ",".join(s for s in _names if s and s not in _forged)
+                    logger.warning("外部部门名撞组码/哨兵，已丢弃(fail-closed): staff_id=%s 丢弃=%s",
+                                   staff_id, sorted(n for n in set(_names) if n in _forged))
+                    user_info = dict(user_info, dept_name=_kept)
                 # —— 最近祖先制（RAG_ACL_ANCESTRY，默认关）——非 partial 即权威：
                 # 组码 CSV 顶替 dept_name 走下方同一缓存/返回路径（_normalize_dept_to_codes
                 # 对组码幂等读回；且不受名字口径 is_partial 影响——id 父链是独立的完整解析）。
@@ -715,9 +728,15 @@ def _resolve_groups_via_ancestry(dept_ids) -> "Optional[tuple]":
 
     token = _get_access_token()
     if not token:
+        logger.warning("ACL 祖先制回退名字口径: 无 access_token dept_ids=%s", dept_ids)
         return None
     codes, partial, undecided = resolve_dept_ids(
         dept_ids or [], lambda did: _fetch_dept_parent(token, did))
+    if partial:
+        # 唯一的可观测点：本模块与 dept_ancestry 此前全文无日志，而下方调用点在 partial 时
+        # 【整块跳过】、退到名字口径并【照常落缓存】(6h)——即显式 [] 锚的权威 deny 可被一次
+        # department/get 超时击穿成名字口径授权并持久化。翻 RAG_ACL_ANCESTRY 前后靠这条盯窗口。
+        logger.warning("ACL 祖先制 partial→回退名字口径(结果会被缓存): dept_ids=%s", dept_ids)
     return None if partial else (codes, undecided)
 
 
