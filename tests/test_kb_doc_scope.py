@@ -204,8 +204,10 @@ def test_conditional_acl_columns_are_read_by_capability():
     """正向：三处 `_mode, _oid` 解包都必须按 capability 分派。"""
     import pathlib
     src = pathlib.Path("opensearch_pipeline/routes/kb_console.py").read_text(encoding="utf-8")
+    # 2026-08-05：审批队列补 owner DTO 后由 3 处增至 4 处。数字是**有意**钉死的——新增解包
+    # 点必须同步改这里，从而强制作者确认新点也按 capability 分派（而不是抄了个 len(r) 启发式）。
     sites = [ln for ln in src.splitlines() if "_mode, _oid = ((r[" in ln]
-    assert len(sites) == 3, f"预期 3 处行级解包，实得 {len(sites)}"
+    assert len(sites) == 4, f"预期 4 处行级解包，实得 {len(sites)}"
     for ln in sites:
         assert '== "present"' in ln, f"未按 capability 判定：{ln.strip()[:100]}"
 

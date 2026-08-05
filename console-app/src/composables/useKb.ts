@@ -36,6 +36,8 @@ export interface DocItem {
 export interface PendingItem {
   doc_id: string; version_no: number; title: string; original_filename: string
   owner_dept: string; permission_level: string; owner_name: string; created_at: string
+  // 阶段 B owner DTO（与 DocItem 同形）：node 文档 owner_dept 恒空，归属只在这两个字段上
+  acl_mode?: string; owner_key?: string; owner_label?: string
 }
 // 授权申请（Phase C）：其他部门申请检索本部门文档；审批人 = 文档所属部门管理员（锁定决策 2026-06-26）。
 // 后端 /api/kb/access-requests 尚未上线 → loadAccessRequests 静默兜底空；DEV ?preview 注入 mock 以可视化。

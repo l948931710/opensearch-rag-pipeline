@@ -2,6 +2,8 @@
 import { computed, ref } from 'vue'
 import { Clock, FileText, Loader2, Download, ArrowDownWideNarrow } from '@lucide/vue'
 import { deptLabel, permLabel } from '@/lib/kb'
+import { resolveDocOwner } from '@/lib/orgTree'
+import type { OrgNode } from '@/composables/useOrgSnapshot'
 import { useKb, type PendingItem } from '@/composables/useKb'
 import LoadError from './LoadError.vue'
 import QueuePager from './QueuePager.vue'
@@ -12,6 +14,12 @@ import { useDialog } from '@/composables/useDialog'
 const { approvals, truncatedQueues, isBusy, isKbAdmin, approve, reject, loadApprovals, loadErrors, openDocPreview } = useKb()
 const { promptText } = useDialog()
 const rowKey = (d: PendingItem) => `appr:${d.doc_id}/${d.version_no}`
+
+// 归属：node 文档的 owner_dept 恒空（归属在 owner_dept_id 上），与台账同一口径解析。
+// 空快照是有意的——节点名后端已 JOIN dept_dim 直给，队列不为显示多拉一次组织树。
+const NO_ORG_SNAPSHOT = new Map<number, OrgNode>()
+const ownerText = (d: PendingItem) =>
+  resolveDocOwner(d.owner_key, d.owner_dept, d.owner_label, NO_ORG_SNAPSHOT, deptLabel).label
 
 // ── 前端分页 + 时间排序（设计稿 2026-07-19 §2：一切列表可分页可排序；队列 2 条/页）──
 // 页码经 computed 收敛：审批通过/驳回后列表变短，当前页自动回落不越界（无需 watcher）。
@@ -64,7 +72,7 @@ async function onReject(d: PendingItem) {
         <div class="min-w-0 flex-1">
           <div class="truncate text-[13.5px] font-semibold text-foreground">{{ d.title || d.original_filename || d.doc_id }}</div>
           <div class="truncate text-[11.5px] text-faint">
-            {{ deptLabel(d.owner_dept) }} · {{ permLabel(d.permission_level) }} · v{{ d.version_no }}
+            {{ ownerText(d) }} · {{ permLabel(d.permission_level) }} · v{{ d.version_no }}
             <span v-if="d.owner_name"> · 上传人 {{ d.owner_name }}</span>
             <!-- 提交时间戳（设计稿 qsub 尾部；仅数据有该字段才显） -->
             <span v-if="d.created_at" class="tabular-nums"> · {{ d.created_at }}</span>

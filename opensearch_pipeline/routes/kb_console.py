@@ -3677,6 +3677,11 @@ class KbPendingItem(BaseModel):
     title: str = ""
     original_filename: str = ""
     owner_dept: str = ""
+    # 阶段 B owner DTO（与 KbDocItem 同形，2026-08-05 补）：node 文档 owner_dept 恒空，
+    # 只靠这两个字段才显示得出归属——审批队列此前对 node 文档是一片空白。
+    acl_mode: str = "legacy"
+    owner_key: str = ""
+    owner_label: str = ""
     permission_level: str = "public"
     owner_name: str = ""
     created_at: str = ""
@@ -3702,10 +3707,14 @@ def kb_pending_approvals(request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
+                # 归属两列按 capability 条件追加（060 未 apply 的环境 SELECT 里根本没有它们）——
+                # 与 my-docs 同款写法，绝不用长度启发式判断列在不在（见本文件同名守卫测试）。
+                _pcap = _kb_node_capability(cur)
+                _pmc = ", m.acl_mode, m.owner_dept_id" if _pcap == "present" else ""
                 cur.execute(
                     f"""
                     SELECT m.doc_id, v.version_no, m.title, m.original_filename, m.owner_dept,
-                           m.permission_level, m.owner_name, v.received_at
+                           m.permission_level, m.owner_name, v.received_at{_pmc}
                     FROM {_kb_db()}.document_version v
                     JOIN {_kb_db()}.document_meta m ON m.doc_id = v.doc_id
                     WHERE v.content_process_status = 'PENDING_APPROVAL'
@@ -3714,6 +3723,10 @@ def kb_pending_approvals(request: Request,
                     """   # 101 = 上限 100 + 1 探针行：多出来那行只用来判断"还有更多"
                 )
                 rows = cur.fetchall()
+                # 节点名批量解析（队列 ≤100 行一次往返；缺行/失活回 id 串，由前端降级成 `#id ⚠️`）。
+                # 索引 r[8]/r[9] 的存在性**由 capability 保证**，绝不用 len(r) 判断（同名守卫测试）。
+                _pnames = (_kb_node_names(cur, [r[9] for r in rows if r[9]])
+                           if _pcap == "present" else {})
         finally:
             conn.close()
     except Exception as e:
@@ -3722,15 +3735,17 @@ def kb_pending_approvals(request: Request,
         raise HTTPException(status_code=500, detail=f"待审批队列查询失败 (trace: {trace_id})")
     _truncated = len(rows) > 100
     rows = rows[:100]
-    items = [
-        KbPendingItem(
+    items = []
+    for r in rows:
+        _mode, _oid = ((r[8] or "legacy"), r[9]) if _pcap == "present" else ("legacy", None)
+        _okey, _olabel = _kb_owner_dto(_mode, r[4] or "", _oid, _pnames)
+        items.append(KbPendingItem(
             doc_id=r[0] or "", version_no=int(r[1] or 1), title=r[2] or "",
             original_filename=r[3] or "", owner_dept=r[4] or "",
+            acl_mode=_mode, owner_key=_okey, owner_label=_olabel,
             permission_level=r[5] or "public", owner_name=r[6] or "",
             created_at=str(r[7]) if r[7] else "",
-        )
-        for r in rows
-    ]
+        ))
     return KbPendingResponse(items=items, truncated=_truncated)
 
 
