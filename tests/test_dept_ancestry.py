@@ -394,3 +394,151 @@ def test_descendants_cycle_and_diamond_defused_by_dedup():
 def test_descendants_oversize_fails_closed_not_truncated():
     """超上限 fail-closed 不截断——截断 = dept_admin 静默少管一片，比失效更难发现。"""
     assert resolve_descendant_ids(_IDX, [2], max_nodes=2) == (set(), False)
+
+
+# ══ 第四部分：2026-08-04 部门名漂移批（08-04 树精确值对照） ══════════
+# 背景：钉钉侧改名/重组把名字表打出 9 个死键（资材部→采购部 等），并把海外系三个单位
+# 升为顶层树 —— 07-03 锚表够不到。本节以 08-04 真实树锁死「补锚后每个部门解析成什么」。
+#
+# ⚠️ 为什么必须逐 path 锁【值】而不是断言「非空」：非空断言对越权变异 0 检出 ——
+#    把 92 人子树误配 ["*"] 全组哨兵、漏掉 overseas、错配 finance、删掉「其他」的 deny 锚，
+#    四种变异都能通过非空断言（2026-08-04 变异实测）。ACL 场景下那是不可接受的降级。
+# ⚠️ 本 fixture 锁的是【该快照树形态下锚表的正确性】，不等于运行时覆盖率：运行时 dept_ids
+#    来自钉钉 user/get、父链来自 department/get，fixture 只是 dept_dim 的日快照。
+#    它也【不能】发现"组织又漂移了"（静态快照永远绿）——那需要定时对 dept_dim 跑覆盖扫描。
+_FIXTURE_0804 = Path(__file__).parent / "fixtures" / "dingtalk_org_snapshot_20260804.json"
+
+# 名字口径 != 祖先制 的全部 path → 祖先制值。28 条 = 27 条「名字口径为空的缺口修复」
+# + 1 条「纸浆模塑事业部 production → overseas+production」（该部门 2026-08 随整建制迁移
+# 挂进了获胜子公司树，同 dept_id 921614009，非同名误授）。
+_DIVERGE_0804 = {
+    "印尼富岭": {"overseas", "production"},
+    "墨西哥富岭": {"overseas", "production"},
+    "获胜包装/获胜生产中心": {"overseas", "production"},
+    "获胜包装/获胜生产中心/纸浆模塑事业部": {"overseas", "production"},
+    "海外中心/海外服务部": {"overseas", "production"},
+    "法务部": {"legal"},
+    "财务中心/信息部": {"it"},
+    "生产中心/采购部": {"supply", "pmc", "production"},
+    "品技中心": {"quality"},
+    "品技中心/品质部/质量管理": {"quality"},
+    "生产中心/薄膜车间": {"production"},
+    "生产中心/薄膜车间/薄膜—仓管": {"production"},
+    "生产中心/薄膜车间/薄膜—其他": {"production"},
+    "生产中心/薄膜车间/薄膜—切袋": {"production"},
+    "生产中心/薄膜车间/薄膜—吹膜机修": {"production"},
+    "生产中心/薄膜车间/薄膜—机修": {"production"},
+    "综合管理中心": {"admin", "hr"},
+    "综合管理中心/办公室": {"admin", "hr"},
+    "综合管理中心/行政部/行政—保安": {"admin"},
+    "综合管理中心/行政部/行政—司机": {"admin"},
+    "综合管理中心/行政部/行政—后勤": {"admin"},
+    "综合管理中心/行政部/行政—松门保安": {"admin"},
+    "综合管理中心/行政部/行政—松门厨房": {"admin"},
+    "综合管理中心/行政部/行政—松门后勤": {"admin"},
+    "综合管理中心/行政部/行政—食堂": {"admin"},
+    "营销中心/国内营销部/内销监装": {"marketing", "production"},
+    "营销中心/国际贸易部/外贸监装": {"marketing", "production"},
+    "营销中心/电子商务部/杭州分公司": {"marketing", "production"},
+}
+
+# 解析为空的部门 —— 按 dept_id 键控而非名字（本次修复的立论就是「名字会漂移」，
+# 用名字做豁免名单等于把同一个坑再挖一遍）。
+_EMPTY_DENY_0804 = {68112184}                       # 「其他」：显式 [] 锚 = 权威仅 public
+_EMPTY_UNDECIDED_0804 = {                           # 真·未决定（锚表覆盖缺口，fail-closed）
+    417762615,          # lzdqr（0 人）
+    920067054,          # 实习生（0 人）
+    1068136163,         # 获胜包装（树根，直挂 11 人）——刻意不设锚，见 dept_ancestry 注释
+    1091358296,         # 获胜包装/获胜行政中心（8 人）——待拍板是否给 admin
+}
+# 锚 id 在 08-04 活跃树中已不存在者（组织撤销）。保留锚 = dept_id 若被钉钉回收则误授（理论
+# 风险）；删除 = 该部门恢复时静默失权。当前选择保留并在此显式登记，防"悄悄多出一个"。
+_KNOWN_DEAD_ANCHORS = {842763367}                   # 工程 → engineering
+
+
+@pytest.fixture(scope="module")
+def snapshot_0804():
+    data = json.loads(_FIXTURE_0804.read_text(encoding="utf-8"))
+    rows = data["depts"]
+    return rows, parent_getter_from_index(build_parent_index(rows))
+
+
+def test_0804_divergences_are_exactly_as_designed(snapshot_0804):
+    """08-04 树上「名字口径 vs 祖先制」的每一处差异，逐 path 锁值（防意外放权/漏授）。"""
+    rows, get = snapshot_0804
+    diverge = {}
+    for r in rows:
+        cur = set(_normalize_dept_to_codes(r["name"]))
+        anc, partial, _ = resolve_dept_ids([r["dept_id"]], get)
+        assert partial is False, r["path"]
+        if set(anc) != cur:
+            diverge[r["path"]] = set(anc)
+    assert diverge == _DIVERGE_0804
+
+
+def test_0804_name_hits_otherwise_resolve_identically(snapshot_0804):
+    """铁律 1 的 08-04 版：名字口径命中的部门，除上表登记的差异外必须逐一全等。"""
+    rows, get = snapshot_0804
+    checked = 0
+    for r in rows:
+        cur = set(_normalize_dept_to_codes(r["name"]))
+        if not cur or r["path"] in _DIVERGE_0804:
+            continue
+        anc, partial, _ = resolve_dept_ids([r["dept_id"]], get)
+        assert partial is False and set(anc) == cur, r["path"]
+        checked += 1
+    assert checked >= 80        # 08-04 树 87 个命中部门、1 个登记差异；防 fixture 变形空转
+
+
+def test_0804_empty_results_split_deny_from_gap(snapshot_0804):
+    """空结果必须分成两类：显式 deny（decided）与覆盖缺口（undecided）——
+    两者都表现为空集但语义相反：前者是权威拒绝、压过名字撞名，后者会落回名字口径兜底。"""
+    rows, get = snapshot_0804
+    deny, gap = set(), set()
+    for r in rows:
+        anc, partial, undecided = resolve_dept_ids([r["dept_id"]], get)
+        assert partial is False, r["path"]
+        if anc:
+            continue
+        (gap if undecided else deny).add(r["dept_id"])
+    assert deny == _EMPTY_DENY_0804
+    assert gap == _EMPTY_UNDECIDED_0804
+
+
+def test_0804_rename_immunity_supply_anchor(snapshot_0804):
+    """改名免疫：资材部 2026-08 改名「采购部」，dept_id 728779788 不变 ⇒ 组不变。
+    这正是 dept_id 键控相对名字表的核心优势（名字表 key「资材部」已成死键）。"""
+    rows, get = snapshot_0804
+    row = next(r for r in rows if r["dept_id"] == 728779788)
+    assert row["name"] == "采购部"                       # fixture 自证现名已漂
+    assert _normalize_dept_to_codes("采购部") == []       # 名字口径确已失效
+    anc, partial, _ = resolve_dept_ids([728779788], get)
+    assert partial is False and set(anc) == {"supply", "pmc", "production"}
+
+
+def test_0804_child_inherits_new_overseas_anchor(snapshot_0804):
+    """新锚的价值在【子节点一跳继承】而非自锚（自锚在 walker 循环顶即命中、父链一次都不查）。
+    纸浆模塑事业部 → 获胜生产中心锚，跨的正是 2026-08 重组后的新父链。"""
+    rows, get = snapshot_0804
+    anc, partial, undecided = resolve_dept_ids([921614009], get)
+    assert partial is False and undecided is False
+    assert set(anc) == {"overseas", "production"}
+
+
+def test_0804_huosheng_root_and_admin_stay_failclosed(snapshot_0804):
+    """获胜包装树根与获胜行政中心刻意【不设锚】：07-03 拍板对象是无子女叶子，
+    今天树根下辖生产+行政双职能，在根设锚会让海外子公司行政/HR 人员拿到大陆生产伞组。
+    维持 fail-closed（与现状一致），是否补锚待拍板。"""
+    rows, get = snapshot_0804
+    for dept_id in (1068136163, 1091358296):
+        anc, partial, undecided = resolve_dept_ids([dept_id], get)
+        assert partial is False and anc == [] and undecided is True
+
+
+def test_0804_every_anchor_exists_in_tree(snapshot_0804):
+    """锚 id 打错/组织撤销都表现为「该子树整片掉空」。登记已知死锚，其余必须在树上存在。"""
+    rows, _ = snapshot_0804
+    tree_ids = {r["dept_id"] for r in rows}
+    missing = set(ANCHOR_GROUPS_BY_DEPT_ID) - tree_ids
+    assert missing == _KNOWN_DEAD_ANCHORS
+

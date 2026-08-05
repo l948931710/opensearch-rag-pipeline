@@ -715,9 +715,15 @@ def _resolve_groups_via_ancestry(dept_ids) -> "Optional[tuple]":
 
     token = _get_access_token()
     if not token:
+        logger.warning("ACL 祖先制回退名字口径: 无 access_token dept_ids=%s", dept_ids)
         return None
     codes, partial, undecided = resolve_dept_ids(
         dept_ids or [], lambda did: _fetch_dept_parent(token, did))
+    if partial:
+        # 唯一的可观测点：本模块与 dept_ancestry 此前全文无日志，而下方调用点在 partial 时
+        # 【整块跳过】、退到名字口径并【照常落缓存】(6h)——即显式 [] 锚的权威 deny 可被一次
+        # department/get 超时击穿成名字口径授权并持久化。翻 RAG_ACL_ANCESTRY 前后靠这条盯窗口。
+        logger.warning("ACL 祖先制 partial→回退名字口径(结果会被缓存): dept_ids=%s", dept_ids)
     return None if partial else (codes, undecided)
 
 
