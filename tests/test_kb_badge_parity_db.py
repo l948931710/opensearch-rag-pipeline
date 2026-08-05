@@ -30,8 +30,14 @@ def _conn():
     cfg = get_config()
     if cfg.rds.host not in _LOCAL_HOSTS or is_prod_target("rds", cfg.rds.host):
         pytest.skip("非本地 dev 栈，跳过（本测试建/删库，绝不指向远端）")
-    return pymysql.connect(host=cfg.rds.host, port=int(cfg.rds.port), user=cfg.rds.user,
-                           password=cfg.rds.password, autocommit=True)
+    try:
+        return pymysql.connect(host=cfg.rds.host, port=int(cfg.rds.port), user=cfg.rds.user,
+                               password=cfg.rds.password, autocommit=True)
+    except Exception as e:   # noqa: BLE001
+        # host 是本地但栈没起（CI 无 MySQL 的普通 test job / 开发机未起栈）——skip 不假红。
+        # 真库覆盖由 CI db-integration job（起 MySQL service）与本地栈强制执行，
+        # 与 test_ingest_lease_db._db_ready 同语义（2026-08-05 CI 首跑即踩：ConnectionRefused 红 2 例）。
+        pytest.skip(f"本地 MySQL 未起，跳过（{type(e).__name__}）")
 
 
 # 每轴都带 NULL / 空串 / 大小写变体 —— COALESCE/UPPER/LOWER 写漏时正是这些取值翻车
