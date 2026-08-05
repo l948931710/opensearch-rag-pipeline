@@ -1,7 +1,7 @@
 # 文档升版可见范围提醒(doc-update-notify)设计稿 _DRAFT · rev3
 
 > 2026-08-04 · 分支 `feature/doc-version-notify` · 决策人 Sam
-> 状态:**Claude 侧补审两轮完成(评审记录 §12);codex 跨模型终审待 8/7(Sam 可裁决是否需要);实施前须过 §11 拍板项**
+> 状态:**Claude 侧补审两轮完成(§12) + 数据附件实测(§11a) + 业务项全部拍板(§11,2026-08-04)——设计收口,可进入实施;codex 跨模型终审待 8/7(可选,Sam 裁决)**
 > 需求一句话:**文档升级到新 version 并在检索侧生效后,提醒所有"对该文档有可见权限"的用户。**
 > ⚠️ 行号锚定基线:main@4e79f16;main 当晚已推进(撞号修复等),**实施前全稿按 main 现头重锚**。
 
@@ -99,7 +99,7 @@ audience(doc) = { s ∈ staff_dim(is_active=1) :
 4. ancestry 姿态按见证:OFF=名字口径;ON=dept_ancestry 锚表走 dept_dim 物理链;见证与预期不符 → 整轮 HOLD。
 **d) 总经办/org_wide**:排除 = "groups ⊇ 全量合法组集"的用户按 knob 剔除(两轨都生效)。
 **e) SUPPRESSED(audience_zero) 前置条件**:快照 fresh + strict 成功 + 姿态见证通过,三者全立才允许落;否则 HOLD(分词 stale_snapshot/authority_unavailable/posture_*)。**HOLD 不建任何 notice 行。**
-**f) 规模护栏**:`bulk_guard` 计数基准**唯一定义 = 本轮进入 resolve 的事件数(含回放)**,超 `MAX_EVENTS_PER_RUN` 的部分重新 HOLD(bulk_guard);`audience > MAX_AUDIENCE` → HOLD(audience_cap)。CLI:`--requeue doc_id[:version] | --requeue --all --limit N`(分批放行)、`--suppress doc_id[:version]`(人工止损,单向落 SUPPRESSED(manual))。public → SUPPRESSED(public_policy);restricted → audience_zero。
+**f) 规模护栏**:`bulk_guard` 计数基准**唯一定义 = 本轮进入 resolve 的事件数(含回放)**,超 `MAX_EVENTS_PER_RUN` 的部分重新 HOLD(bulk_guard);`audience > MAX_AUDIENCE` → HOLD(audience_cap)。CLI:`--requeue doc_id[:version] | --requeue --all --limit N`(分批放行)、`--suppress doc_id[:version]`(人工止损,单向落 SUPPRESSED(manual))。**public → 通知**(Sam 拍板 2026-08-04;受众=全员是 public 的定义态,故 **public 事件不受 MAX_AUDIENCE 约束**——护栏只管 dept_internal 的范围异常;仍受日摘要归并与 bulk_guard);restricted → audience_zero。INCLUDE_PUBLIC knob 保留(可关回)。
 
 ### D4. 存储(fuling_operation,schema/065;DDL 同 rev2 增两列语义)
 
@@ -123,7 +123,7 @@ audience(doc) = { s ∈ staff_dim(is_active=1) :
 同 rev2(七步骨架/py3.7/dry-run 双闸/simulate 先于 flag/显式 env_guard),增量:
 - ENV_KEYS 增补:`RAG_DOC_NOTIFY`、`RAG_DOC_NOTIFY_DINGTALK`、`RAG_DINGTALK_AGENT_ID`、`RAG_NODE_ACL_GRANT`、`RAG_NODE_ACL_ENFORCE`、`RAG_ACL_ANCESTRY`(节点自身解析途径需要;**判定姿态一律以见证行为准**,env 仅兜底);**NODE_FILES 增补 `doc_update_notify_node.py`**;
 - **`.env.production` 补值并与 SAE 控制台 env 现值核对**是上线步骤(§10),不是隐含前提(两文件现均无这些键,grep 计数 0)。
-- flags 同 rev2 五个;调度 07:30(当日晚间收敛顺延一天)。
+- flags 同 rev2 五个,拍板后默认(2026-08-04):`RAG_DOC_NOTIFY_INCLUDE_PUBLIC=True`、`RAG_DOC_NOTIFY_MAX_AUDIENCE=1000`;调度 07:30(当日晚间收敛顺延一天)。
 
 ## 4. 数据流全景
 
@@ -184,14 +184,19 @@ console:GET /api/kb/notices(读复核+退役隔离排除+限频)     (①②③=
 
 1. 代码合 main(全 flag 关,三绿)→ 2. staging 065 apply + dry-run 演练(输出受众差异计数)→ 3. **数据附件三查+切换时点直方图**(prod-RO,user-gated)定 MAX_AUDIENCE 等默认 → 4. 生产 065 apply → 5. SAE 重打包部署(端点+UI+**姿态见证写入**)并确认见证行落库 → 6. **`.env.production` 补 NODE_ACL/ANCESTRY/AGENT_ID 值并与 SAE 控制台现值核对** → 7. DW 节点铸造/粘贴/发布/调度 → 8. **开闸前一刻 `--baseline --commit`** → 9. 语料重传收口后开 `RAG_DOC_NOTIFY`(console 先行)→ 10. 观察后开 `RAG_DOC_NOTIFY_DINGTALK`。
 
-## 11. 尚未确定(Sam 拍板项)
+## 11. 拍板结果(Sam,2026-08-04,逐条问答)
 
-1. public 文档是否通知(默认不)。2. 总经办是否收(默认不)。
-3. MAX_AUDIENCE 默认值 —— **数据附件已实测(见 §11a),建议默认改 1000**(production 受众实测 808,默认 300 会 HOLD 掉 66% 语料;真正的防骚扰是"每人每日 ≤1 条摘要 + public 排除 + bulk_guard",上限只当失控护栏)。
-4. 钉钉通道节奏/调度时刻(建议 07:30)。5. 文案与深链(待确认文档详情路由)。
-6. 重传波期间姿态(bulk_guard HOLD 后人工 --requeue --limit 分批 or --suppress)。
-7. **小程序触达面**:v1 移动端靠钉钉工作通知(开闸后);console-only 观察窗内多数员工零触达——窗长与是否接受,Sam 定;miniapp 站内 inbox 列 v2。
-8. **与 C3′ 版本轴方案的共同依赖声明**:两稿都写 document_version(C3′ 触碰 updated_at 正是 D1c 弃用它的原因);8/7 codex 同批审时互相引用。
+| # | 决定 | 备注 |
+|---|---|---|
+| 1 | **public 文档:通知**(偏离建议) | 进日摘要;连带:public 不受 MAX_AUDIENCE 约束(D3f);INCLUDE_PUBLIC 默认 True |
+| 2 | 总经办:**不收** | 按建议 |
+| 3 | MAX_AUDIENCE = **1000** | 按数据附件建议(production 实测 808) |
+| 4 | 钉钉通道:**console 先行 ≥1 周**;调度 07:30 | 按建议 |
+| 5 | 文案:**不带深链** | 固定引导"到知识库控制台查看" |
+| 6 | 重传波触发 bulk_guard:**整批 --suppress 压掉不通知** | 重传对员工是"知识库重建"非逐篇更新;必要时另发全员公告 |
+| 7 | 小程序 inbox:**v2 再做** | v1 移动端触达=钉钉工作通知(开闸后) |
+
+流程注记(非拍板):**与 C3′ 版本轴方案的共同依赖声明**——两稿都写 document_version(C3′ 触碰 updated_at 正是 D1c 弃用它的原因);8/7 codex 同批审时互相引用。
 
 ## 11a. 数据附件(2026-08-04 prod-RO 实测;脚本=scratch/notify_data_annex_20260804.py,Sam 亲跑 exit=0;真空期语料=退役存量)
 
