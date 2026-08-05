@@ -184,7 +184,25 @@ console:GET /api/kb/notices(读复核+退役隔离排除+限频)     (①②③=
 
 ## 10. 上线次序(rev3)
 
-1. 代码合 main(全 flag 关,三绿)→ 2. staging 065 apply + dry-run 演练(输出受众差异计数)→ 3. **数据附件三查+切换时点直方图**(prod-RO,user-gated)定 MAX_AUDIENCE 等默认 → 4. 生产 065 apply → 5. SAE 重打包部署(端点+UI+**姿态见证写入**)并确认见证行落库 → 6. **`.env.production` 补 NODE_ACL/ANCESTRY/AGENT_ID 值并与 SAE 控制台现值核对** → 7. DW 节点铸造/粘贴/发布/调度 → 8. **开闸前一刻 `--baseline --commit`** → 9. 语料重传收口后开 `RAG_DOC_NOTIFY`(console 先行)→ 10. 观察后开 `RAG_DOC_NOTIFY_DINGTALK`。
+1. 代码合 main(全 flag 关,三绿)→ 2. staging 065 apply + dry-run 演练(输出受众差异计数)→ 3. **数据附件三查+切换时点直方图**(prod-RO,user-gated)定 MAX_AUDIENCE 等默认 → 4. 生产 065 apply → 5. SAE 重打包部署(端点+UI+**姿态见证写入**)并确认见证行落库 → 6. **`.env` 补钉钉 env 并与 SAE 控制台现值核对**（`RAG_DINGTALK_AGENT_ID` ✅ **2026-08-04 已配入 `.env` 并实测通过**，见 §10a；`RAG_NODE_ACL_GRANT/ENFORCE/RAG_ACL_ANCESTRY` 仅供节点自身解析兜底，判定仍以见证行为准）→ 7. DW 节点铸造/粘贴/发布/调度 → 8. **开闸前一刻 `--baseline --commit`** → 9. 语料重传收口后开 `RAG_DOC_NOTIFY`(console 先行)→ 10. 观察后开 `RAG_DOC_NOTIFY_DINGTALK`。
+
+## 10a. 钉钉通道就绪度(2026-08-04 实测,Sam 提供 AgentId)
+
+**应用拓扑(Sam 确认,勿从代码反推)**:①**机器人 + 小程序 = 同一个企业内部应用**——代码里一切
+token 都出自它(`DINGTALK_CLIENT_ID/SECRET`;小程序未配独立凭据故走回退分支);②**console 是独立
+应用**,但类型是指向 https 的网页应用、**不使用 AppKey/AppSecret** ⇒ 换不到 token。
+⇒ **硬约束**:工作通知的 `agent_id` 必须与签发 token 的应用同源,故 `RAG_DINGTALK_AGENT_ID`
+只能是**机器人+小程序**那个应用的 AgentId(填 console 应用的会被拒)。副作用可接受:升版提醒
+显示为机器人应用发出,与员工平时问答同一入口。
+
+**只读实测结论**(未发出任何消息):
+- `oauth2/accessToken` 用 `.env` 凭据换 token → **OK**;
+- 以真 AgentId + **空 userid_list** 调 `asyncsend_v2` → 返回 `errcode=41 Invalid arguments:userid_list`
+  ⇒ 卡在参数校验而非权限 ⇒ **该应用已具备「发送工作通知」权限**(对照组:查应用列表返
+  `errcode=88` 缺 `qyapi_get_microapp_list`,该应用权限确实开得精简)。空收件人 ⇒ 零消息发出。
+- ⇒ 通道除"真实投递"外全链已验;`RAG_DINGTALK_AGENT_ID` 已写入 `.env`(gitignored,仓库零密钥)。
+  DW 节点经 paste 生成器的 ENV_KEYS 取值;**SAE serving 侧只有开 `RAG_ADMIN_NOTIFY`(审批待办,
+  另一功能)才需要同步补该键**,升版提醒本身不依赖 serving 发送。
 
 ## 11. 拍板结果(Sam,2026-08-04,逐条问答)
 
