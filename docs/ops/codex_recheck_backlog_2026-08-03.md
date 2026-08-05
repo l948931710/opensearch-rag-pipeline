@@ -139,7 +139,13 @@ B6 的告警标题）都是**我自己写的代码**里的，同一个人复查�
 - **守卫≠不会再犯**：各守卫的词法边界已在对应测试注释里写明（B4 反转门/跨行赋值不可见、B7 cache 守卫认"offset"字面量、徽章类文本守卫抓删除不抓等价改写）。
 
 **核验后仍开着的**（未随手修，各有原因）：
-- 🔴 **B1 现网一验**（最便宜路径已找到：查一条 `qa_session_log.retrieved_docs_json` 的 version_no ——RDS prod-ro 即可，不碰 HA3；qa_logger 自 c605761 就在消费该字段，比 stitch 更早）——待 Sam 放行 live。
+- ✅ **B1 现网一验已封口**（2026-08-04，Sam 授权 prod-ro；`scratch/b1_versionno_probe_20260804.py`）：
+  300 行 `fuling_operation.qa_session_log`（窗口 06-20..07-29，语料真空期前）共 4752 个
+  retrieved-doc 条目——现代血缘格式下 **4699/4699 = 100% 非零 version_no、0 个零值、
+  0 个与 chunk_id 内嵌版本不匹配**。53 个 None 全部落在 06-20 01:09-01:52 一个 44 分钟
+  窗口、键形态为旧序列化（连 chunk_id 都没有）= c605761 血缘字段上线**前**的旧进程残影，
+  与 HA3 回填无关。⇒ HA3 回填 version_no 坐实，fail-closed 依据从「仓内 spec 文档间接
+  证明」升级为现网实证。
 - chunk_active 轴分叉（doc-status 传真值、其余四处传 None，升版残留 SUCCESS 场景两端点同行不同徽章；锁测试 counts=(5,5,5) 测不到）——修向需裁决（哪边语义为准），记设计题。
 - 主命中图无版本轴（图直接命中 top-k 时 4c 不比版本，双活窗口可投旧版图）——在 B1 两 commit 声明范围外，属独立改进项。
 - B7 include_closed 做对（keyset/去 open-first）仍属设计变更；后端 include_closed 分支仍收 offset（前端已收口）。
