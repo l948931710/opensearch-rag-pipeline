@@ -1255,7 +1255,29 @@ async function uploadBatch(files: File[]) {
   await Promise.all(Array.from({ length: Math.min(BATCH_CONCURRENCY, files.length) }, () => worker()))
   uploadBusy.value = false
   if (principalChangedSince(epoch0)) return         // 批末汇总不写新身份 UI
+
+  // ── 批末只保留「需重试」的文件（2026-08-06）──────────────────────────────────
+  // 此前批末**不清空** selectedFiles（只有单篇路径清），于是部分失败后最自然的动作
+  // ——再点一次「上传」——会把整批重传。而每次 action=new 都取新 doc_id + 新 upload_id
+  // ⇒ raw_key 不同 ⇒ register 的 raw_key 幂等键对不上 ⇒ **已成功的那些变成重复文档**，
+  // 且 ETag 查重是 advisory 只提示不拦 ⇒ 悄悄多出一批重复件。aux 限流打满时（各部门
+  // 自助批量上传的常见场景）这条路径几乎必然被走到。
+  //
+  // 修法刻意**不加「重试」按钮**，而是让选择列表收敛成失败集：再点「上传」天然只重传
+  // 失败项，重复入库在物理上不可能发生（少一个可以点错的控件，也少一处状态要同步）。
+  // 保留判据 = 状态既不是「已提交」也不是「跳过」：
+  //   · 已提交 → 已入库，重传即重复；
+  //   · 跳过   → 空文件/超限，重传必然同样结果，留着只会诱导无效重试；
+  //   · 其余（失败 / 身份切换等异常残留态）→ 保留，可重试。
+  // ⚠️ 放在 principalChangedSince 之后：换身份时整批语义已失效，不动选择列表。
+  const keepIdx = qrows.map((r, i) => (r.status !== '已提交' && r.status !== '跳过' ? i : -1))
+    .filter((i) => i >= 0)
+  const retryN = keepIdx.length
+  selectedFiles = keepIdx.map((i) => files[i])
+  selectedNames.value = selectedFiles.map((f) => f.name)
+
   uploadMsg.value = `${okN} 成功${badN ? `，${badN} 失败/跳过` : ''}`
+    + (retryN ? `　—— 已只保留 ${retryN} 个待重试文件，点「上传」即重试（成功的已移出，不会重复入库）` : '')
   void loadDocs(); void loadApprovals(true)   // force：批量里可能有待审批单
   if (shared && okN) void loadAccessGrants({ afterWrite: true })  // 批末一次权威刷新（逐文件已抑制）
 }
@@ -2034,4 +2056,11 @@ export function __resetKb() {
 }
 
 /** 仅供测试：注入选中文件（绕过 input）。 */
-export function __setSelectedFiles(files: File[]) { selectedFiles = files }
+/** 测试专用：注入已选文件。**必须同时设 selectedNames** —— 选择态是两半（模块级
+ *  File[] + 供模板用的 ref），只设一半会让所有 `selectedNames` 断言恒真（2026-08-06
+ *  写批量重试用例时实测：三条里有两条因此变成空断言，变异注入后仍全绿）。
+ *  与 onFileSelected 的写法保持一致。 */
+export function __setSelectedFiles(files: File[]) {
+  selectedFiles = files
+  selectedNames.value = files.map((f) => f.name)
+}

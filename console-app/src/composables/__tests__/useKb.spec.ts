@@ -735,3 +735,73 @@ describe('useKb.loadFeedbackReview 截断标志', () => {
     expect(kb.feedbackReviewTruncated.value).toBe(false)
   })
 })
+
+// ── 批量上传：批末只保留待重试项（2026-08-06 回归）───────────────────────────
+// 此前批末**不清空** selectedFiles ⇒ 部分失败后再点「上传」会整批重传，而每次 action=new
+// 取新 doc_id + 新 upload_id ⇒ raw_key 不同 ⇒ register 幂等键对不上 ⇒ 已成功的悄悄变重复件
+// （ETag 查重是 advisory 只提示不拦）。aux 限流打满时这条路径几乎必然被走到。
+describe('useKb 批量上传 — 批末选择列表收敛', () => {
+  const bigFile = (n: string) => new File([new Uint8Array(5)], n)
+
+  function batchFetch(failFrom: number) {
+    // 第 failFrom 次（从 1 计）及之后的 register 一律 429
+    let n = 0
+    return vi.fn(async (path: string) => {
+      const p = String(path)
+      if (p.startsWith('/api/kb/upload-url')) {
+        return jsonResp({ upload_token: 'UT', put_url: 'https://oss/x', raw_key: 'r',
+                          doc_id: 'DOC_B', expires_in: 1800, requires_kb_admin_approval: false })
+      }
+      if (p.startsWith('/api/kb/register')) {
+        n += 1
+        if (n >= failFrom) return jsonResp({ detail: '操作太频繁，请稍后再试' }, { ok: false, status: 429 })
+        return jsonResp({ doc_id: `DOC_${n}`, version_no: 1, content_process_status: 'NOT_STARTED',
+                          requires_kb_admin_approval: false, status_badge: '排队中', idempotent: false,
+                          title: 't', content_dups: [], content_dups_other: 0 })
+      }
+      if (p.startsWith('/api/kb/my-docs')) return jsonResp({ items: [], has_more: false })
+      return jsonResp({ items: [], questions: [] })
+    })
+  }
+
+  it('部分失败 → 只留失败项，成功项被移出（再点上传不会重复入库）', async () => {
+    vi.stubGlobal('fetch', batchFetch(2))          // 第 1 篇成功，其余 429
+    const kb = useKb()
+    setIdentity('dept_admin', ['hr'])
+    kb.newOwner.value = 'hr'
+    __setSelectedFiles([bigFile('a.pdf'), bigFile('b.pdf'), bigFile('c.pdf')])
+    kb.doUpload()
+    await waitFor(() => kb.uploadMsg.value.includes('成功'), 3000)
+
+    // 成功的那篇必须从选择列表移出——否则再点「上传」会把它重传成重复文档
+    expect(kb.selectedNames.value).not.toContain('a.pdf')
+    expect(kb.selectedNames.value.sort()).toEqual(['b.pdf', 'c.pdf'])
+    expect(kb.uploadMsg.value).toContain('待重试')
+    // 429 的真实原因要能看见（a60ddaa 的 detail 分级）
+    expect(kb.uploadQueue.value.find((r) => r.name === 'b.pdf')!.msg).toContain('太频繁')
+  })
+
+  it('全部成功 → 选择列表清空，不提示重试', async () => {
+    vi.stubGlobal('fetch', batchFetch(99))
+    const kb = useKb()
+    setIdentity('dept_admin', ['hr'])
+    kb.newOwner.value = 'hr'
+    __setSelectedFiles([bigFile('a.pdf'), bigFile('b.pdf')])
+    kb.doUpload()
+    await waitFor(() => kb.uploadMsg.value.includes('成功'), 3000)
+    expect(kb.selectedNames.value).toEqual([])
+    expect(kb.uploadMsg.value).not.toContain('待重试')
+  })
+
+  it('跳过项（空文件/超限）不进重试集——重传必然同样结果', async () => {
+    vi.stubGlobal('fetch', batchFetch(99))
+    const kb = useKb()
+    setIdentity('dept_admin', ['hr'])
+    kb.newOwner.value = 'hr'
+    __setSelectedFiles([bigFile('ok.pdf'), new File([], 'empty.pdf')])
+    kb.doUpload()
+    await waitFor(() => kb.uploadMsg.value.includes('成功'), 3000)
+    expect(kb.selectedNames.value).toEqual([])          // 成功的移出、跳过的也不留
+    expect(kb.uploadQueue.value.find((r) => r.name === 'empty.pdf')!.status).toBe('跳过')
+  })
+})
