@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { docOwnerText } from '@/lib/orgTree'
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { X, Loader2, Lock } from '@lucide/vue'
 import { deptLabel } from '@/lib/kb'
@@ -162,7 +163,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         <div class="min-w-0 flex-1">
           <div class="text-base font-semibold text-foreground">文档权限</div>
           <div class="mt-0.5 truncate text-[12.5px] text-muted-foreground">
-            《{{ shareCtx.title || shareCtx.original_filename || shareCtx.doc_id }}》 · 归属 {{ deptLabel(shareCtx.owner_dept) }}
+            《{{ shareCtx.title || shareCtx.original_filename || shareCtx.doc_id }}》 · 归属 {{ docOwnerText(shareCtx, deptLabel) }}
           </div>
         </div>
         <button

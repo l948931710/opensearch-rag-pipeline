@@ -254,6 +254,44 @@ def _kb_owner_dto(mode: str, owner: str, oid, node_names: Dict[int, str]):
     return (f"legacy:{owner}" if owner else ""), (owner or "")
 
 
+def _kb_shared_node_labels(cur, pairs) -> Dict[str, List[str]]:
+    """批量 doc_id → 「共享到的」节点现名。pairs = [(doc_id, owner_dept_id)]，仅传 node 文档。
+
+    **为什么不能沿用组码授权**：node 文档的可见性只来自 kb_doc_node_grant，跨部门共享写的
+    是节点 id；而台账副行「· 共享 X、Y」原先只从 /api/kb/access-grants
+    (kb_access_request.requester_dept，**组码**) 聚合 ⇒ node 文档的共享**恒为空**——
+    2026-08-05 生产实测 270 篇「指定部门」上传全部显示成「仅本部门」，共享给了谁完全不可见。
+
+    **排除归属节点自身**：摄取默认给归属节点写一条 subtree 授权（pipeline_nodes 步骤 1b），
+    那条是「本部门可见」的实现方式、不是共享——不排除的话每篇都会多出一个自己的名字。
+    失活节点**保留并标注**（授权还在、节点没了 = 正是需要解释的状态，静默隐藏更糟；
+    与 kb_access.py 的可见性解释同口径）。
+    fail-open：失败回空 dict ⇒ 副行退化成只显示可见级别，绝不影响列表主查询。
+    """
+    owner_of = {str(d): int(o) for d, o in pairs if d and o}
+    if not owner_of:
+        return {}
+    out: Dict[str, List[str]] = {}
+    try:
+        ph = ",".join(["%s"] * len(owner_of))
+        cur.execute(
+            f"SELECT g.doc_id, g.dept_id, d.name, d.is_active "
+            f"FROM {_kb_db()}.kb_doc_node_grant g "
+            f"LEFT JOIN {_kb_db()}.dept_dim d ON d.dept_id = g.dept_id "
+            f"WHERE g.revoked_at IS NULL AND g.doc_id IN ({ph}) ORDER BY g.dept_id",
+            tuple(owner_of.keys()))
+        for r in cur.fetchall():
+            did, node_id = str(r[0]), int(r[1])
+            if node_id == owner_of.get(did):
+                continue
+            name = (r[2] or str(node_id)) + ("" if r[3] else "（已失效）")
+            out.setdefault(did, []).append(name)
+    except Exception as e:   # noqa: BLE001 — 展示 enrichment，失败退化为不显示共享
+        logger.debug("台账共享节点批量解析失败: %s", e)
+        return {}
+    return out
+
+
 def _kb_badge_counts(cur, base_from_where: str, base_params: tuple,
                      perm: str, cited: str):
     """faceted 状态计数（2026-07-16 Sam 实测反馈）：与主查询**同一套筛选**（归属/范围/
@@ -331,6 +369,9 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
                 node_names = _kb_node_names(
                     cur, [r[15] for r in rows[:limit] if cap == "present" and r[15]])
+                shared_nodes = _kb_shared_node_labels(
+                    cur, [(r[0], r[15]) for r in rows[:limit]
+                          if cap == "present" and (r[14] or "legacy") == "node" and r[15]])
         finally:
             conn.close()
     except HTTPException:
@@ -351,6 +392,7 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
         items.append(KbDocItem(
             doc_id=doc_id or "", title=title or "", original_filename=fname or "",
             owner_dept=owner or "", acl_mode=_mode, owner_key=_okey, owner_label=_olabel,
+            shared_labels=shared_nodes.get(doc_id) or [],
             permission_level=perm or "public",
             current_version_no=int(cur_ver or 1), status=status or "active",
             status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs,

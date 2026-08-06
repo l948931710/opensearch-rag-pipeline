@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { centerOf, resolveDocOwner, resolveOwnerBucket, rollupCoverageRows, type CoverageBucket } from '@/lib/orgTree'
+import { centerOf, docOwnerText, resolveDocOwner, resolveOwnerBucket, rollupCoverageRows, type CoverageBucket } from '@/lib/orgTree'
 import { deptLabel } from '@/lib/kb'
 import type { OrgNode } from '@/composables/useOrgSnapshot'
 
@@ -113,5 +113,25 @@ describe('rollupCoverageRows — 中心卷积', () => {
   })
   it('顶层按 docs 降序', () => {
     expect(rows[0].label).toBe('生产中心')
+  })
+})
+
+describe('docOwnerText —— 台账/弹窗归属文案的唯一口径（2026-08-05 口径对账）', () => {
+  it('node 文档：owner_dept 恒空串，仍出后端直给的节点现名（不再是半截文案）', () => {
+    expect(docOwnerText(
+      { owner_key: 'node:2', owner_dept: '', owner_label: '生产中心' }, deptLabel)).toBe('生产中心')
+  })
+  it('legacy 文档：剥掉 legacy: 前缀后交 deptLabel 转中文', () => {
+    expect(docOwnerText({ owner_key: 'legacy:hr', owner_dept: 'hr' }, deptLabel)).toBe(deptLabel('hr'))
+  })
+  it('只有旧 owner_dept 的来源（深链/旧后端）仍能出名字 —— 向后兼容不能破', () => {
+    expect(docOwnerText({ owner_dept: 'hr' }, deptLabel)).toBe(deptLabel('hr'))
+  })
+  it('三字段皆空 → 「未归属」（诚实降级；调用方据此决定整段隐藏，而非渲染空白）', () => {
+    expect(docOwnerText({}, deptLabel)).toBe('未归属')
+    expect(docOwnerText(null, deptLabel)).toBe('')
+  })
+  it('node 但节点名缺失 → `#id ⚠️`，绝不静默回退成组码或空白', () => {
+    expect(docOwnerText({ owner_key: 'node:99', owner_dept: '' }, deptLabel)).toBe('#99 ⚠️')
   })
 })

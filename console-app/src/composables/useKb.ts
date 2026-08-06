@@ -26,6 +26,10 @@ export interface DocItem {
   // owner_label = 展示名（node 由后端 JOIN dept_dim 直给现名 ⇒ 部门改名免疫）。
   // 可选是为了兼容 browse/mock 等尚未带该 DTO 的来源——渲染一律走 lib/orgTree.resolveDocOwner。
   acl_mode?: string; owner_key?: string; owner_label?: string
+  // node 文档「共享到的」节点现名（后端已排除归属节点自身）。node 的跨部门共享写在
+  // kb_doc_node_grant，**不在**组码授权表里 ⇒ 台账副行不能只读 accessGrants 聚合。
+  // 缺省/空 = 未共享或 legacy 行，两种都回退到组码口径（后端 browse 恒不填，见 KbDocItem 注释）。
+  shared_labels?: string[]
   permission_level: string; current_version_no: number; status: string
   status_badge: string; updated_at: string
   can_manage?: boolean   // 可操作（写作用域）；my-docs 恒 true，browse 全部门时外部门为 false
@@ -56,6 +60,9 @@ export interface ApprovalHistoryItem {
   kind: string            // 'access' | 'contribution' | 'upload' | 'admin_grant'
   action: string          // approved | rejected | revoked | accepted | granted
   title: string; owner_dept: string; subject: string
+  // 归属 DTO（与 DocItem 同形）：仅 access/upload 两类填 —— node 文档 owner_dept 恒空串。
+  // contribution 的 owner_dept 是**贡献分类**组码（另一根轴），后端有意不填这两个字段。
+  owner_key?: string; owner_label?: string
   detail: string; extra: string
   decided_by: string; decided_by_name: string; decided_at: string
 }
@@ -83,7 +90,10 @@ export type AccessState = 'none' | 'pending' | 'approved_pending_sync' | 'projec
 // 评审实测：3 个文件卡在「申请上传地址」时 3 行全渲染 aria-valuenow=0 的条，批量失败终态后
 // 条还冻在 0 不消失。那正是 redline③ 禁的假条，只是从单文件路径漏到了队列路径。
 export interface QueueRow { name: string; status: string; pct: number | null; msg: string; dupMsg?: string }
-export interface VerCtx { doc_id: string; title: string; owner_dept: string; permission_level: string; current_version_no: number }
+// owner_key/owner_label 与 DocItem 同义：升版态标题行走 docOwnerText，node 文档的
+// owner_dept 恒空串，只带 owner_dept 会渲染出「· 归属 」半截文案（深链合成态无此二字段
+// ⇒ 显示「未归属」，是诚实降级，不是回到空白）。
+export interface VerCtx { doc_id: string; title: string; owner_dept: string; owner_key?: string; owner_label?: string; permission_level: string; current_version_no: number }
 
 interface MyDocsResp { items: DocItem[]; has_more: boolean; badge_counts?: Record<string, number> | null }
 /** 归属 facet（后端 KbOwnerFacet）：key=`legacy:<code>` | `node:<id>`，label 为展示名
@@ -1042,7 +1052,7 @@ function scrollToUploadCard() {
 }
 
 function enterVersionMode(d: DocItem) {
-  verCtx.value = { doc_id: d.doc_id, title: d.title, owner_dept: d.owner_dept, permission_level: d.permission_level, current_version_no: d.current_version_no }
+  verCtx.value = { doc_id: d.doc_id, title: d.title, owner_dept: d.owner_dept, owner_key: d.owner_key, owner_label: d.owner_label, permission_level: d.permission_level, current_version_no: d.current_version_no }
   newTitle.value = ''; dupWarn.value = ''; contentDupMsg.value = ''; uploadErr.value = ''; uploadMsg.value = ''
   selectedFiles = []; selectedNames.value = []
   scrollToUploadCard()

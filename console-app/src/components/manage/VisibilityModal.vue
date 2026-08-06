@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { docOwnerText } from '@/lib/orgTree'
 import { onUnmounted, watch } from 'vue'
 import { Eye, Loader2, ShieldAlert, X } from '@lucide/vue'
 import { deptLabel, permLabel, viaLabel } from '@/lib/kb'
@@ -38,7 +39,7 @@ const VIA_TONE: Record<string, string> = {
         <div class="min-w-0 flex-1">
           <div class="text-base font-semibold text-foreground">谁能看到这篇文档</div>
           <div class="mt-0.5 truncate text-[12.5px] text-muted-foreground">
-            《{{ visCtx.title || visCtx.original_filename || visCtx.doc_id }}》 · 归属 {{ deptLabel(visCtx.owner_dept) }}
+            《{{ visCtx.title || visCtx.original_filename || visCtx.doc_id }}》 · 归属 {{ docOwnerText(visCtx, deptLabel) }}
           </div>
         </div>
         <button

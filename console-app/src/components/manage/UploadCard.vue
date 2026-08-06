@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { docOwnerText } from '@/lib/orgTree'
 import { computed, ref, watch } from 'vue'
 import { UploadCloud, FileUp, X } from '@lucide/vue'
 import { UPLOAD_ACCEPT, PERM_LABEL, deptLabel } from '@/lib/kb'
@@ -127,7 +128,7 @@ function onDrop(e: DragEvent) {
     <!-- 升版态：展示继承信息（可见范围继承不可改） -->
     <div v-if="verCtx" class="mt-3 rounded-lg bg-secondary/50 px-3 py-2.5 text-xs text-muted-foreground">
       升版目标：<span class="font-medium text-foreground">{{ verCtx.title || verCtx.doc_id }}</span>
-      · 归属 {{ deptLabel(verCtx.owner_dept) }}
+      · 归属 {{ docOwnerText(verCtx, deptLabel) }}
       · 可见范围 {{ verCtx.permission_level ? (PERM_LABEL[verCtx.permission_level] || verCtx.permission_level) : '继承自原文档' }}（不可改）
       <span v-if="verCtx.current_version_no"> · 当前 v{{ verCtx.current_version_no }}</span>
     </div>

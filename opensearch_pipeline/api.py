@@ -2666,6 +2666,12 @@ class KbDocItem(BaseModel):
     acl_mode: str = "legacy"
     owner_key: str = ""
     owner_label: str = ""
+    # node 文档「共享到的」节点现名（已排除归属节点自身；失活节点带「（已失效）」后缀）。
+    # 台账副行「· 共享 X、Y」的 node 侧来源——legacy 侧仍走前端 accessGrants 组码聚合。
+    # 空列表 = 未共享**或**该行是 legacy 文档，两种都由前端回退到组码口径，语义不冲突。
+    # ⚠️ **只在 my-docs 填，browse 恒空**：browse 是「看得见但不能管」的他部门文档，
+    # 把授权拓扑外扩到管辖范围之外是没人要求的放宽（legacy 侧的 accessGrants 同样是管辖内的）。
+    shared_labels: List[str] = Field(default_factory=list)
     permission_level: str = "public"
     current_version_no: int = 1
     status: str = "active"

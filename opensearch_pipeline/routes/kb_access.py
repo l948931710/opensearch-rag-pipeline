@@ -891,6 +891,14 @@ class KbApprovalHistoryItem(BaseModel):
     action: str = ""          # approved|rejected|revoked|accepted|granted
     title: str = ""           # 文档标题 / 贡献问题 / 目标用户
     owner_dept: str = ""      # 作用域部门（contribution=category_dept；admin_grant 无）
+    # 归属 DTO —— 与 KbDocItem 同形（key=`legacy:<code>` | `node:<id>`，label 为展示名）。
+    # 只有 access / upload 两类填：它们的作用域是**文档归属**，而 node 文档的 owner_dept
+    # 按契约恒为空串 ⇒ 不带这两个字段，审批历史里 799 篇 node 文档的「归属」整段消失
+    # （metaOf 是 `if (r.owner_dept)`，2026-08-05 台账口径对账实测）。
+    # contribution 的 category_dept 是**贡献分类**（另一根轴，本就是组码）⇒ 有意不填；
+    # admin_grant 无文档作用域 ⇒ 不填。前端一律走 docOwnerText，缺字段回退组码口径。
+    owner_key: str = ""
+    owner_label: str = ""
     subject: str = ""         # requester_name / author_name / 目标 uid（已存展示名，与队列一致，不脱敏）
     detail: str = ""          # 理由/备注 —— 跨用户自由文本，已脱敏
     extra: str = ""           # 次要状态：contribution 的 ingestion_status
@@ -957,21 +965,32 @@ def kb_approval_history(request: Request,
         # 下一句 execute 不会 "Commands out of sync"。与 /api/kb/insights 同型。
         with conn.cursor() as cur:
             # 1) access —— kb_access_request 的已决行（两角色，owner_dept 作用域）
+            _cap = _kb_node_capability(cur)
+            _nc = ", m.acl_mode, m.owner_dept_id" if _cap == "present" else ""
+            # (out 下标, owner_dept_id) —— 节点名统一在四段跑完后**一次**批量解析（见下方）。
+            pending_nodes: List[tuple] = []
             ran += 1
             try:
                 cur.execute(
                     "SELECT r.doc_id, m.title, r.owner_dept, r.requester_depts, r.requester_name,"
                     " r.status, r.reason, r.decision_note, r.decided_by,"
                     f" COALESCE(CONVERT_TZ(r.decided_at,{_TZ_PACIFIC_TO_BJ}), r.decided_at)"
+                    f"{_nc}"
                     f" FROM {_kb_db()}.kb_access_request r"
                     f" JOIN {_kb_db()}.document_meta m ON m.doc_id = r.doc_id"
                     " WHERE r.status IN ('approved','rejected','revoked') " + scope_owner +
                     " ORDER BY r.decided_at DESC LIMIT %s",
                     tuple(scope_owner_params + [lim]))
                 for x in cur.fetchall():
+                    _mode = (x[10] or "legacy") if _cap == "present" else "legacy"
+                    _oid = x[11] if _cap == "present" else None
+                    if _mode == "node" and _oid:
+                        pending_nodes.append((len(out), int(_oid)))
                     out.append(KbApprovalHistoryItem(
                         kind="access", action=(x[5] or ""), title=(x[1] or ""),
                         owner_dept=(x[2] or ""), subject=(x[4] or ""),
+                        owner_key=(f"node:{int(_oid)}" if (_mode == "node" and _oid)
+                                   else (f"legacy:{x[2]}" if x[2] else "")),
                         detail=(_rq(x[6]) or _rq(x[7])), decided_by=(x[8] or ""),
                         decided_at=str(x[9]) if x[9] else ""))
                     if x[8]:
@@ -1008,15 +1027,22 @@ def kb_approval_history(request: Request,
                     cur.execute(
                         "SELECT a.doc_id, m.title, m.owner_dept, a.action_type, a.operator_id,"
                         f" COALESCE(CONVERT_TZ(a.created_at,{_TZ_PACIFIC_TO_BJ}), a.created_at), a.message"
+                        f"{_nc}"
                         f" FROM {_kb_db()}.kb_audit_log a"
                         f" LEFT JOIN {_kb_db()}.document_meta m ON m.doc_id = a.doc_id"
                         " WHERE a.operator_type='user' AND a.action_type IN ('APPROVE','REJECT')"
                         " ORDER BY a.created_at DESC LIMIT %s", (lim,))
                     for x in cur.fetchall():
                         act = "approved" if (x[3] or "") == "APPROVE" else "rejected"
+                        _mode = (x[7] or "legacy") if _cap == "present" else "legacy"
+                        _oid = x[8] if _cap == "present" else None
+                        if _mode == "node" and _oid:
+                            pending_nodes.append((len(out), int(_oid)))
                         out.append(KbApprovalHistoryItem(
                             kind="upload", action=act, title=(x[1] or x[0] or ""),
                             owner_dept=(x[2] or ""), subject="", detail=_rq(x[6]),
+                            owner_key=(f"node:{int(_oid)}" if (_mode == "node" and _oid)
+                                       else (f"legacy:{x[2]}" if x[2] else "")),
                             decided_by=(x[4] or ""), decided_at=str(x[5]) if x[5] else ""))
                         if x[4]:
                             op_ids.add(x[4])
@@ -1044,6 +1070,18 @@ def kb_approval_history(request: Request,
                 except Exception as e:
                     fails += 1
                     logger.warning("approval_history admin_grant 失败: %s", e)
+            # node 归属节点 id → 现名（一次往返，四段共用）。**懒导入 kb_console**：
+            # ① 避免 routes→routes 的模块级耦合（本包约定是各自向 api 取共享件）；
+            # ② 走模块属性而非拷贝绑定，tests 对 kb_console._kb_node_names 的 monkeypatch 仍生效。
+            # enrichment 语义：失败则 label 留空，前端 docOwnerText 回退成 `#<id> ⚠️`，不影响主列表。
+            if pending_nodes:
+                try:
+                    from opensearch_pipeline.routes import kb_console as _kc
+                    _names = _kc._kb_node_names(cur, [nid for _, nid in pending_nodes])
+                    for idx, nid in pending_nodes:
+                        out[idx].owner_label = _names.get(nid, str(nid))
+                except Exception as e:   # noqa: BLE001
+                    logger.debug("approval_history 节点名解析失败（回退 id 串）: %s", e)
             # 操作者 staffId → 展示名（best-effort，enrichment；失败不计入 fails、回退 uid）
             if op_ids:
                 try:

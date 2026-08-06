@@ -3,8 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Search, ArrowUpDown, FilePlus2, Archive, ArchiveRestore, History, Lock, Clock, Share2, Check, X, Eye, Download, Settings, Loader2 } from '@lucide/vue'
 import { deptLabel, permLabel, PERM_LABEL } from '@/lib/kb'
-import { resolveDocOwner } from '@/lib/orgTree'
-import type { OrgNode } from '@/composables/useOrgSnapshot'
+import { docOwnerText } from '@/lib/orgTree'
 import { useKb, type DocItem, type OwnerFacet, type SortKey } from '@/composables/useKb'
 import StatusPill from './StatusPill.vue'
 import AccessSyncPill from './AccessSyncPill.vue'
@@ -53,19 +52,21 @@ function canManagePerm(d: DocItem): boolean {
 }
 
 // 共享部门名（去 count，直接列名字，>2 个折 +N）——回答"文档共享给了哪些部门"。
+// **双轴**：node 文档的共享写在 kb_doc_node_grant（节点 id），组码授权表里根本没有它的行，
+// 此前只读 grantedLabelsByDoc ⇒ 270 篇「指定部门」上传全显示成「仅本部门」（2026-08-05 实测）。
+// 故 node 优先吃后端直给的 shared_labels（已排除归属节点自身），legacy 仍走组码聚合。
 // O(1)：useKb 侧 computed Map（grants 变更才重算），模板每行 4 次调用不再各自全量扫。
-function sharedLabels(docId: string): string[] { return grantedLabelsByDoc.value.get(docId) || [] }
+function sharedLabels(d: DocItem): string[] {
+  if (d.shared_labels?.length) return d.shared_labels
+  return grantedLabelsByDoc.value.get(d.doc_id) || []
+}
 
 // 归属列：node 文档的 owner_dept 按后端契约为空串（归属在 owner_dept_id 上），直接渲染旧字段
 // 会得到一个空格子——2026-08-04 首篇 node 文档入库后实地暴露。统一走 resolveDocOwner，
 // 与看板 OrgCoverageTable 同一口径（未归属/组码/节点名/失联节点四态）。
-// 空快照是有意的：node 名后端 JOIN dept_dim 直给，台账不为了显示多拉一次组织树。
-const NO_ORG_SNAPSHOT = new Map<number, OrgNode>()
-const ownerText = (d: DocItem): string =>
-  resolveDocOwner(d.owner_key, d.owner_dept, d.owner_label, NO_ORG_SNAPSHOT, deptLabel).label
+const ownerText = (d: DocItem): string => docOwnerText(d, deptLabel)
 // 归属下拉选项文案：与列渲染同一口径（facet 的 legacy label 后端回的是组码原文，故仍走 deptLabel）
-const ownerFacetText = (o: OwnerFacet): string =>
-  resolveDocOwner(o.key, '', o.label, NO_ORG_SNAPSHOT, deptLabel).label
+const ownerFacetText = (o: OwnerFacet): string => docOwnerText({ owner_key: o.key, owner_label: o.label }, deptLabel)
 
 // 利用度副行文案：0=真·从未被引用（退役候选，amber 提示）；>0=引用 N 次；null/undefined=数据不可用不显示。
 function usageText(d: DocItem): string {
@@ -410,7 +411,7 @@ async function onRestore(d: DocItem) {
           <div class="min-w-0 flex-1">
             <div class="truncate text-[13.5px] font-semibold text-foreground" :title="d.title || d.original_filename || d.doc_id">{{ d.title || d.original_filename || d.doc_id }}</div>
             <div class="truncate text-[11px] text-faint">
-              {{ permLabel(d.permission_level) }}<template v-if="sharedLabels(d.doc_id).length"><span class="text-accent-text"> · 共享 {{ sharedLabels(d.doc_id).slice(0, 2).join('、') }}<span v-if="sharedLabels(d.doc_id).length > 2"> +{{ sharedLabels(d.doc_id).length - 2 }}</span></span></template><template v-if="usageText(d)"> · <span :class="d.cited_count === 0 ? 'text-st-warn' : ''" :title="d.last_cited_at ? `最近被引用 ${d.last_cited_at.slice(0, 16)}` : ''">{{ usageText(d) }}</span></template><span v-if="d.original_filename && d.original_filename !== d.title"> · {{ d.original_filename }}</span>
+              {{ permLabel(d.permission_level) }}<template v-if="sharedLabels(d).length"><span class="text-accent-text"> · 共享 {{ sharedLabels(d).slice(0, 2).join('、') }}<span v-if="sharedLabels(d).length > 2"> +{{ sharedLabels(d).length - 2 }}</span></span></template><template v-if="usageText(d)"> · <span :class="d.cited_count === 0 ? 'text-st-warn' : ''" :title="d.last_cited_at ? `最近被引用 ${d.last_cited_at.slice(0, 16)}` : ''">{{ usageText(d) }}</span></template><span v-if="d.original_filename && d.original_filename !== d.title"> · {{ d.original_filename }}</span>
             </div>
             <!-- 驳回原因直出（反馈闭环）：原因一直落库却只有 kb_admin 的审批历史能看到，申请人只见红徽章 -->
             <div v-if="d.reject_reason" class="mt-0.5 truncate text-[11px] text-st-fail" :title="`驳回原因：${d.reject_reason}`">

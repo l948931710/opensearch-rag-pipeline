@@ -181,6 +181,23 @@ export function rollupCoverageRows(
   return [...centers.values(), ...flat].sort((a, b) => b.docs - a.docs)
 }
 
+/** 文档归属文案（台账列 + 各弹窗标题行的**唯一**口径）。
+ *
+ *  为什么不带组织树快照：node 名后端 JOIN dept_dim 直给现名，展示侧不必为了显示多拉一次树
+ *  （也就不会因树没加载好而闪成 id 串）。传空 Map 是有意的，不是遗漏。
+ *
+ *  ⚠️ 直接写 `deptLabel(x.owner_dept)` 是本仓反复踩的坑：node 文档的 owner_dept 按后端契约
+ *  **恒为空串**（归属在 owner_dept_id 上），于是弹窗标题渲染出「· 归属 」这样的半截文案。
+ *  2026-08-05 台账口径对账实测：VisibilityModal / ShareDocModal / UploadCard 升版态三处同病。 */
+export function docOwnerText(
+  d: { owner_key?: string; owner_dept?: string; owner_label?: string } | null | undefined,
+  legacyLabel: (code: string) => string,
+): string {
+  if (!d) return ''
+  return resolveDocOwner(d.owner_key, d.owner_dept, d.owner_label, NO_ORG_SNAPSHOT, legacyLabel).label
+}
+const NO_ORG_SNAPSHOT: Map<number, OrgNode> = new Map()
+
 /** 管辖根 → 最小根集（剔除被另一允许根以祖先身份覆盖的后代根,防同一子树重复渲染；
  *  同时剔除不在快照中的 id）。null = 不过滤。 */
 export function normalizeAllowedRoots(

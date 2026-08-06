@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { docOwnerText } from '@/lib/orgTree'
 import { computed, ref } from 'vue'
 import { History, ArrowDownWideNarrow } from '@lucide/vue'
 import { useKb, type ApprovalHistoryItem } from '@/composables/useKb'
@@ -66,7 +67,9 @@ function subjectLabel(r: ApprovalHistoryItem): string {
 function metaOf(r: ApprovalHistoryItem): string {
   const parts: string[] = []
   if (r.subject) parts.push(subjectLabel(r))
-  if (r.owner_dept) parts.push('归属 ' + deptLabel(r.owner_dept))
+  // node 文档的 owner_dept 恒空串 ⇒ 不能用它当"有没有归属"的判据（此前整段消失）。
+  const owner = docOwnerText(r, deptLabel)
+  if (owner && owner !== '未归属') parts.push('归属 ' + owner)
   if (r.decided_by_name) parts.push('决策人 ' + r.decided_by_name)
   return parts.join(' · ')
 }
