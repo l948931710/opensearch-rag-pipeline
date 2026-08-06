@@ -5,7 +5,6 @@ test_rag_api.py — RAG 问答 API 单元测试
 测试检索器、LLM 生成器、FastAPI 端点（mock 外部 API）。
 """
 
-import contextlib
 import json
 from unittest.mock import MagicMock, patch
 
@@ -261,24 +260,6 @@ class TestLLMGenerator:
 # Test: api.py (FastAPI endpoints)
 # ═══════════════════════════════════════════════════════════════
 
-@contextlib.contextmanager
-def _search_endpoint_on():
-    """临时开启 `POST /api/search`（P3-2 起默认 404）。
-
-    改的是**已缓存 config 对象**的属性而非 env —— `config._config` 是进程级缓存、
-    惰性加载后永不失效，`monkeypatch.setenv` 对它无效（见 conftest
-    `_restore_global_config_cache` 的成因说明）。
-    """
-    from opensearch_pipeline.config import get_config
-    rag = get_config().rag
-    old = rag.search_endpoint_enable
-    rag.search_endpoint_enable = True
-    try:
-        yield
-    finally:
-        rag.search_endpoint_enable = old
-
-
 class TestAPI:
     """测试 FastAPI 端点。"""
 
@@ -295,27 +276,6 @@ class TestAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-
-    @patch("opensearch_pipeline.api.search_chunks")
-    def test_search_endpoint(self, mock_search, client):
-        """测试纯检索端点。"""
-        mock_search.return_value = [
-            {
-                "chunk_text": "住宿申请...",
-                "title": "员工手册",
-                "section_title": "住宿管理",
-                "doc_id": "D1",
-                "category_l1": "行政",
-                "score": 0.9,
-            }
-        ]
-
-        with _search_endpoint_on():
-            resp = client.post("/api/search", json={"query": "住宿申请", "top_k": 5})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["total"] == 1
-        assert data["results"][0]["title"] == "员工手册"
 
     @patch("opensearch_pipeline.api.generate_answer")
     @patch("opensearch_pipeline.api.retrieve_and_enrich")
@@ -402,25 +362,22 @@ class TestAPI:
         resp = client.post("/api/ask", json={"question": ""})
         assert resp.status_code == 422
 
-    @patch("opensearch_pipeline.api.search_chunks")
-    def test_search_error_handling(self, mock_search, client):
-        """检索异常时应返回 500。"""
-        mock_search.side_effect = RuntimeError("连接失败")
 
-        with _search_endpoint_on():
-            resp = client.post("/api/search", json={"query": "测试"})
-        assert resp.status_code == 500
-        assert "检索失败" in resp.json()["detail"]
+# ── `POST /api/search` 已删除（2026-08-06）────────────────────────────────────
 
+class TestSearchEndpointRemoved:
+    """`POST /api/search` **已于 2026-08-06 彻底删除**（Sam 拍板）。
 
-# ── P3-2：`POST /api/search` 下线（2026-08-04）─────────────────────────────────
+    它历史上是一个「已认证但未受治理」的原始检索面：直连 `search_chunks` ⇒ 绕过 v2 敏感
+    查询 guard、不落 `qa_session_log`。2026-08-04 先改成默认 404 + 可开回来（P3-2），
+    但 2026-08-06 codex 补评审发现那条「开回来」的路本身有两个洞：
+      ① 调 `search_chunks` **不传 `acl_ctx`** ⇒ node-ACL 读侧 fail-closed 复核整段被跳过；
+      ② 宣称的「开回来也过敏感 guard」只对一半 —— guard 受它**自己的**默认关闭的 flag 门控。
+    与其维护一条随时会再漂移的逃生路，不如删掉：全仓 console / 小程序 / 钉钉 / eval
+    四类调用方对它**零消费**。
 
-class TestSearchEndpointRetired:
-    """`/api/search` 默认 404，且开回来时不得重新变成"治理绕过面"。
-
-    下线理由不是"没人用"（虽然全仓实测零消费方），而是它是一个**已认证但未受治理**
-    的原始检索面：直连 `search_chunks` ⇒ 绕过 v2 敏感查询 guard（guard 只挂在
-    `_prefilter_route` 与 `dingtalk_bot` 两处）、且不落 `qa_session_log`。
+    ⚠️ 本类守的是「不会被悄悄加回来」。若将来确有需要，请连同 acl_ctx / 强制 guard /
+    qa 审计一起设计，而不是把这几条测试删掉了事。
     """
 
     @pytest.fixture
@@ -429,41 +386,23 @@ class TestSearchEndpointRetired:
         from opensearch_pipeline.api import app
         return TestClient(app)
 
-    def test_default_is_404(self, client):
-        """★ 默认姿态：端点不可达。"""
+    def test_endpoint_is_gone(self, client):
+        """★ 路由表里不再有它 —— 404 且与「flag 关着」无关（flag 本身也删了）。"""
         r = client.post("/api/search", json={"query": "住宿申请"})
-        assert r.status_code == 404, f"/api/search 默认应 404，实得 {r.status_code}"
+        assert r.status_code == 404, f"/api/search 应已删除，实得 {r.status_code}"
 
-    @patch("opensearch_pipeline.api.search_chunks")
-    def test_disabled_endpoint_does_not_retrieve(self, mock_search, client):
-        """🔴 404 必须发生在**检索之前** —— 否则"下线"只是不返回结果，钱照花、日志照留。"""
-        client.post("/api/search", json={"query": "住宿申请"})
-        mock_search.assert_not_called()
+    def test_no_route_registered(self):
+        """比状态码更强的判据：FastAPI 路由表里没有这个 path（404 也可能来自别的原因）。"""
+        from opensearch_pipeline.api import app
+        paths = {getattr(r, "path", "") for r in app.routes}
+        assert "/api/search" not in paths, "路由被重新注册了"
 
-    @patch("opensearch_pipeline.api.search_chunks")
-    def test_enabling_does_not_reopen_the_guard_bypass(self, mock_search, client):
-        """★★ 本类的核心断言：把 flag 开回来，敏感 guard **仍然**拦得住。
+    def test_flag_and_models_are_gone(self):
+        """总闸与请求/响应模型一并清除 —— 留着它们等于给「悄悄加回来」铺好路。"""
+        from opensearch_pipeline import api as api_mod
+        from opensearch_pipeline.config import get_config
+        assert not hasattr(api_mod, "SearchRequest"), "SearchRequest 模型残留"
+        assert not hasattr(api_mod, "SearchResponse"), "SearchResponse 模型残留"
+        assert not hasattr(get_config().rag, "search_endpoint_enable"), "总闸 flag 残留"
 
-        没有这一条，`RAG_SEARCH_ENDPOINT_ENABLE=true` 就等于一键恢复绕过面——
-        而那正是当初下线它的原因。命中 guard ⇒ 空结果集，且**根本不检索**。
-        """
-        mock_search.return_value = [{"chunk_text": "x", "title": "t", "section_title": "",
-                                     "doc_id": "D1", "category_l1": "行政", "score": 0.9}]
-        import opensearch_pipeline.api as api_mod
-        with _search_endpoint_on(), \
-                patch.object(api_mod, "sensitive_guard_route", lambda q: object()):
-            r = client.post("/api/search", json={"query": "帮我查张三的身份证号"})
-        assert r.status_code == 200, "拒答用本端点自己的契约表达（空结果），不是 4xx"
-        assert r.json()["total"] == 0 and r.json()["results"] == []
-        mock_search.assert_not_called(), "命中 guard 后仍去检索了 —— 绕过面没关上"
 
-    @patch("opensearch_pipeline.api.search_chunks")
-    def test_guard_miss_still_searches(self, mock_search, client):
-        """反向：guard 不命中时照常检索（上一条不能靠"永远返回空"来通过）。"""
-        mock_search.return_value = []
-        import opensearch_pipeline.api as api_mod
-        with _search_endpoint_on(), \
-                patch.object(api_mod, "sensitive_guard_route", lambda q: None):
-            r = client.post("/api/search", json={"query": "住宿申请"})
-        assert r.status_code == 200
-        mock_search.assert_called_once()

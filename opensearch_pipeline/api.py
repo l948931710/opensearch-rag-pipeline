@@ -5,7 +5,6 @@ api.py — RAG 问答 FastAPI 应用
 端点：
   POST /api/ask           非流式问答
   POST /api/ask/stream    SSE 流式问答
-  POST /api/search        纯检索（不调用 LLM）—— 已下线，默认 404（RAG_SEARCH_ENDPOINT_ENABLE）
   GET  /api/health        健康检查
 """
 
@@ -32,7 +31,7 @@ from opensearch_pipeline.llm_generator import (
     parse_sse_data_frame,
     strip_doc_citations,
 )
-from opensearch_pipeline.retriever import search_chunks, retrieve_and_enrich
+from opensearch_pipeline.retriever import retrieve_and_enrich
 from opensearch_pipeline.dingtalk_bot import router as dingtalk_router
 from opensearch_pipeline.dingtalk_identity import (
     _exchange_authcode_for_userid,
@@ -412,17 +411,6 @@ class AskRequest(BaseModel):
     )
 
 
-class SearchRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=2000, description="搜索查询")
-    top_k: int = Field(5, ge=1, le=50, description="返回结果数")
-    user_id: Optional[str] = Field(None, max_length=128, description="用户 ID（钉钉 staffId）；仅用于日志归因，权限部门只从 Bearer 令牌解析")
-    user_dept: Optional[str] = Field(
-        None,
-        description="[已废弃·服务端忽略] 部门一律由服务端按 Bearer 令牌/user_id 解析（防越权）",
-        pattern=r'^[\w\-\u4e00-\u9fff]{0,64}$',
-    )
-
-
 class SourceInfo(BaseModel):
     doc_id: str
     title: str
@@ -467,12 +455,6 @@ class SearchResult(BaseModel):
     doc_id: str
     category_l1: str = ""
     score: float = 0.0
-
-
-class SearchResponse(BaseModel):
-    results: List[SearchResult]
-    total: int
-    latency_ms: int = 0
 
 
 class DingtalkAuthRequest(BaseModel):
@@ -900,63 +882,6 @@ def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
         can_manage_kb=can_access_console(kb_ident),
         managed_owner_depts=managed_owner_depts(kb_ident),
         upload_target_depts=upload_target_depts(kb_ident),
-    )
-
-
-@app.post("/api/search", response_model=SearchResponse, include_in_schema=False)
-def search(req: SearchRequest, request: Request,
-           identity: Optional[Identity] = Depends(require_identity)):
-    """纯检索接口 — 只返回相关文档片段，不调用 LLM。**已下线，默认 404**（P3-2，2026-08-04）。
-
-    下线理由不是"没人用"，而是它是一个**已认证但未受治理**的原始检索面：直连
-    `search_chunks` ⇒ 绕过 v2 敏感查询 guard（该 guard 只挂在 `_prefilter_route` 与
-    `dingtalk_bot` 两处）、且不落 `qa_session_log`（检索到了什么无审计）。
-    ACL（server-side dept 过滤）与限频它是有的，缺的是治理与审计。
-    全仓实测零消费方：console / 小程序 / 钉钉 / eval_harness 皆不调用。
-
-    `RAG_SEARCH_ENDPOINT_ENABLE=true` 可开回来。⚠️ **开回来的姿态经 2026-08-06 codex
-    补评审修正过两处**，别再照抄本文档串的旧说法：
-      ① 原文「开启时会跑敏感 guard 前置，不会退回成绕过面」**只说对了一半** ——
-         `sensitive_guard_route` 受**它自己的** `RAG_SENSITIVE_QUERY_GUARD` 门控，
-         该 flag 默认关时恒回 None。两个开关要**同时**开才有 guard。
-      ② 原实现调 `search_chunks` 时**不传 `acl_ctx`**，而 node-ACL 的读侧 fail-closed
-         复核(`_deny_revoked_cross_dept`)整段挂在 `acl_ctx is not None` 之下 ⇒
-         投影滞后期间、HA3 里陈旧 owner_dept 恰等于调用者组码的 node 文档会被直接投放
-         (`tests/test_node_acl_retriever.py::test_stale_real_owner_equal_to_caller_group_still_denied`
-         正是该场景的回归用例)。现已与 `/api/ask` 同构补齐。
-    审计缺口仍在（本端点不落 qa 日志），若要长期使用请先补审计。
-    """
-    if not get_config().rag.search_endpoint_enable:
-        # 404 而非 403/410：让"已下线"看起来就是"没这个路径"，与 include_in_schema=False 一致。
-        # ⚠️ 不是严格的存在性隐藏 —— `require_identity` 是 Depends，先于函数体执行，
-        # 匿名调用者会先拿到 401（未注册路径则是 404），据此仍可推断本路径存在。
-        # 这里不为此重排依赖：它挡的是"误用/被当成受支持接口"，不是侦察。
-        raise HTTPException(status_code=404, detail="Not Found")
-    # 与问答共享限频/日配额（embedding+HA3 也是真金白银），但不计入全局 LLM 熔断
-    _enforce_rate_limit(request, identity, scope="ask", count_llm=False)
-    # 敏感 guard 前置：与 /api/ask 同一判定（RAG_SENSITIVE_QUERY_GUARD 关时恒 None）。
-    # 命中 ⇒ 空结果集 —— 用本端点自己的契约表达拒答，而不是塞一段文案。
-    if sensitive_guard_route(req.query) is not None:
-        return SearchResponse(results=[], total=0, latency_ms=0)
-    t0 = time.time()
-    try:
-        # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
-        # 请求体里的身份字段绝不能反查部门授予 dept_internal 权限。
-        user_dept = identity.acl_groups if identity else None
-        # node-ACL 读身份：与 /api/ask 同构。缺了它 ⇒ retriever 的读侧 fail-closed 复核
-        # 整段被跳过（该复核门控在 `acl_ctx is not None`）。_build_acl_ctx 绝不抛。
-        results = search_chunks(req.query, top_k=req.top_k, user_dept=user_dept,
-                                acl_ctx=_build_acl_ctx(identity))
-    except Exception as e:
-        trace_id = get_request_id()
-        logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"检索失败，请联系管理员 (trace: {trace_id})")
-
-    latency = int((time.time() - t0) * 1000)
-    return SearchResponse(
-        results=[SearchResult(**r) for r in results],
-        total=len(results),
-        latency_ms=latency,
     )
 
 

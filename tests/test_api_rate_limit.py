@@ -52,7 +52,6 @@ def client(monkeypatch):
         monkeypatch.setattr(api, "generate_answer", lambda *a, **kw: dict(FAKE_ANSWER))
         monkeypatch.setattr(api, "generate_answer_via_stream", lambda *a, **kw: dict(FAKE_ANSWER))
         monkeypatch.setattr(api, "generate_answer_stream", fake_stream)
-        monkeypatch.setattr(api, "search_chunks", lambda *a, **kw: [])
         monkeypatch.setattr(api, "build_mini_program_blocks", lambda ans, chunks: [])
         monkeypatch.setattr(api, "log_qa_session", lambda **kw: None)
         monkeypatch.setattr(api, "_append_to_history", lambda *a, **kw: None)
@@ -146,15 +145,15 @@ def test_global_cap_503_health_unaffected(client):
     assert int(r.headers["Retry-After"]) >= 1
     # 健康检查与纯检索不受 LLM 熔断影响
     assert c.get("/api/health").status_code == 200
-    # /api/search 自 P3-2 起默认 404，这里临时开回来——本用例验的是
-    # 「count_llm=False 的端点不吃 LLM 熔断」，不是端点的可达性。
-    from opensearch_pipeline.config import get_config
-    _rag = get_config().rag
-    _old, _rag.search_endpoint_enable = _rag.search_endpoint_enable, True
-    try:
-        assert c.post("/api/search", json={"query": "q"}).status_code == 200
-    finally:
-        _rag.search_endpoint_enable = _old
+    # count_llm=False 不吃 LLM 熔断 —— 2026-08-06 起**改钉机制本身**：
+    # 此前这条借 `POST /api/search` 验证（它是唯一 count_llm=False 的调用方），
+    # 而该端点已被删除。若只把这段删掉，`count_llm` 这个参数就再无任何覆盖、
+    # 会在下次有人复用它时悄悄失效，故改为直接对准入函数断言。
+    from opensearch_pipeline.api import LIMITER
+    assert LIMITER.admit_ask("ip:9.9.9.9", is_user=False, count_llm=False) is None, \
+        "全局 LLM 日配额已触顶时，count_llm=False 的调用方仍应放行"
+    assert LIMITER.admit_ask("ip:9.9.9.9", is_user=False, count_llm=True) is not None, \
+        "反向锚：同一时刻 count_llm=True 必须被熔断挡住（否则上一条恒真、等于没测）"
 
 
 def test_stream_endpoint_shares_admission(client):

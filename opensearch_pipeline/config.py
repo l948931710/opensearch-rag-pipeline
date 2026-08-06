@@ -467,13 +467,6 @@ class RAGConfig:
     # prompt 层第二道防线：SENSITIVE_BOUNDARY_RULE 条件追加进 system prompt
     # （llm_generator._select_system_prompt，gen_nothink 同源）。默认 off。
     sensitive_prompt_guard: bool = False  # RAG_SENSITIVE_PROMPT_GUARD
-    # `POST /api/search`（纯检索、无 LLM）总闸。**默认 off = 该端点一律 404**（P3-2，2026-08-04）。
-    # 下线理由不是"没人用"，而是它是一个**已认证但未受治理**的原始检索面：
-    # 走 search_chunks 直连 ⇒ 绕过 v2 敏感查询 guard（只挂在 _prefilter_route /
-    # dingtalk_bot 两处）、不落 qa_session_log（检索了什么无审计）。ACL 与限频它有。
-    # 全仓实测零消费方（console / 小程序 / 钉钉 / eval 皆不调，仅测试与 docs 提及）。
-    # 开回来时**同时**补上 guard 前置（见 api.py 的注册点），别只翻 flag。
-    search_endpoint_enable: bool = False  # RAG_SEARCH_ENDPOINT_ENABLE
     # C8 审批内容绑定（Sam 2026-08-04 拍板 version-id 固化）。默认 **off**：
     # off ⇒ register 一律写 content_binding_mode='LEGACY_UNBOUND'、预览与摄取都不带
     # versionId ⇒ 逐字节等价于今天。on ⇒ register 必须拿到非空 version_id 才算绑定成功。
@@ -1076,7 +1069,6 @@ def load_config() -> PipelineConfig:
             sensitive_extra_words=_env("SENSITIVE_EXTRA_WORDS", ""),            # RAG_SENSITIVE_EXTRA_WORDS
             sensitive_query_guard=_env_bool("SENSITIVE_QUERY_GUARD", False),    # RAG_SENSITIVE_QUERY_GUARD
             sensitive_prompt_guard=_env_bool("SENSITIVE_PROMPT_GUARD", False),  # RAG_SENSITIVE_PROMPT_GUARD
-            search_endpoint_enable=_env_bool("SEARCH_ENDPOINT_ENABLE", False),  # RAG_SEARCH_ENDPOINT_ENABLE
             content_binding=_env_bool("CONTENT_BINDING", False),                # RAG_CONTENT_BINDING
             dingtalk_streaming=_env_bool("DINGTALK_STREAMING", False),          # RAG_DINGTALK_STREAMING
             dingtalk_stream_interval_ms=_env_int("DINGTALK_STREAM_INTERVAL_MS", 500),  # RAG_DINGTALK_STREAM_INTERVAL_MS

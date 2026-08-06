@@ -15,31 +15,19 @@ import pytest
 
 # ────────────────── ① /api/search 重开时必须带 node-ACL 读身份 ──────────────────
 
-def test_search_端点传_acl_ctx():
-    """BLOCKER。`search_chunks` 收 `acl_ctx`(retriever.py),而 node-ACL 的读侧
-    fail-closed 复核 `_deny_revoked_cross_dept` **整段挂在 `acl_ctx is not None` 之下**。
-    `/api/ask` 传了、`/api/search` 原先没传 ⇒ 投影滞后期间,HA3 里陈旧 owner_dept 恰等于
-    调用者组码的 node 文档会被直接投放(该场景的回归用例见
-    tests/test_node_acl_retriever.py::test_stale_real_owner_equal_to_caller_group_still_denied)。
+def test_search_端点已彻底删除():
+    """原为「/api/search 必须传 acl_ctx」的守卫。**当日晚些时候 Sam 拍板彻底删除该端点**，
+    断言随之改为「它不会被悄悄加回来」。
 
-    端点默认 404,现网不可达 —— 但它是**文档化的 break-glass 开关**,
-    「翻一个开关就绕过 ACL」不能算受支持路径。
+    删除理由：补上 acl_ctx 只堵住了两个洞之一（另一个是敏感 guard 受它自己默认关闭的
+    flag 门控），而全仓 console / 小程序 / 钉钉 / eval 四类调用方对它**零消费**。
+    与其维护一条随时会再漂移的「已认证但未受治理」的原始检索面，不如删掉。
+    详细形状守卫见 tests/test_rag_api.py::TestSearchEndpointRemoved。
     """
     from opensearch_pipeline import api
 
-    src = inspect.getsource(api.search)
-    assert "search_chunks(" in src
-    assert "acl_ctx=" in src, (
-        "/api/search 调 search_chunks 时没传 acl_ctx ⇒ node-ACL 读侧 fail-closed 复核被整段跳过")
-
-
-def test_search_chunks_确实按_acl_ctx_门控复核():
-    """反向锚:如果哪天 retriever 不再用 acl_ctx 门控复核,上面那条断言就失去意义。"""
-    from opensearch_pipeline import retriever
-
-    src = inspect.getsource(retriever)
-    assert "acl_ctx is not None" in src, (
-        "retriever 不再以 acl_ctx 门控复核 —— 请重新评估 /api/search 的断言是否还成立")
+    assert not hasattr(api, "search"), "/api/search 处理函数被加回来了"
+    assert "/api/search" not in {getattr(r, "path", "") for r in api.app.routes}
 
 
 def test_敏感_guard_受自己的_flag_门控_不受_search_开关影响():
@@ -55,13 +43,12 @@ def test_敏感_guard_受自己的_flag_门控_不受_search_开关影响():
         "guard 入口不再自带 flag 门控 —— 端点 docstring 里那段配置说明需同步订正")
 
 
-def test_search_docstring_订正了两处失实宣称():
-    """文档也是契约:下一个人照抄 docstring 就会得出错误的安全结论。"""
-    from opensearch_pipeline import api
+def test_search_总闸_flag_也一并清除():
+    """端点删了但 flag 留着 = 给「悄悄加回来」铺好路，且 config 里会留一个恒无效的旋钮。"""
+    from opensearch_pipeline.config import get_config
 
-    doc = api.search.__doc__ or ""
-    assert "只说对了一半" in doc, "guard 双开关的订正没写进 docstring"
-    assert "acl_ctx" in doc, "acl_ctx 缺失这条修正没写进 docstring"
+    assert not hasattr(get_config().rag, "search_endpoint_enable"), \
+        "RAG_SEARCH_ENDPOINT_ENABLE 总闸残留"
 
 
 # ────────────────── ④ get_conversation 的 200 条静默截断 ──────────────────

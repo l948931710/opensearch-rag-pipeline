@@ -185,6 +185,16 @@ export function uploadErrText(e: any, opts?: { detail?: boolean; maxMb?: number 
   if (status === 413 || /超过大小上限|too large|413/i.test(msg)) return `文件超过上限 ${opts?.maxMb || MAX_UPLOAD_MB}MB，请压缩或拆分后重传。`
   if (status === 403 || /无权|权限|forbidden/i.test(msg)) return '你没有该操作的权限，请联系知识库管理员。'
   if (status === 429) return `操作太频繁，请等 ${retryAfter > 0 ? retryAfter : 60} 秒后再传（同时开着多个管理台页面也会占用额度）。`
+  // 409 = 并发冲突（差评/复审任务已被他人处置、重复上传硬拦）。**必须直出服务端文案**：
+  // 它已经带了「现状 + 请刷新」，掉进兜底档会退化成「请稍后重试」——重试只会再冲突一次。
+  // 服务端 409 detail 全是我方自撰文案，不含内部实现串，直出安全。
+  if (status === 409) {
+    // ⚠️ 读 `e.detail` 而不是 `msg`：detail 为空时 `msg` 会被 `String(e)` 兜成类名
+    // 'ApiError'（非空 ⇒ 顶掉兜底文案 ⇒ 用户看到「ApiError」）。detail 是 ApiError 里
+    // **只放服务端原文**的那个字段，空就是真空。
+    const d = (e && typeof e.detail === 'string' ? e.detail : '').trim()
+    return safeDetail(d) || '该条目已被其他管理员处置，请刷新后再操作。'
+  }
   if (/OSS PUT|CORS|网络错误|超时|timeout/i.test(msg)) return '文件上传通道异常，请稍后重试；若持续失败请联系知识库管理员（可能是 OSS 跨域未放行）。'
   if (/未检测到已上传|请先完成直传|过期/i.test(msg)) return '上传未完成或链接已过期，请重新选择文件上传。'
   if (/空/.test(msg)) return '所选文件为空，请检查后重传。'

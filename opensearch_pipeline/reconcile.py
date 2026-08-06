@@ -172,6 +172,9 @@ def compute_parity(rds_rows: List[Dict[str, Any]],
             "vanished_docs": len(vanished_docs),
             "vanished_at_risk": len(vanished_docs),   # query 单口径=全部 at_risk;fetch 定性后精化
             "orphan_docs": len(orphan_docs),
+            # 机密性残留（见 _STALE_RESIDUE_SUBTYPES）：不影响 ok/退出码，只驱动独立告警
+            "ha3_stale_residue": _residue_count(
+                dict(Counter(s["subtype"] for s in ha3_stale))),
         },
         "stale_subtypes": dict(Counter(s["subtype"] for s in ha3_stale)),
         "rds_active_missing": rds_active_missing,
@@ -179,6 +182,23 @@ def compute_parity(rds_rows: List[Dict[str, Any]],
         "ha3_stale_sample": ha3_stale[:50],
         "orphan_docs_sample": orphan_docs[:50],
     }
+
+
+# 方向二（HA3→RDS）的**机密性**子集（2026-08-06 Sam 拍板分级）。
+#
+# `compute_parity` 的 `ok` 有意只看 recall-loss，docstring 称 HA3 stale 是
+# "purge lag ... harmless to recall" —— 那句话**只论了召回、没论机密性**：
+#   · rds_inactive  = RDS 已把该 chunk 置 is_active=0（文档退役 / 旧版本停用），HA3 仍留着
+#   · orphan_chunkid = RDS 里已完全没有这行，HA3 仍留着
+# 这两类是「**本该消失的内容仍然可被检索到**」，不是清理滞后。
+# `dup` 不计入：它是同文档重切后的旧 PK，内容在另一个 active PK 下仍是正当在服的，
+# 且服务端 4c 的 B7 物理 PK 轴已经把它拦掉 —— 那才是真正意义上的 purge 滞后。
+_STALE_RESIDUE_SUBTYPES = ("rds_inactive", "orphan_chunkid")
+
+
+def _residue_count(stale_subtypes: dict) -> int:
+    """机密性残留条数。输入是 subtype→count 的映射（两条产出路径同一形状）。"""
+    return sum(int(stale_subtypes.get(k) or 0) for k in _STALE_RESIDUE_SUBTYPES)
 
 
 def _scan_concurrency() -> int:
@@ -537,6 +557,7 @@ class _ParityAccumulator:
                 "vanished_docs": len(vanished),
                 "vanished_at_risk": len(vanished),   # 与 compute_parity 同构;fetch 定性后精化
                 "orphan_docs": len(orphan_docs),
+                "ha3_stale_residue": _residue_count(dict(self._stale_subtypes)),
             },
             "stale_subtypes": dict(self._stale_subtypes),
             "rds_active_missing": self._missing,
@@ -698,9 +719,15 @@ def run_parity_check(*, alert: bool = False, hi: Optional[int] = None,
 
     # 触发条件必须显式含 complete=False / enum_health≠healthy：否则「桶不健康但本轮 diff
     # 恰好为零」会得到 ok=True + complete=False —— 退出码 3 却不发告警（红灯无声）。
+    # 2026-08-06：方向二的机密性残留也要叫醒人。⚠️ **有意不动 `ok` 与退出码** ——
+    # 那两个的语义是 recall-loss（"drift"），改了会让已部署的 launchd 作业开始变红，
+    # 属于需要 Sam 先知情的部署面变化（B6 同族教训）。这里只加一条**独立标题+独立去重槽**
+    # 的告警，不占真 drift 的槽。
+    _residue = int((report.get("counts") or {}).get("ha3_stale_residue") or 0)
     if alert and (not report.get("ok") or report.get("error")
                   or report.get("complete") is False
-                  or (report.get("enum_health") or "healthy") != "healthy"):
+                  or (report.get("enum_health") or "healthy") != "healthy"
+                  or _residue > 0):
         _alert_on_drift(report)
     return report
 
@@ -1047,10 +1074,22 @@ def _alert_on_drift(report: Dict[str, Any]) -> None:
                        and not (c.get("missing_confirmed") or 0)
                        and (report.get("complete") is False
                             or (report.get("enum_health") or "healthy") != "healthy"))
+        # 2026-08-06 第四档：**只有机密性残留、召回没问题**（ok=True 且核验完整）。
+        # 它与 drift 是不同的故障：drift 是"该在的不在"（召回），残留是"该没的还在"（机密性）。
+        # 顶 drift 标题会误导排障方向，占 drift 去重槽还会掩盖真 drift。
+        _residue_only = (not _errored and not _incomplete and report.get("ok")
+                         and int(c.get("ha3_stale_residue") or 0) > 0)
         if _errored:
             title, dk = "RDS↔HA3 parity 探针失败", "reconcile:rds-ha3-parity:error"
         elif _incomplete:
             title, dk = "RDS↔HA3 parity 核验不完整", "reconcile:rds-ha3-parity:incomplete"
+        elif _residue_only:
+            title = "HA3 残留：已停用/已删除的 chunk 仍可被检索"
+            dk = "reconcile:rds-ha3-parity:residue"
+            text = (f"HA3 stale 残留 **{c.get('ha3_stale_residue', 0)}** 条"
+                    f"（rds_inactive / orphan_chunkid，见 stale_subtypes="
+                    f"{report.get('stale_subtypes', {})}）——本该消失的内容仍在索引里。"
+                    f"召回侧无异常（ok=True），故退出码仍为 0。")
         else:
             title, dk = "RDS↔HA3 parity drift", "reconcile:rds-ha3-parity"
         send_ops_alert(title, text, severity="critical", dedup_key=dk)

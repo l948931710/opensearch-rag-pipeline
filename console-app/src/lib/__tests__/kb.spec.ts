@@ -1,3 +1,4 @@
+import { ApiError } from '@/lib/api'
 import { describe, expect, it, vi } from 'vitest'
 import { MAX_UPLOAD_MB, uploadErrText, buildDupMsg, fileCore, badgeTone, deptLabel, permLabel, extOf, unsupportedNames, putWithProgress } from '@/lib/kb'
 
@@ -8,6 +9,17 @@ describe('uploadErrText（技术错误 → 人话，绝不暴露 trace/HTTP）',
     // 直到 150→300 才暴露（2026-08-06）。子串断言遇到数字尤其容易这样假绿。
     expect(uploadErrText({ status: 413 })).toContain(`${MAX_UPLOAD_MB}MB`)
     expect(uploadErrText(new Error('文件超过大小上限'))).toContain(`${MAX_UPLOAD_MB}MB`)
+  })
+  it('409 并发冲突直出服务端文案 —— 掉兜底档会退化成「请稍后重试」，而重试只会再冲突一次', () => {
+    // 服务端 409 detail 自带「现状 + 请刷新」，是这条错误里唯一有用的信息。
+    // 这与今天开场那个 bug 同族：兜底档把真原因吞掉，用户只看到「请稍后重试」。
+    // ⚠️ 用**真的 ApiError** 而不是裸对象：ApiError 把 detail 同时写进 message，而
+    // uploadErrText 读的是 message —— 传 `{status, detail}` 会让 msg 变成
+    // '[object Object]'，测的就不是真实形状了（本条首版实测踩中）。
+    expect(uploadErrText(new ApiError('该复审任务已是「RESOLVED」状态，请刷新后再操作', 409)))
+      .toContain('请刷新')
+    // detail 为空时也必须给出下一步动作，不能落回通用兜底
+    expect(uploadErrText(new ApiError('', 409))).toContain('刷新')
   })
   it('403/无权 → 权限提示', () => {
     expect(uploadErrText({ status: 403 })).toContain('权限')

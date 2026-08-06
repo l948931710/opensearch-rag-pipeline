@@ -736,10 +736,13 @@ class TestHA3FilterInjectionAPIBoundary:
         assert len(dept_errors) > 0, f"应有 user_dept 校验错误，实际: {errors}"
 
     def test_pydantic_accepts_normal_dept(self):
-        """正常部门代码应通过 Pydantic 校验。"""
-        from opensearch_pipeline.api import SearchRequest
+        """正常部门代码应通过 Pydantic 校验。
 
-        req = SearchRequest(query="测试", user_dept="IT_研发部-01")
+        2026-08-06：原用 `SearchRequest` 作载体，该模型随 `POST /api/search` 一并删除，
+        改用同族的 `AskRequest`（`user_dept` 的 pattern 是同一条，与上一条拒绝用例同源）。"""
+        from opensearch_pipeline.api import AskRequest
+
+        req = AskRequest(question="测试", user_dept="IT_研发部-01")
         assert req.user_dept == "IT_研发部-01"
 
     def test_pydantic_accepts_none_dept(self):

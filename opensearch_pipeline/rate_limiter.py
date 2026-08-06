@@ -351,8 +351,10 @@ class ServingRateLimiter:
 
     def admit_ask(self, actor: str, *, is_user: bool, thinking: bool = False,
                   count_llm: bool = True) -> Optional[Denial]:
-        """问答类端点准入（/api/ask、/api/ask/stream；/api/search 以 count_llm=False
-        共享限频/日配额但不计入全局熔断——它不调 LLM）。
+        """问答类端点准入（/api/ask、/api/ask/stream）。
+
+        `count_llm=False` 的调用方共享限频/日配额但不计入全局 LLM 熔断。
+        （唯一那个调用方 `POST /api/search` 已于 2026-08-06 删除，参数保留供将来复用。）
 
         检查顺序：全局熔断 → 深思策略 → 每分钟限频 → 日配额；全部通过才原子计入。
         """

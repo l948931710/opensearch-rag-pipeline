@@ -1273,11 +1273,34 @@ def kb_feedback_resolve(req: KbFeedbackResolveRequest, request: Request,
                     if not cur.fetchone():
                         conn.rollback()
                         raise HTTPException(status_code=403, detail="无权处置该差评（不在管理范围内）")
+                # 前态谓词（2026-08-06 codex 补评审）：原实现只按 message_id 更新 ⇒ 两个管理员
+                # 同时处置同一条差评是**静默 last-writer-wins**，后手悄悄覆盖前手的判断，
+                # 双方都以为自己的处置生效了。`decision_endpoint_shapes_2026-08-04.md` 曾宣称
+                # 本端点「有前态谓词」——那是失实的。
+                # 谓词取自队列语义：resolve/dismiss 的前提是「仍未处置」，reopen 的前提是
+                # 「已处置」。不引入 expected_status 请求字段是有意的——调用方看到的就是队列
+                # 状态，把前态写进服务端比让每个客户端自己传更难被绕过。
+                _pre = ("handled_status IS NULL OR handled_status NOT IN %s"
+                        if req.action != "reopen" else "handled_status IN %s")
                 n = cur.execute(
                     f"UPDATE {_op_db()}.user_feedback"
                     " SET handled_status=%s, handled_by=%s, handled_at=NOW(), updated_at=NOW()"
-                    " WHERE message_id=%s AND feedback_type='downvote'",
-                    (new_status, kb.user_id, req.message_id))
+                    f" WHERE message_id=%s AND feedback_type='downvote' AND ({_pre})",
+                    (new_status, kb.user_id, req.message_id, _KB_FEEDBACK_HANDLED_DONE))
+                if isinstance(n, int) and n == 0:
+                    # 0 行有两种成因，必须分开告诉操作人（"不存在"和"已被别人处置"
+                    # 是完全不同的处置动作）。
+                    cur.execute(
+                        f"SELECT handled_status FROM {_op_db()}.user_feedback"
+                        " WHERE message_id=%s AND feedback_type='downvote' LIMIT 1",
+                        (req.message_id,))
+                    _row = cur.fetchone()
+                    conn.rollback()
+                    if not _row:
+                        raise HTTPException(status_code=404, detail="该差评不存在")
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"该差评已被处置为「{_row[0] or '未处置'}」，请刷新后再操作")
             conn.commit()
         finally:
             conn.close()
@@ -1457,12 +1480,27 @@ def kb_review_task_resolve(req: KbReviewTaskResolveRequest, request: Request,
                     sets.append("reviewer_comment=%s")
                     params.append(comment)
                 params.append(req.task_id)
+                # 前态谓词（2026-08-06 codex 补评审）：与 feedback 同族缺陷 —— 原实现只按
+                # task_id 更新 ⇒ 并发处置静默 last-writer-wins。open 态是 PENDING。
+                if req.action == "reopen":
+                    _pre, _pre_p = "review_status <> %s", ["PENDING"]
+                else:
+                    _pre, _pre_p = "review_status = %s", ["PENDING"]
+                params.extend(_pre_p)
                 n = cur.execute(
                     f"UPDATE {_kb_db()}.review_task SET {', '.join(sets)}"
-                    " WHERE task_id=%s", tuple(params))
+                    f" WHERE task_id=%s AND {_pre}", tuple(params))
                 if isinstance(n, int) and n == 0:
+                    # 分流：不存在 vs 已被他人处置（后者给 409 + 现状，前端提示刷新）
+                    cur.execute(f"SELECT review_status FROM {_kb_db()}.review_task"
+                                " WHERE task_id=%s LIMIT 1", (req.task_id,))
+                    _row = cur.fetchone()
                     conn.rollback()
-                    raise HTTPException(status_code=404, detail="复审任务不存在")
+                    if not _row:
+                        raise HTTPException(status_code=404, detail="复审任务不存在")
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"该复审任务已是「{_row[0]}」状态，请刷新后再操作")
             conn.commit()
         finally:
             conn.close()

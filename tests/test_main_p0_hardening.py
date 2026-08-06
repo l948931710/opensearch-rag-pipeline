@@ -40,7 +40,6 @@ def _bearer(uid="U1", dept="行政部"):
 
 
 @pytest.mark.parametrize("method,path,body", [
-    ("post", "/api/search", {"query": "问"}),
     ("post", "/api/ask", {"question": "问"}),
     ("post", "/api/resign-images", {"oss_keys": ["k1"]}),
 ])
