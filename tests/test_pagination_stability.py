@@ -7,7 +7,9 @@
 既漏行又重行 —— 用户侧就是"我明明传了，翻遍列表也找不到"。
 
 本地真库实测（MySQL 8.0.46，12 篇同一秒的文档，每页 4 条翻 3 页 = 12 个位置）：
-    无 tiebreaker：并集只有 **8/12**，DOC_a~DOC_d **一页都没出现过**，另 4 篇各出现两次
+    无 tiebreaker：2026-08-03 本机实测并集只有 8/12（DOC_a~DOC_d 一页都没出现过、
+    另 4 篇各出现两次）。⚠️ 这是**一次观测**，不是契约 —— SQL 只保证"不保证次序"，
+    并不保证某个计划**必然**显形为漏行，故对应的反证断言已于 2026-08-06 删除
     有 tiebreaker：并集 **12/12**
 下面 `test_offset_pagination_covers_every_row_exactly_once` 就是这段实测的固化。
 """
@@ -17,16 +19,64 @@ import re
 
 import pytest
 
-# 各表的唯一键列（ORDER BY 里出现任一即构成全序）。
-# ⚠️ message_id 已移除（2026-08-04 独立核验 B3）：qa_session_log 只有普通 idx_message_id，
-# 唯一键全是复合键——把它当全序列会让未来的分页点静默漏保。
-UNIQUE_COLS = {
-    "id",                # AUTO_INCREMENT PK
-    "doc_id",            # document_meta.uk_doc_id
-    "contribution_id",   # kb_contribution.uk_contribution_id
-    "conversation_id",   # qa_conversation PK 的后半（查询已按 user_id 收窄）
-    "chunk_id", "feedback_id", "task_id", "job_id",
+# ── 分页站点契约（2026-08-06 codex 补评审：全局裸列名白名单不够用）──────────────
+#
+# 为什么不再用 `UNIQUE_COLS = {"id","doc_id",...}` 这种**全局裸列名**集合：
+#   · 唯一性是**站点性质**，不是列名性质。`conversation_id` 只在 WHERE 固定 user_id 后唯一
+#     （DDL 是复合 PK `(user_id, conversation_id)`）；`chunk_meta.doc_id` 在 chunk 表里
+#     大量重复；同名 `id` 在不同表语义不同。裸列名白名单对这三种全部误判为"安全"。
+#   · JOIN 会改变唯一性：document_meta.doc_id 在当前一对零/一 JOIN 后仍唯一，
+#     换成一对多 JOIN 就不再唯一，而列名毫无变化。
+# 故改为**显式站点契约**：每个 OFFSET 分页点登记 (端点, 臂, 唯一项, 唯一性依据, 是否方向敏感)。
+#
+# `direction_sensitive`（方向敏感）**只登记 conversations**：
+#   `qa_conversation` 的索引 `(user_id, hidden_at, last_message_at)` + PK
+#   `(user_id, conversation_id)` 恰好覆盖同向复合排序 —— InnoDB 二级索引隐含主键后缀，
+#   固定前缀后正扫得 `last_message_at ASC, conversation_id ASC`、反扫得两者皆 DESC；
+#   混向无法由该索引单次扫描满足，通常退化 filesort。
+#   ⚠️ 这**不是全仓普适规则**：document_meta / kb_contribution 没有覆盖完整排序键的复合索引，
+#   本来就要排序；browse 的 `owner_dept ASC, updated_at DESC, doc_id DESC` 与 gaps 的
+#   `days_ago ASC, rid DESC` 都是**合法**混向 —— 把"方向必须跟随"当全仓规则会误伤它们
+#   （codex 2026-08-06 指出，我原提案正是这个错）。
+SITES = {
+    ("opensearch_pipeline/api.py", "list_conversations", 1): dict(
+        unique="conversation_id",
+        basis="qa_conversation PK (user_id, conversation_id)；查询固定 user_id=%s",
+        # 2026-08-06 实测置 False：生产索引 `(user_id, hidden_at, last_message_at)` 只到
+        # last_message_at，MySQL **不会**用隐含主键后缀满足 ORDER BY ⇒ 加了 tiebreaker
+        # 无论方向都 filesort，方向规则在现状下**无适用对象**。
+        # 待 `idx_user_visible_recent` 扩到含 conversation_id 后再翻回 True
+        # （schema 变更，user-gated；见 test_tiebreaker_plan_cost_is_governed_by_index_coverage_not_direction）。
+        direction_sensitive=False, lexical=True),
+    ("opensearch_pipeline/routes/contribution.py", "kb_contributions_mine", 1): dict(
+        unique="contribution_id",
+        basis="kb_contribution.uk_contribution_id（全局唯一）", direction_sensitive=False, lexical=True),
+    ("opensearch_pipeline/routes/contribution.py", "kb_contributions_pending", 1): dict(
+        unique="contribution_id",
+        basis="同上", direction_sensitive=False, lexical=True),
+    ("opensearch_pipeline/routes/kb_console.py", "kb_my_docs", 1): dict(
+        unique="m.doc_id",
+        basis="document_meta.uk_doc_id；LEFT JOIN 由 uk_doc_version 保证不扇出",
+        direction_sensitive=False, lexical=True),
+    ("opensearch_pipeline/routes/kb_console.py", "kb_browse", 1): dict(
+        unique="m.doc_id",
+        basis="同上", direction_sensitive=False, lexical=True),
+    # lexical=False：ORDER BY 在动态变量 `order` 里（两条分支），词法扫描解析不出，
+    # 强行扫会把变量后面的整段代码当成子句。改由「捕获最终 cursor.execute SQL」的
+    # 行为测试 test_review_tasks_both_arms_end_with_task_id 覆盖（codex 2026-08-06 的分工建议）。
+    ("opensearch_pipeline/routes/kb_console.py", "kb_review_tasks", 1): dict(
+        unique="t.task_id",
+        basis="review_task.task_id NOT NULL UNIQUE；JOIN document_meta 一对一不扇出",
+        direction_sensitive=False, lexical=False),
+    ("opensearch_pipeline/api.py", "history", 1): dict(
+        unique="id",
+        basis="qa_session_log.id AUTO_INCREMENT PK", direction_sensitive=False, lexical=True),
 }
+
+# 严格的 `[alias.]column` —— 函数调用 / 算术 / 取模 / 括号表达式**一律不认**为唯一项。
+# `_bare_col("id % 2 DESC")` 旧实现会取到 "id" 并判为唯一，而 `id % 2` 显然非单射。
+_STRICT_TERM = re.compile(r"^(?:(?P<alias>[A-Za-z_]\w*)\.)?(?P<col>[A-Za-z_]\w*)"
+                          r"(?:\s+(?P<dir>ASC|DESC))?$", re.I)
 
 
 def _split_top_level(clause: str):
@@ -47,61 +97,171 @@ def _split_top_level(clause: str):
     return [t.strip() for t in out if t.strip()]
 
 
-def _bare_col(term: str) -> str:
-    tok = term.strip().split()[0] if term.strip() else ""
-    return tok.split(".")[-1].strip("`()\"' ")
+def _parse_term(term: str):
+    """→ (列名, 方向) 或 None（非严格单列表达式，不得充当唯一项）。"""
+    m = _STRICT_TERM.match(term.strip().strip("`"))
+    if not m:
+        return None
+    # **保留 alias**：只回裸列名的话，`m.doc_id`（一对一 JOIN，唯一）与
+    # `x.doc_id`（一对多 JOIN，不唯一）无法区分 —— 那就没真正做到"表/作用域语义"
+    # （codex 2026-08-06 指出）。契约里登记的也是完整 `alias.column`。
+    alias = (m.group("alias") or "").lower()
+    return (f"{alias}.{m.group('col')}" if alias else m.group("col"),
+            (m.group("dir") or "ASC").upper())
+
+
+def _enclosing_def(src: str, pos: int) -> str:
+    """OFFSET 所在的最近一个 `def name(`——站点身份用函数名，不用行号
+    （行号会因无关插行整体漂移，制造纯噪音的红）。"""
+    # `async def` 必须认（FastAPI 仓库的现实演进面，codex 2026-08-06 点名）
+    names = [(m.start(), m.group(1))
+             for m in re.finditer(r"^(?:async\s+)?def (\w+)\(", src, re.M)]
+    names += [(m.start(), m.group(1))
+              for m in re.finditer(r"^    (?:async\s+)?def (\w+)\(", src, re.M)]
+    prev = [n for st, n in sorted(names) if st < pos]
+    return prev[-1] if prev else "<module>"
 
 
 def _paginated_order_bys():
-    """扫出所有 `OFFSET %s` 分页点，回其窗口内**每一个** ORDER BY 子句。
+    """扫出所有 OFFSET 分页点，回 (函数名, 文件, 该点窗口内每一个 ORDER BY 臂)。
 
-    2026-08-04 独立核验（B3 变异 C）：旧版只 `rfind` 最近一个 ORDER BY —— 分支构造的
-    `order = "ORDER BY …DESC…" if x else "ORDER BY …ASC…"` 只有靠后那臂被查，前一臂的
-    方向/全序可整体改坏而全绿。现改为窗口内全量枚举、逐臂检查（宁可保守多查：窗口内
-    偶发混入邻近查询的 ORDER BY 时守卫会红并点名，作者看一眼即可，好过静默漏保）。"""
+    2026-08-04（B3 变异 C）：旧版只 `rfind` 最近一个 ORDER BY —— 分支构造的
+    `order = "…DESC…" if x else "…ASC…"` 只有靠后那臂被查。现为窗口内全量枚举、逐臂检查。
+    2026-08-06（codex 补评审）：
+      · `OFFSET` 匹配加 `re.I` —— SQL 关键字大小写不敏感，小写 `offset %s` 是**现实**写法，
+        而不是刻意绕法（改成不敏感几乎零成本）；
+      · 窗口下界由「固定 900 字符」改为「上一个 `.execute(`」—— 固定窗口两头不是人：
+        放窄会随 SQL 变长越窗漏扫（本批给 my-docs/browse 各加了一列，正在逼近），
+        放宽则跨查询污染（实测 2000 字符时 pending 抓到了 mine 的 ORDER BY）。
+
+    ⚠️ **本守卫的词法边界**（抓删除、不抓等价改写；下列写法它看不见）：
+      · `LIMIT %s, %s` 两参形式、`OFFSET %(offset)s` 具名占位符 —— 本仓风格禁止，未专门封堵；
+      · 刻意拆词 `"OFF" + "SET"`、任意元编程拼 SQL；
+      · 窗口内注释/无关字符串里的假 `ORDER BY`（会被当成真子句 ⇒ 守卫**偏严**，红了看一眼即可）。
+    动态拼接的两个端点（pending 的 scope_clause、review-tasks 的 order 分支）不靠词法覆盖，
+    另由「捕获最终 cursor.execute SQL」的行为测试兜底。
+    """
     found = []
     for path in sorted(pathlib.Path("opensearch_pipeline").rglob("*.py")):
         src = path.read_text(encoding="utf-8")
-        for m in re.finditer(r"OFFSET\s+%s", src):
-            window = src[max(0, m.start() - 900):m.start()]
+        ordinal = {}
+        for m in re.finditer(r"OFFSET\s+%s", src, flags=re.I):
+            # 窗口下界取**上一个 `cur.execute(`**——固定字符窗口会跨查询污染
+            # （2000 字符时 pending 抓到了 mine 的 ORDER BY，900 字符又会随 SQL 变长越窗）。
+            _ex = [mm.end() for mm in re.finditer(r"\.execute\(", src[:m.start()])]
+            lo = _ex[-1] if _ex else max(0, m.start() - 2000)
+            window = src[lo:m.start()]
             starts = [mm.start() for mm in re.finditer(r"ORDER BY", window, flags=re.I)]
-            site = f"{path}:{src[:m.start()].count(chr(10)) + 1}"
+            fn = _enclosing_def(src, m.start())
+            ordinal[fn] = ordinal.get(fn, 0) + 1
+            key = (str(path), fn, ordinal[fn])
+            # 🔴 每个 OFFSET **恒产出至少一条记录**（臂可为空字符串）。
+            # 旧版只在找到 ORDER BY 后才 append ⇒ 新增一个**没有 ORDER BY** 的
+            # `LIMIT %s OFFSET %s` 会产出零条记录，于是"每个站点都登记""唯一项必须收尾"
+            # 这些守卫**全部照绿** —— 恰恰漏掉了最危险的那种新增（codex 2026-08-06 实测复现）。
+            if not starts:
+                found.append((key, ""))
+                continue
             for j, i in enumerate(starts):
                 end = starts[j + 1] if j + 1 < len(starts) else len(window)
-                clause = window[i + len("ORDER BY"):end]
-                # 截到 LIMIT 为止；去掉 Python 字符串拼接的引号/换行噪音
-                clause = re.split(r"\bLIMIT\b", clause, flags=re.I)[0]
+                clause = re.split(r"\bLIMIT\b", window[i + len("ORDER BY"):end], flags=re.I)[0]
                 clause = clause.replace('"', " ").replace("'", " ").replace("\n", " ")
-                found.append((site, clause.strip()))
+                found.append((key, clause.strip()))
     return found
 
 
-def test_every_offset_pagination_has_a_unique_tiebreaker():
-    """类级守卫：**将来**新增的分页端点漏 tiebreaker 也会在这里红。
+def test_every_offset_pagination_is_a_registered_site():
+    """★ 每个 OFFSET 分页点都必须**在 SITES 里登记**。
 
-    单点断言只能锁住今天这 5 处；这条锁的是"凡 OFFSET 分页必须全序"这条规则本身。
+    新增一个分页端点却不登记 ⇒ 这里红，倒逼作者写清"唯一项是谁、依据什么 DDL、方向敏不敏感"。
+    旧版只查"裸列名落在全局白名单里"，等于允许作者不写依据就过关。
     """
-    sites = _paginated_order_bys()
-    assert sites, "没扫到任何 OFFSET 分页点——扫描逻辑失效了（防守本测试自身变空转）"
+    seen = {key for key, _c in _paginated_order_bys()}
+    assert seen, "没扫到任何 OFFSET 分页点——扫描逻辑失效了（防守本测试自身变空转）"
+    unregistered = seen - set(SITES)
+    assert not unregistered, (
+        f"这些 OFFSET 分页点未登记进 SITES（请写明唯一项与 DDL 依据）：{sorted(unregistered)}")
+    missing = {k for k, v in SITES.items() if v["lexical"]} - seen
+    assert not missing, f"SITES 登记了但扫不到（站点没了？改名了？）：{sorted(missing)}"
+
+
+def test_unique_tiebreaker_is_present_and_last():
+    """★ 唯一项必须存在，且**位于 ORDER BY 末位**。
+
+    "末位"这条不是洁癖：唯一项后面还挂东西时（例如
+    `last_message_at DESC, conversation_id ASC, 0 ASC`），只比较"最后两项方向"的守卫会被
+    整体绕过 —— 而全序其实早在唯一项那里就成立了，后面那项纯属噪音/伪装。
+    要求收尾同时堵死这类构造（codex 2026-08-06 给的绕法）。
+    """
     bad = []
-    for where, clause in sites:
-        cols = {_bare_col(t) for t in _split_top_level(clause)}
-        if not (cols & UNIQUE_COLS):
-            bad.append(f"{where}  ORDER BY {clause}")
+    for key, clause in _paginated_order_bys():
+        if not SITES[key]["lexical"]:
+            continue   # 动态构造，另由行为测试覆盖
+        want = SITES[key]["unique"]
+        terms = [_parse_term(t) for t in _split_top_level(clause)]
+        if terms and terms[-1] and terms[-1][0] == want:
+            continue
+        cols = [t[0] if t else f"<非单列表达式:{raw.strip()}>"
+                for t, raw in zip(terms, _split_top_level(clause))]
+        bad.append(f"{key}  ORDER BY {clause}  ⇒ 末位应为唯一项 {want!r}，实得 {cols}")
     assert not bad, (
-        "以下 OFFSET 分页的 ORDER BY 不是全序（同值行次序逐次可变 ⇒ 翻页漏行/重行）：\n  "
-        + "\n  ".join(bad))
+        "以下 OFFSET 分页的唯一 tiebreaker 缺失或不在末位"
+        "（同值行次序逐次可变 ⇒ 翻页漏行/重行）：\n  " + "\n  ".join(bad))
 
 
-def test_scanner_actually_sees_the_known_sites():
-    """防守上一条：扫描器必须真的覆盖到已知的 5 个分页点（否则它可能什么都没查）。"""
-    sites = dict(_paginated_order_bys())
-    files = [w.split(":")[0] for w in sites]
-    for f in ("opensearch_pipeline/routes/kb_console.py",
-              "opensearch_pipeline/routes/contribution.py",
-              "opensearch_pipeline/api.py"):
-        assert any(x == f for x in files), f"扫描器漏了 {f}"
-    assert len(sites) >= 5, f"已知 5 处分页，只扫到 {len(sites)}"
+def test_direction_rule_applies_only_to_direction_sensitive_sites():
+    """★ tiebreaker 方向跟随前项 —— **只对登记为方向敏感的站点**生效。
+
+    仅 conversations 有覆盖完整排序键的复合索引（`(user_id,hidden_at,last_message_at)`
+    + PK 后缀 conversation_id），混向用不上单次索引扫描 ⇒ filesort。
+    ⚠️ 绝不能推广成全仓规则：browse 的 `owner_dept ASC, updated_at DESC, doc_id DESC`
+    与 gaps 的 `days_ago ASC, rid DESC` 都是**合法**混向，全仓化会把它们误判成缺陷
+    （codex 2026-08-06 拦下的正是这个提案）。
+    """
+    bad = []
+    for key, clause in _paginated_order_bys():
+        if not SITES[key]["lexical"] or not SITES[key]["direction_sensitive"]:
+            continue
+        terms = [_parse_term(t) for t in _split_top_level(clause)]
+        if len(terms) < 2 or not all(terms[-2:]):
+            bad.append(f"{key}  ORDER BY {clause}  ⇒ 末两项无法解析为单列")
+            continue
+        if terms[-2][1] != terms[-1][1]:
+            bad.append(f"{key}  ORDER BY {clause}  ⇒ {terms[-2]} 与 {terms[-1]} 方向不一致")
+    assert not bad, (
+        "方向敏感站点的 tiebreaker 方向与前项不一致 —— 会用不上二级索引的隐含主键序、"
+        "退化成 filesort：\n  " + "\n  ".join(bad))
+
+
+def test_strict_term_parser_rejects_non_injective_expressions():
+    """★ 严格列解析的反证：非单射表达式**不得**被当成唯一项。
+
+    旧的 `_bare_col("id % 2 DESC")` 会取到 "id" 并判唯一 —— 而 `id % 2` 只有两个取值。
+    """
+    for bogus in ("id % 2 DESC", "COALESCE(a,b) DESC", "LEFT(doc_id,3) ASC",
+                  "id+1", "(status='active') DESC", "RAND()"):
+        assert _parse_term(bogus) is None, f"非单射表达式被当成了单列：{bogus!r}"
+    assert _parse_term("m.doc_id DESC") == ("m.doc_id", "DESC")   # alias 必须保留
+    assert _parse_term("conversation_id") == ("conversation_id", "ASC")
+
+
+def test_scanner_sees_every_registered_arm():
+    """防守以上三条：扫描器必须真的产出足够多的排序臂（否则它可能什么都没查）。
+
+    2026-08-06：旧版用 `dict(_paginated_order_bys())` 去重，会把 review-tasks
+    同一位置的**两条动态分支臂折叠成一条**，覆盖数被静默低估（codex 指出）。
+    现按 (函数, 臂序) 计数，不折叠。
+    """
+    arms = _paginated_order_bys()
+    n_lex = sum(1 for v in SITES.values() if v["lexical"])
+    assert len(arms) >= n_lex, f"登记 {n_lex} 个词法站点，只扫到 {len(arms)} 条排序臂"
+    for key, meta in SITES.items():
+        if not meta["lexical"]:
+            continue
+        got = [c for k, c in arms if k == key]
+        assert got, f"{key} 扫不到任何排序臂"
+        assert any(c.strip() for c in got), (
+            f"{key} 有 OFFSET 但**没有 ORDER BY** —— 这正是 2026-08-06 补上的漏检形态")
 
 
 # ── 真库行为测试（本地 MySQL 才跑；make test 默认无凭据 → skip）────────────────
@@ -124,7 +284,11 @@ def _local_db_ok():
 
 @pytest.mark.skipif(not _local_db_ok(), reason="Local MySQL not available")
 def test_offset_pagination_covers_every_row_exactly_once():
-    """同一秒 12 篇 → 每页 4 条翻 3 页：无 tiebreaker 会漏 4 篇，有 tiebreaker 恰好全覆盖。"""
+    """同一秒 12 篇 → 每页 4 条翻 3 页：**有 tiebreaker 必须恰好全覆盖**。
+
+    只断言正向契约。"无 tiebreaker 会漏 4 篇"是 2026-08-03 的一次观测，不作断言
+    （理由见下方注释与模块 docstring）。
+    """
     import pymysql
     from opensearch_pipeline.config import get_config
     cfg = get_config()
@@ -163,11 +327,15 @@ def test_offset_pagination_covers_every_row_exactly_once():
             withtb = pages(base + ", doc_id DESC")
 
         assert len(set(withtb)) == 12 and len(withtb) == 12, (
-            f"加 tiebreaker 后必须不重不漏，实得 {sorted(withtb)}")
-        # 现状必然漏行——若哪天 MySQL 恰好稳定了，本断言会提醒该重新评估（而不是静默失效）
-        assert len(set(without)) < 12, (
-            "无 tiebreaker 竟然全覆盖了：本机 MySQL 优化器恰好稳定，"
-            "该缺陷仍在（无序保证），请勿据此撤销 tiebreaker")
+            f"加 tiebreaker 后必须不重不漏，实得 {sorted(withtb)}"
+            f"（对照：同参数无 tiebreaker 实得 {sorted(without)}）")
+        # ⚠️ 2026-08-06（codex 补评审）**删掉了**原来那条反证断言
+        # `assert len(set(without)) < 12`（"无 tiebreaker 必须实际漏行"）：
+        # SQL 只是**不保证**同值行次序，并不保证某个具体计划**必然**表现为漏行。
+        # 那条断言把"缺陷存在"错写成"缺陷必然显形"，会随优化器/版本变化随机变红，
+        # 而它红了并不说明 tiebreaker 有问题。正向断言（有 tiebreaker ⇒ 不重不漏）才是契约。
+        # `without` 只进失败信息作对照，不作断言（此前写"保留用于失败信息"却没真的输出，
+        # codex 2026-08-06 指出）。
     finally:
         with conn.cursor() as cur:
             cur.execute(f"DROP DATABASE IF EXISTS {db}")
@@ -179,48 +347,175 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
-# ── tiebreaker 方向必须跟随前一排序键（2026-08-04 B3 复核，EXPLAIN 实测）──────────
+# ── 动态构造站点：靠捕获最终 SQL，不靠词法 ──────────────────────────────────
 
-def test_tiebreaker_direction_follows_the_preceding_key():
-    """🔴 tiebreaker 的 ASC/DESC 必须与它前一个排序键一致 —— 这是**性能**约束，不是风格。
+# review-tasks 的两条动态分支由 `tests/test_kb_approval.py::
+# test_review_tasks_order_by_has_unique_tiebreaker` 覆盖 —— 那里已有捕获最终
+# cursor.execute SQL 的 harness（`_review_tasks`），不在本文件重复造一套驱动。
 
-    真库 EXPLAIN 实测（MySQL 8.0.46，qa_conversation 单用户 8000 行，
-    索引 `idx_user_visible_recent (user_id, hidden_at, last_message_at)`）：
 
-        ORDER BY last_message_at DESC, conversation_id DESC
-          → type=range key=idx_user_visible_recent  Backward index scan; Using index   ← 无 filesort
-        ORDER BY last_message_at DESC, conversation_id ASC
-          → type=ref   key=PRIMARY                  **Using filesort**（4000 行）
+def test_gaps_upstream_limits_are_totally_ordered():
+    """★ gaps 的**上游两个 LIMIT** 也必须全序（codex 2026-08-06 BLOCKER）。
 
-    机制：InnoDB 二级索引物理上就是 `(索引列…, 主键列…)`，`(user_id, hidden_at,
-    last_message_at, conversation_id)` 恰好覆盖同向的复合排序；方向一混就用不上，
-    退化成主键扫 + 全量 filesort。
-
-    ⚠️ 顺带纠一处我自己的判断：当初写 `d2c8e12` 时的理由是「这些查询本就走 filesort，
-    故加列可忽略」。5 处里 4 处如此，**`/api/conversations` 那处不是** —— 它改前就没有
-    filesort，改后**依然**没有（正因为方向跟随）。结论对，理由曾经是错的。
+    下游 hash 终排序只决定"已选出的候选怎么排"，补不回**上游边界处漏选**的行：
+      · NO_RESULT 侧 `created_at` 是秒精度 DATETIME；
+      · REFUSAL 侧 `days_ago` 只有整天粒度。
+    同值撞在 LIMIT 边界时，静态库两次重算都可能选出不同候选集。
+    tiebreaker 依据：`q.id` 是 qa_session_log 的 PK（`message_id` 只有普通 idx_message_id，
+    DDL 注释「消息唯一ID」**不是**约束）；`t.rid` = 子查询的 `MAX(q.id)`，
+    而 `GROUP BY q.message_id` 的分组彼此不相交 ⇒ 各组 MAX 必不相同。
     """
-    bad = []
-    for site, clause in _paginated_order_bys():
-        terms = _split_top_level(clause)
-        if len(terms) < 2:
-            continue
+    from opensearch_pipeline.routes import contribution
 
-        def _dir(t: str) -> str:
-            u = t.upper().split()
-            return "DESC" if "DESC" in u else "ASC"
+    seen = []
 
-        # 只看最后一项（tiebreaker）与其紧邻的前一项
-        if _dir(terms[-1]) != _dir(terms[-2]):
-            bad.append(f"{site}: …{terms[-2].strip()} , {terms[-1].strip()}")
-    assert not bad, (
-        "tiebreaker 方向与前一排序键不一致 —— 会让 InnoDB 用不上二级索引的隐含主键序、"
-        "退化成 filesort（真库 EXPLAIN 实测）：\n  " + "\n  ".join(bad))
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            seen.append(" ".join(sql.split()))
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return (0,)
+
+        def close(self):
+            pass
+
+    class _Conn:
+        def cursor(self, *a, **k):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    import unittest.mock as _m
+    with _m.patch("opensearch_pipeline.db._get_db_conn", lambda: _Conn()):
+        try:
+            contribution._compute_open_gaps(["hr"], "t")
+        except Exception:      # noqa: BLE001 — 桩不完整无妨，SQL 已捕获
+            pass
+    # ★ 捕获**最终执行的 SQL**，不是 inspect.getsource 搜字符串 —— 后者对死代码里的
+    # 同款字符串照样绿（codex 2026-08-06 指出）。
+    no_result = [q for q in seen if "ORDER BY q.created_at" in q]
+    refusal = [q for q in seen if "ORDER BY t.days_ago" in q]
+    assert no_result, f"没捕获到 NO_RESULT 上游查询：{seen}"
+    assert refusal, f"没捕获到 REFUSAL 上游查询：{seen}"
+    for tag, qs, want in (("NO_RESULT", no_result, "q.id"), ("REFUSAL", refusal, "t.rid")):
+        order = qs[0].split("ORDER BY")[1].split("LIMIT")[0]
+        terms = [_parse_term(t) for t in _split_top_level(order)]
+        assert terms and terms[-1] and terms[-1][0] == want, (
+            f"{tag} 上游 LIMIT 的唯一 tiebreaker 不在末位：{order}")
+    # rid 的唯一性依据是 `MAX(q.id)` + 互斥分组 —— 换成非唯一表达式就不成立，钉住它
+    assert "MAX(q.id) rid" in refusal[0], f"rid 不再是 MAX(q.id)：{refusal[0][:300]}"
+    # ⚠️ 补全序只稳定「选哪 2000 条」，**不解决 2000 硬 cap 本身的不完整**
+    #（第 2001 条起永不可见）——那是设计题，见 backlog §F。
 
 
-def test_direction_scanner_is_not_vacuous():
-    """守卫上一条不是空转：扫描器确实看到了多项 ORDER BY 的分页点。"""
-    multi = [(s, c) for s, c in _paginated_order_bys() if len(_split_top_level(c)) >= 2]
-    assert len(multi) >= 3, (
-        f"只扫到 {len(multi)} 个多项 ORDER BY 分页点——方向守卫基本没覆盖到东西，"
-        "检查 _paginated_order_bys 的窗口大小/正则是否失效")
+
+
+# ── 可执行 EXPLAIN（2026-08-06 codex 补评审：此前 EXPLAIN 只写在 docstring 里）──────
+
+@pytest.mark.skipif(not _local_db_ok(), reason="Local MySQL not available")
+def test_tiebreaker_plan_cost_is_governed_by_index_coverage_not_direction():
+    """★ 把「方向跟随」从**口头结论**变成**可复现实测** —— 结果推翻了原结论。
+
+    账本 §C-bis 记「EXPLAIN 实测 5/5 零计划影响」「逆向 ASC 会从 Backward index scan
+    掉成 PRIMARY + filesort」。仓里此前**没有任何执行 EXPLAIN 的测试**（代码里的断言纯词法，
+    codex 2026-08-06 指出）。本条把它跑出来，实测（MySQL 8.0.46）结论是：
+
+      索引 = 生产现状 3 列 `(user_id, hidden_at, last_message_at)`（tiebreaker 只靠**隐含主键后缀**）
+        · `ORDER BY last_message_at DESC`（仅索引前缀）      → 无 filesort，backward index scan
+        · `… DESC, conversation_id DESC`（同向）             → **filesort**
+        · `… DESC, conversation_id ASC`（混向）              → **filesort**
+      索引 = 显式 4 列 `(…, last_message_at, conversation_id)`
+        · 同向 → **无 filesort，backward index scan**
+        · 混向 → filesort
+
+    ⇒ 两条订正：
+      1. **在该查询形态 + 该索引 + FORCE INDEX 下，MySQL 8.0.46 未利用隐含的
+         `conversation_id` 后缀消除排序。**（措辞刻意收窄：这**不**支持"MySQL 普遍不使用
+         隐含 PK 后缀"，隐含后缀在其他访问/覆盖场景仍可能被用到；本条也**不**断言
+         生产实际选定计划已经切换——探针用了 FORCE INDEX，不测优化器自主选路。）
+         在生产现状的 DDL 下，
+         `d2c8e12` 加 tiebreaker **本身**就让 `/api/conversations` 丢掉了 backward index scan
+         —— 账本的「零计划影响」对该端点**失实**。（正确性仍需要 tiebreaker，不能撤。）
+      2. 「方向必须跟随」**只在索引显式含 tiebreaker 列时才有意义**；生产现状下方向根本
+         不影响计划。故 SITES 里 conversations 的 `direction_sensitive` 已置 False，
+         并把"扩索引"记为 user-gated 的独立项（schema 变更走 schema/ + 台账，F-35 纪律）。
+
+    本条测的是**索引覆盖度 ⇒ 排序能力**这条确定性质（用 FORCE INDEX 固定），
+    不测优化器在特定行数/统计下的自主选路（那受版本与统计影响，不适合当阻塞断言）。
+    """
+    import json
+
+    import pymysql
+    from opensearch_pipeline.config import get_config
+
+    def _walk(o, key):
+        """EXPLAIN JSON 嵌套层数不固定；**必须解析 JSON**，不能对原文做子串判断
+        —— `"using_filesort": false` 里也含 "filesort"（本测试初版即踩）。"""
+        if isinstance(o, dict):
+            if o.get(key) is True:
+                return True
+            return any(_walk(v, key) for v in o.values())
+        if isinstance(o, list):
+            return any(_walk(v, key) for v in o)
+        return False
+
+    cfg = get_config()
+    conn = pymysql.connect(host=cfg.rds.host, port=cfg.rds.port, user=cfg.rds.user,
+                           password=cfg.rds.password, autocommit=True)
+    db = f"pg_explain_{os.getpid()}"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"CREATE DATABASE IF NOT EXISTS {db}")
+            cur.execute(f"USE {db}")
+
+            def _plan(idx_cols, order, idx_name):
+                cur.execute("DROP TABLE IF EXISTS qc")
+                cur.execute(f"""CREATE TABLE qc (
+                    user_id VARCHAR(64) NOT NULL, conversation_id VARCHAR(64) NOT NULL,
+                    hidden_at DATETIME DEFAULT NULL, last_message_at DATETIME DEFAULT NULL,
+                    PRIMARY KEY (user_id, conversation_id),
+                    INDEX {idx_name} ({idx_cols})) DEFAULT CHARSET utf8mb4""")
+                cur.executemany(
+                    "INSERT INTO qc VALUES (%s,%s,NULL,%s)",
+                    [("u1", f"c{i:05d}", f"2026-08-01 00:{i % 60:02d}:00") for i in range(2000)])
+                cur.execute("ANALYZE TABLE qc")
+                cur.execute(
+                    f"EXPLAIN FORMAT=JSON SELECT conversation_id FROM qc FORCE INDEX ({idx_name})"
+                    f" WHERE user_id='u1' AND hidden_at IS NULL ORDER BY {order} LIMIT 20 OFFSET 40")
+                raw = cur.fetchone()[0]
+                j = json.loads(raw) if isinstance(raw, str) else raw
+                return _walk(j, "using_filesort"), _walk(j, "backward_index_scan")
+
+            prod_idx = "user_id, hidden_at, last_message_at"
+            full_idx = "user_id, hidden_at, last_message_at, conversation_id"
+            # ① 生产现状：仅前缀排序可走索引
+            fs, bw = _plan(prod_idx, "last_message_at DESC", "ix")
+            assert not fs and bw, (
+                "仅按索引前缀排序应当无 filesort 且走 backward index scan —— "
+                f"实得 filesort={fs} backward={bw}，本机 MySQL 与实测基线不符，先查环境")
+            # ② 生产现状：加 tiebreaker 后**无论方向**都 filesort（隐含主键后缀用不上）
+            fs, bw = _plan(prod_idx, "last_message_at DESC, conversation_id DESC", "ix")
+            assert fs and not bw, (
+                "隐含主键后缀竟然满足了 ORDER BY —— 本 MySQL 行为已变，"
+                f"「扩索引」那条待办可重估（filesort={fs} backward={bw}）")
+            assert _plan(prod_idx, "last_message_at DESC, conversation_id ASC", "ix")[0]
+            # ③ 显式含 tiebreaker 列：同向可走索引、混向不行 —— 方向规则的**真正**适用条件
+            fs, bw = _plan(full_idx, "last_message_at DESC, conversation_id DESC", "ix")
+            assert not fs and bw, (
+                "显式含列的索引在同向下应免排序 + backward scan —— 「扩索引」这条补救不成立，"
+                f"勿据此改 schema（filesort={fs} backward={bw}）")
+            assert _plan(full_idx, "last_message_at DESC, conversation_id ASC", "ix")[0]
+    finally:
+        with conn.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {db}")
+        conn.close()

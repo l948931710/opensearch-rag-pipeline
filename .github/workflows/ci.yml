@@ -103,7 +103,10 @@ jobs:
     timeout-minutes: 15
     services:
       mysql:
-        image: mysql:8.0
+        # 钉小版本（2026-08-06）：`mysql:8.0` 是浮动 tag，镜像自动升级会让
+        # test_pagination_stability 的 EXPLAIN 断言因**非代码变化**而红。
+        # 8.0.46 是这些断言的实测基线；升版本时须一并复跑那条并更新其 docstring 表格。
+        image: mysql:8.0.46
         env:
           MYSQL_ROOT_PASSWORD: your_password   # 对齐 docker-compose.yml / tests/local_stack.py 的 dev 凭证
         ports:
@@ -154,10 +157,14 @@ jobs:
           "
       - name: DB integration tests (real MySQL, real DML)
         # 这些模块在 conftest 的 xdist 分组里本就同组串行（互相清表），xdist 无收益 → 直接串行跑
+        # test_pagination_stability（2026-08-06 加）：它的真库分页 + EXPLAIN 用例在无 MySQL 的
+        # 普通 CI 里 skip，而此前又**没进**本清单 ⇒ CI 实际只跑了词法守卫、从不执行 EXPLAIN
+        # （codex 补评审指出）。加进来后那两条才真正在 CI 上承重。
         run: >-
           python -m pytest tests/test_pipeline.py tests/test_classification.py
           tests/test_concurrency.py tests/test_image_funnel.py
           tests/test_kb_db_integration.py
+          tests/test_pagination_stability.py
           -q --tb=short -p no:cacheprovider
 
   # 供应链/密钥门（P2-03）：secret 扫描 + 依赖 CVE 审计。此前 CI 完全无安全门。

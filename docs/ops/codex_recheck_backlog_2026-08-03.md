@@ -100,7 +100,7 @@ Sam 要求「验证到 100% 确认为止」。逐条实测结论：
 |---|---|---|
 | **B1** | 🔴 **我错了，已修** | 我偏离 codex 的 fail-closed 建议，理由是「HA3 是否回填 version_no 无法验证」——**那条理由错的，证据一直在仓里**：`docs/ha3_stg_table_spec.md` 是生产表实时导出、含 `version_no INT64`；`stitch_neighbor_chunks` 自 `16eb40b` 起就拿它建 WHERE（不回该字段的话邻居拼接会静默全空）。改回 fail-closed（`f9e59ea`）。**顺带查出独立既存 bug**：本地 OS 回退路径读侧漏取 version_no ⇒ 该路径邻居拼接自 2026-06-28 起一直静默全空 |
 | **B2** | ✅ 问一成立；问二有隐雷已拆 | 真库**全交叉积 20160 组 0 不一致**（`5566f1f`）。但 gate 轴此前只在 doc-status/版本历史的 `_is_q` 外挂里，SQL 镜像只看 publish ⇒ gate-only 隔离在列表侧会显「已上线」。**当前不可达**（三个 gate_status 写方里两个 quarantined 都与 publish 同 UPDATE），已两侧补齐 |
-| **B3** | ✅ 结论对、理由曾错 | EXPLAIN 实测 5/5 零计划影响（`858f515`）。但 `/api/conversations` **改前就没走 filesort**（"本就 filesort"在那处不成立）。**新发现**：tiebreaker 方向承重 —— 逆向 ASC 会从 Backward index scan 掉成 PRIMARY + filesort。已加守卫 |
+| **B3** | 🔴 **本行已被 2026-08-06 实测推翻，见 §F** | ~~EXPLAIN 实测 5/5 零计划影响；tiebreaker 方向承重~~ —— 那次是**一次性人工跑**，仓里当时没有任何可执行 EXPLAIN 测试。补上可执行测试后结论反转，详见 §F |
 | **B4** | ✅ 无问题 | **全量审 19 个调用点**（7 promptText + 9 confirm + notice）：取消值一律落到中止分支。加守卫（`922c9f1`/`f32e255`）。retry 语义属产品取舍，留 Sam |
 | **B5** | ✅ 不改 | 断言全是安全性质；唯一"精确形状"那条**必须保留** —— `/api/kb/approve` 无 `response_model`，它是唯一形状契约 |
 | **B6** | ✅ 属实且已在跑；**顺带查出 C1 同族漏修** | launchd `com.fuling.ops-monitor` 上次退出码正是 3（根因 DNS，被正确归 error 而非 drift）。但**告警标题层**没跟上：探针失败顶着「parity drift」+critical 发。三处已修 + AST 守卫（`9cd9436`） |
@@ -324,3 +324,63 @@ vue-tsc + build exit=0；**变异 21/21 全红 0 存活**。codex APPROVE（四�
   - P3-4 决策端点形态 —— **审计后判定不改**（0 守卫缺口，改名纯破坏性），
     约定与理由见 `docs/ops/decision_endpoint_shapes_2026-08-04.md`
 - ⚠️ 这 4 条**均未过 codex**，与本文件 §B 的 6 条一并等 2026-08-07 额度恢复。
+
+
+## F. 2026-08-06 codex 补评审：`d2c8e12` 分页 tiebreaker 族（B3/B7）
+
+该族过了自查与六员对抗核验，但**从未过 codex**。补评审抓出 1 BLOCKER + 4 MAJOR，
+并且**可执行 EXPLAIN 一跑就推翻了 §C-bis 的 B3 结论**。
+
+### 🔴 已实施
+
+1. **gaps 上游两个 `LIMIT 2000` 补全序**（BLOCKER）：`_compute_open_gaps` 里
+   `ORDER BY q.created_at DESC` → `, q.id DESC`；`ORDER BY t.days_ago ASC` → `, t.rid DESC`。
+   依据：`q.id` 是 `qa_session_log` 的 PK（`message_id` 只有普通 `idx_message_id`，
+   DDL 注释「消息唯一ID」**不是**约束）；`t.rid = MAX(q.id)` 而 `GROUP BY q.message_id`
+   分组不相交 ⇒ 各组 MAX 必不同。
+   此前 created_at 秒精度 / days_ago 整天粒度，在 LIMIT 边界同值时两次重算可选出不同候选，
+   而下游 hash 终排序**补不回上游已漏选**的行。
+2. **守卫重构**：全局裸列名白名单 `UNIQUE_COLS` → **SITES 站点契约**
+   （端点 / 唯一项 / DDL 依据 / 是否方向敏感 / 是否可词法扫）；唯一项**必须收尾**；
+   `_parse_term` 严格单列（`id % 2`、`COALESCE(...)` 一律不认唯一）。
+   ⚠️ 我原提的「检查全部相邻方向对」被 codex 拦下——会把 browse 的
+   `owner_dept ASC, updated_at DESC, doc_id DESC` 这种**合法**混向误判。
+3. **可执行 EXPLAIN 进 CI**：`test_pagination_stability.py` 加入 db-integration 清单；
+   MySQL 镜像由浮动 `mysql:8.0` **钉到 `8.0.46`**（浮动 tag 会让断言因非代码变化而红）。
+   同时删掉「无 tiebreaker 必须实际漏行」那条脆断言——SQL 只是不保证次序，
+   不保证某个计划**必然**显形。
+
+### 🔴 §C-bis 的 B3 结论被推翻（实测，MySQL 8.0.46 / FORCE INDEX / 2000 行 / ANALYZE）
+
+| 索引 | ORDER BY | using_filesort |
+|---|---|---|
+| **生产现状** `(user_id, hidden_at, last_message_at)` | `last_message_at DESC`（仅前缀） | **false**（backward index scan） |
+| 同上 | `…, conversation_id DESC`（同向） | **true** |
+| 同上 | `…, conversation_id ASC`（混向） | **true** |
+| 显式 4 列（含 `conversation_id`） | 同向 | **false**（backward index scan） |
+| 同上 | 混向 | **true** |
+
+⇒ 在**该查询形态 + 该索引 + FORCE INDEX** 下，MySQL 8.0.46 **未**利用隐含的
+`conversation_id` 后缀来消除排序。故：
+- 「EXPLAIN 实测 5/5 零计划影响」对 `/api/conversations` **失实** ——
+  在现状 DDL 下，**加 tiebreaker 本身**（而非方向）就让该索引失去免排序能力；
+- 「方向必须跟随」**只在索引显式含 tiebreaker 列时才有适用对象**。
+  SITES 里 conversations 的 `direction_sensitive` 已置 **False**（该守卫现为 dormant）。
+
+⚠️ 措辞边界（codex 要求）：以上只支持「该形态下不消除排序」，**不**支持
+「MySQL 普遍不使用隐含 PK 后缀」，也**不**等于断言生产实际选定计划已经切换
+（探针用了 FORCE INDEX，不测优化器自主选路）。
+⚠️ 正确性仍需要 tiebreaker，**不得因 filesort 撤回**。
+
+### 待 Sam 裁决 / user-gated
+
+1. **扩 `idx_user_visible_recent` 到 `(user_id, hidden_at, last_message_at, conversation_id)`**
+   —— 实测这样同向即可免排序。属 schema 变更，须走 `schema/` 文件 + `schema_migrations`
+   台账（F-35 纪律）。做完后 conversations 的 `direction_sensitive` 可翻回 True。
+2. **`_KB_MAX_OFFSET=10000` 的静默钳位**：现为 `offset=min(requested,10000)` + HTTP 200，
+   请求 10001/20000 返回同一页窗口、更深行不可达、响应不回 `effective_offset`。
+   与本仓 "no silent caps" 纪律相悖（P3-3 正是为此做的），但改响应形态要动前端。
+3. **gaps 的 2000 硬 cap 是否允许不完整视图**（补全序只稳定「选哪 2000 条」，
+   第 2001 条起仍永不可见）。
+4. **OFFSET 活数据竞态**（覆盖全部分页端点）：翻页期间的增删改/权限变化仍会漏行重行，
+   彻底解法是 keyset cursor + 快照水位，属架构变更。

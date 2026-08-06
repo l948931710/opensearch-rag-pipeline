@@ -1441,7 +1441,14 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
                         " WHERE q.answer_status='NO_RESULT'"
                         "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
                         f"   AND q.user_dept IN ({ph})"
-                        " ORDER BY q.created_at DESC LIMIT %s")
+                        # 全序（2026-08-06 codex 补评审）：created_at 是**秒精度** DATETIME，
+                        # 同秒行在 LIMIT 边界上由优化器任选 ⇒ 两次重算可选中不同候选，
+                        # 而下游 hash 终排序补不回**上游已漏选**的行。
+                        # tiebreaker 取 `q.id`（PK）——`message_id` 只有普通索引
+                        # `idx_message_id`，DDL 注释「消息唯一ID」**不是**唯一约束。
+                        # ⚠️ 补全序只稳定「选哪 2000 条」，**不解决 2000 硬 cap 本身的
+                        # 不完整**（第 2001 条起永不可见）——后者记为设计题，见 backlog。
+                        " ORDER BY q.created_at DESC, q.id DESC LIMIT %s")
                     _params = tuple([win] + depts + [_GAP_CANDIDATE_CAP])
                     _has_rw = _exec_gap_sql(cur, _nr_base.format(rw=", q.rewritten_query"),
                                             _nr_base.format(rw=""), _params)
@@ -1479,7 +1486,13 @@ def _compute_open_gaps(depts: List[str], trace_id: str):
                     "   AND q.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
                     " GROUP BY q.message_id"
                     ") t WHERE t.hit_mine=1 OR t.all_public=1"
-                    " ORDER BY t.days_ago ASC LIMIT %s")
+                    # 全序（同上）：days_ago 只有**整天**粒度，同日行在 LIMIT 边界不确定。
+                    # tiebreaker 取 `t.rid`（子查询的 `MAX(q.id)`）：q.id 是全局 PK，
+                    # 而 `GROUP BY q.message_id` 的分组彼此不相交 ⇒ 各组 MAX(id) 必不相同。
+                    # DESC 让同一天内较新的日志优先，与「最近优先」的展示语义一致。
+                    # （方向与前项 ASC 不同是**有意**的：该查询经 GROUP BY/派生表，本就要排序，
+                    #  不存在可被单次索引扫描满足的计划——方向跟随规则不适用于此站点。）
+                    " ORDER BY t.days_ago ASC, t.rid DESC LIMIT %s")
                 _rf_params = tuple(params + [_GAP_CANDIDATE_CAP])
                 _has_rw = _exec_gap_sql(
                     cur,

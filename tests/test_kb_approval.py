@@ -290,9 +290,17 @@ def test_review_tasks_order_by_has_unique_tiebreaker(monkeypatch):
     """新增 OFFSET 分页不得重演 d2c8e12：created_at 是秒精度，必须带 task_id。"""
     _, seen_open = _review_tasks(monkeypatch, 1, include_closed=False)
     _, seen_closed = _review_tasks(monkeypatch, 1, include_closed=True)
+    from tests.test_pagination_stability import _parse_term, _split_top_level
     for tag, seen in (("open", seen_open), ("closed", seen_closed)):
         order = seen["sql"].split("ORDER BY")[1].split("LIMIT")[0]
         assert "t.task_id" in order, f"{tag} 分支 ORDER BY 缺唯一 tiebreaker：{order}"
+        # ★ 2026-08-06（codex 补评审）：不只要"出现"，还必须**位于末位**。
+        # 唯一项后面还挂东西时（如 `…, t.task_id ASC, 0 ASC`），只比较"最后两项方向"的
+        # 守卫会被整体绕过；要求收尾即堵死这类构造。
+        terms = [_parse_term(t) for t in _split_top_level(order)]
+        # `_parse_term` 保留 alias（`m.doc_id` 与 `x.doc_id` 必须可区分），故比 "t.task_id"
+        assert terms and terms[-1] and terms[-1][0] == "t.task_id", (
+            f"{tag} 分支的唯一 tiebreaker 不在 ORDER BY 末位：{order}")
 
 
 def test_review_tasks_cache_key_includes_offset(monkeypatch):
