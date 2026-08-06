@@ -21,7 +21,17 @@ from typing import Optional, Tuple
 
 # 上传约束
 UPLOAD_TOKEN_TTL = 30 * 60          # upload token / 签名 PUT 有效期：30 分钟
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 单文件上限 50MB（可后续配置化）
+
+# 单文件上限（2026-08-06 由 50MB 提到 150MB,Sam 要求;并顺手配置化——原注释"可后续配置化"）。
+# ⚠️ 三个下游边界决定了 150 这个数**是安全的**,改之前请复核它们仍成立:
+#   · 抽取下载闸 RAG_EXTRACT_MAX_BYTES 默认 **200MB**(pipeline_nodes:593)——必须留在其下;
+#   · xlsx >100MB 自动切 openpyxl read_only(unified_extractor:1403),已处理;
+#   · 签名 PUT / upload token 共用 30 分钟 TTL —— 150MB 需 ≥0.67 Mbps 持续上行才传得完。
+#     办公网轻松,弱网(VPN/4G)可能超时 ⇒ 报「上传未完成或链接已过期」,可重传但白费一次。
+#     真要支持更大的文件,先把 TTL 一起调,而不是只调这一个数。
+# 现网实测基线(2026-08-06):1447 个版本里最大 49.7MB(正好顶到旧上限),均值 0.93MB,
+# 97.6% 在 10MB 以下 ⇒ **>50MB 是没跑过的区间**,首批大文件建议盯一次抽取耗时与内存。
+MAX_UPLOAD_BYTES = int(os.environ.get("RAG_MAX_UPLOAD_MB", "150") or 150) * 1024 * 1024
 _UPLOAD_TOKEN_TYP = "kb_upload"
 
 # Phase 1 直传支持的扩展名（office + 图片）。遗留 doc/xls/ppt 单独提示走 Phase 1.5 转换。

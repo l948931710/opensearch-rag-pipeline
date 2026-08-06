@@ -1176,7 +1176,7 @@ async function uploadSingle(file: File) {
     if (principalChangedSince(epoch0)) return       // 旧身份的失败不写新身份 UI
     // detail:true —— 管理台（受 _require_kb_console 保护）要看得到后端原因与 trace 号；
     // 员工侧的贡献页仍走默认档不外泄。2026-08-04 全员上传中断即因这里吞掉了 500 的 detail。
-    uploadErr.value = uploadErrText(e, { detail: true }); uploadMsg.value = ''
+    uploadErr.value = uploadErrText(e, { detail: true, maxMb: maxUploadMb.value }); uploadMsg.value = ''
   } finally { uploadBusy.value = false; uploadPct.value = null }   // 任何退出路径都撤条，含 PUT 中途失败
 }
 
@@ -1241,7 +1241,7 @@ async function uploadBatch(files: File[]) {
     } catch (e: any) {
       row.pct = null                                // PUT 中途失败也要撤条，否则冻在原值不消失
       if (principalChangedSince(epoch0)) return     // 旧身份的失败不写新身份 UI
-      row.status = '失败'; row.msg = uploadErrText(e, { detail: true }); badN++   // 同上：批量行也要能看见真原因
+      row.status = '失败'; row.msg = uploadErrText(e, { detail: true, maxMb: maxUploadMb.value }); badN++   // 同上：批量行也要能看见真原因
     }
   }
   // 小并发池：worker 共享游标领任务，按队列顺序开工（uploadOne 自吞异常，Promise.all 不会中途 reject）。

@@ -1,7 +1,10 @@
 // 知识库管理：纯常量 + 工具（直传 OSS、报错转人话、查重文案、徽章配色）。可独立单测。
 // 后端契约见 /api/kb/*；徽章【唯一真相在后端 _kb_status_badge】，前端只展示字符串 + 本地配色。
 
-export const MAX_UPLOAD_MB = 50   // 必须与后端 kb_upload.MAX_UPLOAD_BYTES 对齐（否则传完才 413）
+// 仅作**兜底**：真值来自 /api/kb/config 的 max_upload_bytes（useKb.maxUploadBytes 优先取它）。
+// 保持与后端 kb_upload.MAX_UPLOAD_BYTES 的默认值同步，否则 config 未回的那一小段窗口里
+// 客户端预检会用错数（放行了后端要 413 的文件，或反过来白拦）。2026-08-06 随后端 50→150。
+export const MAX_UPLOAD_MB = 150
 export const UPLOAD_ACCEPT = '.pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png'
 // 受支持扩展名（= UPLOAD_ACCEPT 拆分；后端 validate_filename 为权威，前端仅预检省一次失败往返）。
 export const UPLOAD_EXTS = UPLOAD_ACCEPT.split(',')
@@ -162,14 +165,16 @@ function safeDetail(msg: string): string {
  *   · 429 —— 此前掉进兜底，长得和真故障一模一样（当晚为此查了一轮限流台账才排除）
  *   · 5xx —— 「服务端的锅」和「你再试试」必须可区分，否则用户会一直连点
  */
-export function uploadErrText(e: any, opts?: { detail?: boolean }): string {
+export function uploadErrText(e: any, opts?: { detail?: boolean; maxMb?: number }): string {
   const msg = (e && e.message) || String(e || '')
   const status = Number(e && e.status) || 0
   const retryAfter = Number(e && e.retryAfter) || 0
   // 原始信息恒进 devtools（不进 UI）——员工侧也能让管理员远程问一句"控制台报了什么"。
   try { console.warn('[upload] 失败', { status, detail: msg, retryAfter }) } catch { /* 无 console 环境 */ }
 
-  if (status === 413 || /超过大小上限|too large|413/i.test(msg)) return `文件超过上限 ${MAX_UPLOAD_MB}MB，请压缩或拆分后重传。`
+  // 数字取**运行时真值**（调用方传 maxUploadMb，来自 /api/kb/config），常量只兜底：
+  // 上限从 50 提到 150 那次，若这里仍写死常量，服务端已放行 150 而提示还说「超过 50MB」。
+  if (status === 413 || /超过大小上限|too large|413/i.test(msg)) return `文件超过上限 ${opts?.maxMb || MAX_UPLOAD_MB}MB，请压缩或拆分后重传。`
   if (status === 403 || /无权|权限|forbidden/i.test(msg)) return '你没有该操作的权限，请联系知识库管理员。'
   if (status === 429) return `操作太频繁，请等 ${retryAfter > 0 ? retryAfter : 60} 秒后再传（同时开着多个管理台页面也会占用额度）。`
   if (/OSS PUT|CORS|网络错误|超时|timeout/i.test(msg)) return '文件上传通道异常，请稍后重试；若持续失败请联系知识库管理员（可能是 OSS 跨域未放行）。'

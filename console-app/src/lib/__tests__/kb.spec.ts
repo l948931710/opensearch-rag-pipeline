@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { uploadErrText, buildDupMsg, fileCore, badgeTone, deptLabel, permLabel, extOf, unsupportedNames, putWithProgress } from '@/lib/kb'
+import { MAX_UPLOAD_MB, uploadErrText, buildDupMsg, fileCore, badgeTone, deptLabel, permLabel, extOf, unsupportedNames, putWithProgress } from '@/lib/kb'
 
 describe('uploadErrText（技术错误 → 人话，绝不暴露 trace/HTTP）', () => {
   it('413/超大 → 大小提示', () => {
@@ -121,5 +121,15 @@ describe('fileCore / badgeTone / labels', () => {
     expect(extOf('noext')).toBe('')
     expect(unsupportedNames([{ name: 'a.pdf' }, { name: 'b.png' }])).toEqual([])
     expect(unsupportedNames([{ name: 'a.pdf' }, { name: 'm.zip' }, { name: 'x.exe' }])).toEqual(['m.zip', 'x.exe'])
+  })
+})
+
+describe('uploadErrText 大小提示用运行时上限（2026-08-06 50→150）', () => {
+  it('413 优先用调用方传入的 maxMb，而非硬编码常量', () => {
+    expect(uploadErrText({ status: 413 }, { maxMb: 150 })).toContain('150MB')
+  })
+  it('未传 maxMb 时回落常量（且常量已与后端默认值同步）', () => {
+    expect(uploadErrText({ status: 413 })).toContain(`${MAX_UPLOAD_MB}MB`)
+    expect(MAX_UPLOAD_MB).toBe(150)   // 与 kb_upload.MAX_UPLOAD_BYTES 默认值对齐
   })
 })
