@@ -1115,8 +1115,8 @@ def test_version_history_retired_doc_badges(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     ver_rows = [
-        (2, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-20"),   # 退役前是「已上线」，doc 退役后应显已退役
-        (1, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-10"),
+        (2, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-20", ""),   # 退役前是「已上线」，doc 退役后应显已退役
+        (1, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-10", ""),
     ]
     _stub_multi(monkeypatch, [("marketing", "retired"), ver_rows])   # meta(fetchone) + versions(fetchall)
     from opensearch_pipeline import api
@@ -1129,7 +1129,7 @@ def test_version_history_active_doc_pipeline_badge(monkeypatch):
     """对照：active 文档版本仍显流水线态（已上线），doc_status 传入不误伤。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    _stub_multi(monkeypatch, [("marketing", "active"), [(1, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-10")]])
+    _stub_multi(monkeypatch, [("marketing", "active"), [(1, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-10", "")]])
     from opensearch_pipeline import api
     resp = api.kb_version_history(request=None, doc_id="D1", identity=api.Identity(user_id="kb1"))
     assert resp.versions[0].status_badge == "已上线"
@@ -2107,9 +2107,9 @@ def test_version_history_gate_only_quarantine_badge_and_flags(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     ver_rows = [
-        (3, "SUCCESS", "", "SUCCESS", "", "quarantined", 1, "", "2026-07-01"),   # gate-only 隔离
-        (2, "SUCCESS", "", "SUCCESS", "QUARANTINED", "", 1, "", "2026-06-20"),   # publish 路径隔离
-        (1, "SUCCESS", "", "SUCCESS", "", "", 0, "", "2026-06-10"),              # 正常但无原件
+        (3, "SUCCESS", "", "SUCCESS", "", "quarantined", 1, "", "2026-07-01", ""),   # gate-only 隔离
+        (2, "SUCCESS", "", "SUCCESS", "QUARANTINED", "", 1, "", "2026-06-20", ""),   # publish 路径隔离
+        (1, "SUCCESS", "", "SUCCESS", "", "", 0, "", "2026-06-10", ""),              # 正常但无原件
     ]
     _stub_multi(monkeypatch, [("marketing", "active"), ver_rows])
     from opensearch_pipeline import api
@@ -2551,7 +2551,7 @@ def test_doc_status_badge_agrees_with_version_history(monkeypatch):
     for cps, chs, ixs, err, pubs, gate in cases:
         ds = _doc_status(monkeypatch, (cps, chs, ixs, err, pubs, gate))
         _stub_multi(monkeypatch, [("hr", "active"),
-                                  [(3, cps, chs, ixs, pubs, gate, 1, err, "2026-08-03")]])
+                                  [(3, cps, chs, ixs, pubs, gate, 1, err, "2026-08-03", "")]])
         vh = api.kb_version_history(request=None, doc_id="D1",
                                     identity=api.Identity(user_id="kb1"))
         assert ds.status_badge == vh.versions[0].status_badge, (
@@ -2688,3 +2688,33 @@ def test_pending_approvals_excludes_retired_docs():
     assert "content_process_status = 'PENDING_APPROVAL'" in q
     assert "LOWER(m.status) = 'active'" in q, (
         "待审批队列未排除已退役文档 ⇒ 会出现永远批不掉的僵尸条目")
+
+
+# ── 退役自动撤销审批 ↔ 恢复自动还原（2026-08-06，必须成对）─────────────────────
+def test_retire_withdraws_pending_approval_and_restore_resubmits():
+    """★ 成对守卫。只做退役侧 = 把「可见的僵尸」换成「看不见的僵尸」:文档恢复上线了,
+    那一版却卡在 WITHDRAWN —— 审批队列不列(不是 PENDING)、stage-1 不认领,没人会发现。
+    """
+    import pathlib
+    import re
+    src = pathlib.Path("opensearch_pipeline/routes/kb_console.py").read_text(encoding="utf-8")
+    rt = re.search(r"def kb_retire.*?(?=\n@router)", src, re.S).group(0)
+    rs = re.search(r"def kb_restore.*?(?=\n@router)", src, re.S).group(0)
+    assert "approval_status='WITHDRAWN'" in rt and "approval_status='PENDING'" in rt, \
+        "kb_retire 未把待审批版本置 WITHDRAWN"
+    assert "approval_status='PENDING'" in rs and "approval_status='WITHDRAWN'" in rs, \
+        "kb_restore 未对称还原 WITHDRAWN→PENDING（隐形僵尸）"
+    # 撤销按 doc 维度（顺带堵上 kb_approve:3190 记的「更早 pending 版本会被复活」洞）
+    assert "WHERE doc_id=%s AND approval_status='PENDING'" in rt, "撤销应覆盖该文档全部待审批版本"
+    # 还原只碰仍待审批的版本，别把后来已处理的版本拨回 PENDING
+    assert "content_process_status='PENDING_APPROVAL'" in rs, "还原缺 content_process_status 限定"
+
+
+def test_approval_status_surfaced_in_version_history_only():
+    """可见性落在版本历史,**不进 status_badge** —— 徽章有 SQL 镜像,加新值要同步筛选与计数。"""
+    import pathlib
+    src = pathlib.Path("opensearch_pipeline/routes/kb_console.py").read_text(encoding="utf-8")
+    assert "approval_status=(appr or \"\")" in src, "版本历史未回填 approval_status"
+    assert "'WITHDRAWN'" not in pathlib.Path("opensearch_pipeline/api.py").read_text(
+        encoding="utf-8").split("def _kb_status_badge")[1][:2000], \
+        "WITHDRAWN 渗进了 status_badge —— 会与 _KB_BADGE_CASE_SQL 漂移"

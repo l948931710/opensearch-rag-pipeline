@@ -156,6 +156,9 @@ export interface VersionItem {
   version_no: number; content_process_status: string; chunk_status: string
   index_status: string; publish_status: string; status_badge: string; error_message: string; created_at: string
   has_raw?: boolean; quarantined?: boolean   // 历史版本下载：无原件/已封存 → 按钮置灰
+  // 'WITHDRAWN' = 该版本提交过审批、文档退役时被自动撤销（kb_retire ↔ kb_restore 成对）。
+  // 不进 status_badge：徽章有 SQL 镜像 _KB_BADGE_CASE_SQL，加新值要同步服务端筛选与计数。
+  approval_status?: string
 }
 interface UploadUrlResp { upload_token: string; put_url: string; raw_key: string; doc_id: string; expires_in: number; requires_kb_admin_approval: boolean; content_type?: string }
 interface RegisterResp { doc_id: string; version_no: number; content_process_status: string; requires_kb_admin_approval: boolean; status_badge: string; idempotent: boolean; title: string; content_dups: DupDoc[]; content_dups_other: number }

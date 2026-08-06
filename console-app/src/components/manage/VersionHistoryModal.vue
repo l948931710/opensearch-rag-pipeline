@@ -54,6 +54,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
               <div class="flex items-center gap-2.5">
                 <span class="font-mono text-[13px] font-bold text-foreground">v{{ h.version_no }}</span>
                 <StatusPill :badge="h.status_badge" />
+                <!-- 审批被退役自动撤销（kb_retire ↔ kb_restore 成对）。徽章仍显「已退役」是 doc 级
+                     状态,回答不了"我提交的审批去哪了" —— 这一处专答那个疑问。恢复上线会自动还原。 -->
+                <span v-if="h.approval_status === 'WITHDRAWN'"
+                      class="whitespace-nowrap rounded border border-border bg-panel px-1.5 py-px text-[10px] font-medium text-faint"
+                      title="该版本提交过审批,文档退役时已自动撤销；恢复上线后会重新进入审批队列">审批已撤销</span>
                 <div class="flex-1" />
                 <span class="shrink-0 font-mono text-[11.5px] text-faint">{{ (h.created_at || '').slice(0, 16) }}</span>
                 <button

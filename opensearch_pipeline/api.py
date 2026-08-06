@@ -2708,6 +2708,11 @@ class KbVersionItem(BaseModel):
     # quarantined=publish_status/gate_status 任一命中隔离（原件不外发，前端按钮置灰）。
     has_raw: bool = False
     quarantined: bool = False
+    # 审批态（2026-08-06）：退役会把待审批版本自动置 WITHDRAWN（kb_retire ↔ kb_restore 成对）。
+    # 只在版本历史外露,**不进 status_badge** —— 徽章有 SQL 镜像 _KB_BADGE_CASE_SQL,加新值
+    # 就要同步服务端筛选与计数,blast radius 不划算;而"我提交的审批为什么没了"这个疑问,
+    # 用户看的正是版本历史这一处。
+    approval_status: str = ""
 
 
 class KbVersionHistoryResponse(BaseModel):

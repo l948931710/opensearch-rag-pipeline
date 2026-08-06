@@ -2198,7 +2198,7 @@ def kb_version_history(request: Request, doc_id: str,
                     SELECT version_no, content_process_status, chunk_status, index_status,
                            publish_status, gate_status,
                            COALESCE(raw_key, '') <> '' AS has_raw,
-                           error_message, created_at
+                           error_message, created_at, approval_status
                     FROM {_kb_db()}.document_version
                     WHERE doc_id=%s ORDER BY version_no DESC
                     """,
@@ -2216,7 +2216,7 @@ def kb_version_history(request: Request, doc_id: str,
 
     versions = []
     for r in rows:
-        (vno, cps, chs, ixs, pubs, gate, has_raw, err, created) = r
+        (vno, cps, chs, ixs, pubs, gate, has_raw, err, created, appr) = r
         # 隔离徽章统一走 _kb_version_quarantined（gate-only 隔离此前会显「已上线」——
         # 存量 bug，codex 评审 2026-08-02 抓出；publish_status/chunk_status 同时补传给
         # badge helper，EMPTY/NEEDS_REVIEW 语义在版本行同样生效）。
@@ -2228,7 +2228,7 @@ def kb_version_history(request: Request, doc_id: str,
                 cps, ixs, _doc_status,   # 传 doc 级状态 → 退役文档各版本如实显「已退役」(B4)
                 publish_status=pubs, chunk_status=chs)),
             error_message=err or "", created_at=str(created) if created else "",
-            has_raw=bool(has_raw), quarantined=_is_q,
+            has_raw=bool(has_raw), quarantined=_is_q, approval_status=(appr or ""),
         ))
     return KbVersionHistoryResponse(doc_id=doc_id, owner_dept=owner_dept, versions=versions)
 
@@ -3312,6 +3312,20 @@ def kb_retire(req: KbRetireRequest, request: Request,
                 # 漏删而无限期滞留。退役语义是「整篇下线」，故停全部活跃 chunk（stage-3 reconcile 再兜底 HA3）。
                 cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=0 "
                             "WHERE doc_id=%s AND is_active=1", (req.doc_id,))
+                # 退役自动撤销该文档【全部】待审批版本（2026-08-06，Sam 拍板）。
+                # ⚠️ 不改 content_process_status：那是摄取管线的状态机（NOT_STARTED/LOADING/
+                # PROCESSING/DONE/FAILED/NEEDS_REVIEW/…），塞进一个撤销态要教会徽章映射、
+                # _KB_BADGE_CASE_SQL、前端色调表一串地方；approval_status 是纯审批语义、
+                # 消费面仅 5 处，是正确的落点。且 PENDING_APPROVAL 保持原值 ⇒ 恢复上线后
+                # 那一版**确实**仍待审批，语义不撒谎。
+                # 覆盖面刻意按 doc 而非当前版本：kb_approve:3190 的注释记着「kb_retire 只把
+                # current 版本置 retired，更早的 pending 版本仍 status=active，放行后会被
+                # stage-1 认领复活」——按 doc 撤销顺带堵上那个洞。
+                # ⚠️ 与 kb_restore 的还原**必须成对**，否则文档恢复后那一版卡在 WITHDRAWN：
+                # 既不进审批队列、也不被 stage-1 认领 = 一个没人会发现的隐形僵尸。
+                cur.execute(f"UPDATE {_kb_db()}.document_version "
+                            "SET approval_status='WITHDRAWN', updated_at=NOW() "
+                            "WHERE doc_id=%s AND approval_status='PENDING'", (req.doc_id,))
                 # 真实检索下线不能只靠 RDS（盲区审计 P2-1）：HA3 行仍在且带原 permission_level，
                 # 检索照常命中。喂 PENDING_DELETE outbox——stage-3 每轮 reconcile_pending_deletes
                 # 自动 drain 删 HA3 后落 DELETED（全版本入队，顺带清双版本残留；与
@@ -3445,6 +3459,15 @@ def kb_restore(req: KbRetireRequest, request: Request,
                             f"WHERE doc_id=%s AND version_no=%s AND index_status IN "
                             f"({sql_in_list((DocVersionIndexStatus.PENDING_DELETE, DocVersionIndexStatus.DELETED))})",
                             (req.doc_id, cur_ver))
+                # 对称还原 kb_retire 的审批撤销（2026-08-06）：WITHDRAWN → PENDING。
+                # 只还原**仍待审批**的版本（content_process_status='PENDING_APPROVAL'）——
+                # 若该版本后来已被处理/放行，approval_status 早不是 WITHDRAWN，这里也不该动它。
+                # 缺了这一句就是把「可见的僵尸」换成「看不见的僵尸」：文档恢复上线了，
+                # 那一版却卡在 WITHDRAWN，队列不列、stage-1 不认领，没人会发现。
+                cur.execute(f"UPDATE {_kb_db()}.document_version "
+                            "SET approval_status='PENDING', updated_at=NOW() "
+                            "WHERE doc_id=%s AND approval_status='WITHDRAWN' "
+                            "AND content_process_status='PENDING_APPROVAL'", (req.doc_id,))
                 write_audit(doc_id=req.doc_id, version_no=cur_ver, action_type="RESTORE_REQUEST",
                             operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
                             message=f"owner={owner_dept} perm={perm} reason={(req.reason or '')[:200]}",
