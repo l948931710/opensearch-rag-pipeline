@@ -762,7 +762,11 @@ def _revalidate_main_hits(results, *, strict_on_unavailable: bool = False):
     """主命中 RDS 复核（盲区审计 P3-1）——权限执行不对称的补齐。
 
     strict_on_unavailable（2026-08-03，cosurface 补图用）：**权威复核没跑成**时（RDS 不可达 /
-    返回空集 / 两个轴都没有键）直接返回空集，而不是 fail-open 保留。仅对"可选增强"路径开启：
+    返回空集 / 两个轴都没有键）直接返回空集，而不是 fail-open 保留。
+    ⚠️ 2026-08-06 补齐两处**逐行**漏网（此前 strict 只在"整批"层面生效）：
+      · 混合批里单条无键的行不再无条件保留（原 `[KEYLESS, KEYED]` → 两条全过）；
+      · 缺 HA3`id` 的行不再跳过物理 PK 轴（缺字段本就是"未复核"的一种）。
+    仅对"可选增强"路径开启：
     主命中 fail-open 的理由是"不把 RDS 故障放大成全站无答案"，但**补图失败的代价只是没有配图，
     正文答案不受影响** —— 那里没有任何理由拿未复核的图去赌。
     ⚠️ 只作用于"复核**没跑成**"，不作用于"复核**按配置不跑**"（`main_hit_revalidate` 关、
@@ -842,7 +846,14 @@ def _revalidate_main_hits(results, *, strict_on_unavailable: bool = False):
         cid = str(r.get("chunk_id") or "")
         row = meta.get(cid) if cid else meta_by_pk.get(str(r.get("id") or ""))
         if row is None and not cid and not r.get("id"):
-            kept.append(r)     # 两个轴都没有键 → 无从复核，保留（沿用既有 fail-open）
+            # 两个轴都没有键 → 无从复核。
+            # 🔴 strict 档下**逐行**也要 fail-closed（2026-08-06 修）：此前只有「整批无键」
+            # 走 strict 返空集，混合批里单条无键的行照样 `kept.append` 无条件保留 ——
+            # 实测 `[KEYLESS(A), KEYED(B)]` → `['A','B']`，strict 对它完全失效。
+            if strict_on_unavailable:
+                dropped += 1
+                continue
+            kept.append(r)     # 非 strict：沿用既有 fail-open
             continue
         if row is None:
             dropped += 1       # RDS 已无此 chunk（purge/删除），HA3 残留
@@ -859,6 +870,12 @@ def _revalidate_main_hits(results, *, strict_on_unavailable: bool = False):
         # 孤儿行（旧文本），丢弃。**HA3 id 缺失时只跳过这一项比对**、不丢弃命中 ——
         # 历史行没有该字段，因缺字段整条丢会把正常内容一起打掉。
         _ha3_pk = r.get("id")
+        if _ha3_pk in (None, "") and strict_on_unavailable:
+            # 🔴 strict 档下缺 HA3 id **不再跳过** PK 轴（2026-08-06 修）：跳过等于对
+            # 「同版本重切的孤儿 PK」这条轴完全失明，而 strict 的语义就是「补图失败只是
+            # 没配图，绝不拿未复核的图去赌」——缺字段正是"未复核"的一种。
+            dropped += 1
+            continue
         if (_ha3_pk not in (None, "") and rds_pk is not None
                 and str(_ha3_pk) != str(rds_pk)):
             dropped += 1
@@ -867,6 +884,276 @@ def _revalidate_main_hits(results, *, strict_on_unavailable: bool = False):
     if dropped:
         logger.info("主命中 RDS 复核：丢弃 %d/%d 条陈旧/已停用命中", dropped, len(results))
     return kept
+
+
+# ── 图片「当前版本」不变量（2026-08-06，codex 四轮 REVISE 收敛）────────────────────────
+# 权威值 = **该文档最高的「完整 INDEXED」active 版本**（见 `_resolve_serving_versions`）。
+#
+# ⚠️ 这一条**推翻了**原定的 `document_meta.current_version_no`（2026-08-06 codex 补评审）：
+#   · `routes/kb_console.py:3072` 在**上传登记的同一个事务里**就把指针推到 N+1 —— 此时摄取
+#     （DAG1-3）一步都没跑；而按 CLAUDE.md 的安全不变量，旧版 chunk 要服务到新版索引成功为止。
+#     ⇒ 拿指针当权威，会让「待审批 / DAG 处理中 / 索引失败」的文档**正文照常、图片全没**，
+#     可能持续数天。仓内 `asset_set_diff.py:185` 早就写明「上一成功服务版本**不是**
+#     current_version_no 指针」。
+#   · 退而求其次的 `MAX(version_no) WHERE is_active=1` 同样不成立：新 chunk 在 **DAG2** 就以
+#     `is_active=1 + index_status=NOT_INDEXED` 落库（`chunker.py:154`），DAG3 才推 HA3 ——
+#     那只是把同一个回归从「上传后」挪到「DAG2 后」。
+#   · 采用的口径与本仓既有惯用法同源：`spot_checker.py:585` 的 `reconcile_stranded_versions`
+#     正是「max_active_ver **且** 该版本全部 INDEXED」；`pipeline_nodes.py:7462` 的停用闸
+#     判据也是「该版本无 active 且非 INDEXED 的行」。
+#
+# 为什么必须是**独立于 4c 的**一道门（v1 方案被 codex 打掉的正是这点）：
+# `_revalidate_main_hits` 在任何 SQL 之前就早退（`not cfg.rag.main_hit_revalidate` /
+# `cfg.simulate_db`）—— 把版本门塞进 4c，等于让一个**性能开关**能关掉一道**安全门**。
+#
+# 为什么不能只看 `chunk_type == "image"`（v1 的第二个洞）：`llm_generator.py` 的
+# `text_chunk/clause_chunk/ocr_chunk/visual_knowledge` 分支只要带 `image_refs` 或
+# `source_image` 同样注入 `<<IMG:N>>` 出图。谓词取并集，见 `_row_carries_image`。
+
+# 整条 chunk 就是图（其 chunk_text 本身即图 caption 派生）⇒ 版本陈旧时**丢行**。
+# 其余类型带图 ⇒ **剥图保正文**：正文是它自己那个版本的正文，不该被图连坐。
+_IMAGE_ONLY_CHUNK_TYPES = ("image", "visual_knowledge")
+
+
+def _row_carries_image(c: Dict[str, Any], rds_chunk_type: Optional[str] = None) -> bool:
+    """本行是否可能出图（版本门的作用域谓词——并集）。
+
+    两类进作用域：
+      · **类型本身即图**（`image`/`visual_knowledge`）—— 即便投影里 `source_image` 为空
+        也要进：那种行的 `chunk_text`/`visual_summary` 本身就是旧版内容；
+      · **当前已带出图载荷**的任意类型 —— `llm_generator` 的
+        `text_chunk/clause_chunk/ocr_chunk/step_card` 分支只要有 `image_refs` 或
+        `source_image` 就注入 `<<IMG:N>>`，只看 `chunk_type=='image'` 会全部漏掉。
+
+    ⚠️ 有意**不**把「可能在下游装载图的类型」（无 refs 的 step_card）纳入：
+      · 那会让**几乎每一批**检索都多一次 RDS 查表（`text_chunk` 无处不在），而对
+        无载荷的行本函数什么也做不了 —— 纯粹的成本；
+      · 下游那两个装载面各自已经堵住：`_probe_pool_image_refs` 先经
+        `_resolve_serving_versions` 裁决，再按 `(doc_id, version_no)` 取 refs
+        （根本不装非 serving 版本的 refs），expand 之后有消费点③重新过门。
+
+    `image_refs` 走 `_normalize_image_refs` 而非裸 truthiness —— `'[]'` / `'null'`
+    都是真值字符串（`_row_has_images` 同款教训）。
+    """
+    if any(r.get("oss_key") for r in _normalize_image_refs(c.get("image_refs"))):
+        return True
+    if c.get("source_image") or c.get("oss_key"):
+        return True
+    return (str(c.get("chunk_type") or "") in _IMAGE_ONLY_CHUNK_TYPES
+            or str(rds_chunk_type or "") in _IMAGE_ONLY_CHUNK_TYPES)
+
+
+def _strip_images(c: Dict[str, Any]) -> Dict[str, Any]:
+    """剥掉一行的出图载荷，保留正文（返回副本，绝不就地改调用方的 dict）。
+
+    三个键都要清：`image_refs`（step/vk/probe 装载的）、`source_image`（HA3 直接回的
+    首图）、`oss_key`（部分行形态直接带）。少清一个，`llm_generator` 那条
+    `(image_refs) or source_image` 的 or 链就会把图放回去。
+    """
+    out = dict(c)
+    out["image_refs"] = []
+    out["source_image"] = ""
+    out["oss_key"] = ""
+    out["_stale_image_stripped"] = True
+    return out
+
+
+def _resolve_serving_versions(cur, doc_ids: List[str]) -> Dict[str, Optional[int]]:
+    """每个 doc「当前实际在服务的版本」——版本门与 probe **共用的唯一权威解析**。
+
+    三态裁决（codex 2026-08-06 收窄，宽 fallback 已被证伪，见下）：
+      · 存在「完整 INDEXED」的 active 版本 ⇒ 取其中最高者（`complete_max`）；
+      · 无完整版本、但**只有一个** active 版本 ⇒ 取它（`single_active_fallback`）；
+      · 无完整版本、且有**多个** active 版本 ⇒ **None = 无从裁决 ⇒ fail-closed**；
+      · 无 active 行（整篇退役）⇒ None ⇒ fail-closed。
+
+    「完整 INDEXED」= 该 (doc, version) 下**没有** active 且 `index_status != 'INDEXED'` 的行。
+    与本仓既有判据同源：`pipeline_nodes.py` 停用闸、`spot_checker.reconcile_stranded_versions`。
+
+    🔴 为什么单版本 fallback 必须存在：ACL 重投影 / 标题分类投影 / 可见性变更都会把
+    **正在服务的那一版**的 active chunk 标成 `NOT_INDEXED`（`access_grants.py:507`、
+    `routes/kb_console.py:3782`）—— 「无完整版本」因此是**常态**而非脏数据；不给 fallback，
+    每次改个权限就会让该文档的图集体消失。
+
+    🔴 为什么 fallback 不能放宽成「无完整版本就取 MAX(active)」（我提过，codex 举反例否掉）：
+    可达状态是 vN 正在服务但被投影标脏、同时 vN+1 在 DAG3 **部分**推送成功
+    （图片 chunk 已 INDEXED 进了 HA3、兄弟 chunk FAILED）。两版都不完整，宽 fallback 会选中
+    vN+1 —— 而系统正因为 vN+1 不完整才**刻意保留** vN。那是**错版本投放**，比少图严重。
+    多 active 版本且无完整版本 = 真歧义，只能 fail-closed。
+    """
+    if not doc_ids:
+        return {}
+    ph = ",".join(["%s"] * len(doc_ids))
+    # 单查询同时取三个量（内层按版本聚合完整性，外层按 doc 归并）。分成两条聚合会重复扫同一批
+    # active 行，且在隔离级别变化时可能落在两个快照上。
+    cur.execute(
+        "SELECT doc_id,"
+        "       MAX(CASE WHEN nonindexed = 0 THEN version_no END) AS complete_max,"
+        "       MAX(version_no) AS active_max,"
+        "       COUNT(*) AS active_version_count"
+        "  FROM (SELECT doc_id, version_no,"
+        "               SUM(CASE WHEN index_status = 'INDEXED' THEN 0 ELSE 1 END) AS nonindexed"
+        "          FROM chunk_meta"
+        f"        WHERE doc_id IN ({ph}) AND is_active = 1"
+        "         GROUP BY doc_id, version_no) v"
+        " GROUP BY doc_id",
+        tuple(doc_ids))
+    out: Dict[str, Optional[int]] = {}
+    for row in (cur.fetchall() or []):
+        # ⚠️ 行形态**两种都要吃**：本 helper 被两处调用，而它们的游标类型不同 ——
+        # 版本门用默认元组游标，`_probe_pool_image_refs` 用 `pymysql.cursors.DictCursor`。
+        # 直接按四元组解包 dict 会解出**键名**，`int("complete_max")` 抛 ValueError，
+        # 再被 probe 的 fail-open 吞掉 ⇒ 生产上 probe **永远装不上图**（功能静默失效、
+        # 测试却全绿，因为桩的 `cursor(*a, **k)` 忽略了 cursor 类）。codex 2026-08-06 实证。
+        if isinstance(row, dict):
+            doc_id = row.get("doc_id")
+            complete_max = row.get("complete_max")
+            active_max = row.get("active_max")
+            n_ver = row.get("active_version_count")
+        else:
+            doc_id, complete_max, active_max, n_ver = row
+        if complete_max is not None:
+            out[str(doc_id)] = int(complete_max)
+        elif int(n_ver or 0) == 1:
+            # 唯一 active 版本被投影标脏 ⇒ 它就是在服务的那一版，无歧义
+            out[str(doc_id)] = int(active_max)
+        else:
+            out[str(doc_id)] = None      # 多版本且都不完整 ⇒ 歧义 ⇒ 不裁决
+    return out
+
+
+def _deny_stale_version_images(
+    rows: List[Dict[str, Any]], *, source: str = "",
+) -> List[Dict[str, Any]]:
+    """版本门：非**当前版本**的图一律不得进入下游（不论渲染、还是外发第三方重排）。
+
+    缺陷（2026-08-06 codex 补评审，三条均已独立复现）：
+      1. 🔴 4c 的 SQL 只取 `chunk_id/is_active/permission_level/owner_dept/id`——**无版本列**。
+         双活版本窗口里旧版图 `is_active=1` 干净通过；而 `cosurface_doc_images` 遇到
+         `any(chunk_type=='image')` **直接短路**，cosurface 内那段版本 fail-closed 根本
+         没机会跑 ⇒ 主命中的旧版本图被直接投放。
+      2. 🔴 `_probe_pool_image_refs` 在 **rerank 之前**从 RDS 附 `image_refs`，
+         `reranker._img_key` 取它、签名后进 `docs[].image_url` ⇒ **旧版本图会先被外发给
+         DashScope 的 qwen3-vl-rerank**。那不是显示问题，是数据流出第三方。
+         （缓解：`rerank_enable`/`rerank_img_probe` 现网默认均 False ⇒ 本门是「开 rerank
+         之前必须修好」的前置条件，不是正在流血。）
+
+    逐行五类处置（**不是**调用级参数 —— codex 明确否掉了 `drop_refs_only` 当调用级开关：
+    同一批里 image 行与带图正文行的正确处置本就不同）：
+      · `image` / `visual_knowledge` 陈旧 ⇒ 丢行；
+      · 其余类型陈旧 ⇒ 剥图保正文；
+      · 无键（`chunk_id`/`id` 都没有）⇒ fail-closed（缺陷 2 的同族：无从复核不等于放行）；
+      · RDS 查不到该行 / 该 doc 解析不出 serving 版本 ⇒ fail-closed；
+      · 等于 serving 版本 ⇒ 原样。
+
+    ⚠️ 版本取 **RDS 的 `chunk_meta.version_no`**，不取 HA3 返回的 `version_no`：后者是被
+    复核的对象，拿它当依据等于让投影自证。（HA3 确实回真值——2026-08-04 prod-ro 实证
+    4699/4699 非零——但那是「可用作旁证」，不是「可用作权威」。）
+
+    SIM 两档（codex 第二轮点名，不可合并）：
+      · 全模拟（`simulate_db` 且 `simulate_opensearch`）⇒ no-op：没有真数据面，门无意义；
+      · **半模拟**（`simulate_db` + 真 HA3）⇒ **fail-closed**：
+        `_validate_environment_target_consistency` 在 `simulate_db` 时**跳过 RDS 目标校验**
+        ⇒ 这一档完全没有守卫，不能 warning 后放行。
+    """
+    if not rows:
+        return rows
+    scoped = [i for i, c in enumerate(rows) if _row_carries_image(c)]
+    if not scoped:
+        return rows           # 全批不出图 → 零 DB 往返
+
+    cfg = get_config()
+    if cfg.simulate_db:
+        if cfg.simulate_opensearch:
+            return rows       # 全模拟：无真数据面
+        # 半模拟（假 DB + 真 HA3）：无守卫档，fail-closed
+        logger.warning("版本门%s：半模拟档（simulate_db + 真 HA3）无权威可查 —— fail-closed",
+                       f"（{source}）" if source else "")
+        return _apply_stale_disposition(rows, scoped, {}, source=source, unverifiable=True)
+
+    cid_axis = sorted({str(rows[i].get("chunk_id")) for i in scoped if rows[i].get("chunk_id")})
+    pk_axis = sorted({str(rows[i].get("id")) for i in scoped
+                      if not rows[i].get("chunk_id") and rows[i].get("id") not in (None, "")})
+    verdicts: Dict[str, Tuple[bool, Optional[str]]] = {}
+    try:
+        from opensearch_pipeline.db import _get_db_conn   # 惰性：tests monkeypatch db._get_db_conn
+        conn = _get_db_conn()
+        try:
+            fetched = []
+            with conn.cursor() as cur:
+                _sel = ("SELECT cm.chunk_id, cm.id, cm.chunk_type, cm.version_no, cm.doc_id"
+                        " FROM chunk_meta cm")
+                # 两条查询轴必须**都**查（4c 的老教训：把两者压进同一个列表按 chunk_id 查，
+                # 「只有 HA3 id」的历史行永远查不到，所谓 id 兜底是假的）。
+                if cid_axis:
+                    ph = ",".join(["%s"] * len(cid_axis))
+                    cur.execute(f"{_sel} WHERE cm.chunk_id IN ({ph})", tuple(cid_axis))
+                    fetched.extend(cur.fetchall() or [])
+                if pk_axis:
+                    ph2 = ",".join(["%s"] * len(pk_axis))
+                    cur.execute(f"{_sel} WHERE cm.id IN ({ph2})", tuple(pk_axis))
+                    fetched.extend(cur.fetchall() or [])
+                serving = _resolve_serving_versions(
+                    cur, sorted({str(r[4]) for r in fetched if r[4] is not None}))
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 — 权威不可达 ⇒ fail-closed（丢图不丢正文）
+        logger.warning("版本门%s：权威表不可达 —— fail-closed（%s）",
+                       f"（{source}）" if source else "", e)
+        return _apply_stale_disposition(rows, scoped, {}, source=source, unverifiable=True)
+
+    for r in fetched:
+        want = serving.get(str(r[4])) if r[4] is not None else None
+        ok = want is not None and str(r[3]) == str(want)
+        rct = str(r[2] or "")
+        if r[0]:
+            verdicts[f"cid:{r[0]}"] = (ok, rct)
+        if r[1] is not None:
+            verdicts[f"pk:{r[1]}"] = (ok, rct)
+    return _apply_stale_disposition(rows, scoped, verdicts, source=source)
+
+
+def _apply_stale_disposition(
+    rows: List[Dict[str, Any]],
+    scoped: List[int],
+    verdicts: Dict[str, Tuple[bool, Optional[str]]],
+    *,
+    source: str = "",
+    unverifiable: bool = False,
+) -> List[Dict[str, Any]]:
+    """把版本裁决落到每一行（`_deny_stale_version_images` 的处置半边，便于单测直驱）。
+
+    `unverifiable=True`（半模拟 / RDS 不可达）⇒ 作用域内全部按陈旧处置。
+    """
+    scoped_set = set(scoped)
+    out: List[Dict[str, Any]] = []
+    dropped = stripped = 0
+    for i, c in enumerate(rows):
+        if i not in scoped_set:
+            out.append(c)
+            continue
+        cid, pk = c.get("chunk_id"), c.get("id")
+        if unverifiable:
+            ok, rct = False, None
+        elif not cid and pk in (None, ""):
+            ok, rct = False, None      # 两个轴都没有键 ⇒ 无从复核 ⇒ 不放行
+        else:
+            key = f"cid:{cid}" if cid else f"pk:{pk}"
+            ok, rct = verdicts.get(key, (False, None))
+        if ok:
+            out.append(c)
+            continue
+        # 类型判定取 HA3 侧与 RDS 侧的**并集**：HA3 投影可能陈旧到连 chunk_type 都不对。
+        if (str(c.get("chunk_type") or "") in _IMAGE_ONLY_CHUNK_TYPES
+                or str(rct or "") in _IMAGE_ONLY_CHUNK_TYPES):
+            dropped += 1
+            continue
+        out.append(_strip_images(c))
+        stripped += 1
+    if dropped or stripped:
+        logger.info("版本门%s：丢弃 %d 条纯图行、剥图保正文 %d 条（非当前版本或无从复核）",
+                    f"（{source}）" if source else "", dropped, stripped)
+    return out
 
 
 def _search_chunks_opensearch(
@@ -1230,10 +1517,12 @@ def search_chunks(
     #  生产配置了 HA3 endpoint，此分支不可达 —— 2026-06-10 本地 E2E 引入）
     _full_cfg = get_config()
     if not _full_cfg.alibaba_vector.endpoint and getattr(_full_cfg.opensearch, "host", ""):
-        return _revalidate_main_hits(_deny_revoked_cross_dept(
+        # 本地 OS 回退**同样**过版本门：它是 return，不经下方 4b/4c/4d，只接主路等于
+        # 「另一条执行路径恒不触发」（本仓 flag 传播的老教训）。
+        return _deny_stale_version_images(_revalidate_main_hits(_deny_revoked_cross_dept(
             _search_chunks_opensearch(query, dense, top_k, user_dept, degraded=degraded,
                                       acl_ctx=acl_ctx),
-            user_dept, acl_ctx=acl_ctx))
+            user_dept, acl_ctx=acl_ctx)), source="主命中/本地OS回退")
 
     client = _get_ha3_client()
 
@@ -1333,6 +1622,10 @@ def search_chunks(
 
     # 4c. 主命中 RDS 复核（P3-1）：is_active/权限轴与权威表不一致的陈旧投影不投放。
     results = _revalidate_main_hits(results)
+
+    # 4d. 图片版本门（消费点①）：4c **不看版本**，双活窗口里旧版本图 is_active=1 会干净通过。
+    # 有意放在 4c 之后且**不受 main_hit_revalidate 门控**——那是性能开关，不该能关掉安全门。
+    results = _deny_stale_version_images(results, source="主命中")
 
     # 5. （F-20）原 max_distance「距离上限」过滤已删除：HA3 索引是 InnerProduct（score 是相似度，
     # 越大越相关），不存在「距离」；旧代码 `score <= max_distance` 方向与内积相反，会把最相关结果全滤掉。
@@ -2225,44 +2518,24 @@ def cosurface_doc_images(
     #     折叠掉了 ⇒ 稳态下当前版本正文也能配上旧版本的图。
     # 复核必须在 best_by_doc **之前**：否则排第一的失效图被丢后，同文档排第二的有效图
     # 没有递补机会（本来能出图的文档变成不出图）。
-    _ver_by_doc = {}
-    for c in chunks:
-        d, v = c.get("doc_id"), c.get("version_no")
-        if d and d not in _ver_by_doc and str(v or "") not in ("", "0"):
-            _ver_by_doc[d] = str(v)
     _n_raw = len(img_results)
-    # 版本轴：**fail-closed** —— 版本对不上、或任一边版本未知，都不补这张图（2026-08-04 改）。
-    #
-    # 🔴 本处原为 fail-open，理由写的是「HA3 是否回填 version_no 无法对真实 HA3 验证」。
-    #    那条理由**是错的**，仓内有三份证据（2026-08-04 复核 codex 建议时查出）：
-    #      1. `docs/ha3_stg_table_spec.md` 是**生产表 fuling_kb_chunks 的实时导出**
-    #         （2026-06-10 只读 get_table），23 个字段里明确含 `version_no INT64`；
-    #      2. `stitch_neighbor_chunks`（本文件 :1469，`16eb40b` 2026-06-28 起）拿 HA3 返回的
-    #         version_no 去建 `WHERE version_no=%s` —— 若 HA3 不回该字段，`center_ver=0`，
-    #         邻居拼接从那天起就会是**静默全空**；它没有，所以 HA3 确实回了真值；
-    #      3. `_fetch_cosurface_images` 用的 `HA3_DEFAULT_OUTPUT_FIELDS` 本就请求了 version_no。
-    #    ⇒ 生产路径上"版本未知"是**异常**而非常态，对异常 fail-open 是错的默认。
+    # 版本轴（消费点④）：**fail-closed** —— 非当前版本、或无从复核，都不补这张图。
     #
     # 为什么这一轴不能省（4b/4c 都覆盖不到）：`_revalidate_main_hits` 只比
     # chunk_id / is_active / permission_level / owner_dept / id，**不看版本**；而双活版本
     # 窗口里旧版本 chunk 本就是 `is_active=1` ⇒ 旧版本的图能干干净净地通过 4c。
-    _ver_bad = 0
-
-    def _ver_ok(r) -> bool:
-        want = _ver_by_doc.get(r.get("doc_id"))
-        if not want:                       # 主命中侧版本未知 ⇒ 无从比对 ⇒ 不补（codex 原议）
-            return False
-        got = str(r.get("version_no") or "0")
-        return got != "0" and got == want
-
-    img_results, _kept = [], img_results
-    for r in _kept:
-        if _ver_ok(r):
-            img_results.append(r)
-        else:
-            _ver_bad += 1
-    if _ver_bad:
-        logger.info("cosurface 版本轴丢弃 %d 条（版本不符或任一边版本未知，fail-closed）", _ver_bad)
+    #
+    # 🔴 2026-08-06 改：权威值从「主结果里首个非零 version_no」换成**该 doc 最高的
+    #    「完整 INDEXED」active 版本**（`_resolve_serving_versions`；中途提过的
+    #    `document_meta.current_version_no` 与 `MAX(active)` 都已被证伪，理由见该函数
+    #    docstring）。原 `_ver_by_doc` 已整段删除 ——
+    #    它既不是权威值（拿被复核的 HA3 投影自证），胜出者**还取决于主结果的排序**：
+    #    同一 doc 的多个命中版本不同时，谁排第一谁说了算，这不是任何人定义过的语义。
+    #    该策略此前零契约守卫（改成「取最后一个版本」全绿），现由版本门的测试面钉住。
+    #
+    # 位置：必须在 `best_by_doc` **之前** —— 否则排第一的失效图被丢后，同文档排第二的
+    # 有效图没有递补机会（本来能出图的文档变成不出图）。
+    img_results = _deny_stale_version_images(img_results, source="cosurface 补图")
     # 4b：撤销跨部门授权即时生效（4c 有意不比对 allowed_depts，故这条不可省）
     img_results = _deny_revoked_cross_dept(img_results, user_dept, acl_ctx=acl_ctx)
     # 4c：is_active / ACL 轴 / 物理 PK 轴。strict——补图失败只是没配图，绝不拿未复核的图去赌
@@ -2345,7 +2618,8 @@ def _probe_pool_image_refs(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     重排发生在 expand_step_context 之前：step_card 此时无 image_refs（RDS 未拉）
     且 HA3 行无 source_image → reranker._img_key 恒 None，qwen3-vl-rerank 对带图
     step_card 结构性失明；rerank OFF 的近平局倾斜同样无信号可用。本函数对池内
-    step_card 批量 IN 查 chunk_meta.image_refs_json（PK 索引、一次往返）并经
+    step_card 批量 IN 查 chunk_meta.image_refs_json（PK 索引；先经
+    `_resolve_serving_versions` 裁决 serving 版本，故为**两条** SQL）并经
     _normalize_image_refs 附到 chunk 上——expand 的 C2/兄弟逻辑对已带 refs 的
     chunk 幂等（`if meta_row and not chunk.get("image_refs")`），不会重复装载。
     任何失败原样返回（fail-open，优雅降级铁律）。
@@ -2368,11 +2642,22 @@ def _probe_pool_image_refs(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
         conn = _get_db_conn()
         cursor = conn.cursor(pymysql.cursors.DictCursor)
+        # 消费点②（图片版本门，2026-08-06）：本函数跑在 rerank **之前**，装上的 refs 会被
+        # `reranker._img_key` 取走、签名后进 `docs[].image_url` ⇒ 旧版本图会先被外发给
+        # DashScope 的 qwen3-vl-rerank。所以不能"先装上、下游再剥"，必须**根本不装**。
+        # 权威解析与主门**共用** `_resolve_serving_versions`（两套 SQL 迟早漂移）。
+        serving = _resolve_serving_versions(
+            cursor, sorted({str(c.get("doc_id")) for c in chunks if c.get("doc_id")}))
+        pairs = [(d, v) for d, v in serving.items() if v is not None]
+        if not pairs:
+            return chunks      # 一个 doc 都裁决不出 serving 版本 ⇒ 一张图都不装（fail-closed）
         ph = ",".join(["%s"] * len(ids))
+        # version_no 是语义守卫（chunk_id 已唯一）；`is_active=1` 不可省。
+        _vc = " OR ".join(["(cm.doc_id=%s AND cm.version_no=%s)"] * len(pairs))
         cursor.execute(
-            f"SELECT chunk_id, image_refs_json FROM chunk_meta "
-            f"WHERE chunk_id IN ({ph}) AND is_active = 1",
-            tuple(ids),
+            f"SELECT cm.chunk_id, cm.image_refs_json FROM chunk_meta cm "
+            f"WHERE cm.chunk_id IN ({ph}) AND cm.is_active = 1 AND ({_vc})",
+            tuple(ids) + tuple(x for p in pairs for x in p),
         )
         for row in cursor.fetchall():
             refs_by_id[row["chunk_id"]] = row.get("image_refs_json")
@@ -2700,6 +2985,15 @@ def retrieve_and_enrich(
                     _shared_conn.close()   # 池化连接 close = 归还池
                 except Exception:   # noqa: BLE001
                     pass
+    # 消费点③（图片版本门）：**expand_step_context** 会从 RDS 新装 image_refs
+    # （给 step_card / visual_knowledge / 展开出来的兄弟步骤）——那是独立于主命中的注入面，
+    # 主命中过了门不代表这里装上的是 serving 版本。
+    # ⚠️ 注意 stitch_neighbor_chunks **不**装图（它的 SELECT 只有 doc_id/version_no/
+    # chunk_index/chunk_text/section_title/permission_level/owner_dept 七列）——本注释此前
+    # 写成"stitch/expand 都会装"，会误导后续接线审计（codex 2026-08-06 点名）。
+    # 放在连接作用域**之外**（与 _attach_doc_dates 同侧），不掺进 stitch/expand 那次 checkout。
+    if chunks:
+        chunks = _deny_stale_version_images(chunks, source="expand 后")
     # 图片召回增强（仅多模态渲染路径 opt-in；可经 RAG_IMAGE_COSURFACE 全局关闭；
     # P2-4 嵌入降级时跳过，理由见上方 _cos_pref 注释）
     if chunks and cosurface_images and get_config().rag.image_cosurface and not _emb_degraded:

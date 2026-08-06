@@ -107,18 +107,72 @@ def test_retrieve_and_enrich_opt_in_gating(mock_search, mock_stitch, mock_expand
 
 # ── 版本轴 fail-closed（2026-08-04，复核 codex 对 e5e29ce 的建议后改回）─────────
 
+def _gate_env(monkeypatch, *, vrows, srows, imgs, simulate_db=False, simulate_os=False):
+    """把版本门接到一个可控的权威表上（默认真 DB 档）。就地打桩，返回 None。
+
+    ⚠️ `_fetch_cosurface_images` **必须一并打桩**：本函数替换的 cfg 是个
+    SimpleNamespace，没有 `alibaba_vector` —— 取图会抛异常走 cosurface 的 fail-open
+    出口，于是"没有图"恒成立，「图被丢弃」类断言**全部变成空转**（本文件 2026-08-06
+    首版就踩了这个，`test_stale_version_image_is_dropped` 假绿了一轮）。
+    """
+    import types
+    from opensearch_pipeline import db as _db
+
+    monkeypatch.setattr(retriever, "_fetch_cosurface_images",
+                        lambda *a, **k: [dict(i) for i in imgs])
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            self.k = ("serving" if "active_version_count" in sql
+                      else "identity" if "cm.chunk_type" in sql else "acl")
+
+        def fetchall(self):
+            return {"serving": srows, "identity": vrows}.get(getattr(self, "k", ""), [])
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(retriever, "get_config", lambda: types.SimpleNamespace(
+        simulate_db=simulate_db, simulate_opensearch=simulate_os, simulate=False,
+        rag=types.SimpleNamespace(main_hit_revalidate=False, allowed_depts_acl=False)))
+    monkeypatch.setattr(_db, "_get_db_conn", lambda: _Conn())
+
+
 @patch("opensearch_pipeline.retriever._parse_ha3_response")
 @patch("opensearch_pipeline.retriever._get_ha3_client")
 @patch("opensearch_pipeline.retriever.get_query_embedding", return_value=([0.1] * 8, [], []))
-def test_stale_version_image_is_dropped(mock_emb, mock_client, mock_parse):
+def test_stale_version_image_is_dropped(mock_emb, mock_client, mock_parse, monkeypatch):
     """★ 旧版本的图**不得**配到当前版本的正文上。
 
     双活版本窗口（新版已 INDEXED、旧版尚未 deactivate）里旧版本 chunk 仍 `is_active=1`
     ⇒ 它能干净通过 4c（`_revalidate_main_hits` 只比 chunk_id/is_active/permission/owner/id，
-    **不看版本**）。版本轴是唯一能挡住它的一道。
+    **不看版本**）。版本门是唯一能挡住它的一道。
+
+    2026-08-06：权威值改为**该 doc 最高的「完整 INDEXED」active 版本**
+    （`_resolve_serving_versions`）；HA3 自报的 version_no 不再参与裁决（它正是被复核的
+    对象）。故本条由权威表桩建模"该 chunk 是 v2、serving 是 v3"，并刻意让 HA3 侧**谎报**
+    v3 —— 若权威取错边，本条即红。
     """
     mock_client.return_value = MagicMock()
-    mock_parse.return_value = [dict(_IMGS[0], version_no=2)]      # 正文是 v3，图是 v2
+    img = dict(_IMGS[0], version_no=3, chunk_id="cA", id="11")   # HA3 谎报 v3
+    # 先立反证锚：权威说"当前版本"时这张图**确实出得来**，否则下面的断言是空转的。
+    _gate_env(monkeypatch, vrows=[("cA", "11", "image", 3, "A")],
+              srows=[("A", 3, 3, 1)], imgs=[img])
+    ok = retriever.cosurface_doc_images("q", _chunks(ver=3))
+    assert [c for c in ok if c["chunk_type"] == "image"], "反证锚失败：当前版本的图本就出不来"
+
+    _gate_env(monkeypatch, vrows=[("cA", "11", "image", 2, "A")],
+              srows=[("A", 3, 3, 1)], imgs=[img])  # RDS: 本行 v2、serving 是 v3
     out = retriever.cosurface_doc_images("q", _chunks(ver=3))
     assert not [c for c in out if c["chunk_type"] == "image"], "旧版本的图被配进了当前版本正文"
 
@@ -126,25 +180,28 @@ def test_stale_version_image_is_dropped(mock_emb, mock_client, mock_parse):
 @patch("opensearch_pipeline.retriever._parse_ha3_response")
 @patch("opensearch_pipeline.retriever._get_ha3_client")
 @patch("opensearch_pipeline.retriever.get_query_embedding", return_value=([0.1] * 8, [], []))
-def test_unknown_version_is_fail_closed(mock_emb, mock_client, mock_parse):
-    """★ 任一边版本未知 ⇒ **不补**（fail-closed，codex 原议）。
+def test_version_gate_sim_tiers(mock_emb, mock_client, mock_parse, monkeypatch):
+    """★ SIM **两档不可合并**（codex 第二轮点名）。
 
-    此前是 fail-open，写的理由是「HA3 是否回填 version_no 无法验证」。那条理由**是错的**：
-    `docs/ha3_stg_table_spec.md` 是生产表实时导出、含 `version_no INT64`；且
-    `stitch_neighbor_chunks` 自 `16eb40b`(2026-06-28) 起就拿它建 WHERE —— 若 HA3 不回该字段，
-    邻居拼接从那天起会是静默全空。⇒ 生产上"版本未知"是**异常**，对异常 fail-open 是错的默认。
+    · 全模拟（假 DB + 假 HA3）⇒ **no-op**：没有真数据面，门无意义，强行 fail-closed
+      只会让 `make sim-all` 与所有演示路径一张图都不出；
+    · **半模拟**（假 DB + **真 HA3**）⇒ **fail-closed**：这一档
+      `_validate_environment_target_consistency` 会**跳过 RDS 目标校验**，等于完全没有
+      守卫 —— 不能 warning 后放行。
+
+    两档合并成任意一边，本条即红。
     """
     mock_client.return_value = MagicMock()
-    for bad in ({}, {"version_no": 0}, {"version_no": None}, {"version_no": ""}):
-        mock_parse.return_value = [dict(_IMGS[0], **bad)] if bad else [
-            {k: v for k, v in _IMGS[0].items() if k != "version_no"}]
-        out = retriever.cosurface_doc_images("q", _chunks(ver=3))
-        assert not [c for c in out if c["chunk_type"] == "image"], f"图侧版本={bad} 仍被放行"
-    # 反过来：正文侧版本未知也不补
-    mock_parse.return_value = list(_IMGS)
-    out = retriever.cosurface_doc_images("q", [{k: v for k, v in c.items() if k != "version_no"}
-                                               for c in _chunks()])
-    assert not [c for c in out if c["chunk_type"] == "image"], "正文侧版本未知时仍补了图"
+    img = dict(_IMGS[0], version_no=3, chunk_id="cA", id="11")
+
+    # 两档喂**同样的**权威表（空集 = 查不到任何行），差别只在 simulate_opensearch。
+    _gate_env(monkeypatch, vrows=[], srows=[], imgs=[img], simulate_db=True, simulate_os=True)
+    out = retriever.cosurface_doc_images("q", _chunks(ver=3))
+    assert [c for c in out if c["chunk_type"] == "image"], "全模拟档应 no-op（图不该被拦）"
+
+    _gate_env(monkeypatch, vrows=[], srows=[], imgs=[img], simulate_db=True, simulate_os=False)
+    out = retriever.cosurface_doc_images("q", _chunks(ver=3))
+    assert not [c for c in out if c["chunk_type"] == "image"], "半模拟档必须 fail-closed"
 
 
 def test_local_os_fallback_selects_version_no():

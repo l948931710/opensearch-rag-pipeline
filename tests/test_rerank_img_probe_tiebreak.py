@@ -26,17 +26,31 @@ def _set_rag(monkeypatch, **kw):
 
 
 class _ProbeCursor:
-    def __init__(self, refs_by_id):
+    """2026-08-06：probe 现在发**两次**查询 —— 先经共用的 `_resolve_serving_versions`
+    裁决每个 doc 的 serving 版本，再按 (doc_id, version_no) 约束取 refs。
+    旧桩对任何 SQL 都回 refs 行，改动后会让 serving 解析恒空 ⇒ 一张图都装不上。"""
+
+    def __init__(self, refs_by_id, serving=(("D1", 3, 3, 1),)):
         self.refs_by_id = refs_by_id
+        self.serving = list(serving)
         self.executed = []
+        self._rows = []
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
+        if "active_version_count" in sql:
+            self._rows = list(self.serving)
+            return
         self._rows = [
             {"chunk_id": cid, "image_refs_json": refs}
             for cid, refs in self.refs_by_id.items()
             if cid in (params or ())
         ]
+
+    @property
+    def refs_sql(self):
+        """refs 查询（跳过 serving 解析那条）——断言应锚到它，别锚到第一条。"""
+        return [e for e in self.executed if "active_version_count" not in e[0]]
 
     def fetchall(self):
         return list(self._rows)
@@ -58,15 +72,32 @@ def test_probe_attaches_refs_to_step_cards():
     refs = json.dumps([{"oss_key": "s1.png", "caption": "图"}])
     cur = _ProbeCursor({"S1": refs})
     chunks = [
-        {"chunk_type": "step_card", "chunk_id": "S1", "score": 8.0, "chunk_text": "x"},
-        {"chunk_type": "text_chunk", "chunk_id": "T1", "score": 7.9},
+        {"chunk_type": "step_card", "chunk_id": "S1", "doc_id": "D1", "score": 8.0,
+         "chunk_text": "x"},
+        {"chunk_type": "text_chunk", "chunk_id": "T1", "doc_id": "D1", "score": 7.9},
     ]
     with patch("opensearch_pipeline.db._get_db_conn", return_value=_conn(cur)):
         out = _probe_pool_image_refs(chunks)
     assert out[0]["image_refs"][0]["oss_key"] == "s1.png"
     assert "image_refs" not in out[1]                      # 非 step_card 不动
-    assert len(cur.executed) == 1                          # 单次批量 IN 查询
-    assert "is_active = 1" in cur.executed[0][0]
+    assert len(cur.refs_sql) == 1                          # refs 仍是单次批量 IN 查询
+    assert "cm.is_active = 1" in cur.refs_sql[0][0]
+    assert "cm.version_no" in cur.refs_sql[0][0]           # 版本约束不可省
+
+
+def test_probe_loads_nothing_when_serving_version_is_ambiguous():
+    """★ 该 doc 有两个 active 版本且都不完整 ⇒ serving 无从裁决 ⇒ **一张图都不装**。
+
+    probe 在 rerank **之前**：装上的 refs 会被 `reranker._img_key` 取走、签名后进
+    `docs[].image_url` 外发 DashScope。所以歧义态不能"先装上、下游再剥"。
+    """
+    refs = json.dumps([{"oss_key": "s1.png"}])
+    cur = _ProbeCursor({"S1": refs}, serving=(("D1", None, 4, 2),))
+    chunks = [{"chunk_type": "step_card", "chunk_id": "S1", "doc_id": "D1", "score": 8.0}]
+    with patch("opensearch_pipeline.db._get_db_conn", return_value=_conn(cur)):
+        out = _probe_pool_image_refs(chunks)
+    assert "image_refs" not in out[0]
+    assert cur.refs_sql == [], "歧义态下不该发出 refs 查询"
 
 
 def test_probe_skips_chunks_with_existing_refs_and_is_failopen():
@@ -86,10 +117,11 @@ def test_probe_skips_chunks_with_existing_refs_and_is_failopen():
 def test_probe_drops_refs_without_oss_key():
     refs = json.dumps([{"caption": "无图源"}])
     cur = _ProbeCursor({"S1": refs})
-    chunks = [{"chunk_type": "step_card", "chunk_id": "S1", "score": 8.0}]
+    chunks = [{"chunk_type": "step_card", "chunk_id": "S1", "doc_id": "D1", "score": 8.0}]
     with patch("opensearch_pipeline.db._get_db_conn", return_value=_conn(cur)):
         out = _probe_pool_image_refs(chunks)
     assert "image_refs" not in out[0]
+    assert cur.refs_sql, "反证锚：serving 可裁决时 refs 查询必须真的发出去过"
 
 
 # ═══════════════ (b) _image_tiebreak_reorder ═══════════════

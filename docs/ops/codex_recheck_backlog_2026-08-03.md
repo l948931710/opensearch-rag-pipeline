@@ -173,17 +173,94 @@ codex 裁决 **REVISE**：1 BLOCKER + 5 MAJOR。我方逐条核验 **7/7 属实�
 | 🟠 | P3-3 的第六个队列 `my-access-requests`：truncated 后端在回、前端在存、**全前端零消费** ⇒ 六队列实为五个 |
 | 🟡 | `get_conversation`：`LIMIT 200` + 无条件 `has_more=False`，docstring 自称「全部消息」。不在 P3-3 的六队列定义内，当时漏网 |
 
-### 待 Sam 拍板（未修）
-1. **`/api/search` 去留**：保留为正式 break-glass（还需强制 guard + 审计）还是彻底删除。
-   我倾向删——仓内 console / 小程序 / 钉钉 / eval 四类调用方都不依赖它。
-2. **feedback / review-task 的并发语义**：两者更新**都没有前态谓词**
-   （`WHERE message_id=%s AND feedback_type='downvote'` / `WHERE task_id=%s`）⇒ 静默
-   last-writer-wins。⚠️ **`decision_endpoint_shapes_2026-08-04.md` 宣称的「0 守卫缺口」
-   不成立**；仓里只对 gaps 做过 last-action-wins 的明确裁决，这两处没有。
-   另 `/api/kb/admin-grants` 完全漏审（跨 `user_role` + 两张 grant 表写入，前置读无 `FOR UPDATE`）。
-3. **HA3 方向二（stale/zombie）恒绿**：`ok = not rds_active_missing and not vanished_docs`。
-   设计上有意，但 docstring 只论了**召回**（"harmless to recall"）、没论**机密性** ——
-   已退役文档的 chunk 残留在 HA3 是「本该消失的内容仍可检索」，不是清理滞后。
+### Sam 已拍板 → 已落地（`05385ab`，2026-08-06）
+1. ~~**`/api/search` 去留**~~ ⇒ **彻底删除**（连同 `SearchRequest`/`SearchResponse`/
+   `RAG_SEARCH_ENDPOINT_ENABLE` 总闸；守卫改向断言路由表无该 path）。
+2. ~~**feedback / review-task 的并发语义**~~ ⇒ 两处 UPDATE **加前态谓词** + 0 影响行分流
+   404/409，前端 `uploadErrText` 补 409 直出服务端文案。
+   ⚠️ `decision_endpoint_shapes_2026-08-04.md` 宣称的「0 守卫缺口」**已确认失实**。
+   `/api/kb/admin-grants` 漏审**仍开着**（跨 `user_role` + 两张 grant 表写入，前置读无
+   `FOR UPDATE`）—— 未随本批处理。
+3. ~~**HA3 方向二（stale/zombie）恒绿**~~ ⇒ 按子类**分级告警**（`rds_inactive` /
+   `orphan_chunkid` 计入，`dup` 不计），独立标题 + 独立去重槽；**有意不动 `ok` 与退出码**
+   （那属需 Sam 先知情的部署面变化，B6 同族）。
+
+### 第四项：图片「当前版本」不变量 —— 已实施（2026-08-06，未提交）
+
+Sam 拍板四项里范围最大的一条，`05385ab` 当时显式留作单独一批。核心是新增
+`_deny_stale_version_images` + `_resolve_serving_versions`（`retriever.py`），
+在 **4 个消费点**生效（主命中 4d / 本地 OS 回退 / expand 后 / cosurface 内），
+`_probe_pool_image_refs` 共用同一权威解析。
+
+✅ **权威值已回签**（Sam 2026-08-06：「图必须是当前版本就行」）——
+即**拍板的是意图、不是机制**：原字面拍板「以 `document_meta.current_version_no` 为准」
+被 codex 补评审证伪后，按下述口径实现，意图不变。实测证据：
+- `routes/kb_console.py:3072` 在**上传登记的同一个事务里**就把指针推到 N+1（摄取一步没跑）；
+  `asset_set_diff.py:185` 仓内自证「上一成功服务版本**不是** current_version_no 指针」
+  ⇒ 待审批 / DAG 处理中 / 索引失败期间会**正文照常、图片全没**，可能持续数天。
+- 退一步的 `MAX(version_no) WHERE is_active=1` 同样被证伪：新 chunk 在 **DAG2** 就以
+  `is_active=1 + NOT_INDEXED` 落库（`chunker.py:154`），只是把回归从「上传后」挪到「DAG2 后」。
+
+**实际采用**：该 doc 最高的「**完整 INDEXED**」active 版本；无完整版本但**只有一个** active
+版本时降级取它（ACL/标题/可见性投影会把**正在服务的那一版**标成 `NOT_INDEXED` ——
+`access_grants.py:507`、`kb_console.py:3782` —— 所以「无完整版本」是**正常投影更新会
+产生的合法过渡态**，不是异常，也不等于生产中长期普遍存在）；
+**多个** active 版本且都不完整 ⇒ 真歧义 ⇒ fail-closed。
+与本仓既有惯用法同源（`spot_checker.reconcile_stranded_versions`、stage-3 停用闸）。
+
+#### 上线前置项①：生产 `index_status` 分布 —— **已跑（2026-08-06，Sam 点名 prod-ro）**
+
+探针：`scratch/serving_version_distribution_probe_20260806.py`（全程只读，
+`get_prod_readonly_conn()` 会话级 READ ONLY；**直接调用 `_resolve_serving_versions` 本体**
+而非另写等价 SQL，否则分桶结论就不是关于将上线那段代码的证据）。
+
+⚠️ **首轮结论作废**：现网正处**语料真空期**，`chunk_meta` 只剩 **6 行 `is_active=1`**
+（`is_active=0` 有 63,882 行，document_meta 3,416 篇）。对 active 面的分桶只有 1 篇 doc、
+0 张图，「✅ 不会造成图消失」是**空转结论**，不足为据。改用退役 population 作**代理**测量：
+
+| 测量 | 结果 |
+|---|---|
+| 全量 63,888 行 `index_status` | INDEXED 29,403 (46.0%) / NOT_INDEXED 24,425 (38.2%) / DELETED 10,060 (15.8%) —— **无 NULL、无 FAILED** |
+| 版本组（doc×version，2,074 组）完整性 | 完整 1,547 (74.6%) / 不完整 527 (25.4%) |
+| **每篇 doc 的最新版本组** | **完整 1,544 / 1,557 = 99.17%**；不完整仅 **13 篇 (0.83%)** |
+| 「不完整」的成因构成 | 旧版：DELETED ×460 + NOT_INDEXED ×54；最新版：NOT_INDEXED ×9 + DELETED ×4 |
+| 13 篇最新版不完整中**带图**的 | **8 篇**（FINANCE 1 / MARKETING 4 / PRODUCTION 2 / QUALITY 1） |
+
+**判读**：不完整绝大多数（460/527 ≈ 87%）是**旧版退役产生的 DELETED**，那些行 `is_active=0`、
+不参与 serving ⇒ 无影响。真正相关的是最新版不完整的 13 篇（其中 8 篇带图）——
+只要它们重灌后**只有一个 active 版本**，就落进「单版本降级」⇒ **图照常服务**；
+只有在「两个 active 版本且都不完整」的瞬时窗口才会 fail-closed。
+codex 担心的 **NULL 语义在本语料里不存在**（0 行 NULL、0 行 FAILED）。
+
+🔴 **仍须在语料重灌完成后复跑本探针**：以上是退役 population 的代理测量，
+不能替代对真实 active 面的核验。重灌后 active 面成形，再跑一次即可定案。
+
+#### 上线前置项②：生产等量 `EXPLAIN` + 实测 —— **已跑（2026-08-06）**
+
+计划形态：外层 `type=ALL` + `Using temporary`；内层 `type=index key=idx_doc_version
+rows=57,410 filtered=8.11` —— 即**优化器没有用 `doc_id IN` 去 range-seek，而是扫索引**。
+现有 `idx_doc_active(doc_id,is_active)` / `idx_doc_version(doc_id,version_no)` 都不覆盖
+`index_status`，确如 codex 所料。
+
+实测（本机 → 杭州 RDS，**基线 RTT `SELECT 1` = 188–194 ms，必须先剥掉**）：
+
+| 样本 | 端到端 | **净成本（扣 RTT）** |
+|---|---|---|
+| 典型池（中位规模 20 篇；中位 16 chunk/篇、P90 54） | 193–206 ms | **≈ 0–15 ms** |
+| 最坏池（chunk 数最大的 20 篇，含 11,818 / 9,195 / 1,649） | 353–415 ms | ≈ 160–220 ms |
+
+**判读**：典型候选池的净成本落在 RTT 噪声内，**不构成上线阻塞**；真正吃成本的是那几篇
+万级 chunk 的巨型 doc（属离群值，中位数只有 16）。SAE 与 RDS 同 VPC，真实 RTT ~1ms，
+端到端会远好于上表。
+⇒ **暂不加覆盖索引** `(doc_id,is_active,version_no,index_status)`，但把它记为
+「若重灌后 active 面规模显著大于 63k、或巨型 doc 进入常规候选池，则重新评估」的待办。
+（⚠️ 本行数字来自退役 population 的代理基数；重灌后应随①一并复跑。）
+
+**已知残留**（均经 codex 确认「不使本批失效」，各自独立立项）：
+- gate→rerank 的窄 TOCTOU（过门时是 serving 版本、随后新版切服，仍可能签名外发）；
+- HA3 `source_image` 的**字段级**投影漂移（本门只验 chunk 身份属于 serving 版本）；
+- 本地 OpenSearch 回退的字符串 `id` vs 数字 `chunk_meta.id`（**既存**缺陷，在 4c 的物理
+  PK 轴上；版本门走 cid 轴不受影响）。
 
 ### §C-ter 自认开放项**不完整**
 上述五条它一项都没列到。这印证了 §C-bis 自己写的：同一个人复查同一批代码有系统性盲区。
