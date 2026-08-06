@@ -914,9 +914,17 @@ def search(req: SearchRequest, request: Request,
     ACL（server-side dept 过滤）与限频它是有的，缺的是治理与审计。
     全仓实测零消费方：console / 小程序 / 钉钉 / eval_harness 皆不调用。
 
-    `RAG_SEARCH_ENDPOINT_ENABLE=true` 可开回来 —— 开启时**会跑敏感 guard 前置**，
-    命中即返回空结果集，不会退回成绕过面。审计缺口仍在（本端点不落 qa 日志），
-    若要长期使用请先补审计。
+    `RAG_SEARCH_ENDPOINT_ENABLE=true` 可开回来。⚠️ **开回来的姿态经 2026-08-06 codex
+    补评审修正过两处**，别再照抄本文档串的旧说法：
+      ① 原文「开启时会跑敏感 guard 前置，不会退回成绕过面」**只说对了一半** ——
+         `sensitive_guard_route` 受**它自己的** `RAG_SENSITIVE_QUERY_GUARD` 门控，
+         该 flag 默认关时恒回 None。两个开关要**同时**开才有 guard。
+      ② 原实现调 `search_chunks` 时**不传 `acl_ctx`**，而 node-ACL 的读侧 fail-closed
+         复核(`_deny_revoked_cross_dept`)整段挂在 `acl_ctx is not None` 之下 ⇒
+         投影滞后期间、HA3 里陈旧 owner_dept 恰等于调用者组码的 node 文档会被直接投放
+         (`tests/test_node_acl_retriever.py::test_stale_real_owner_equal_to_caller_group_still_denied`
+         正是该场景的回归用例)。现已与 `/api/ask` 同构补齐。
+    审计缺口仍在（本端点不落 qa 日志），若要长期使用请先补审计。
     """
     if not get_config().rag.search_endpoint_enable:
         # 404 而非 403/410：让"已下线"看起来就是"没这个路径"，与 include_in_schema=False 一致。
@@ -935,7 +943,10 @@ def search(req: SearchRequest, request: Request,
         # 权限部门仅来自已验证的 Bearer 令牌；无令牌一律按匿名处理（仅 public 文档）。
         # 请求体里的身份字段绝不能反查部门授予 dept_internal 权限。
         user_dept = identity.acl_groups if identity else None
-        results = search_chunks(req.query, top_k=req.top_k, user_dept=user_dept)
+        # node-ACL 读身份：与 /api/ask 同构。缺了它 ⇒ retriever 的读侧 fail-closed 复核
+        # 整段被跳过（该复核门控在 `acl_ctx is not None`）。_build_acl_ctx 绝不抛。
+        results = search_chunks(req.query, top_k=req.top_k, user_dept=user_dept,
+                                acl_ctx=_build_acl_ctx(identity))
     except Exception as e:
         trace_id = get_request_id()
         logger.error("Search failed [trace=%s]: %s", trace_id, e, exc_info=True)
@@ -2265,7 +2276,15 @@ def list_conversations(request: Request, limit: int = 30, offset: int = 0,
 @app.get("/api/conversations/{conversation_id}", response_model=HistoryResponse)
 def get_conversation(conversation_id: str, request: Request,
                      identity: Optional[Identity] = Depends(current_identity)):
-    """某会话的全部消息（时间正序，走 idx_user_conversation_time）；复用 history 图文重签。仅本人。"""
+    """某会话的消息（时间正序，走 idx_user_conversation_time）；复用 history 图文重签。仅本人。
+
+    ⚠️ **硬上限 200 条**。2026-08-06 codex 补评审发现：原 docstring 自称「全部消息」，SQL 却
+    固定 `LIMIT 200`、且无条件返回 `has_more=False` —— 超长会话第 201 条起**静默消失**，
+    与 P3-3「no silent caps」纪律相悖（它只是不在 P3-3 定义的六个管理队列里，故当时漏网）。
+    现改为 `LIMIT 201` 取探针行 + 如实回 `has_more`。
+    与六队列口径一致：**不给「加载更多」** —— 真分页要稳定排序键，属设计变更另议
+    （`created_at` 只到秒，OFFSET 翻页会漏行/重行，见 d2c8e12 真库实测）。
+    """
     _enforce_rate_limit(request, identity, scope="aux")
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="需要登录")
@@ -2284,7 +2303,7 @@ def get_conversation(conversation_id: str, request: Request,
                     FROM {_op_db()}.qa_session_log
                     WHERE user_id=%s AND conversation_id=%s
                     ORDER BY created_at ASC, id ASC
-                    LIMIT 200
+                    LIMIT 201
                     """,
                     (identity.user_id, conversation_id),
                 )
@@ -2295,6 +2314,9 @@ def get_conversation(conversation_id: str, request: Request,
         trace_id = get_request_id()
         logger.error("get_conversation 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"会话读取失败 (trace: {trace_id})")
+    # N+1 探针行（与六队列同型）：多取一条只为判断有没有被截断，不外发。
+    _truncated = len(rows) > 200
+    rows = rows[:200]
     items: List[HistoryItem] = []
     for row in rows:
         message_id, question, answer_text, blocks_json, created_at, status = row
@@ -2312,7 +2334,7 @@ def get_conversation(conversation_id: str, request: Request,
             answer=strip_image_markers(answer_text or ""), blocks=blocks,
             created_at=str(created_at) if created_at else "", status=status or "",
         ))
-    return HistoryResponse(items=items, has_more=False)
+    return HistoryResponse(items=items, has_more=_truncated)
 
 
 class DeleteConversationResponse(BaseModel):

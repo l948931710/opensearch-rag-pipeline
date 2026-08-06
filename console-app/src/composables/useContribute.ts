@@ -211,17 +211,26 @@ async function loadMine(offset = 0) {
   await _loadMineInner(0)
 }
 
+// 追加代际，同 useKb.reviewTasksSeq：忙闸只挡追加对追加。提交/采纳/驳回/重试 ingestion
+// 都会触发 loadMine() 替换，在途的旧第 2 页回来仍会追加到刷新后的第 1 页上
+// （2026-08-06 codex 补评审确认）。
+let mineSeq = 0
+
 async function _loadMineInner(offset = 0) {
   const s = useSession()
   if (import.meta.env.DEV && s.token === 'dev-preview') { myContribs.value = _previewMine(); mineHasMore.value = false; return }
   clearLoadError('mine')
+  if (!offset) mineSeq++
+  const seq = mineSeq
   try {
     // P2-11：后端一直返回 has_more（contribution.py:741），此前被丢弃 ⇒ 贡献 >50 条的人
     // 只能看到最新 50 条、旧稿无从翻到，且界面看起来像「就这些」（与 pending 的 ε-1 同型）。
     const r = await apiJson<ContribListResp>(`/api/kb/contributions/mine?limit=50&offset=${offset}`, { auth: true })
+    if (seq !== mineSeq) return          // 期间列表已被替换 → 丢弃本页
     myContribs.value = offset ? [...myContribs.value, ...(r.items || [])] : (r.items || [])
     mineHasMore.value = !!r.has_more
   } catch (e) {
+    if (seq !== mineSeq) return
     if (!offset) myContribs.value = []
     noteLoadError('mine', e)
   }

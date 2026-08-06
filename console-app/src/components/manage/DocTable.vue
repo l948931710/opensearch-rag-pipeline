@@ -9,6 +9,7 @@ import StatusPill from './StatusPill.vue'
 import AccessSyncPill from './AccessSyncPill.vue'
 import LoadError from './LoadError.vue'
 import QueuePager from './QueuePager.vue'
+import TruncationNotice from '@/components/manage/TruncationNotice.vue'
 import { useDialog } from '@/composables/useDialog'
 
 const { confirm, notice } = useDialog()
@@ -18,7 +19,7 @@ const {
   ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, ledgerTotal, setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,
   docsPage, docsTotal, docsPerPage, docsMaxPage, loadDocsPage,
   setQuery, sortBy, setScope, enterVersionMode, retire, restore, openHistory, openDocPreview,
-  openAccessRequest, accessStateOf, accessNoteOf, loadDocs, loadErrors,
+  openAccessRequest, accessStateOf, accessNoteOf, loadDocs, loadErrors, truncatedQueues,
   openShare, openDocMeta, grantedLabelsByDoc, openVisibility,
   selectableVisible, selectedDocs, selectedCount, allVisibleSelected, isSelected, toggleSelect, toggleSelectAllVisible, clearSelection, bulkBusy, bulkMsg, bulkDone, bulkTotal, bulkRetire, bulkSetVisibility,
 } = useKb()
@@ -541,6 +542,12 @@ async function onRestore(d: DocItem) {
         :class="loadingDocs ? 'pointer-events-none opacity-60' : ''"
         @update:page="onPage"
       />
+      <!-- P3-3 收尾（2026-08-06 codex 补评审）：六队列里 my-access-requests 的 truncated
+           后端一直在回、前端也一直在存，但**全前端零消费** —— 等于这条截断从未被呈现过。
+           它驱动的是行内授权状态 pill（accessStateOf/accessNoteOf），截断的后果不是"少几行"，
+           而是**已申请的文档错显成「申请授权」**，用户会重复提交。故挂在台账而非某个队列里。 -->
+      <TruncationNotice class="px-[18px] pb-1" :when="truncatedQueues.myAccessRequests" :cap="100"
+                        label="我的授权申请" hint="超出部分的文档可能错显为「申请授权」，请勿重复提交" />
     </div>
   </section>
 </template>

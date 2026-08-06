@@ -279,6 +279,11 @@ const reviewTasks = ref<ReviewTaskItem[] | null>(null)
 const reviewTasksHasMore = ref(false)   // P2-11：后端 limit=20 此前静默截断，前端无从知道还有
 const reviewTasksLoadBusy = ref(false)   // 「加载更多」追加在途（独立核验：双击重复追加）
 const showClosedReviewTasks = ref(false)
+// 追加代际（照抄同文件 docsSeq，useKb.ts:739 的 loadMoreDocs 已是正确范式）。
+// 忙闸只挡「追加 vs 追加」，挡不住「追加在途时列表被替换」：切「显示已处理」/处置后重载
+// 都走 offset=0 替换，旧的第 2 页回来仍会追加到**新视图**上 ⇒ 两种视图混在一起
+// （2026-08-06 codex 补评审确认，非仅测试不足）。替换时自增，追加回来发现代际变了就丢弃。
+let reviewTasksSeq = 0
 const reviewTaskResolveBusy = ref<Set<string>>(new Set())
 // 共享目标可选项 = 10 个用户面 ACL 组码（与后端 sanitize 白名单同源；生产子线是 owner 粒度、非读者组）。
 const SHARE_TARGETS = Object.keys(GROUP_LABEL)
@@ -1613,15 +1618,21 @@ async function _loadReviewTasksInner(offset = 0) {
     return
   }
   clearLoadError('reviewTasks')
+  if (!offset) reviewTasksSeq++          // 替换 ⇒ 作废所有在途追加
+  const seq = reviewTasksSeq
   try {
     // P2-11：后端 limit 默认 20 且此前不回 has_more —— 复审任务是「安全网承诺」，
     // 静默截断意味着第 21 条以后的隐患在界面上根本不存在。offset>0=追加，0=回首页替换。
     const qs = showClosedReviewTasks.value ? '&include_closed=true' : ''
     const r = await apiJson<{ items: ReviewTaskItem[]; has_more?: boolean }>(
       `/api/kb/review-tasks?offset=${offset}${qs}`, { auth: true })
+    if (seq !== reviewTasksSeq) return    // 期间列表已被替换（含换视图）→ 丢弃本页
     reviewTasks.value = offset ? [...(reviewTasks.value || []), ...(r.items || [])] : (r.items || [])
     reviewTasksHasMore.value = !!r.has_more
-  } catch (e) { reviewTasks.value = reviewTasks.value ?? []; noteLoadError('reviewTasks', e) }
+  } catch (e) {
+    if (seq !== reviewTasksSeq) return
+    reviewTasks.value = reviewTasks.value ?? []; noteLoadError('reviewTasks', e)
+  }
 }
 
 function toggleShowClosedReviewTasks() {
