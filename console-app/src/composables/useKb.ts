@@ -1299,7 +1299,16 @@ function removeApproval(d: PendingItem) {
 async function approve(d: PendingItem) {
   await withInflight(`appr:${d.doc_id}/${d.version_no}`, async () => {
     try {
-      await apiJson('/api/kb/approve', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no }) })
+      // ⚠️ 200 ≠ 放行成功:kb_approve 对**已退役**文档有意 no-op(返回 200 + approved:0,
+      // 防止放行后被 stage-1 认领复活)。此前只看 HTTP 码就本地移除 ⇒ 用户以为批过了,
+      // 刷新又回来,点多少次都一样(2026-08-06 现网 20 个僵尸条目即此形态)。必须看计数。
+      const ar = await apiJson<{ approved?: number; note?: string }>(
+        '/api/kb/approve', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no }) })
+      if (!ar?.approved) {
+        void notice({ title: '未放行', message: ar?.note || '该文档当前状态不可放行（可能已退役），队列将自动刷新。' })
+        await loadApprovals(true)     // force：拉服务端真值，绕过 30s staleness 门
+        return
+      }
       removeApproval(d)
       await loadDocs()
     } catch (e: any) { void notice({ title: '通过失败', message: uploadErrText(e), danger: true }) }

@@ -2670,3 +2670,21 @@ def test_appending_two_columns_does_not_silently_flip_acl_mode(monkeypatch):
     assert seen_node_ids == [], (
         f"追加的两列被静默当成 acl_mode/owner_dept_id：{seen_node_ids}")
     assert resp.items[0].owner_dept == "hr", "归属轴被污染"
+
+
+# ── 待审批队列必须排除已退役文档（2026-08-06 现网 20 个僵尸条目）────────────────
+def test_pending_approvals_excludes_retired_docs():
+    """★ kb_retire 不动 content_process_status ⇒ 被退役的待审批公开件仍是 PENDING_APPROVAL。
+    若队列不按 m.status 过滤,它们会永远挂着:kb_approve 对退役文档有意 no-op(200+approved:0),
+    于是"点一次成功一次、刷新又回来"。修在列表侧——那一版**确实**从未被批准,改数据反而
+    会让 kb_restore 后无法重进审批。
+    """
+    import pathlib
+    import re
+    src = pathlib.Path("opensearch_pipeline/routes/kb_console.py").read_text(encoding="utf-8")
+    m = re.search(r"def kb_pending_approvals.*?LIMIT 101", src, re.S)
+    assert m, "kb_pending_approvals 的查询形态变了,本守卫需同步"
+    q = m.group(0)
+    assert "content_process_status = 'PENDING_APPROVAL'" in q
+    assert "LOWER(m.status) = 'active'" in q, (
+        "待审批队列未排除已退役文档 ⇒ 会出现永远批不掉的僵尸条目")

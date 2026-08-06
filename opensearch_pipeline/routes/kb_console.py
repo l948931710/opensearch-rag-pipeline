@@ -3764,7 +3764,16 @@ def kb_pending_approvals(request: Request,
                            m.permission_level, m.owner_name, v.received_at{_pmc}
                     FROM {_kb_db()}.document_version v
                     JOIN {_kb_db()}.document_meta m ON m.doc_id = v.doc_id
+                    -- 2026-08-06:必须排除已退役文档。kb_retire 只改 document_meta/version 的
+                    -- status,**不动 content_process_status** ⇒ 一篇待审批的公开件被退役后,
+                    -- 版本仍是 PENDING_APPROVAL、仍被本查询列出;而 kb_approve 对退役文档
+                    -- 有意 no-op(返回 200 + approved:0,防止放行后被 stage-1 认领复活)
+                    -- ⇒ 队列里出现**永远批不掉的僵尸条目**:点一次成功一次、刷新又回来。
+                    -- 实测:一次批量退役 66 篇重复件,其中 20 篇是待审批公开件,当场制造 20 个僵尸。
+                    -- 修在**列表侧**而不是去改数据:PENDING_APPROVAL 是那一版的真实状态
+                    -- (它确实从未被批准),把它改成 REJECTED 反而会让 kb_restore 后无法重进审批。
                     WHERE v.content_process_status = 'PENDING_APPROVAL'
+                      AND LOWER(m.status) = 'active'
                     ORDER BY v.received_at DESC
                     LIMIT 101
                     """   # 101 = 上限 100 + 1 探针行：多出来那行只用来判断"还有更多"
