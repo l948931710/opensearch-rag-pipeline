@@ -153,6 +153,46 @@ B6 的告警标题）都是**我自己写的代码**里的，同一个人复查�
 
 **08-07 codex 交接物**：本节 + 六份核验报告结论 + 上表 5 提交的 diff。codex 复核重点可收窄到：三态分流的语义边界（incomplete vs drift 的判据）、渲染侧 gate 轴的列序改动、两个在途闸的收窄语义。
 
+## E. 2026-08-06 codex 补评审第一轮（额度已恢复）
+
+范围按 §C-ter 自己写的交接重点收窄：**C-ter 五提交的三个语义问题 + P3 四项**（后者从未过任何评审）。
+codex 裁决 **REVISE**：1 BLOCKER + 5 MAJOR。我方逐条核验 **7/7 属实、0 推翻**
+（上一轮我推翻过 codex 一条，本轮没有）。
+
+### 通过的
+- `307f98d` gate 列序：三处 unpack 与 SQL 列**均对齐**（my-docs 13/14/15、browse 12/13/14、contribution 6）
+- `c3c4101` P3-1 鉴权收敛：**没有变松**，事务内 helper 与旧内联判断等价
+- `cc7ceaf` 三态分流本身正确：已确认的 recall drift 不会被误分到 incomplete
+
+### 已修（`3075012`，四条不需业务裁决的）
+| | 缺陷 |
+|---|---|
+| 🔴 | `/api/search` 调 `search_chunks` **不传 `acl_ctx`** ⇒ node-ACL 读侧 fail-closed 复核整段被跳过（该复核门控在 `acl_ctx is not None`）。默认 404 不可达，但它是文档化的 break-glass 开关 |
+| 🔴 | `eb1162f` 宣称「开回来也过敏感 guard」**只对一半**：guard 受它自己的 `RAG_SENSITIVE_QUERY_GUARD` 门控，默认关时恒 None。旧测试把 guard patch 成命中，从未覆盖真实配置组合 |
+| 🟠 | `loadReviewTasks` / `loadMine` 的 **append-vs-replace 竞态**：忙闸只挡追加对追加，挡不住追加在途时列表被替换。正确范式在同文件 850 行外（`docsSeq`），只是没照抄 |
+| 🟠 | P3-3 的第六个队列 `my-access-requests`：truncated 后端在回、前端在存、**全前端零消费** ⇒ 六队列实为五个 |
+| 🟡 | `get_conversation`：`LIMIT 200` + 无条件 `has_more=False`，docstring 自称「全部消息」。不在 P3-3 的六队列定义内，当时漏网 |
+
+### 待 Sam 拍板（未修）
+1. **`/api/search` 去留**：保留为正式 break-glass（还需强制 guard + 审计）还是彻底删除。
+   我倾向删——仓内 console / 小程序 / 钉钉 / eval 四类调用方都不依赖它。
+2. **feedback / review-task 的并发语义**：两者更新**都没有前态谓词**
+   （`WHERE message_id=%s AND feedback_type='downvote'` / `WHERE task_id=%s`）⇒ 静默
+   last-writer-wins。⚠️ **`decision_endpoint_shapes_2026-08-04.md` 宣称的「0 守卫缺口」
+   不成立**；仓里只对 gaps 做过 last-action-wins 的明确裁决，这两处没有。
+   另 `/api/kb/admin-grants` 完全漏审（跨 `user_role` + 两张 grant 表写入，前置读无 `FOR UPDATE`）。
+3. **HA3 方向二（stale/zombie）恒绿**：`ok = not rds_active_missing and not vanished_docs`。
+   设计上有意，但 docstring 只论了**召回**（"harmless to recall"）、没论**机密性** ——
+   已退役文档的 chunk 残留在 HA3 是「本该消失的内容仍可检索」，不是清理滞后。
+
+### §C-ter 自认开放项**不完整**
+上述五条它一项都没列到。这印证了 §C-bis 自己写的：同一个人复查同一批代码有系统性盲区。
+
+### 下一轮优先级（codex 给出、我方认同）
+`e5e29ce` cosurface 补图 —— 图片是最高 PII 风险模态，涉及版本 / 物理 PK / ACL / TOCTOU 四轴。
+其后依次：`a61fe87`（徽章语义，chunk_active 轴仍在 doc-status 与列表间分叉）、
+`d2c8e12`（五处分页依赖全序与方向）、`a4f6e37`/`b8e11b4`（分页状态机，本轮竞态的根表面）。
+
 ## D. 状态
 
 - 附录B「值得优先自查的 7 条」——**全部完成**（其余 43 条正文没给，在工作流原始输出里，
