@@ -590,8 +590,12 @@ def node_extract_text_with_ocr(ctx: dict):
                 # doc-intrinsic（重试无意义）：经 oversize_note → partial_loss_notes
                 # 通道收 NEEDS_REVIEW。HEAD 失败 fail-open（OSS 不可达时下载分支自己
                 # 会失败并走既有告警路径）。
+                # 2026-08-05：200MB → 400MB。**不变量：必须严格大于自助上传闸**
+                # （kb_upload.MAX_UPLOAD_BYTES，现 300MB）——否则用户传得上去、摄取端
+                # HEAD 一看就拒下载，文档以 NEEDS_REVIEW 静默卡住，看起来像"传完了没反应"。
+                # 留 100MB 余量是给非自助路径（DataWorks 直投 raw/）的。
                 _max_bytes = int(os.environ.get("RAG_EXTRACT_MAX_BYTES",
-                                                str(200 * 1024 * 1024)) or 0)
+                                                str(400 * 1024 * 1024)) or 0)
                 _osize = 0
                 if _max_bytes > 0:
                     try:

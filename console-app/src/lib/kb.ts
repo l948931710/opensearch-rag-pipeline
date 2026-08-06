@@ -3,8 +3,9 @@
 
 // 仅作**兜底**：真值来自 /api/kb/config 的 max_upload_bytes（useKb.maxUploadBytes 优先取它）。
 // 保持与后端 kb_upload.MAX_UPLOAD_BYTES 的默认值同步，否则 config 未回的那一小段窗口里
-// 客户端预检会用错数（放行了后端要 413 的文件，或反过来白拦）。2026-08-06 随后端 50→150。
-export const MAX_UPLOAD_MB = 150
+// 客户端预检会用错数（放行了后端要 413 的文件，或反过来白拦）。
+// 50 →(08-06)→ 150 →(08-05)→ 300，每次都随后端 kb_upload.MAX_UPLOAD_BYTES 同步改。
+export const MAX_UPLOAD_MB = 300
 export const UPLOAD_ACCEPT = '.pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png'
 // 受支持扩展名（= UPLOAD_ACCEPT 拆分；后端 validate_filename 为权威，前端仅预检省一次失败往返）。
 export const UPLOAD_EXTS = UPLOAD_ACCEPT.split(',')
@@ -130,7 +131,9 @@ export const TERMINAL_BADGES = ['已上线', '未入索引', '处理失败', '�
 
 /**
  * 直传 OSS：fetch 无法上报上传进度，故用 XHR 接 upload.onprogress。File 必须留闭包、勿进 Vue 响应式
- * （Proxy 包裹会破坏 xhr.send(file)）。timeout 25min（略小于令牌 30min TTL）。
+ * （Proxy 包裹会破坏 xhr.send(file)）。timeout 55min，**必须略小于**后端
+ * kb_upload.UPLOAD_TOKEN_TTL（现 60min）——反过来的话浏览器还在传、令牌已过期，
+ * 用户白等满全程才拿到一个失败。两个数改一个就要改另一个。
  */
 export function putWithProgress(url: string, file: File, onProg?: (pct: number) => void, contentType?: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -146,7 +149,7 @@ export function putWithProgress(url: string, file: File, onProg?: (pct: number) 
       : reject(new Error('OSS PUT 失败 HTTP ' + xhr.status)))
     xhr.onerror = () => reject(new Error('OSS PUT 网络错误（可能是 OSS 桶未对本页来源放行 CORS PUT）'))
     xhr.ontimeout = () => reject(new Error('OSS PUT 超时'))
-    xhr.timeout = 25 * 60 * 1000
+    xhr.timeout = 55 * 60 * 1000
     xhr.send(file)
   })
 }

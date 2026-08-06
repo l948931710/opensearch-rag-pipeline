@@ -301,7 +301,9 @@ class OCRConfig:
     api_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     model: str = "gemini-3.1-flash-lite"            # OCR 专用模型
     vlm_model: str = ""                              # VLM caption/审计模型（为空则 fallback 到 model）
-    max_ocr_pages: int = 50
+    # 2026-08-05：50 → 200（Sam 拍板，配合单文件上限 300MB）。**按页计费的付费路径**——
+    # 一篇 200 页扫描件的 OCR 成本是原来的 4 倍。真要控成本请压这个数，别压 pdf_native。
+    max_ocr_pages: int = 200
     ocr_threshold_chars: int = 100
 
 
@@ -656,12 +658,15 @@ class PipelineConfig:
 
     # ── PDF 抽取页上限（G2：原 20 页硬编码 env 化）──────────────────
     # 原生文本抽取（pdfplumber/pypdf，本地 CPU、零 API 成本）页上限。旧值 20 使长手册
-    # 第 21 页起既无原生文本也不进 OCR（P1-09 仅标注截断）；默认提升到 200。
+    # 第 21 页起既无原生文本也不进 OCR（P1-09 仅标注截断）；200 → **1000**（2026-08-05，
+    # 配合单文件上限 300MB：300MB 的 PDF 几乎必然数百至数千页，200 页会让它照常入库却
+    # 只索引前 200 页——带 [TRUNCATED] 留痕，但不报错，后半本书就是查不到）。
+    # 这条是**零 API 成本**的，代价只是 CPU 墙钟（随页数线性）。
     # 付费路径各有独立上限：OCR=ocr.max_ocr_pages，图片挖掘=pdf_image_max_pages。
-    pdf_native_max_pages: int = 200         # RAG_PDF_NATIVE_MAX_PAGES
-    # PDF 嵌入图片挖掘页上限：挖掘本身是本地操作，但每张产出图都进 OCR+VLM 付费漏斗，
-    # 故保守维持 20；成本熔断/漏斗配额到位后可放大。
-    pdf_image_max_pages: int = 20           # RAG_PDF_IMAGE_MAX_PAGES
+    pdf_native_max_pages: int = 1000        # RAG_PDF_NATIVE_MAX_PAGES
+    # PDF 嵌入图片挖掘页上限：挖掘本身是本地操作，但每张产出图都进 OCR+VLM 付费漏斗。
+    # 20 → 100（2026-08-05，Sam 拍板）。**付费路径**，富岭 SOP 截图密集 ⇒ 这是主要花费项。
+    pdf_image_max_pages: int = 100          # RAG_PDF_IMAGE_MAX_PAGES
 
 
 def _require_ack(var: str) -> bool:
@@ -918,8 +923,8 @@ def load_config() -> PipelineConfig:
         max_concurrent_tasks=_env_int("MAX_CONCURRENT_TASKS", 5),
         max_retry_count=_env_int("MAX_RETRY_COUNT", 3),
         scan_batch_size=_env_int("SCAN_BATCH_SIZE", 50),
-        pdf_native_max_pages=_env_int("PDF_NATIVE_MAX_PAGES", 200),
-        pdf_image_max_pages=_env_int("PDF_IMAGE_MAX_PAGES", 20),
+        pdf_native_max_pages=_env_int("PDF_NATIVE_MAX_PAGES", 1000),
+        pdf_image_max_pages=_env_int("PDF_IMAGE_MAX_PAGES", 100),
 
         oss=OSSConfig(
             endpoint=_env("OSS_ENDPOINT"),
@@ -993,7 +998,7 @@ def load_config() -> PipelineConfig:
             api_base_url=ocr_base_url,
             model=ocr_model,
             vlm_model=vlm_model,
-            max_ocr_pages=_env_int("OCR_MAX_PAGES", 50),
+            max_ocr_pages=_env_int("OCR_MAX_PAGES", 200),
             ocr_threshold_chars=_env_int("OCR_THRESHOLD_CHARS", 100),
         ),
 

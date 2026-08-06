@@ -20,18 +20,35 @@ import time
 from typing import Optional, Tuple
 
 # 上传约束
-UPLOAD_TOKEN_TTL = 30 * 60          # upload token / 签名 PUT 有效期：30 分钟
+# upload token / 签名 PUT 有效期。2026-08-05：30 → 60 分钟（Sam 拍板，配合 300MB 上限）。
+# 算术：300MB / 60min ⇒ 需 ≥0.67 Mbps 持续上行（30min 时要 1.33 Mbps，弱网必超时）。
+# 代价是签名 URL 的泄露窗口翻倍——该 URL 只能 PUT 这一个对象键，且 C8 内容绑定后
+# 审批看到的与摄取下载的是同一个 objectVersion，重 PUT 只造新版本改不了已绑定那份。
+# ⚠️ 前端 XHR 超时（console-app/src/lib/kb.ts）必须略小于本值，否则浏览器还在传、
+# 令牌已过期 ⇒ 用户等满全程才拿到失败。
+UPLOAD_TOKEN_TTL = 60 * 60
 
-# 单文件上限（2026-08-06 由 50MB 提到 150MB,Sam 要求;并顺手配置化——原注释"可后续配置化"）。
-# ⚠️ 三个下游边界决定了 150 这个数**是安全的**,改之前请复核它们仍成立:
-#   · 抽取下载闸 RAG_EXTRACT_MAX_BYTES 默认 **200MB**(pipeline_nodes:593)——必须留在其下;
-#   · xlsx >100MB 自动切 openpyxl read_only(unified_extractor:1403),已处理;
-#   · 签名 PUT / upload token 共用 30 分钟 TTL —— 150MB 需 ≥0.67 Mbps 持续上行才传得完。
-#     办公网轻松,弱网(VPN/4G)可能超时 ⇒ 报「上传未完成或链接已过期」,可重传但白费一次。
-#     真要支持更大的文件,先把 TTL 一起调,而不是只调这一个数。
-# 现网实测基线(2026-08-06):1447 个版本里最大 49.7MB(正好顶到旧上限),均值 0.93MB,
-# 97.6% 在 10MB 以下 ⇒ **>50MB 是没跑过的区间**,首批大文件建议盯一次抽取耗时与内存。
-MAX_UPLOAD_BYTES = int(os.environ.get("RAG_MAX_UPLOAD_MB", "150") or 150) * 1024 * 1024
+# 单文件上限。50MB →(2026-08-06)→ 150MB →(2026-08-05)→ **300MB**,均 Sam 要求。
+# ⚠️ **调这个数从来不是一处改动**。整条链上有五道闸跟它联动,漏一道就是"传得上去、
+#    却静默不完整"——比直接报错难查得多。改之前逐条复核:
+#   ① 抽取下载闸 RAG_EXTRACT_MAX_BYTES 默认 **400MB**(pipeline_nodes:593)——必须严格在其上;
+#      不满足则 300MB 文件传完即被 HEAD 拒下载,转 NEEDS_REVIEW,前台毫无异常。
+#   ② 签名 PUT / upload token TTL **60 分钟**(上方)——300MB 需 ≥0.67 Mbps 持续上行;
+#      前端 XHR 超时(kb.ts)须略小于它。
+#   ③ **PDF 原生抽取页上限 RAG_PDF_NATIVE_MAX_PAGES=1000**(config.py)——300MB 的 PDF
+#      几乎必然数百至数千页。这一条才是"大文档"的真瓶颈:超限文档照常入库、只索引前 N 页,
+#      带 [TRUNCATED] 留痕走 NEEDS_REVIEW,但**不报错**。
+#   ④ 付费页上限 OCR_MAX_PAGES=200 / PDF_IMAGE_MAX_PAGES=100 —— 按页/按图计费,大文档
+#      直接放大账单。控成本压这两个,别压 ③。
+#   ⑤ xlsx >100MB 自动切 openpyxl read_only(unified_extractor:1403),无需改。
+# ⚠️ 未随本次一起解决(独立事项):stage-1 的 tmp_dir 整批共用、**批末才清**
+#    (pipeline_nodes:564/804)。批量 100 篇 × 300MB ⇒ 理论峰值 30GB 落在 DataWorks
+#    serverless 资源组(data_process/500CU)本地盘上。改成逐篇删原件会撞上
+#    _upload_clean_assets 对 asset.local_path 的批末生命周期依赖,须单独设计。
+# 现网实测基线(2026-08-05 只读查证):2117 个版本里最大 **77.4MB**,均值 0.89MB,
+# >50MB 仅 1 个、>100MB **零个**;最大页数 382,>200 页仅 2 个。
+# ⇒ **>100MB 与 >382 页都是没跑过的区间**,首批大文件必须盯一次抽取耗时/内存/账单。
+MAX_UPLOAD_BYTES = int(os.environ.get("RAG_MAX_UPLOAD_MB", "300") or 300) * 1024 * 1024
 _UPLOAD_TOKEN_TYP = "kb_upload"
 
 # Phase 1 直传支持的扩展名（office + 图片）。遗留 doc/xls/ppt 单独提示走 Phase 1.5 转换。

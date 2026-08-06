@@ -997,9 +997,9 @@ class UnifiedExtractor:
     # extract_pdf 调用、截断标注与 OCR 扫描钳位共用同一值。
     # OCR 门槛只考察【原生抽取实际覆盖过】的页：超过此上限的页根本没被抽取（按设计截断），
     # 不能因其"0 原生字符"就误判为需 OCR——那会浪费 Qwen-VL 预算、并把真扫描页挤出 OCR 配额。
-    pdf_native_max_pages = 200
-    # PDF 嵌入图片挖掘页上限（RAG_PDF_IMAGE_MAX_PAGES）：产出图逐张进 OCR+VLM 付费漏斗，保守默认。
-    pdf_image_max_pages = 20
+    pdf_native_max_pages = 1000
+    # PDF 嵌入图片挖掘页上限（RAG_PDF_IMAGE_MAX_PAGES）：产出图逐张进 OCR+VLM 付费漏斗。
+    pdf_image_max_pages = 100
 
     def __init__(
         self,
@@ -1025,8 +1025,8 @@ class UnifiedExtractor:
         self.simulate = simulate
         self.config = cfg
         # G2：PDF 页上限从 config 注入（getattr 兜底保护直接构造 PipelineConfig 的旧测试桩）
-        self.pdf_native_max_pages = int(getattr(cfg, "pdf_native_max_pages", 200) or 200)
-        self.pdf_image_max_pages = int(getattr(cfg, "pdf_image_max_pages", 20) or 20)
+        self.pdf_native_max_pages = int(getattr(cfg, "pdf_native_max_pages", 1000) or 1000)
+        self.pdf_image_max_pages = int(getattr(cfg, "pdf_image_max_pages", 100) or 100)
         # 可选：运行级成本熔断器（由 orchestrator 注入，跨文档累计运行预算）。
         # 为空时 vlm_rebuilder 会按 cfg 现造一个做单文档闸。
         self.cost_breaker = None
