@@ -3,8 +3,11 @@ import { MAX_UPLOAD_MB, uploadErrText, buildDupMsg, fileCore, badgeTone, deptLab
 
 describe('uploadErrText（技术错误 → 人话，绝不暴露 trace/HTTP）', () => {
   it('413/超大 → 大小提示', () => {
-    expect(uploadErrText({ status: 413 })).toContain('50MB')
-    expect(uploadErrText(new Error('文件超过大小上限'))).toContain('50MB')
+    // ⚠️ 断言必须跟 MAX_UPLOAD_MB 走，别写死数字：写死 '50MB' 时，上限 50→150 这一档
+    // 因为 '150MB' **含子串** '50MB' 而继续绿 —— 一条早已失效的断言装了一整档没人发现，
+    // 直到 150→300 才暴露（2026-08-06）。子串断言遇到数字尤其容易这样假绿。
+    expect(uploadErrText({ status: 413 })).toContain(`${MAX_UPLOAD_MB}MB`)
+    expect(uploadErrText(new Error('文件超过大小上限'))).toContain(`${MAX_UPLOAD_MB}MB`)
   })
   it('403/无权 → 权限提示', () => {
     expect(uploadErrText({ status: 403 })).toContain('权限')
@@ -50,7 +53,7 @@ describe('uploadErrText（技术错误 → 人话，绝不暴露 trace/HTTP）',
     expect(uploadErrText(new TypeError('Failed to fetch'))).toContain('网络中断')
   })
   it('优先级：413/403 仍先于 5xx 命中', () => {
-    expect(uploadErrText({ status: 413, message: '文件超过大小上限' })).toContain('50MB')
+    expect(uploadErrText({ status: 413, message: '文件超过大小上限' })).toContain(`${MAX_UPLOAD_MB}MB`)
     expect(uploadErrText({ status: 403, message: '无权上传：owner_dept_not_managed' })).toContain('权限')
   })
 })
@@ -126,10 +129,10 @@ describe('fileCore / badgeTone / labels', () => {
 
 describe('uploadErrText 大小提示用运行时上限（2026-08-06 50→150）', () => {
   it('413 优先用调用方传入的 maxMb，而非硬编码常量', () => {
-    expect(uploadErrText({ status: 413 }, { maxMb: 150 })).toContain('150MB')
+    expect(uploadErrText({ status: 413 }, { maxMb: 512 })).toContain('512MB')   // 显式 maxMb 覆盖兜底常量
   })
   it('未传 maxMb 时回落常量（且常量已与后端默认值同步）', () => {
     expect(uploadErrText({ status: 413 })).toContain(`${MAX_UPLOAD_MB}MB`)
-    expect(MAX_UPLOAD_MB).toBe(150)   // 与 kb_upload.MAX_UPLOAD_BYTES 默认值对齐
+    expect(MAX_UPLOAD_MB).toBe(300)   // 与 kb_upload.MAX_UPLOAD_BYTES 默认值对齐
   })
 })
