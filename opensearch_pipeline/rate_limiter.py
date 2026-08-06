@@ -215,6 +215,14 @@ class Limits:
     anon_per_min: int = 3
     anon_per_day: int = 30
     aux_per_min: int = 30
+    # 登录换令牌（/api/auth/dingtalk）独立桶（2026-08-06）。**必须与 aux 分开**：该端点在
+    # 身份建立【之前】,只能按 IP 计数,而全公司员工共用一个 NAT 出口 ⇒ 一个桶要装下整个
+    # 公司的登录。挂在 aux(默认 30、现网 120)上时,一条广播让几十人同时开小程序就会把桶
+    # 打满 ⇒ 他们**登不进来**(而不是"慢一点")。默认给 300:够整层楼同时开,又仍能挡住
+    # 滥打 authCode 烧钉钉 OpenAPI 配额(那才是这道限流的本意)。
+    # 副作用(有意):拒绝台账因此能区分 `auth_per_min` 与 `aux_per_min` —— 2026-08-05 那次
+    # 344 次拒绝无法定位来源,正是因为两者混在同一个 reason 码里,只能去翻 SLS。
+    auth_per_min: int = 300
     thinking_daily_quota: int = 10
     # 通用能力（T2/T3 通用 LLM 回答）每日配额（通用能力分级开放，intent_router/
     # general_answerer）。canned 寒暄与确定性计算零成本不经此；0 = 通用 LLM 层整体关闭。
@@ -264,6 +272,7 @@ def _load_limits() -> Limits:
         anon_per_min=_env_int("RAG_RATE_ANON_PER_MIN", 3),
         anon_per_day=_env_int("RAG_RATE_ANON_PER_DAY", 30),
         aux_per_min=_env_int("RAG_RATE_AUX_PER_MIN", 30),
+        auth_per_min=_env_int("RAG_RATE_AUTH_PER_MIN", 300),
         thinking_daily_quota=_env_int("RAG_THINKING_DAILY_QUOTA", 10),
         general_daily_quota=_env_int("RAG_GENERAL_DAILY_QUOTA", 20),
         global_daily_llm_cap=_env_int("RAG_GLOBAL_DAILY_LLM_CAP", 2000),
@@ -472,6 +481,31 @@ class ServingRateLimiter:
                     f"今日通用问答次数已用完（{lim.general_daily_quota} 次/天）",
                     _secs_to_beijing_midnight(now), "general_quota"))
             self._daily[key] = (day, g_cnt + 1)
+        return None
+
+    def admit_auth(self, actor: str) -> Optional[Denial]:
+        """登录换令牌准入（/api/auth/dingtalk）——**独立于 aux 的桶**。
+
+        为什么必须独立:该端点在身份建立【之前】,只能按 IP 计数;而全公司走同一个 NAT
+        出口 ⇒ 这个 actor 实际代表**整个公司**。与控制台的只读端点共用一个桶时,一条
+        广播让几十人同时开小程序,就会把桶打满 ⇒ 他们**登不进来**——症状远比"控制台慢"
+        严重,却长得像"服务挂了"。
+        文案也因此与 aux 不同:这里要告诉用户「稍后重试即可」,而不是让他以为自己没权限。
+        """
+        lim = self.limits()
+        if not lim.enabled or lim.auth_per_min <= 0:
+            return None
+        now = self._now()
+        with self._lock:
+            dq = self._minute.setdefault(f"auth:{actor}", deque())
+            while dq and now - dq[0] >= _MINUTE_WINDOW_S:
+                dq.popleft()
+            if len(dq) >= lim.auth_per_min:
+                retry = max(1, int(_MINUTE_WINDOW_S - (now - dq[0])) + 1)
+                return self._deny(actor, Denial(
+                    429, "当前登录人数较多，请稍等几秒后重试", retry, "auth_per_min"))
+            dq.append(now)
+            self._maybe_prune(now, _beijing_day(now))
         return None
 
     def admit_aux(self, actor: str) -> Optional[Denial]:

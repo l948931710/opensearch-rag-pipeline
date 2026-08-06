@@ -387,3 +387,67 @@ def test_thinking_weighted_toward_global_cap(make_limiter, sync_dispatch):
     assert lim.admit_ask("u:c", is_user=True) is None                   # +1 → 10 触顶
     assert alerts == [10]
     assert lim.admit_ask("u:d", is_user=True).reason == "global_cap"
+
+
+# ── 登录换令牌独立桶（2026-08-06）────────────────────────────────────────────
+# 为什么必须独立：该端点在身份建立【之前】,只能按 IP 计数,而全公司共用一个 NAT 出口
+# ⇒ 一个 actor 实际代表整个公司。与 aux 共用时,一条广播让几十人同时开小程序就把桶打满,
+# 他们**登不进来**。副作用(有意)：拒绝台账因此能区分两者,不必翻 SLS 才知道是谁挤爆的。
+def test_auth_bucket_independent_from_aux(make_limiter):
+    clock = FakeClock()
+    lim = make_limiter(clock, RAG_RATE_AUTH_PER_MIN=2, RAG_RATE_AUX_PER_MIN=1)
+    # auth 桶用满
+    assert lim.admit_auth("ip:1.2.3.4") is None
+    assert lim.admit_auth("ip:1.2.3.4") is None
+    d = lim.admit_auth("ip:1.2.3.4")
+    assert d is not None and d.status_code == 429
+    assert d.reason == "auth_per_min", "reason 必须可区分——这正是不必翻 SLS 的前提"
+    # aux 桶不受影响（两个窗独立；反之亦然）
+    assert lim.admit_aux("ip:1.2.3.4") is None
+
+
+def test_auth_bucket_does_not_consume_aux_quota(make_limiter):
+    """登录不吃控制台额度：否则早高峰登录会把管理员的只读操作一起饿死。"""
+    clock = FakeClock()
+    lim = make_limiter(clock, RAG_RATE_AUTH_PER_MIN=5, RAG_RATE_AUX_PER_MIN=1)
+    for _ in range(4):
+        assert lim.admit_auth("ip:9.9.9.9") is None
+    assert lim.admit_aux("ip:9.9.9.9") is None          # aux 首次仍应放行
+    assert lim.admit_aux("ip:9.9.9.9") is not None      # 第二次才是 aux 自己的上限
+
+
+def test_auth_window_slides(make_limiter):
+    clock = FakeClock()
+    lim = make_limiter(clock, RAG_RATE_AUTH_PER_MIN=1)
+    assert lim.admit_auth("ip:5.5.5.5") is None
+    assert lim.admit_auth("ip:5.5.5.5") is not None
+    clock.advance(61)
+    assert lim.admit_auth("ip:5.5.5.5") is None, "滑动窗过后必须恢复"
+
+
+def test_auth_default_is_company_sized(monkeypatch):
+    """默认 300：够整层楼同时开小程序，又仍挡得住滥打 authCode。"""
+    monkeypatch.delenv("RAG_RATE_AUTH_PER_MIN", raising=False)
+    from opensearch_pipeline.rate_limiter import _load_limits
+    assert _load_limits().auth_per_min == 300
+
+
+def test_auth_endpoint_wired_to_auth_bucket(monkeypatch):
+    """★ 接线守卫：/api/auth/dingtalk 必须走 scope='auth' 而非共享的 'aux'。
+
+    只测桶的机制不够——把端点接回 aux 时全套限流单测仍全绿（2026-08-06 变异实测），
+    而那正是"全公司登录共用一个桶、一条广播就登不进来"的原状。
+    """
+    from opensearch_pipeline import api
+    seen = {}
+
+    def _spy(request, identity, *, scope, **kw):
+        seen["scope"] = scope
+        raise RuntimeError("stop-here")          # 记录后即止，无需后续换证链路
+
+    monkeypatch.setattr(api, "_enforce_rate_limit", _spy)
+    with pytest.raises(RuntimeError):
+        api.auth_dingtalk(api.DingtalkAuthRequest(auth_code="x"), None)
+    assert seen["scope"] == "auth", (
+        f"登录端点接到了 {seen['scope']!r} 桶——身份未建立时按 IP 计数，"
+        "而全公司共用一个 NAT 出口，与控制台只读端点混桶会让人登不进来")

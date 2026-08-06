@@ -665,6 +665,9 @@ def _enforce_rate_limit(request: Optional[Request], identity: Optional[Identity]
         if scope == "ask":
             denial = LIMITER.admit_ask(actor, is_user=is_user,
                                        thinking=thinking, count_llm=count_llm)
+        elif scope == "auth":
+            # 登录换令牌：独立桶（身份未建立 ⇒ 按 IP，而全公司共用一个 NAT 出口）
+            denial = LIMITER.admit_auth(actor)
         else:
             denial = LIMITER.admit_aux(actor)
     except Exception:
@@ -871,8 +874,12 @@ def auth_dingtalk(req: DingtalkAuthRequest, request: Request):
     部门在服务端解析后写入令牌；客户端只持有短期 authCode 与签发的令牌，
     AppSecret / 签名密钥永不下发到客户端。模拟模式下返回测试用户（见 _exchange_authcode_for_userid）。
     """
-    # 按 IP 限频（身份尚未建立）：滥打 authCode 烧钉钉 OpenAPI 配额，可能拖垮发卡链路
-    _enforce_rate_limit(request, None, scope="aux")
+    # 按 IP 限频（身份尚未建立）：滥打 authCode 烧钉钉 OpenAPI 配额，可能拖垮发卡链路。
+    # scope="auth" 而非 "aux"（2026-08-06）：这个 actor 因 NAT 实际代表**整个公司**，
+    # 与控制台只读端点共用一个桶时，一条广播让几十人同时开小程序就会把桶打满 ⇒
+    # 他们**登不进来**。独立桶另有观测收益：拒绝台账从此能区分 auth_per_min / aux_per_min，
+    # 不必再去翻 SLS 才知道是谁挤爆的（2026-08-05 那次 344 次拒绝就卡在这一点上）。
+    _enforce_rate_limit(request, None, scope="auth")
     userid = _exchange_authcode_for_userid(req.auth_code)
     if not userid:
         raise HTTPException(status_code=401, detail="免登失败：authCode 无效或已过期")
