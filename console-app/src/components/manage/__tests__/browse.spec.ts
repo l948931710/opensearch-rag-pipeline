@@ -198,6 +198,12 @@ describe('DocTable — 更多操作菜单（2026-07-19 重设计）', () => {
   })
 })
 
+// 这两条各挂载 50~120 行 DocTable 并用 5ms 步进轮询，本身就要 6~12s——vitest 默认 5000ms
+// 对它们从来不够。隔离跑一直 19/19 绿，只在全量并行争抢 CPU 时红，于是长期被当"抖动"
+// 忽略；2026-08-05 加了两个新 spec、transform 负载上去一点，第二条也跟着翻红才逼出真相。
+// **不是缩短测试**：断言的就是整页替换与筛选回第 1 页，行数少了就测不到。给足时限。
+const PAGER_TIMEOUT_MS = 30_000
+
 describe('DocTable — 页码翻页器（2026-07-19 设计稿 doc-table.html pager）', () => {
   async function waitFor(cond: () => boolean, ms = 1000) {
     const t0 = Date.now()
@@ -240,7 +246,7 @@ describe('DocTable — 页码翻页器（2026-07-19 设计稿 doc-table.html pag
     expect(kb.docs.value[0].doc_id).toBe('p2-0')
     expect(w.find('[data-testid="pager-info"]').text()).toContain('第 51–100 条')
     expect(w.find('[data-testid="pager-page"][data-current="1"]').text()).toBe('2')
-  })
+  }, PAGER_TIMEOUT_MS)
 
   it('筛选变化回第 1 页（接现有 loadDocs 重置路径，不造第二套）', async () => {
     const calls: string[] = []
@@ -256,7 +262,7 @@ describe('DocTable — 页码翻页器（2026-07-19 设计稿 doc-table.html pag
     expect(kb.docsPage.value).toBe(1)
     expect(calls[0]).toContain('offset=0')
     expect(calls[0]).toContain('badge=')            // 服务端筛选参数随行
-  })
+  }, PAGER_TIMEOUT_MS)
 
   it('竞态守卫：翻页在途时列表被重载 → 旧页响应作废不落地', async () => {
     let release!: () => void
