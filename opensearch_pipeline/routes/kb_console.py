@@ -2882,6 +2882,53 @@ def kb_register(req: KbRegisterRequest, request: Request,
                         title=payload.get("title") or "",
                     )
                 doc_id = payload["doc_id"]
+
+                # ── 误重传硬拦（2026-08-06，Sam 拍板：24h 窗 + 硬拦 409）─────────────
+                # 为什么 raw_key 幂等挡不住：每次 upload-url(action=new) 都现铸新 doc_id +
+                # 新 upload_id ⇒ raw_key 必不同 ⇒ 上面那次幂等 SELECT 永远查不到 ⇒
+                # **重试与首次上传在协议层无法区分**，已成功的那篇会被再落一份。
+                # 批量部分失败后「再点一次上传」是最自然的动作,aux 限流打满时几乎必然发生。
+                # 前端 a57db5b 已让选择列表收敛成失败集(堵住该条具体路径),这里是服务端兜底:
+                # 还能挡住「手动重选同样的文件」「两个管理员传同一份」「任何前端 bug」。
+                #
+                # 三个限定条件都是有意收窄,不是随手加的:
+                #   · **同归属**——同一份文件被两个部门各留一份是真实场景(全公司制度各部门
+                #     各存一份),跨部门硬拦会误伤;跨部门那条现有 advisory 提示继续保留。
+                #   · **24h 窗**——误重传发生在几分钟内;三个月后重传同内容(退役后想恢复、
+                #     换标题重录)是正当操作。加窗口让它是**防手滑**而不是**立规矩**。
+                #   · **仅 active**——之前那篇已退役的话,重传是正当的"恢复"动作。
+                # ⚠️ 残留(如实):两个**完全同时**的相同上传仍可能双双通过(各自 raw_key 不同、
+                #    本检查无锁)。罕见,且为它加唯一约束代价不成比例——advisory 查重仍会提示。
+                if action != "version" and etag_val:
+                    _dupcap = _kb_node_capability(cur)
+                    if node_owner_id is not None and _dupcap == "present":
+                        _own_pred, _own_arg = "m.acl_mode='node' AND m.owner_dept_id=%s", node_owner_id
+                    else:
+                        _own_pred, _own_arg = "m.owner_dept=%s", owner
+                    try:
+                        cur.execute(
+                            f"""
+                            SELECT m.doc_id, m.title
+                            FROM {_kb_db()}.document_version v
+                            JOIN {_kb_db()}.document_meta m ON m.doc_id = v.doc_id
+                            WHERE v.etag=%s AND v.status='active' AND LOWER(m.status)='active'
+                              AND m.doc_id<>%s AND {_own_pred}
+                              AND v.received_at >= NOW() - INTERVAL 24 HOUR
+                            LIMIT 1
+                            """,
+                            (etag_val, doc_id, _own_arg))
+                        _dup = cur.fetchone()
+                    except Exception as _de:   # noqa: BLE001 — 查不出不拦(防手滑不该反过来挡正常上传)
+                        logger.warning("误重传检查失败(放行): %s", _de)
+                        _dup = None
+                    if _dup:
+                        conn.rollback()
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"这份文件 24 小时内已上传成功：《{_dup[1] or _dup[0]}》。"
+                                   f"未重复入库——如需替换内容请对该文档「升版」，"
+                                   f"如确需再存一份请先修改文件内容或改传到其它部门。")
+
                 if action == "version":
                     # 行锁串行化版本号分配，避免并发升版撞号
                     cur.execute(f"SELECT current_version_no, permission_level, status FROM {_kb_db()}.document_meta "

@@ -64,6 +64,9 @@ class _FakeCur:
             return self.conn.idempotent_row
         if "current_version_no, permission_level" in s:
             return self.conn.meta_row
+        # 误重传硬拦（2026-08-06）：同 etag + 同归属 + 24h 内的既有 active 文档
+        if "v.etag=%s" in s and "24 HOUR" in s:
+            return self.conn.dup_recent_row
         return None
 
     def fetchall(self):
@@ -76,13 +79,14 @@ class _FakeCur:
 class _FakeConn:
     def __init__(self, *, idempotent_row=None, meta_row=None, winner_row=None, raise_dupkey=False,
                  dup_rows=None, raise_on_dedup=False, lock_recheck_row=None,
-                 dv_max=None, clash_row=None):
+                 dv_max=None, clash_row=None, dup_recent_row=None):
         self.idempotent_row = idempotent_row
         self.meta_row = meta_row
         self.winner_row = winner_row
         self.lock_recheck_row = lock_recheck_row   # F-38 升版锁内复查命中行（None=不命中）
         self.dv_max = dv_max          # 升版取号 MAX(version_no) 返回值（None=无 dv 行）
         self.clash_row = clash_row    # 1062 兜底撞号行诊断返回 (raw_key, content_process_status)
+        self.dup_recent_row = dup_recent_row   # 误重传硬拦命中行 (doc_id, title)；None=未命中
         self._rawkey_query_count = 0
         self.raise_dupkey_on_version_insert = raise_dupkey
         self.dup_rows = dup_rows or []        # 内容查重 SELECT 返回的 (doc_id, title, owner_dept) 行
@@ -415,3 +419,41 @@ def test_register_concurrent_dupkey_returns_idempotent(monkeypatch):
     assert resp.doc_id == "DOC_TEST"
     assert resp.version_no == 1
     assert conn.rolled_back is True                     # 走了回滚分支而非 500
+
+
+# ── 误重传硬拦（2026-08-06，Sam 拍板 24h 窗 + 硬拦 409）────────────────────────
+# raw_key 幂等挡不住重试：每次 upload-url(action=new) 现铸新 doc_id + 新 upload_id ⇒
+# raw_key 必不同 ⇒ 幂等 SELECT 永远查不到 ⇒ 重试与首次在协议层无法区分。
+def test_reupload_within_24h_same_owner_blocked_409(monkeypatch):
+    """同 etag + 同归属 + 24h 内已有 active 文档 → 409，且告知既有标题。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch)
+    _install_conn(monkeypatch, _FakeConn(idempotent_row=None,
+                                         dup_recent_row=("DOC_OLD", "考勤制度")))
+    with pytest.raises(Exception) as ei:
+        _call(monkeypatch, _mint())
+    e = ei.value
+    assert getattr(e, "status_code", None) == 409
+    assert "24 小时内已上传成功" in e.detail
+    assert "考勤制度" in e.detail          # 必须告知是哪一篇,否则用户以为自己传失败了
+    assert "升版" in e.detail              # 给出正确出路
+
+
+def test_no_recent_dup_passes(monkeypatch):
+    """未命中 → 照常登记（防手滑不得反过来挡正常上传）。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn(idempotent_row=None, dup_recent_row=None))
+    resp = _call(monkeypatch, _mint())
+    assert resp.version_no == 1 and conn.committed is True
+
+
+def test_version_upgrade_never_blocked_by_dup_check(monkeypatch):
+    """升版路径不进该检查——同 etag 重传正是「内容未变」的合法升版语义(B14)。"""
+    _skip_if_not_sim()
+    _dept_admin(monkeypatch)
+    conn = _install_conn(monkeypatch, _FakeConn(
+        idempotent_row=None, meta_row=(2, "dept_internal", "active"),
+        dup_recent_row=("DOC_OLD", "别的文档")))     # 即便命中也必须放行
+    resp = _call(monkeypatch, _mint(action="version", doc_id="DOC_TEST"))
+    assert resp.version_no == 3 and conn.committed is True

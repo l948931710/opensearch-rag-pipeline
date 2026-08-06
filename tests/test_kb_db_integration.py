@@ -394,3 +394,72 @@ def test_ingest_node_default_grant_created_and_never_revives_revoked():
             conn.commit()
     finally:
         conn.close()
+
+
+# ── 误重传硬拦的三条限定语义（2026-08-06）──────────────────────────────────────
+# 桩库证不了：24h 时间窗要真的 NOW()-INTERVAL 比较、同归属要真的 JOIN、仅 active 要真的
+# 看 m.status。这三条**每一条都是有意收窄**，写错任何一条都会从"防手滑"变成"挡正常上传"。
+_DUP_A, _DUP_B = "DOC_ITEST_DUP_A", "DOC_ITEST_DUP_B"
+_DUP_ETAG = "itest-etag-0123456789abcdef"
+
+
+def _dup_cleanup(cur):
+    for d in (_DUP_A, _DUP_B):
+        cur.execute("DELETE FROM document_version WHERE doc_id=%s", (d,))
+        cur.execute("DELETE FROM document_meta WHERE doc_id=%s", (d,))
+
+
+def _dup_seed(cur, doc_id, owner_dept, etag, *, status="active", hours_ago=0):
+    cur.execute("INSERT INTO document_meta (doc_id,title,owner_dept,status,current_version_no) "
+                "VALUES (%s,%s,%s,%s,1)", (doc_id, f"T-{doc_id}", owner_dept, status))
+    cur.execute("INSERT INTO document_version (doc_id,version_no,bucket_name,raw_key,raw_key_hash,"
+                "etag,status,content_process_status,received_at) "
+                "VALUES (%s,1,'b',%s,%s,%s,'active','DONE', NOW() - INTERVAL %s HOUR)",
+                (doc_id, f"raw/{doc_id}", doc_id.lower().ljust(64, "0")[:64], etag, hours_ago))
+
+
+def _dup_hit(cur, etag, owner_dept, exclude_doc):
+    """与 kb_register 里那条判据逐字同构（谓词漂移即失效,故此处照抄形态）。"""
+    cur.execute("""
+        SELECT m.doc_id FROM document_version v JOIN document_meta m ON m.doc_id=v.doc_id
+        WHERE v.etag=%s AND v.status='active' AND LOWER(m.status)='active'
+          AND m.doc_id<>%s AND m.owner_dept=%s
+          AND v.received_at >= NOW() - INTERVAL 24 HOUR LIMIT 1""",
+                (etag, exclude_doc, owner_dept))
+    return cur.fetchone()
+
+
+@requires_local_db
+def test_dup_block_window_owner_and_active_scoping():
+    from opensearch_pipeline.db import _get_db_conn
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _dup_cleanup(cur); conn.commit()
+
+            # ① 同归属 + 1 小时前 → 命中（防手滑生效）
+            _dup_seed(cur, _DUP_A, "hr", _DUP_ETAG, hours_ago=1); conn.commit()
+            assert _dup_hit(cur, _DUP_ETAG, "hr", _DUP_B) is not None
+
+            # ② 跨部门 → **不**命中：同一份文件被两部门各留一份是真实场景,硬拦会误伤
+            assert _dup_hit(cur, _DUP_ETAG, "finance", _DUP_B) is None
+
+            # ③ 超出 24h → **不**命中：三个月后重传同内容是正当操作,不该被立规矩
+            cur.execute("UPDATE document_version SET received_at = NOW() - INTERVAL 25 HOUR "
+                        "WHERE doc_id=%s", (_DUP_A,)); conn.commit()
+            assert _dup_hit(cur, _DUP_ETAG, "hr", _DUP_B) is None
+
+            # ④ 已退役 → **不**命中：重传是正当的"恢复"动作
+            cur.execute("UPDATE document_version SET received_at=NOW() WHERE doc_id=%s", (_DUP_A,))
+            cur.execute("UPDATE document_meta SET status='retired' WHERE doc_id=%s", (_DUP_A,))
+            conn.commit()
+            assert _dup_hit(cur, _DUP_ETAG, "hr", _DUP_B) is None
+
+            # ⑤ 自己不拦自己（幂等重放走 raw_key 分支,不该被本检查误伤）
+            cur.execute("UPDATE document_meta SET status='active' WHERE doc_id=%s", (_DUP_A,))
+            conn.commit()
+            assert _dup_hit(cur, _DUP_ETAG, "hr", _DUP_A) is None
+        with conn.cursor() as cur:
+            _dup_cleanup(cur); conn.commit()
+    finally:
+        conn.close()
