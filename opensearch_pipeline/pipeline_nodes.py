@@ -574,6 +574,10 @@ def node_extract_text_with_ocr(ctx: dict):
     except ValueError:
         extract_concurrency = 1
 
+    # 提前释放的字节数。用 list 而非 int += ：并发路径下 `nonlocal x; x += n` 非原子会丢计数，
+    # 而 list.append 在 GIL 下是原子的。批末求和只为打一行可观测日志。
+    _released_bytes: List[int] = []
+
     def _extract_one(task, task_tmp_dir):
         doc_id = task["doc_id"]
         task["_tmp_dir"] = task_tmp_dir  # 传递给 image_extraction_utils 导出嵌入图片
@@ -663,6 +667,12 @@ def node_extract_text_with_ocr(ctx: dict):
                             else:
                                 file_size = os.path.getsize(local_path)
                                 task["local_path"] = local_path
+                                # ownership 登记：记**精确路径**而非布尔（codex MINOR）。
+                                # 只有走到这里的文件才是"本节点本次下载写入 tmp 的"——
+                                # 抽取完成后可提前释放（_release_owned_raw）。
+                                # LOCAL-DEV 采样语料(:684 分支)与 run_simulation 传入的
+                                # 仓库语料**永远不会**经过这里,故也永远不会被删。
+                                task["_owned_local_path"] = local_path
                                 print(f"    📥 {doc_id}: downloaded {raw_key} ({file_size} bytes)"
                                       + (f" @version {_bvid}" if _bound else ""))
                         except Exception as e:
@@ -728,6 +738,13 @@ def node_extract_text_with_ocr(ctx: dict):
                 f"    └─ {doc_id}: {result.text_length} chars via "
                 f"{result.extract_method} [{block_summary}]"
             )
+        # perf/disk（2026-08-06，codex 共识）：抽取完成 ⇒ 下载的原件再无消费者,立即释放。
+        # 批次 tmp_dir 到批末才 rmtree,不释放的话磁盘峰值 = O(批大小 × 单文件上限);
+        # 单文件上限 300MB × 单批 ≤100 篇 ⇒ 理论 30GB。释放后降到 O(单个最大原件 + 图片资产)。
+        # 只在**成功路径**释放：_extract_guarded 捕获异常时不走到这里,交批末 rmtree 兜底
+        # （注意：这**不是**"保留诊断现场"——批末照样删,只是不在异常点提前删）。
+        _released_bytes.append(_release_owned_raw(task, tmp_dir))
+
         return result
 
     # A1（2026-07-25）：无条件打印 configured/effective —— 这三个并发旋钮的代码路径早就就绪、
@@ -776,38 +793,47 @@ def node_extract_text_with_ocr(ctx: dict):
                 if _res is not None:
                     extractions.append(_res)
     finally:
-        # ─── 在清理 tmp 之前，将保留图片上传到 OSS ───
-        # 解决 local_path 生命周期问题：downstream 的 embedding 节点不再依赖 local_path。
-        # ⚠️ ROUTE_TO_TEXT 也必须上传：绑定注入（_insert_image_refs_heuristic /
-        # _enrich_existing_image_refs）会把 TO_TEXT 截图绑进 step_card 并构造
-        # processing/assets/ 路径 —— 只传 TO_VECTOR 时这些路径永不存在，
-        # serving 签出 403 死图（2026-06-10 对抗评审发现，UI 截图多数走 TO_TEXT）。
-        # 已带 oss_key 的资产跳过（独立图片文档 oss_key=raw_key，原对象已在 OSS）。
-        bucket_upload, is_sim_oss = _get_oss_bucket(ctx)
-        if not is_sim_oss and bucket_upload:
-            _upload_clean_assets(extractions, bucket_upload)
-
-        # perf#27：VLM 缓存的 OSS 整包上传已降频为每 N 文档一次，这里 flush 未满一轮的尾巴
-        # （无脏时零动作；失败不影响提取结果——本地副本已逐文档原子落盘）
+        # ⚠️ 这层嵌套 finally 是 load-bearing（2026-08-06 codex 评审发现的现存缺陷）：
+        # 此前 _get_oss_bucket / _upload_clean_assets 在 finally 里**裸调用**，而其后的
+        # 两个 cache flush 与 rmtree 各自有 try —— 二者任一抛出就会让控制流直接离开
+        # finally，**rmtree 永不执行 ⇒ 整批临时目录泄漏**。单文件上限提到 300MB 之后，
+        # 一次泄漏可达 30-40GB（stage-1 单批 ≤100 篇，见 node_scan_raw_files 的 LIMIT 100）。
+        # 这里**只修可达性、不改失败语义**：取 bucket / 上传资产的异常照旧向外传播
+        # （吞掉会把「node 应当失败」变成「静默成功」），清理动作移进内层 finally。
         try:
-            UnifiedExtractor.flush_vlm_cache_to_oss()
-        except Exception as _ve:
-            print(f"    ⚠️ VLM cache OSS flush failed (non-fatal): {_ve}")
+            # ─── 在清理 tmp 之前，将保留图片上传到 OSS ───
+            # 解决 local_path 生命周期问题：downstream 的 embedding 节点不再依赖 local_path。
+            # ⚠️ ROUTE_TO_TEXT 也必须上传：绑定注入（_insert_image_refs_heuristic /
+            # _enrich_existing_image_refs）会把 TO_TEXT 截图绑进 step_card 并构造
+            # processing/assets/ 路径 —— 只传 TO_VECTOR 时这些路径永不存在，
+            # serving 签出 403 死图（2026-06-10 对抗评审发现，UI 截图多数走 TO_TEXT）。
+            # 已带 oss_key 的资产跳过（独立图片文档 oss_key=raw_key，原对象已在 OSS）。
+            bucket_upload, is_sim_oss = _get_oss_bucket(ctx)
+            if not is_sim_oss and bucket_upload:
+                _upload_clean_assets(extractions, bucket_upload)
+        finally:
+            # perf#27：VLM 缓存的 OSS 整包上传已降频为每 N 文档一次，这里 flush 未满一轮的尾巴
+            # （无脏时零动作；失败不影响提取结果——本地副本已逐文档原子落盘）
+            try:
+                UnifiedExtractor.flush_vlm_cache_to_oss()
+            except Exception as _ve:
+                print(f"    ⚠️ VLM cache OSS flush failed (non-fatal): {_ve}")
 
-        # A5（2026-07-25）：OCR 页级缓存同款收尾——底座只从 finalize 推 OSS 镜像，没有这个
-        # 调用点镜像就永远不会产生（DataWorks 每次都是全新 pod，跨运行命中率恒 0）。
-        try:
-            from opensearch_pipeline.extraction.ocr_client import OCRClient
-            OCRClient.flush_page_cache_to_oss()
-        except Exception as _oe:
-            print(f"    ⚠️ OCR page cache OSS flush failed (non-fatal): {_oe}")
+            # A5（2026-07-25）：OCR 页级缓存同款收尾——底座只从 finalize 推 OSS 镜像，没有这个
+            # 调用点镜像就永远不会产生（DataWorks 每次都是全新 pod，跨运行命中率恒 0）。
+            try:
+                from opensearch_pipeline.extraction.ocr_client import OCRClient
+                OCRClient.flush_page_cache_to_oss()
+            except Exception as _oe:
+                print(f"    ⚠️ OCR page cache OSS flush failed (non-fatal): {_oe}")
 
-        # 清理临时文件
-        import shutil
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
+            # 可观测：没有这行就无法从 DataWorks 节点日志验证提前释放到底有没有生效
+            # （照抄本节点 [concurrency] configured/effective 的无条件打印惯例）。
+            _rel_n = sum(1 for b in _released_bytes if b > 0)
+            print(f"    └─ [disk] 原件提前释放: {_rel_n}/{len(tasks)} 篇, "
+                  f"{sum(_released_bytes) / 1048576:.1f}MB "
+                  f"(RAG_EXTRACT_RELEASE_RAW)")
+            _cleanup_batch_tmp_dir(tmp_dir)
 
     ctx["extractions"] = extractions
 
@@ -1780,6 +1806,96 @@ def node_build_canonical(ctx: dict):
 # （retriever 按 permission_level="dept_internal" AND owner_dept=<部门> 放行本部门文档；
 #  写入 'internal' 的 chunk 两个分支都不命中，会对所有人不可见）。
 _PERMISSION_ALIAS = {"internal": "dept_internal"}
+
+
+def _release_owned_raw(task: dict, tmp_root: str) -> int:
+    """抽取完成后释放**本节点下载的原件**,返回释放字节数(0=未释放)。
+
+    动机:批次 tmp_dir 到批末才 rmtree,原件却在 extract() 返回后就再无消费者 ——
+    磁盘峰值因此是 O(批大小 × 单文件上限)。300MB × ≤100 篇 ⇒ 理论 30GB。
+
+    **四重校验,缺一不可**(2026-08-06 codex 评审共识):
+      ① ownership 存在:`task["_owned_local_path"]` —— 只有下载成功且通过内容绑定核对的
+         文件才登记(node_extract_text 内);
+      ② 目标 == 登记路径:防中途被改写;
+      ③ `realpath` 严格位于批次 tmp 根之内 —— **这条是防「删掉仓库语料」的那道闸**:
+         LOCAL-DEV 把 `scratch/sample_corpus/<raw_key>` 挂成 local_path、run_simulation
+         直接引用 `fuling_chunk_exp/*.docx`(git 跟踪的真实语料),两者都不在 tmp 内。
+         它们同时也拿不到 ownership 登记 ⇒ 双保险;
+      ④ 是普通文件且**不是 symlink**:既然把 realpath containment 定义为安全边界,
+         就必须显式排除指向 tmp 外的链接。
+
+    ⚠️ **不清任何 `local_path` 字段**(本轮刻意为之,评审共识):
+    `ocr_text` block 的 `extra["local_path"]` 是 chunker 区分「图片 OCR」与
+    「整页 OCR fallback」的 **load-bearing 判据**(chunker.py:863)——独立图片文档的该
+    block **没有** `source_image`(unified_extractor.py:2547-2557),清掉 local_path 会让
+    OCR 文本 fallthrough 进步骤正文,正是 chunker.py:854-861 要避免的
+    「重复圈号 / ERP 菜单项垃圾」。悬空 local_path 是本仓已被测试固化的现状
+    (test_multimodal_diagnostic.py),不是本次要收的债。
+
+    独立图片文档(jpg/png)**同样释放**:其 asset 的 `oss_key=raw_key` 已是持久 OSS 键,
+    `_upload_clean_assets` 在 `not asset.get("oss_key")` 处短路,本地文件无消费者。
+
+    删除失败**只记告警**:资源优化绝不能把一篇成功的抽取变成失败文档。
+    """
+    if os.environ.get("RAG_EXTRACT_RELEASE_RAW", "on").lower() in ("off", "0", "false", "no"):
+        return 0
+    owned = (task or {}).get("_owned_local_path") or ""
+    if not owned or owned != (task.get("local_path") or ""):
+        return 0
+    try:
+        real, root = os.path.realpath(owned), os.path.realpath(tmp_root)
+        if os.path.commonpath([real, root]) != root:
+            return 0
+        if os.path.islink(owned) or not os.path.isfile(real):
+            return 0
+        n = os.path.getsize(real)
+        os.remove(real)
+        return n
+    except Exception as e:   # noqa: BLE001 — 见 docstring:绝不因释放失败拖垮抽取
+        print(f"    ⚠️ 原件提前释放失败(不影响本篇抽取结果) {task.get('doc_id')}: "
+              f"{type(e).__name__}: {e}")
+        return 0
+
+
+def _dir_size_bytes(path: str) -> int:
+    """目录字节数估算。**纯观测、fail-open**：任何异常回 -1，绝不能阻止清理。"""
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    continue
+    except Exception:   # noqa: BLE001
+        return -1
+    return total
+
+
+def _cleanup_batch_tmp_dir(tmp_dir: str) -> None:
+    """批次临时目录清理 —— **可观测**，且**永不抛出**。
+
+    两处修的都是「清理失败完全看不见」（2026-08-06 codex 评审）：
+      · 原实现是 `rmtree(..., ignore_errors=True)` 外面再套 `try/except: pass` ——
+        ignore_errors 已经吞掉一切，外层 except 是死代码，磁盘泄漏零日志零指标。
+        改 ignore_errors=False + 显式 except 打印（路径 / 异常类型 / 清理前字节）。
+      · 本函数由 finally 调用，**绝不能抛**：抛出会覆盖正在向外传播的原始异常
+        （上传失败的真实根因会被一个 rmtree 报错顶掉）。故整体再包一层。
+    清理前的字节数只在**失败时**才有诊断价值，但必须在 rmtree 之前取——所以无条件先算，
+    fail-open 回 -1。
+    """
+    import shutil
+    try:
+        _bytes = _dir_size_bytes(tmp_dir)
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=False)
+        except Exception as e:   # noqa: BLE001
+            _mb = f"{_bytes / 1048576:.1f}MB" if _bytes >= 0 else "未知"
+            print(f"    ⚠️ 批次临时目录清理失败(磁盘泄漏 {_mb}): {tmp_dir} "
+                  f"{type(e).__name__}: {e}")
+    except Exception as e:   # noqa: BLE001 — finally 内绝不抛，见 docstring
+        print(f"    ⚠️ 批次临时目录清理收尾异常(已吞): {type(e).__name__}: {e}")
 
 
 def _upload_clean_assets(extractions, bucket_upload) -> int:
