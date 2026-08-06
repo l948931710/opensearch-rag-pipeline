@@ -66,6 +66,11 @@ export const ADMISSION_REASON_LABEL: Record<string, string> = {
   global_cap: '全局日熔断', per_min: '单人每分钟上限', per_day: '单人每日上限',
   thinking_quota: '深度思考日配额', thinking_anon: '匿名深度思考', thinking_off: '深度思考未开放',
   aux_per_min: '辅助接口每分钟上限',
+  // 2026-08-06 补齐:auth_per_min 是当天新增的登录独立桶——**分桶的观测收益全靠这一行**
+  // (台账能区分"登录挤爆"与"控制台在刷",否则又要去翻 SLS);general_* 三个是早先就漏的。
+  // ⚠️ 新增 Denial reason 码时必须同步本表——tests/test_admission_reason_parity.py 会红。
+  auth_per_min: '登录换令牌每分钟上限',
+  general_quota: '通用问答日配额', general_anon: '匿名通用问答', general_off: '通用能力未开放',
 }
 export const admissionReasonLabel = (r: string) => ADMISSION_REASON_LABEL[r] || r
 
