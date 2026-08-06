@@ -355,7 +355,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status,
-                           v.chunk_status, v.content_process_error, v.gate_status{_mc}
+                           v.chunk_status, v.content_process_error, v.gate_status,
+                           v.status{_mc}
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -367,11 +368,14 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
                 )
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
+                # ⚠️ 基础列 2026-08-06 由 14 列增至 15（末列 v.status，供「历史版本」徽章），
+                # capability 附加列整体后移 14/15 → 15/16。本仓明令禁止用行长启发式推断
+                # 条件列，故此处与下方解包都写死新索引，并有喂"带/不带 capability 完整行"的测试。
                 node_names = _kb_node_names(
-                    cur, [r[15] for r in rows[:limit] if cap == "present" and r[15]])
+                    cur, [r[16] for r in rows[:limit] if cap == "present" and r[16]])
                 shared_nodes = _kb_shared_node_labels(
-                    cur, [(r[0], r[15]) for r in rows[:limit]
-                          if cap == "present" and (r[14] or "legacy") == "node" and r[15]])
+                    cur, [(r[0], r[16]) for r in rows[:limit]
+                          if cap == "present" and (r[15] or "legacy") == "node" and r[16]])
         finally:
             conn.close()
     except HTTPException:
@@ -385,8 +389,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
     items = []
     for r in rows[:limit]:
         (doc_id, title, fname, owner, perm, cur_ver, status, updated,
-         cps, ixs, pubs, chks, cpe, gate) = r[:14]
-        _mode, _oid = ((r[14] or "legacy"), r[15]) if cap == "present" else ("legacy", None)
+         cps, ixs, pubs, chks, cpe, gate, vst) = r[:15]
+        _mode, _oid = ((r[15] or "legacy"), r[16]) if cap == "present" else ("legacy", None)
         _okey, _olabel = _kb_owner_dto(_mode, owner or "", _oid, node_names)
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
@@ -395,7 +399,8 @@ def kb_my_docs(request: Request, limit: int = 20, offset: int = 0, q: str = "",
             shared_labels=shared_nodes.get(doc_id) or [],
             permission_level=perm or "public",
             current_version_no=int(cur_ver or 1), status=status or "active",
-            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs,
+            status_badge=_kb_status_badge(cps, ixs, status, version_status=vst,
+                                          publish_status=pubs,
                                           chunk_status=chks, gate_status=gate),
             updated_at=str(updated) if updated else "",
             cited_count=(None if usage is None else (_u[0] if _u else 0)),
@@ -460,7 +465,7 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                     SELECT m.doc_id, m.title, m.original_filename, m.owner_dept,
                            m.permission_level, m.current_version_no, m.status, m.updated_at,
                            v.content_process_status, v.index_status, v.publish_status,
-                           v.chunk_status, v.gate_status{_mc}
+                           v.chunk_status, v.gate_status, v.status{_mc}
                     FROM {_kb_db()}.document_meta m
                     LEFT JOIN {_kb_db()}.document_version v
                       ON v.doc_id = m.doc_id AND v.version_no = m.current_version_no
@@ -474,8 +479,9 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
                 )
                 rows = cur.fetchall()
                 usage = _kb_usage_enrich(cur, [r[0] for r in rows[:limit]])
+                # ⚠️ 基础列 13 → 14（末列 v.status），capability 附加列后移 13/14 → 14/15。
                 node_names = _kb_node_names(
-                    cur, [r[14] for r in rows[:limit] if _bcap == "present" and r[14]])
+                    cur, [r[15] for r in rows[:limit] if _bcap == "present" and r[15]])
         finally:
             conn.close()
     except HTTPException:
@@ -493,8 +499,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
     items = []
     for r in rows[:limit]:
         (doc_id, title, fname, owner, perm, cur_ver, status, updated,
-         cps, ixs, pubs, chks, gate) = r[:13]
-        _mode, _oid = ((r[13] or "legacy"), r[14]) if _bcap == "present" else ("legacy", None)
+         cps, ixs, pubs, chks, gate, vst) = r[:14]
+        _mode, _oid = ((r[14] or "legacy"), r[15]) if _bcap == "present" else ("legacy", None)
         _okey, _olabel = _kb_owner_dto(_mode, owner or "", _oid, node_names)
         _u = usage.get(doc_id) if usage is not None else None
         items.append(KbDocItem(
@@ -502,7 +508,8 @@ def kb_browse(request: Request, scope: str = "all", q: str = "", owner_dept: str
             owner_dept=owner or "", acl_mode=_mode, owner_key=_okey, owner_label=_olabel,
             permission_level=perm or "dept_internal",
             current_version_no=int(cur_ver or 1), status=status or "active",
-            status_badge=_kb_status_badge(cps, ixs, status, publish_status=pubs,
+            status_badge=_kb_status_badge(cps, ixs, status, version_status=vst,
+                                          publish_status=pubs,
                                           chunk_status=chks, gate_status=gate),
             updated_at=str(updated) if updated else "",
             can_manage=_cmd(kb, _mode, owner or "", _oid, _descendants),
@@ -2278,7 +2285,7 @@ def kb_version_history(request: Request, doc_id: str,
                     SELECT version_no, content_process_status, chunk_status, index_status,
                            publish_status, gate_status,
                            COALESCE(raw_key, '') <> '' AS has_raw,
-                           error_message, created_at, approval_status
+                           error_message, created_at, approval_status, status
                     FROM {_kb_db()}.document_version
                     WHERE doc_id=%s ORDER BY version_no DESC
                     """,
@@ -2296,7 +2303,7 @@ def kb_version_history(request: Request, doc_id: str,
 
     versions = []
     for r in rows:
-        (vno, cps, chs, ixs, pubs, gate, has_raw, err, created, appr) = r
+        (vno, cps, chs, ixs, pubs, gate, has_raw, err, created, appr, vst) = r
         # 隔离徽章统一走 _kb_version_quarantined（gate-only 隔离此前会显「已上线」——
         # 存量 bug，codex 评审 2026-08-02 抓出；publish_status/chunk_status 同时补传给
         # badge helper，EMPTY/NEEDS_REVIEW 语义在版本行同样生效）。
@@ -2305,7 +2312,8 @@ def kb_version_history(request: Request, doc_id: str,
             version_no=int(vno or 0), content_process_status=cps or "",
             chunk_status=chs or "", index_status=ixs or "", publish_status=pubs or "",
             status_badge=("已隔离" if _is_q else _kb_status_badge(
-                cps, ixs, _doc_status,   # 传 doc 级状态 → 退役文档各版本如实显「已退役」(B4)
+                cps, ixs, _doc_status,   # 第 3 位是 **doc 级**状态 → 退役文档各版本如实显「已退役」(B4)
+                version_status=vst,      # 版本级：superseded ⇒「历史版本」(2026-08-06)
                 publish_status=pubs, chunk_status=chs)),
             error_message=err or "", created_at=str(created) if created else "",
             has_raw=bool(has_raw), quarantined=_is_q, approval_status=(appr or ""),
@@ -2340,7 +2348,7 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
                 vno = int(version) if version else cur_ver
                 cur.execute(
                     "SELECT content_process_status, chunk_status, index_status, error_message, "
-                    "publish_status, gate_status "
+                    "publish_status, gate_status, status "
                     f"FROM {_kb_db()}.document_version WHERE doc_id=%s AND version_no=%s LIMIT 1",
                     (doc_id, vno),
                 )
@@ -2360,7 +2368,7 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
         logger.error("kb_doc_status 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"文档状态查询失败 (trace: {trace_id})")
 
-    cps, chs, ixs, err, pubs, gate = (dv or ("", "", "", "", "", ""))
+    cps, chs, ixs, err, pubs, gate, vst = (dv or ("", "", "", "", "", "", ""))
     active = int(active or 0)
     # doc-status 是**前端轮询**的那个端点（useKb.trackStatus 每 8s 一次，只在徽章 ∈
     # TERMINAL_BADGES 时收手）。此前它是全仓唯一**不传** publish_status/chunk_status 的
@@ -2380,8 +2388,12 @@ def kb_doc_status(request: Request, doc_id: str, version: Optional[int] = None,
         doc_id=doc_id, version_no=vno, owner_dept=owner_dept,
         content_process_status=cps or "", chunk_status=chs or "", index_status=ixs or "",
         chunk_total=int(total or 0), chunk_active=active, chunk_indexed=int(indexed or 0),
+        # chunk_active 不再进徽章（2026-08-06 去轴，理由见 _kb_status_badge docstring）——
+        # 三个计数字段照常返回，"0 活跃 chunk" 的诊断信号不丢，只是不再折叠成徽章，
+        # 从而消除本端点与 version-history/my-docs/browse/contribution 的同行不同徽章。
         status_badge=("已隔离" if _is_q else _kb_status_badge(
-            cps, ixs, doc_status, active, publish_status=pubs, chunk_status=chs)),
+            cps, ixs, doc_status, version_status=vst,
+            publish_status=pubs, chunk_status=chs)),
         error_message=err or "",
     )
 
@@ -3482,7 +3494,12 @@ def kb_restore(req: KbRetireRequest, request: Request,
                identity: Optional[Identity] = Depends(current_identity)):
     """恢复上线（退役的逆操作）：把退役文档重新激活 + 标脏待重索引。授权与退役同款。
 
-    仅改 RDS（document_meta/version.status='active' + chunk_meta.is_active=1 + index_status='NOT_INDEXED'）。
+    仅改 RDS。版本级 status 的处置**分两支**（2026-08-06 起）：
+      · `document_meta` 与**当前版本** `document_version.status` → `'active'`；
+      · 更早的残留 `status='active'` 旧版本 → **归一为 `'superseded'`**（否则恢复后它们
+        既不命中「历史版本」也不命中「已上线」，落进一个永不前进的「处理中」）。
+      · 已 `superseded` / `inactive`（corpus_cleanup 卫生排除）的旧行**不动**。
+    chunk 侧只重激活当前版本（`chunk_meta.is_active=1` + `index_status='NOT_INDEXED'`）。
     软退役不删 HA3（is_active=0 仅 RDS 标记）：若退役后【尚未】跑 HA3 清除维护，chunk 仍在 HA3 →
     本操作即时恢复检索；若已被 gated 维护从 HA3 删除，则标脏 NOT_INDEXED，下次 stage-3 drain 重嵌+重推
     后恢复（与退役"可逆"承诺对齐，且覆盖已清除的边界情形）。不触碰 HA3（重推交 stage-3）。
@@ -3528,6 +3545,18 @@ def kb_restore(req: KbRetireRequest, request: Request,
                             "WHERE doc_id=%s", (req.doc_id,))
                 cur.execute(f"UPDATE {_kb_db()}.document_version SET status='active', updated_at=NOW() "
                             "WHERE doc_id=%s AND version_no=%s", (req.doc_id, cur_ver))
+                # 旧版本归一（2026-08-06，codex 共识）：**retired 不是终态**，本端点就是它的逆操作。
+                # 上面两句只把 doc 与**当前版本**置回 active；2026-07-12 补版本级 supersede
+                # 之前的存量旧行仍是 `status='active' + index_status='DELETED'` ⇒ 恢复后
+                # `document_meta.status` 不再截胡，这些行既不命中「历史版本」也不命中「已上线」，
+                # 落默认「处理中」——一个永远不会前进的假进行态。
+                # 这里比升版收尾更安全：retire 已停用整篇 chunk，而本端点只重激活 cur_ver 的 chunk
+                # （下方 UPDATE 带 version_no=%s）⇒ 旧版本绝不会重新服务。
+                # `AND status='active'` 保证幂等，且不改写已 superseded / corpus_cleanup 置的 inactive 行。
+                cur.execute(f"UPDATE {_kb_db()}.document_version "
+                            "SET status='superseded', updated_at=NOW() "
+                            "WHERE doc_id=%s AND version_no<%s AND status='active'",
+                            (req.doc_id, cur_ver))
                 # 重新激活本版本 chunk + 标脏 NOT_INDEXED（下次 stage-3 重推 HA3；若 HA3 未删则为幂等重推）。
                 cur.execute(f"UPDATE {_kb_db()}.chunk_meta SET is_active=1, index_status='{ChunkIndexStatus.NOT_INDEXED}' "
                             "WHERE doc_id=%s AND version_no=%s AND is_active=0", (req.doc_id, cur_ver))

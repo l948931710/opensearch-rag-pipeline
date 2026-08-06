@@ -517,7 +517,10 @@ function countOf(badge: string): number {
 }
 
 // 异常文档徽章（退役候选/需人工处理）：待办摘要条 + 台账速览共用口径。
-const BAD_BADGES = ['未入索引', '处理失败', '已隔离', '已驳回']
+// ⚠️ 必须与后端 api.py::_KB_BAD_BADGES 同集（parity 测试守）。2026-08-06 补「内容不符」：
+// 此前后端「异常」筛选会把它返回，前端本地 filtered 又把它排除 ⇒ 服务端说有、界面看不到，
+// 异常计数同步少算（既存缺陷，codex 独立发现）。「历史版本」是正常生命周期，**不入本集**。
+const BAD_BADGES = ['未入索引', '处理失败', '已隔离', '已驳回', '内容不符']
 // 「异常」伪徽章筛选：一次圈出全部 BAD_BADGES(服务端 my-docs 有同名 IN 分支)。
 // 待办条「异常文档」chip 点击即设——原先只滚动到台账,还得自己再挑一个坏徽章点。
 const ANOMALY_FILTER = '异常'
@@ -1122,6 +1125,14 @@ function trackStatus(docId: string, versionNo: number) {
       patchRow(docId, s.status_badge)
       if (TERMINAL_BADGES.includes(s.status_badge)) {
         if (s.status_badge === '处理失败') { uploadOk.value = false; uploadErr.value = `入库失败：${s.error_message || ''}（${docId} v${versionNo}）`; uploadMsg.value = '' }
+        // 「内容不符」：审批放行的字节 ≠ 摄取到的字节。它**不可自动重试**（后端 badge helper
+        // 注释写明唯一出路是重新上传形成新版本）⇒ 必须给失败态 + 可执行提示。
+        // 只把它加进 TERMINAL_BADGES 而不给反馈，结果是「不再空转、但成功侧文案残留」。
+        else if (s.status_badge === '内容不符') { uploadOk.value = false; uploadErr.value = `内容校验不通过：入库的文件与审批放行的不是同一份（${docId} v${versionNo}）。请重新上传以形成新版本——该状态无法自动重试。`; uploadMsg.value = '' }
+        // 「历史版本」：正常生命周期终点，**既不是成功也不是失败**。只把它加进 TERMINAL_BADGES
+        // 而不给反馈 ⇒ 轮询虽停，界面仍绿着显示上一条「已提交…（排队中）」，用户以为还在跑。
+        // uploadOk=false 让 UploadCard 走 muted 而非失败红——不能把正常生命周期显示成出错。
+        else if (s.status_badge === '历史版本') { uploadOk.value = false; uploadErr.value = ''; uploadMsg.value = `该版本已被后续版本取代，不再继续处理；请查看当前最新版本（${docId}）` }
         else if (s.status_badge === '已上线') uploadMsg.value = `已上线（${s.chunk_active} 段）`
         void loadDocs()
         return

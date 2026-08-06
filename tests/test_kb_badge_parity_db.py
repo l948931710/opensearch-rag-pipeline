@@ -8,13 +8,19 @@ CASE 里出现、查各分支首次出现的先后顺序。它守得住「漏加
 把 `= 'QUARANTINED'` 写成 `!=`、把 `LEFT(...,7)` 写成 `LEFT(...,8)`、漏个
 `UPPER()`，字面量和顺序统统不变，那条测试照绿。
 
-本模块把两份实现放在**真 MySQL** 上跑全交叉积（约 12 万组），逐组比对。
+本模块把两份实现放在**真 MySQL** 上跑全交叉积（6 × 129,360 = **776,160** 组），逐组比对。
 
 ## 覆盖的输入轴
 
-doc_status × publish_status × chunk_status × index_status × content_process_status × gate_status，
-每轴都含 NULL / 空串 / 大小写变体 / 真实取值。`chunk_active` 恒 None —— 那正是列表路径的
-调用形态，也是 SQL 镜像唯一声明支持的形态（镜像的 docstring 写明不含 chunk_active 分支）。
+**两条 status 轴独立**（2026-08-06 修）：`m.status`（文档级 →「已退役」）与
+`v.status`（版本级 →「历史版本」）。此前本模块把同一张表自连（`FROM t m JOIN t v ON v.i=m.i`）
+⇒ `m.status ≡ v.status` 恒成立，两轴的交叉是**实质盲区**（codex 独立指出）。现改为两张表
+`t_m` / `t_v` 做 CROSS JOIN——插入仅 6 + 129,360 行（比旧方案只多 6 行），
+776,160 组交叉积在 SQL 侧展开，不用逐组灌库。
+
+m 轴：status。v 轴：publish_status × chunk_status × index_status ×
+content_process_status × gate_status × status(版本级)。每轴都含 NULL / 空串 / 大小写变体。
+`chunk_active` 轴已于 2026-08-06 整个移除（不再有"镜像只支持 None 形态"这一说）。
 
 依赖本地 MySQL（conftest 串行组成员）。无本地栈则 skip。
 """
@@ -48,8 +54,13 @@ def _conn():
 
 
 # 每轴都带 NULL / 空串 / 大小写变体 —— COALESCE/UPPER/LOWER 写漏时正是这些取值翻车
-_AXES = {
+_M_AXES = {
+    # 文档级（document_meta.status）
     "status": [None, "active", "ACTIVE", "retired", "archived", ""],
+}
+_V_AXES = {
+    # 版本级（document_version.status）——本次新增的独立轴，含大小写变体（镜像用 LOWER）
+    "status": [None, "", "active", "superseded", "SUPERSEDED", "inactive"],
     "publish_status": [None, "", "QUARANTINED", "quarantined", "SKIPPED_PII", "SKIPPED", "PUBLISHED"],
     "chunk_status": [None, "", "EMPTY", "empty", "NEEDS_REVIEW", "needs_review", "OK"],
     "index_status": [None, "", "INDEXED", "SUCCESS", "success", "FAILED", "PROCESSING", "DELETED"],
@@ -57,12 +68,24 @@ _AXES = {
                                "PENDING_APPROVAL", "DONE", "LOADING", "CONTENT_MISMATCH", "content_mismatch"],
     "gate_status": [None, "", "quarantined", "QUARANTINED", "pending_clean"],
 }
-_COLS = list(_AXES)
+_MCOLS = list(_M_AXES)
+_VCOLS = list(_V_AXES)
 
 
 @pytest.fixture(scope="module")
 def _rows():
-    return list(itertools.product(*(_AXES[c] for c in _COLS)))
+    """(m 行, v 行) 两组，交叉积由 SQL 的 CROSS JOIN 展开。"""
+    return (list(itertools.product(*(_M_AXES[c] for c in _MCOLS))),
+            list(itertools.product(*(_V_AXES[c] for c in _VCOLS))))
+
+
+def _seed(cur, name, cols, rows):
+    cur.execute(f"DROP TABLE IF EXISTS {name}")
+    coldef = ", ".join(f"{c} VARCHAR(32)" for c in cols)
+    cur.execute(f"CREATE TABLE {name} (i INT PRIMARY KEY, {coldef}) DEFAULT CHARSET utf8mb4")
+    ph = ",".join(["%s"] * (len(cols) + 1))
+    cur.executemany(f"INSERT INTO {name} VALUES ({ph})",
+                    [(i,) + r for i, r in enumerate(rows)])
 
 
 def test_badge_python_sql_parity_full_cross_product(_rows):
@@ -78,26 +101,30 @@ def test_badge_python_sql_parity_full_cross_product(_rows):
         with conn.cursor() as cur:
             cur.execute(f"CREATE DATABASE IF NOT EXISTS {_DB}")
             cur.execute(f"USE {_DB}")
-            cur.execute("DROP TABLE IF EXISTS t")
-            cols = ", ".join(f"{c} VARCHAR(32)" for c in _COLS)
-            cur.execute(f"CREATE TABLE t (i INT PRIMARY KEY, {cols}) DEFAULT CHARSET utf8mb4")
-            ph = ",".join(["%s"] * (len(_COLS) + 1))
-            cur.executemany(f"INSERT INTO t VALUES ({ph})",
-                            [(i,) + r for i, r in enumerate(_rows)])
-            # 镜像引用 m./v. 两个别名 → 同一张表自连，两侧取同一行
-            cur.execute(f"SELECT m.i, ({_KB_BADGE_CASE_SQL}) FROM t m JOIN t v ON v.i=m.i")
-            sql_out = dict(cur.fetchall())
+            mrows, vrows = _rows
+            _seed(cur, "t_m", _MCOLS, mrows)
+            _seed(cur, "t_v", _VCOLS, vrows)
+            # 两张表 CROSS JOIN：m.status 与 v.status 真正独立（自连同一行是本模块旧盲区）
+            cur.execute(f"SELECT m.i, v.i, ({_KB_BADGE_CASE_SQL}) FROM t_m m CROSS JOIN t_v v")
+            sql_out = {(a, b): c for a, b, c in cur.fetchall()}
 
         bad = []
-        for i, r in enumerate(_rows):
-            v = dict(zip(_COLS, r))
-            py = _kb_status_badge(v["content_process_status"], v["index_status"], v["status"],
-                                  chunk_active=None, publish_status=v["publish_status"],
-                                  chunk_status=v["chunk_status"], gate_status=v["gate_status"])
-            if py != sql_out[i]:
-                bad.append((v, py, sql_out[i]))
+        for mi, mr in enumerate(mrows):
+            mv = dict(zip(_MCOLS, mr))
+            for vi, vr in enumerate(vrows):
+                vv = dict(zip(_VCOLS, vr))
+                py = _kb_status_badge(
+                    vv["content_process_status"], vv["index_status"], mv["status"],
+                    version_status=vv["status"], publish_status=vv["publish_status"],
+                    chunk_status=vv["chunk_status"], gate_status=vv["gate_status"])
+                if py != sql_out[(mi, vi)]:
+                    # 先铺 vv 再覆盖两个 status，否则 vv["status"] 会顶掉文档级 mv["status"]，
+                    # 失败输出里就看不到真正的 m.status（codex 2026-08-06 点名）。
+                    bad.append(({**vv, "m.status": mv["status"], "v.status": vv["status"]},
+                                py, sql_out[(mi, vi)]))
+        n_total = len(mrows) * len(vrows)
         assert not bad, (
-            f"Python 阶梯与 SQL 镜像在 {len(bad)}/{len(_rows)} 组上不一致，前 3 组："
+            f"Python 阶梯与 SQL 镜像在 {len(bad)}/{n_total} 组上不一致，前 3 组："
             + "; ".join(f"{v} → py={p!r} sql={s!r}" for v, p, s in bad[:3]))
     finally:
         with conn.cursor() as cur:
@@ -114,13 +141,10 @@ def test_sql_mirror_never_emits_outside_vocab(_rows):
         with conn.cursor() as cur:
             cur.execute(f"CREATE DATABASE IF NOT EXISTS {_DB}")
             cur.execute(f"USE {_DB}")
-            cur.execute("DROP TABLE IF EXISTS t2")
-            cols = ", ".join(f"{c} VARCHAR(32)" for c in _COLS)
-            cur.execute(f"CREATE TABLE t2 (i INT PRIMARY KEY, {cols}) DEFAULT CHARSET utf8mb4")
-            ph = ",".join(["%s"] * (len(_COLS) + 1))
-            cur.executemany(f"INSERT INTO t2 VALUES ({ph})",
-                            [(i,) + r for i, r in enumerate(_rows)])
-            cur.execute(f"SELECT DISTINCT ({_KB_BADGE_CASE_SQL}) FROM t2 m JOIN t2 v ON v.i=m.i")
+            mrows, vrows = _rows
+            _seed(cur, "t_m", _MCOLS, mrows)
+            _seed(cur, "t_v", _VCOLS, vrows)
+            cur.execute(f"SELECT DISTINCT ({_KB_BADGE_CASE_SQL}) FROM t_m m CROSS JOIN t_v v")
             got = {r[0] for r in cur.fetchall()}
         assert got <= set(_KB_BADGE_VOCAB), f"SQL 镜像产出了词表外的徽章：{got - set(_KB_BADGE_VOCAB)}"
     finally:
@@ -143,8 +167,25 @@ def test_gate_axis_is_in_both_implementations():
     """
     from opensearch_pipeline.api import _KB_BADGE_CASE_SQL, _kb_status_badge
     assert "gate_status" in _KB_BADGE_CASE_SQL, "SQL 镜像缺 gate 轴"
-    assert _kb_status_badge("DONE", "SUCCESS", "active", None, None, None,
+    assert _kb_status_badge("DONE", "SUCCESS", "active",
                             gate_status="quarantined") == "已隔离", "Python 阶梯缺 gate 轴"
+
+
+def test_version_status_axis_is_in_both_implementations():
+    """★ 版本级 status 轴必须**两侧都有**（2026-08-06）。
+
+    升版收尾只写 `document_version.status='superseded'`、不动 `index_status` ⇒ 旧版本行
+    永远停在 SUCCESS；两侧任一侧漏掉该轴，旧版本就会重新显示成「已上线」。
+    ⚠️ 与第一支的 `m.status`（文档级）是**两条不同的轴**——本模块此前自连同一张表，
+    二者恒等，这个交叉是测不到的。
+    """
+    from opensearch_pipeline.api import _KB_BADGE_CASE_SQL, _kb_status_badge
+    assert "v.status" in _KB_BADGE_CASE_SQL, "SQL 镜像缺版本级 status 轴"
+    assert _kb_status_badge("DONE", "SUCCESS", "active",
+                            version_status="superseded") == "历史版本"
+    # 文档级优先于版本级
+    assert _kb_status_badge("DONE", "SUCCESS", "retired",
+                            version_status="superseded") == "已退役"
 
 
 def test_gate_only_quarantine_is_unreachable_today():

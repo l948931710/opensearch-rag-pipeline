@@ -266,9 +266,48 @@ rows=57,410 filtered=8.11` —— 即**优化器没有用 `doc_id IN` 去 range-
 上述五条它一项都没列到。这印证了 §C-bis 自己写的：同一个人复查同一批代码有系统性盲区。
 
 ### 下一轮优先级（codex 给出、我方认同）
-`e5e29ce` cosurface 补图 —— 图片是最高 PII 风险模态，涉及版本 / 物理 PK / ACL / TOCTOU 四轴。
-其后依次：`a61fe87`（徽章语义，chunk_active 轴仍在 doc-status 与列表间分叉）、
-`d2c8e12`（五处分页依赖全序与方向）、`a4f6e37`/`b8e11b4`（分页状态机，本轮竞态的根表面）。
+1. ~~`e5e29ce` cosurface 补图~~ ⇒ **已收官**：图片「当前版本」不变量，见上一小节。
+2. ~~`a61fe87` 徽章语义~~ ⇒ **已收官**，见下一小节。
+3. 仍开着：`d2c8e12`（五处分页依赖全序与方向）、`a4f6e37`/`b8e11b4`（分页状态机）。
+
+### 第五项：徽章 `chunk_active` 轴分叉 —— 已实施（2026-08-06，未提交）
+
+§C-ter 把它记成「哪边语义为准，需裁决」，**但事实是两边都错**。正常升版后旧版本是
+`document_version.status='superseded'` + `index_status` **仍是 SUCCESS**
+（`pipeline_nodes.py:7832` 注释自陈「只写 status、不动 index_status」）+ chunk 全 `is_active=0`：
+- **doc-status** 传真实 `chunk_active=0` ⇒ 落穿「已上线」⇒「处理中」。错（没有东西在处理），
+  且「处理中」非终态 ⇒ 前端 `trackStatus` 空转 22 次 ×8s；
+- **version-history / my-docs / browse / contribution / SQL 镜像** ⇒「已上线」。也错（搜不到）。
+
+而权威信号 `document_version.status='superseded'` 是管线亲手写的，**读侧全仓零消费**。
+
+**Sam 拍板**：消费 superseded，新增徽章「历史版本」（放「内容不符」之后、「已上线」之前）。
+**同时整个移除 `chunk_active` 轴** —— codex 逐条枚举了所有会停用 chunk 的生产写路径，
+证明「当前版本 SUCCESS + 0 活跃 chunk 且逃过全部更早分支」不可达；留着它等于永久保留一处
+`_KB_BADGE_CASE_SQL` **原理上无法表达**的分叉。doc-status 仍单独返回三个计数字段。
+`_kb_status_badge` 的可选轴全改 **keyword-only**（contribution 是位置调用，删第 4 位后
+`gate_status` 会撞 `TypeError` 又被其 fail-open 吞掉 ⇒ **贡献列表徽章整片静默消失**）。
+
+**顺带闭合两条既存缺陷**（同一手工同步面）：「内容不符」是后端自陈的不可自动重试终态却不在
+前端 `TERMINAL_BADGES`（空转到上限）；`_KB_BAD_BADGES` 前后端不一致（服务端"异常"筛选返回的行
+被前端本地再排除、计数少算）。并补了此前**不存在**的跨层词表 parity 测试。
+
+**`kb_restore` 一并修**：retired **不是终态**，而该端点只把当前版本置回 active ⇒ 恢复后
+残留 `status='active'` 的旧版本落进「处理中」这个永不前进的假进行态。同事务加归一
+（`version_no<%s AND status='active'`，CAS 保证不改写已 superseded / corpus_cleanup 的 inactive）。
+
+**存量核查（prod-ro 只读）**：老版本 status 分布 superseded 979 / **active 94** / inactive 65。
+那 94 行**全部** `dm.status='retired'` ⇒ 徽章第一条分支即命中「已退役」，**当前无用户可见缺口**、
+**零 prod 写**；未来经 restore 复活时由新加的归一语句兜住。
+
+验证：`make test` 4377 passed / `make lint` / `make sim-all` 全 exit=0；vitest 496；
+vue-tsc + build exit=0；**变异 21/21 全红 0 存活**。codex APPROVE（四轮，2 BLOCKER + 4 MAJOR，
+其中**四条是我测试里的假绿**：trackStatus 只验成员没验状态机、appending-column 行退化成恰好
+等于基础列数、裸 `"status"` 被 `*_status` 子串命中、`shared_labels` 桩恒定空）。
+
+⚠️ **记为独立项、本批不做**：`kb_restore` 目前也能把 `corpus_cleanup` 标为 `inactive` 的
+语料卫生排除件"恢复上线"（入口只区分 active/非 active）。属独立的业务授权语义，
+需 Sam 裁决是「只允许 retired 的逆操作」还是「明确 inactive 的重灌/校验流程」。
 
 ## D. 状态
 

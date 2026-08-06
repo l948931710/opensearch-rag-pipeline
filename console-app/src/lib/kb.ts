@@ -88,6 +88,9 @@ export const BADGE_TONE: Record<string, string> = {
   // C8（2026-08-04）：审批放行的字节 ≠ 摄取到的字节。用 'fail' 而非 'warn'——它是
   // **不可自动重试**的安全终态，唯一出路是重新上传形成新版本，不是"等一等会好"。
   内容不符: 'fail',
+  // 「历史版本」（2026-08-06）：document_version.status='superseded' —— 升版后旧版本的
+  // **正常**生命周期终点，不是异常。用 muted（与已退役/内容未变同族），绝不用 warn/fail。
+  历史版本: 'muted',
 }
 export const badgeTone = (badge: string) => BADGE_TONE[badge] || 'muted'
 
@@ -127,7 +130,11 @@ const QBADGE_TONE: Record<string, string> = {
 export const qBadgeTone = (s: string) => QBADGE_TONE[s] || 'queue'
 
 // 轮询终态：命中即停（含已退役，不含待审核——待审核要等人审，根本不轮询）。
-export const TERMINAL_BADGES = ['已上线', '未入索引', '处理失败', '已隔离', '已驳回', '内容未变', '已退役']
+// ⚠️ 2026-08-06 补两词：
+//   · 「内容不符」——后端 badge helper 自己写明它是**不可自动重试**的安全终态，却一直不在
+//     本表里 ⇒ trackStatus 命中后仍继续轮询到 22 次上限才放弃（既存缺陷，codex 独立发现）；
+//   · 「历史版本」——轮询中的版本若被另一次成功升版取代，应当即停手。
+export const TERMINAL_BADGES = ['已上线', '未入索引', '处理失败', '已隔离', '已驳回', '内容未变', '已退役', '内容不符', '历史版本']
 
 /**
  * 直传 OSS：fetch 无法上报上传进度，故用 XHR 接 upload.onprogress。File 必须留闭包、勿进 Vue 响应式

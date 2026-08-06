@@ -191,17 +191,37 @@ def test_kb_status_badge_recognizes_success():
     assert b("NOT_STARTED", "NOT_INDEXED", "active") == "排队中"
     assert b("PENDING_APPROVAL", "NOT_INDEXED", "active") == "待审核"   # 公开/跨组上传待审批
     assert b("REJECTED", "NOT_INDEXED", "active") == "已驳回"   # 升版被驳回：不得落到默认"处理中"
-    assert b("DONE", "SUCCESS", "active", 0) == "处理中"     # SUCCESS 但 0 活跃 chunk → 不算已上线
+    # 🔴 契约反转（2026-08-06）：`chunk_active` 轴已整个移除 —— 它此前只有 doc-status 传真值、
+    # 其余四处传 None，同一行数据两个端点两个徽章。现在**当前** active 版本即使活跃 chunk 数为 0，
+    # 徽章仍由持久状态判为「已上线」；计数作为 doc-status 的独立诊断字段返回，信号不丢。
+    # 旧断言是 `b("DONE","SUCCESS","active",0) == "处理中"`。
+    assert b("DONE", "SUCCESS", "active") == "已上线"
+    # 「历史版本」：升版收尾只写 document_version.status、不动 index_status ⇒ 旧版本永远停在
+    # SUCCESS，不拦就会显示"在线"。判定源是**版本级** status，与第 3 位的文档级 status 是两条轴。
+    assert b("DONE", "SUCCESS", "active", version_status="superseded") == "历史版本"
+    assert b("DONE", "SUCCESS", "retired", version_status="superseded") == "已退役"  # 文档级优先
     # PII 隔离：即便 index_status 残留 SUCCESS 也必须显示已隔离（绝不能误显示已上线）
-    assert b("DONE", "SUCCESS", "active", None, "QUARANTINED") == "已隔离"
-    assert b("DONE", "NOT_INDEXED", "active", None, "QUARANTINED") == "已隔离"
-    assert b("DONE", "SUCCESS", "superseded", None, "QUARANTINED") == "已退役"   # 退役判定仍优先
+    assert b("DONE", "SUCCESS", "active", publish_status="QUARANTINED") == "已隔离"
+    assert b("DONE", "NOT_INDEXED", "active", publish_status="QUARANTINED") == "已隔离"
+    assert b("DONE", "SUCCESS", "superseded", publish_status="QUARANTINED") == "已退役"   # 退役判定仍优先
+    # 隔离/EMPTY/内容不符 的优先级高于「历史版本」——异常态对排障的信息量更高（codex 裁定）
+    assert b("DONE", "SUCCESS", "active", version_status="superseded",
+             publish_status="QUARANTINED") == "已隔离"
+    assert b("DONE", "SUCCESS", "active", version_status="superseded",
+             chunk_status="EMPTY") == "未入索引"
+    assert b("CONTENT_MISMATCH", "SUCCESS", "active", version_status="superseded") == "内容不符"
+    # ★ keyword-only 守卫：第 4 个**位置**实参必须被拒。contribution 曾是位置调用，
+    # 删掉 chunk_active 后位置会静默错位、撞成 TypeError 又被其 fail-open except 吞掉。
+    with pytest.raises(TypeError):
+        b("DONE", "SUCCESS", "active", None)
     # 0-chunk / 版本被跳过终态 → 未入索引（此前落到"处理中"，管理员看不出永远搜不到）
-    assert b("DONE", None, "active", None, None, "EMPTY") == "未入索引"
-    assert b("DONE", None, "active", None, "SKIPPED_EMPTY") == "未入索引"
-    assert b("QUARANTINED", None, "active", None, "SKIPPED_EXPLOSION", "QUARANTINED_EXPLOSION") == "未入索引"
-    assert b("DONE", None, "active", None, "QUARANTINED", "EMPTY") == "已隔离"   # PII 隔离优先
-    assert b("DONE", "SUCCESS", "active", None, None, "DONE") == "已上线"        # 正常件不受影响
+    assert b("DONE", None, "active", chunk_status="EMPTY") == "未入索引"
+    assert b("DONE", None, "active", publish_status="SKIPPED_EMPTY") == "未入索引"
+    assert b("QUARANTINED", None, "active", publish_status="SKIPPED_EXPLOSION",
+             chunk_status="QUARANTINED_EXPLOSION") == "未入索引"
+    assert b("DONE", None, "active", publish_status="QUARANTINED",
+             chunk_status="EMPTY") == "已隔离"   # PII 隔离优先
+    assert b("DONE", "SUCCESS", "active", chunk_status="DONE") == "已上线"        # 正常件不受影响
 
 
 def test_my_docs_dept_admin_search_keeps_owner_scope(monkeypatch):
@@ -281,8 +301,8 @@ def test_browse_can_manage_flags_dept_admin(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "dept_admin")
     monkeypatch.setenv("RAG_SIM_MANAGED_OWNER_DEPTS", "marketing")
     rows = [
-        ("D1", "营销规范", "a.pdf", "marketing", "dept_internal", 1, "active", "2026-06-26", "DONE", "SUCCESS", None, "DONE", None),
-        ("D2", "HR 手册", "b.pdf", "hr", "dept_internal", 2, "active", "2026-06-25", "DONE", "SUCCESS", None, "DONE", None),
+        ("D1", "营销规范", "a.pdf", "marketing", "dept_internal", 1, "active", "2026-06-26", "DONE", "SUCCESS", None, "DONE", None, "active"),
+        ("D2", "HR 手册", "b.pdf", "hr", "dept_internal", 2, "active", "2026-06-25", "DONE", "SUCCESS", None, "DONE", None, "active"),
     ]
     _stub_rows(monkeypatch, rows)
     from opensearch_pipeline import api
@@ -296,7 +316,7 @@ def test_browse_kb_admin_all_manageable(monkeypatch):
     """kb_admin 全部门皆可管：can_manage 恒 True。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    rows = [("D1", "x", "a.pdf", "hr", "dept_internal", 1, "active", "t", "DONE", "SUCCESS", None, "DONE", None)]
+    rows = [("D1", "x", "a.pdf", "hr", "dept_internal", 1, "active", "t", "DONE", "SUCCESS", None, "DONE", None, "active")]
     _stub_rows(monkeypatch, rows)
     from opensearch_pipeline import api
     resp = api.kb_browse(request=None, scope="all", identity=api.Identity(user_id="dev1"))
@@ -758,8 +778,8 @@ def test_my_docs_usage_enrich_when_fact_join_on(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: True)
     docrows = [
-        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None, None),
-        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None, None),
+        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None, None, "active"),
+        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None, None, "active"),
     ]
     _stub_multi(monkeypatch, [[], docrows, [("D1", 5, "2026-07-01 10:00:00")]])   # 首个 []=faceted 计数查询
     from opensearch_pipeline import api
@@ -774,7 +794,7 @@ def test_my_docs_usage_none_when_fact_join_off(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
-    docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None, None)]
+    docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "DONE", "SUCCESS", None, "DONE", None, None, "active")]
     _stub_multi(monkeypatch, [[], docrows])   # 首个 []=faceted 计数查询
     from opensearch_pipeline import api
     resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
@@ -788,8 +808,8 @@ def test_my_docs_reject_reason_only_when_rejected(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
     docrows = [
-        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "REJECTED", None, None, "DONE", "内容过期，已被 v3 取代", None),
-        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "FAILED", "FAILED", None, "DONE", "OCR timeout traceback…", None),
+        ("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts", "REJECTED", None, None, "DONE", "内容过期，已被 v3 取代", None, "active"),
+        ("D2", "t2", "b.pdf", "hr", "dept_internal", 1, "active", "ts", "FAILED", "FAILED", None, "DONE", "OCR timeout traceback…", None, "active"),
     ]
     _stub_multi(monkeypatch, [[], docrows])   # 首个 []=faceted 计数查询
     from opensearch_pipeline import api
@@ -1115,8 +1135,8 @@ def test_version_history_retired_doc_badges(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     ver_rows = [
-        (2, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-20", ""),   # 退役前是「已上线」，doc 退役后应显已退役
-        (1, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-10", ""),
+        (2, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-20", "", "active"),   # 退役前是「已上线」，doc 退役后应显已退役
+        (1, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-10", "", "active"),
     ]
     _stub_multi(monkeypatch, [("marketing", "retired"), ver_rows])   # meta(fetchone) + versions(fetchall)
     from opensearch_pipeline import api
@@ -1129,7 +1149,7 @@ def test_version_history_active_doc_pipeline_badge(monkeypatch):
     """对照：active 文档版本仍显流水线态（已上线），doc_status 传入不误伤。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
-    _stub_multi(monkeypatch, [("marketing", "active"), [(1, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-10", "")]])
+    _stub_multi(monkeypatch, [("marketing", "active"), [(1, "SUCCESS", "", "SUCCESS", "", "", 1, "", "2026-06-10", "", "active")]])
     from opensearch_pipeline import api
     resp = api.kb_version_history(request=None, doc_id="D1", identity=api.Identity(user_id="kb1"))
     assert resp.versions[0].status_badge == "已上线"
@@ -1154,6 +1174,30 @@ def test_retire_deactivates_all_versions(monkeypatch):
     pd = [c for c in sink["calls"] if "SET index_status='PENDING_DELETE'" in c[0]]
     assert len(pd) == 1 and pd[0][1] == ("D1",)
     assert "NOT IN ('DELETED', 'PENDING_DELETE')" in pd[0][0]
+
+
+def test_restore_normalizes_stale_active_old_versions(monkeypatch):
+    """★ retired **不是终态**：本端点就是它的逆操作，必须在同一事务把残留的
+    `status='active'` 旧版本归一为 `superseded`（codex 2026-08-06 blocker）。
+
+    不归一的后果：恢复后 `document_meta.status` 不再截胡，那些旧行是
+    `status='active' + index_status='DELETED'` ⇒ 既不命中「历史版本」也不命中「已上线」
+    ⇒ 落默认「处理中」——一个永远不会前进的假进行态。
+    （现网实测：2026-07-12 补版本级 supersede 之前的存量共 94 行正是这个形态。）
+
+    安全性：retire 已停用整篇 chunk，本端点只重激活 cur_ver 的 chunk ⇒ 旧版本不会重新服务。
+    """
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    sink = _stub_multi(monkeypatch, [("marketing", "dept_internal", "retired", 5)])
+    from opensearch_pipeline import api
+    api.kb_restore(api.KbRetireRequest(doc_id="D1"), request=None, identity=api.Identity(user_id="kb1"))
+    sup = [c for c in sink["calls"] if "SET status='superseded'" in c[0]]
+    assert len(sup) == 1, "恢复事务未归一旧版本"
+    sql, params = sup[0]
+    assert "version_no<%s" in sql, "归一必须只作用于**更早**的版本"
+    assert "status='active'" in sql, "必须 CAS 在 status='active' 上——不得改写已 superseded / inactive 行"
+    assert params == ("D1", 5)
 
 
 def test_restore_reactivates_retired(monkeypatch):
@@ -1770,9 +1814,10 @@ def test_kb_badge_case_sql_parity():
     # 1) list 路径（chunk_active=None）代表性输入 → Python 徽章必出现在 CASE 里
     samples = [
         b("DONE", "SUCCESS", "retired"),                       # 已退役
-        b("DONE", "SUCCESS", "active", None, "QUARANTINED"),   # 已隔离
-        b("DONE", None, "active", None, None, "EMPTY"),        # 未入索引
-        b("DONE", None, "active", None, "SKIPPED_EMPTY"),      # 未入索引（SKIPPED 前缀）
+        b("DONE", "SUCCESS", "active", publish_status="QUARANTINED"),   # 已隔离
+        b("DONE", None, "active", chunk_status="EMPTY"),        # 未入索引
+        b("DONE", None, "active", publish_status="SKIPPED_EMPTY"),      # 未入索引（SKIPPED 前缀）
+        b("DONE", "SUCCESS", "active", version_status="superseded"),    # 历史版本
         b("DONE", "SUCCESS", "active"),                        # 已上线
         b("FAILED", None, "active"),                           # 处理失败
         b("REJECTED", None, "active"),                         # 已驳回
@@ -1784,7 +1829,9 @@ def test_kb_badge_case_sql_parity():
     for badge in samples:
         assert f"'{badge}'" in sql, f"徽章 {badge} 未出现在 CASE 里"
     # 2) 优先级顺序：CASE 里各徽章首次出现的位置必须与 Python if 阶梯同序
-    order = ["已退役", "已隔离", "未入索引", "已上线", "处理失败", "已驳回", "内容未变", "待审核", "排队中", "处理中"]
+    # 「历史版本」在「已上线」之前（2026-08-06）——它拦的正是旧版本残留 SUCCESS 的那条。
+    order = ["已退役", "已隔离", "未入索引", "历史版本", "已上线", "处理失败", "已驳回",
+             "内容未变", "待审核", "排队中", "处理中"]
     positions = [sql.index(f"'{x}'") for x in order]
     assert positions == sorted(positions), "CASE 徽章顺序与 _kb_status_badge 优先级阶梯不一致"
     # 3) SKIPPED 前缀不得用带字面 % 的 LIKE（pymysql 参数化坑）；用 LEFT(...)='SKIPPED'
@@ -2107,9 +2154,9 @@ def test_version_history_gate_only_quarantine_badge_and_flags(monkeypatch):
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     ver_rows = [
-        (3, "SUCCESS", "", "SUCCESS", "", "quarantined", 1, "", "2026-07-01", ""),   # gate-only 隔离
-        (2, "SUCCESS", "", "SUCCESS", "QUARANTINED", "", 1, "", "2026-06-20", ""),   # publish 路径隔离
-        (1, "SUCCESS", "", "SUCCESS", "", "", 0, "", "2026-06-10", ""),              # 正常但无原件
+        (3, "SUCCESS", "", "SUCCESS", "", "quarantined", 1, "", "2026-07-01", "", "active"),   # gate-only 隔离
+        (2, "SUCCESS", "", "SUCCESS", "QUARANTINED", "", 1, "", "2026-06-20", "", "active"),   # publish 路径隔离
+        (1, "SUCCESS", "", "SUCCESS", "", "", 0, "", "2026-06-10", "", "active"),              # 正常但无原件
     ]
     _stub_multi(monkeypatch, [("marketing", "active"), ver_rows])
     from opensearch_pipeline import api
@@ -2351,13 +2398,15 @@ def test_kb_status_badge_closed_set():
     doc_vals = [None, "active", "retired"]
     publish_vals = [None, "PUBLISHED", "QUARANTINED", "SKIPPED_EXPLOSION"]
     chunk_status_vals = [None, "OK", "EMPTY"]
-    chunk_active_vals = [None, 0, 3]
+    # 2026-08-06：`chunk_active` 轴已移除，换成**版本级** status 轴（与第 3 位的文档级 status
+    # 是两条独立轴——真库 parity 此前自连同一张表使二者恒等，正是那处盲区的同源）。
+    version_vals = [None, "active", "superseded", "inactive"]
 
     seen = set()
-    for cs, ix, ds, ps, cks, ca in itertools.product(
-            content_vals, index_vals, doc_vals, publish_vals, chunk_status_vals, chunk_active_vals):
-        out = _kb_status_badge(cs, ix, ds, ca, ps, cks)
-        assert out in _KB_BADGE_VOCAB, f"未登记的新徽章词 {out!r}（inputs cs={cs} ix={ix} ds={ds} ps={ps} cks={cks} ca={ca}）"
+    for cs, ix, ds, ps, cks, vs in itertools.product(
+            content_vals, index_vals, doc_vals, publish_vals, chunk_status_vals, version_vals):
+        out = _kb_status_badge(cs, ix, ds, version_status=vs, publish_status=ps, chunk_status=cks)
+        assert out in _KB_BADGE_VOCAB, f"未登记的新徽章词 {out!r}（inputs cs={cs} ix={ix} ds={ds} ps={ps} cks={cks} vs={vs}）"
         seen.add(out)
     assert seen == _KB_BADGE_VOCAB, f"词表不再全可达（死词该从封闭集摘除）：缺 {_KB_BADGE_VOCAB - seen}"
 
@@ -2370,18 +2419,43 @@ def test_my_docs_and_browse_gate_only_row_renders_quarantined(monkeypatch):
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
     from opensearch_pipeline import api
-    # my-docs：14 列（…, cpe, gate_status）
+    # my-docs：15 列（…, cpe, gate_status, v.status）
     docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts",
-                "DONE", "SUCCESS", None, "DONE", None, "quarantined")]
+                "DONE", "SUCCESS", None, "DONE", None, "quarantined", "active")]
     _stub_multi(monkeypatch, [[], docrows])
     resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
     assert resp.items[0].status_badge == "已隔离"
-    # browse：13 列（…, chunk_status, gate_status）
+    # browse：14 列（…, chunk_status, gate_status, v.status）
     rows = [("D2", "y", "b.pdf", "hr", "dept_internal", 1, "active", "t",
-             "DONE", "SUCCESS", None, "DONE", "quarantined")]
+             "DONE", "SUCCESS", None, "DONE", "quarantined", "active")]
     _stub_multi(monkeypatch, [[], rows])
     resp2 = api.kb_browse(request=None, identity=api.Identity(user_id="adm1"))
     assert resp2.items[0].status_badge == "已隔离"
+
+
+def test_my_docs_and_browse_render_superseded_row_as_history(monkeypatch):
+    """★ 渲染侧版本轴（与 2026-08-04 B2 的 gate 轴同型）：list 端点的 DTO 是 **Python helper**
+    算的，而按徽章筛选 / badge_counts / stats 走的是 **SQL 镜像** —— 镜像认 `v.status`。
+
+    任一侧漏掉该轴，同一行就会「按历史版本筛出、列表里显示已上线」自相矛盾（B2 那次
+    gate-only 隔离踩的正是这个）。my-docs 与 browse 双端点各钉一枚。
+    ⚠️ 正常不变量下 current 版本不该是 superseded，但**该轴的两侧一致性不能依赖那个不变量**
+    ——它一旦被破（skip-gate 回退指针、手工改库、未来新写方），两侧就必须仍然同口径。
+    """
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
+    from opensearch_pipeline import api
+    docrows = [("D1", "t1", "a.pdf", "hr", "dept_internal", 1, "active", "ts",
+                "DONE", "SUCCESS", "PUBLISHED", "DONE", None, None, "superseded")]
+    _stub_multi(monkeypatch, [[], docrows])
+    resp = api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="adm1"))
+    assert resp.items[0].status_badge == "历史版本"
+    rows = [("D2", "y", "b.pdf", "hr", "dept_internal", 1, "active", "t",
+             "DONE", "SUCCESS", "PUBLISHED", "DONE", None, "superseded")]
+    _stub_multi(monkeypatch, [[], rows])
+    resp2 = api.kb_browse(request=None, identity=api.Identity(user_id="adm1"))
+    assert resp2.items[0].status_badge == "历史版本"
 
 
 def test_my_docs_badge_counts_faceted(monkeypatch):
@@ -2392,7 +2466,7 @@ def test_my_docs_badge_counts_faceted(monkeypatch):
     monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
     counts_rows = [("已上线", 12), ("未入索引", 3), ("已退役", 5)]
     docrows = [("D1", "t1", "a.pdf", "production", "dept_internal", 1, "active", "ts",
-                "DONE", "SUCCESS", None, "DONE", None, None)]
+                "DONE", "SUCCESS", None, "DONE", None, None, "active")]
     sink = _stub_multi(monkeypatch, [counts_rows, docrows])
     from opensearch_pipeline import api
     resp = api.kb_my_docs(request=None, limit=20, offset=0, owner_dept="production",
@@ -2461,9 +2535,14 @@ def test_org_tree_flag_fails_safe_to_legacy(monkeypatch):
 # _kb_status_badge 的三条终态分支全部不可达。后果两个方向都有：轮询等不到终态，
 # 以及 index_status 残留 'SUCCESS' 的隔离/缺内容件被显示成「已上线」。
 
-def _doc_status(monkeypatch, dv_row, *, doc_status="active", counts=(5, 5, 5), sink=None):
+def _doc_status(monkeypatch, dv_row, *, doc_status="active", version_status="active",
+                counts=(5, 5, 5), sink=None):
+    """dv_row 传 6 元组即可（末位 document_version.status 由 version_status 补齐）——
+    2026-08-06 该端点 SELECT 由 6 列增至 7 列（加 status，供「历史版本」徽章）。"""
     _skip_if_not_sim()
     monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    if len(dv_row) == 6:
+        dv_row = tuple(dv_row) + (version_status,)
     s = _stub_multi(monkeypatch, [("hr", doc_status, 3), dv_row, counts])
     if sink is not None:
         sink["s"] = s
@@ -2480,14 +2559,19 @@ def test_doc_status_selects_the_columns_its_unpacking_needs(monkeypatch):
     """
     sink = {}
     _doc_status(monkeypatch, ("SUCCESS", "", "SUCCESS", "", "", ""), sink=sink)
-    dv_sql = [c[0] for c in sink["s"]["calls"] if "document_version" in c[0]][0]
+    dv_sql = " ".join([c[0] for c in sink["s"]["calls"] if "document_version" in c[0]][0].split())
     for col in ("content_process_status", "chunk_status", "index_status",
                 "error_message", "publish_status", "gate_status"):
         assert col in dv_sql, f"doc-status 的 document_version 查询漏取 {col}：{dv_sql}"
+    # ⚠️ 版本级 `status` **不能**用裸子串断言 —— `content_process_status` 等就含 "status"，
+    # 删掉末列照样恒真（codex 2026-08-06 实证的假阳性）。钉**相邻列序**。
+    assert "publish_status, gate_status, status FROM" in dv_sql, \
+        f"doc-status 漏取版本级 status（末列）：{dv_sql}"
 
 
 # dv_row = (content_process_status, chunk_status, index_status, error_message,
-#           publish_status, gate_status)
+#           publish_status, gate_status[, status])   # 末位可省，由 _doc_status 补 'active'
+
 
 def test_doc_status_quarantined_never_shows_online(monkeypatch):
     """最严重的一支：隔离件的 index_status 可能残留 'SUCCESS' ⇒ 漏传时先命中「已上线」，
@@ -2549,14 +2633,58 @@ def test_doc_status_badge_agrees_with_version_history(monkeypatch):
         ("SUCCESS", "", "SUCCESS", "", "PUBLISHED", ""),
     ]
     for cps, chs, ixs, err, pubs, gate in cases:
-        ds = _doc_status(monkeypatch, (cps, chs, ixs, err, pubs, gate))
-        _stub_multi(monkeypatch, [("hr", "active"),
-                                  [(3, cps, chs, ixs, pubs, gate, 1, err, "2026-08-03", "")]])
-        vh = api.kb_version_history(request=None, doc_id="D1",
-                                    identity=api.Identity(user_id="kb1"))
-        assert ds.status_badge == vh.versions[0].status_badge, (
-            f"两端点对同一行漂移：doc-status={ds.status_badge} "
-            f"version-history={vh.versions[0].status_badge}（{cps}/{chs}/{ixs}/{pubs}/{gate}）")
+        for vst, counts in (("active", (5, 5, 5)),
+                            # ★ 2026-08-06 新增两轴：旧版本（superseded + **0 活跃 chunk**）——
+                            #   这正是此前漂移的真实形态：doc-status 传真值 0 落「处理中」、
+                            #   version-history 传 None 落「已上线」。原用例的 counts 恒为
+                            #   (5,5,5)，对这条**完全测不到**（codex 独立指出）。
+                            ("superseded", (5, 0, 0)),
+                            # 当前版本但 0 活跃 chunk：去轴后两端点都应是「已上线」
+                            ("active", (5, 0, 0))):
+            ds = _doc_status(monkeypatch, (cps, chs, ixs, err, pubs, gate),
+                             version_status=vst, counts=counts)
+            _stub_multi(monkeypatch, [("hr", "active"),
+                                      [(3, cps, chs, ixs, pubs, gate, 1, err, "2026-08-03",
+                                        "", vst)]])
+            vh = api.kb_version_history(request=None, doc_id="D1",
+                                        identity=api.Identity(user_id="kb1"))
+            assert ds.status_badge == vh.versions[0].status_badge, (
+                f"两端点对同一行漂移：doc-status={ds.status_badge} "
+                f"version-history={vh.versions[0].status_badge}"
+                f"（{cps}/{chs}/{ixs}/{pubs}/{gate} v={vst} counts={counts}）")
+
+
+def test_superseded_version_is_history_not_online_or_processing(monkeypatch):
+    """★ 本批的核心断言：正常升版后的旧版本在**两个端点**都显示「历史版本」。
+
+    升版收尾 `node_deactivate_old_chunks` 只写 `document_version.status='superseded'`、
+    **不动 index_status**（该处注释自陈）⇒ 旧行永远停在 SUCCESS。此前：
+      · doc-status 传真实 chunk_active=0 ⇒ 落穿「已上线」⇒「处理中」（且非终态，前端轮询
+        22 次 ×8s 才放弃）；
+      · version-history 传 None ⇒「已上线」（而它的 chunk 全 is_active=0，根本搜不到）。
+    两个都错，且互相矛盾。
+    """
+    from opensearch_pipeline import api
+    ds = _doc_status(monkeypatch, ("SUCCESS", "", "SUCCESS", "", "PUBLISHED", ""),
+                     version_status="superseded", counts=(7, 0, 0))
+    assert ds.status_badge == "历史版本"
+    assert ds.chunk_active == 0, "计数字段必须照常返回（信号不丢，只是不折叠进徽章）"
+    _stub_multi(monkeypatch, [("hr", "active"),
+                              [(2, "SUCCESS", "", "SUCCESS", "PUBLISHED", "", 1, "",
+                                "2026-08-03", "", "superseded")]])
+    vh = api.kb_version_history(request=None, doc_id="D1", identity=api.Identity(user_id="kb1"))
+    assert vh.versions[0].status_badge == "历史版本"
+
+
+def test_current_version_zero_active_chunks_is_still_online(monkeypatch):
+    """★ 去 chunk_active 轴的契约反转（旧行为：SUCCESS + 0 活跃 chunk → 处理中）。
+
+    codex 逐条枚举了所有会停用 chunk 的生产写路径，证明「当前版本 SUCCESS + 0 活跃 chunk
+    且逃过全部更早分支」不可达；保留该轴的唯一效果是留一处 SQL 镜像无法表达的分叉。
+    """
+    ds = _doc_status(monkeypatch, ("SUCCESS", "", "SUCCESS", "", "PUBLISHED", ""),
+                     version_status="active", counts=(7, 0, 0))
+    assert ds.status_badge == "已上线" and ds.chunk_active == 0
 
 
 def test_new_terminal_badges_are_terminal_in_frontend_poller():
@@ -2565,7 +2693,9 @@ def test_new_terminal_badges_are_terminal_in_frontend_poller():
     import pathlib
     src = pathlib.Path("console-app/src/lib/kb.ts").read_text(encoding="utf-8")
     line = [ln for ln in src.splitlines() if "TERMINAL_BADGES" in ln][0]
-    for badge in ("未入索引", "已隔离"):
+    # 2026-08-06 补两词：「内容不符」是后端自陈的不可自动重试终态却一直漏登记（既存缺陷）；
+    # 「历史版本」新增。真正的行为断言（命中后不再排下一次 timer）在 vitest 侧。
+    for badge in ("未入索引", "已隔离", "内容不符", "历史版本"):
         assert badge in line, f"前端轮询未把「{badge}」当终态：{line}"
 
 
@@ -2634,9 +2764,10 @@ def test_appending_a_column_no_longer_corrupts_acl_mode(monkeypatch):
                         lambda cur, ids: seen_node_ids.extend(ids) or {})
     monkeypatch.setattr(kb_console, "_kb_usage_enrich", lambda cur, ids: {})
     monkeypatch.setattr(kb_console, "_kb_badge_counts", lambda *a, **k: {})
-    # 13 个基础列 + **1 个追加列**（模拟 m.acl_revision），capability=absent ⇒ 无 _mc
+    # 15 个基础列 + **1 个追加列**（模拟 m.acl_revision），capability=absent ⇒ 无 _mc
+    # （2026-08-06 基础列由 14 增至 15：末位 v.status）
     row = ("D1", "标题", "f.pdf", "hr", "dept_internal", 1, "active", "2026-08-04",
-           "DONE", "SUCCESS", "PUBLISHED", "", "", 77)
+           "DONE", "SUCCESS", "PUBLISHED", "", "", "", "active", 77)
     _stub_multi(monkeypatch, [[row]])
     resp = api.kb_my_docs(request=None, identity=api.Identity(user_id="kb1"))
     assert resp.items, "用例前提：应返回一行"
@@ -2663,8 +2794,11 @@ def test_appending_two_columns_does_not_silently_flip_acl_mode(monkeypatch):
                         lambda cur, ids: seen_node_ids.extend(ids) or {})
     monkeypatch.setattr(kb_console, "_kb_usage_enrich", lambda cur, ids: {})
     monkeypatch.setattr(kb_console, "_kb_badge_counts", lambda *a, **k: {})
+    # ⚠️ 必须是 **15 个基础列 + 2 个追加列**（2026-08-06 基础列由 13 增至 15：gate_status、
+    # v.status）。少写就退化成"行长恰好等于基础列数"，77/88 被当成基础列读掉，
+    # "追加两列"的前提消失、本条空转（本次改动首版即踩，codex 独立发现）。
     row = ("D1", "标题", "f.pdf", "hr", "dept_internal", 1, "active", "2026-08-04",
-           "DONE", "SUCCESS", "PUBLISHED", "", "", 77, 88)      # 追加**两**列
+           "DONE", "SUCCESS", "PUBLISHED", "", "", "", "active", 77, 88)      # 追加**两**列
     _stub_multi(monkeypatch, [[row]])
     resp = api.kb_my_docs(request=None, identity=api.Identity(user_id="kb1"))
     assert seen_node_ids == [], (
@@ -2718,3 +2852,127 @@ def test_approval_status_surfaced_in_version_history_only():
     assert "'WITHDRAWN'" not in pathlib.Path("opensearch_pipeline/api.py").read_text(
         encoding="utf-8").split("def _kb_status_badge")[1][:2000], \
         "WITHDRAWN 渗进了 status_badge —— 会与 _KB_BADGE_CASE_SQL 漂移"
+
+
+def test_frontend_backend_badge_vocab_and_bad_badges_parity():
+    """★ 跨层词表 parity（codex 2026-08-06 指出这条**此前不存在**）。
+
+    api.py 的注释自己列了「三处词表人工同步」，但只有其中两处有测试守：
+      · 后端封闭集 —— test_kb_status_badge_closed_set ✅
+      · 前端 BADGE_TONE 键集 —— contribute.spec 的 seam 锁 ✅
+      · **异常集合 `_KB_BAD_BADGES` ↔ 前端 `useKb.BAD_BADGES`** —— 无人守 ❌
+    实证后果：「内容不符」在后端 `_KB_BAD_BADGES` 里、前端 BAD_BADGES 里没有 ⇒
+    服务端「异常」筛选把它返回、前端本地 filtered 又把它排除，异常计数同步少算。
+    """
+    import pathlib
+    import re
+    from opensearch_pipeline.api import _KB_BAD_BADGES, _KB_BADGE_VOCAB
+
+    ts = pathlib.Path("console-app/src/composables/useKb.ts").read_text(encoding="utf-8")
+    m = re.search(r"const BAD_BADGES = \[([^\]]*)\]", ts)
+    assert m, "前端 BAD_BADGES 未找到"
+    fe_bad = set(re.findall(r"'([^']+)'", m.group(1)))
+    assert fe_bad == set(_KB_BAD_BADGES), (
+        f"异常徽章集合前后端漂移：后端={set(_KB_BAD_BADGES)} 前端={fe_bad}")
+    assert fe_bad <= _KB_BADGE_VOCAB, f"异常集合含词表外的词：{fe_bad - _KB_BADGE_VOCAB}"
+
+    tone = pathlib.Path("console-app/src/lib/kb.ts").read_text(encoding="utf-8")
+    block = tone[tone.index("export const BADGE_TONE"):tone.index("export const badgeTone")]
+    fe_tone = set(re.findall(r"([一-鿿]+):\s*'", block))
+    assert fe_tone == _KB_BADGE_VOCAB, (
+        f"BADGE_TONE 键集与后端封闭集漂移：后端多={_KB_BADGE_VOCAB - fe_tone} "
+        f"前端多={fe_tone - _KB_BADGE_VOCAB}")
+
+
+def test_all_list_endpoints_select_the_version_status_column(monkeypatch):
+    """★ 五端点 SELECT 列自检（codex 2026-08-06：此前只有 doc-status 一处有）。
+
+    桩游标**无条件**返回补齐后的元组 ⇒ 即便从生产 SELECT 里删掉 `v.status`，
+    纯徽章断言依旧全绿（这正是 a61fe87 踩过的"少列解包 ⇒ 500"同族反证空洞）。
+    故必须单独钉住列清单本身。
+    """
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr("opensearch_pipeline.qa_facts.fact_join_enabled", lambda: False)
+    from opensearch_pipeline import api
+
+    sink = _stub_capture(monkeypatch)
+    api.kb_my_docs(request=None, limit=20, offset=0, identity=api.Identity(user_id="kb1"))
+    assert "v.gate_status" in sink["sql"] and "v.status" in sink["sql"], \
+        f"my-docs 漏取版本级 status：{sink['sql']}"
+
+    sink = _stub_capture(monkeypatch)
+    api.kb_browse(request=None, identity=api.Identity(user_id="kb1"))
+    assert "v.gate_status" in sink["sql"] and "v.status" in sink["sql"], \
+        f"browse 漏取版本级 status：{sink['sql']}"
+
+    s = _stub_multi(monkeypatch, [("hr", "active"), []])
+    api.kb_version_history(request=None, doc_id="D1", identity=api.Identity(user_id="kb1"))
+    vh_sql = " ".join([c[0] for c in s["calls"] if "document_version" in c[0]][0].split())
+    # 同上：钉相邻列序，不用裸子串（"status" 会被一堆 *_status 列命中）
+    assert "error_message, created_at, approval_status, status FROM" in vh_sql, \
+        f"version-history 漏取版本级 status（末列）：{vh_sql}"
+
+
+def test_contribution_badge_query_selects_version_status(monkeypatch):
+    """contribution 的徽章派生固定读 v1，且整个裹在 fail-open except 里 ——
+    漏取 dv.status 的表现是**整片 doc_badge=None**，不是报错。列清单必须单独钉。"""
+    import inspect
+    from opensearch_pipeline.routes import contribution
+    src = inspect.getsource(contribution._contrib_doc_badges)
+    assert "dv.gate_status, dv.status" in src, f"contribution 漏取 dv.status：{src[:400]}"
+
+
+def test_my_docs_capability_present_full_row_keeps_node_fields_aligned(monkeypatch):
+    """★ capability=present 的**完整行**：加了 v.status 之后 acl_mode / owner_dept_id 后移，
+    `_kb_node_names` / 共享节点 / owner_label 的读取位必须全部跟上。
+
+    本仓明令禁止用行长启发式推断条件列；只断言 SQL 里有 `v.status` 是不够的 ——
+    错位不报错、只错归属与权限展示（codex 2026-08-06 要求补此条）。
+    """
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "present")
+    seen = []
+    monkeypatch.setattr(kb_console, "_kb_node_names",
+                        lambda cur, ids: seen.extend(ids) or {41: "注塑一车间"})
+    shared_pairs = []
+    monkeypatch.setattr(kb_console, "_kb_shared_node_labels",
+                        lambda cur, pairs: shared_pairs.extend(pairs) or {"D1": ["装配组"]})
+    monkeypatch.setattr(kb_console, "_kb_usage_enrich", lambda cur, ids: {})
+    monkeypatch.setattr(kb_console, "_kb_badge_counts", lambda *a, **k: {})
+    # 15 基础列 + acl_mode + owner_dept_id
+    row = ("D1", "标题", "f.pdf", None, "dept_internal", 1, "active", "2026-08-06",
+           "DONE", "SUCCESS", "PUBLISHED", "DONE", "", "", "active", "node", 41)
+    _stub_multi(monkeypatch, [[row]])
+    resp = api.kb_my_docs(request=None, identity=api.Identity(user_id="kb1"))
+    it = resp.items[0]
+    assert it.acl_mode == "node", f"acl_mode 读位错了：{it.acl_mode}"
+    assert seen == [41], f"owner_dept_id 读位错了：{seen}"
+    assert it.owner_label == "注塑一车间"
+    # 共享节点读取位：入参取 r[16]（owner_dept_id）——退回 r[15] 会传成 'node' 字符串
+    assert shared_pairs == [("D1", 41)], f"共享节点入参读位错了：{shared_pairs}"
+    assert it.shared_labels == ["装配组"], "共享标签没回填到 DTO"
+    assert it.status_badge == "已上线"   # v.status='active' 被正确读到（不是把 'node' 当版本态）
+
+
+def test_browse_capability_present_full_row_keeps_node_fields_aligned(monkeypatch):
+    """browse 同款（基础列 14 + acl_mode + owner_dept_id）。"""
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import kb_console
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    monkeypatch.setattr(kb_console, "_kb_node_capability", lambda cur: "present")
+    seen = []
+    monkeypatch.setattr(kb_console, "_kb_node_names",
+                        lambda cur, ids: seen.extend(ids) or {42: "包装车间"})
+    monkeypatch.setattr(kb_console, "_kb_usage_enrich", lambda cur, ids: {})
+    row = ("D2", "t", "b.pdf", None, "dept_internal", 1, "active", "2026-08-06",
+           "DONE", "SUCCESS", "PUBLISHED", "DONE", "", "superseded", "node", 42)
+    _stub_multi(monkeypatch, [[], [row]])
+    resp = api.kb_browse(request=None, identity=api.Identity(user_id="kb1"))
+    it = resp.items[0]
+    assert it.acl_mode == "node" and seen == [42] and it.owner_label == "包装车间"
+    assert it.status_badge == "历史版本", "v.status 读位错了（错位会把 'node' 当成版本态）"

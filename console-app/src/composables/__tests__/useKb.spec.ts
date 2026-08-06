@@ -805,3 +805,50 @@ describe('useKb 批量上传 — 批末选择列表收敛', () => {
     expect(kb.uploadQueue.value.find((r) => r.name === 'empty.pdf')!.status).toBe('跳过')
   })
 })
+
+describe('trackStatus 终态行为（codex 2026-08-06：只验成员不够，必须验状态机）', () => {
+  const _drive = async (badge: string, pred: (kb: any) => boolean) => {
+    const fetchMock = routeFetch({
+      uploadUrl: jsonResp({ upload_token: 'UT', put_url: 'https://oss/x', raw_key: 'r',
+                            doc_id: 'DOC_T', expires_in: 1800, requires_kb_admin_approval: false }),
+      register: jsonResp({ doc_id: 'DOC_T', version_no: 2, content_process_status: 'NOT_STARTED',
+                           requires_kb_admin_approval: false, status_badge: '排队中',
+                           idempotent: false, title: 'T', content_dups: [], content_dups_other: 0 }),
+      myDocs: jsonResp({ items: [], has_more: false }),
+      docStatus: jsonResp({ status_badge: badge, chunk_active: 0, error_message: 'x' }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const kb = useKb()
+    setIdentity('dept_admin', ['hr'])
+    kb.newOwner.value = 'hr'
+    __setSelectedFiles([new File([new Uint8Array(20)], 'a.pdf', { type: 'application/pdf' })])
+    kb.doUpload()
+    await waitFor(() => kb.uploadOk.value === true)      // 上传完成 → 「已提交…（排队中）」
+    expect(kb.uploadMsg.value).toContain('已提交')
+    // 首查延 4s（给 scanner 认领时间），后续每 8s —— 时限必须给足，
+    // vitest 默认 5000ms 在这里从来不够（本仓 f2f48b9 同款教训）。
+    await waitFor(() => pred(kb), 12000)                 // 首次 doc-status 命中终态
+    const n = () => fetchMock.mock.calls.filter(
+      (c: any[]) => String(c[0]).includes('/api/kb/doc-status')).length
+    const nAfter = n()
+    await new Promise(r => setTimeout(r, 9000))          // 跨过一整个 8s 间隔，绝不该有第二次
+    expect(n()).toBe(nAfter)                             // ★ 命中终态后不再排下一次
+    return kb
+  }
+
+  it('★「历史版本」：停轮询 + 清掉残留的成功文案 + 给中性解释（不是失败红）', { timeout: 30000 }, async () => {
+    const kb = await _drive('历史版本', k => String(k.uploadMsg.value).includes('取代'))
+    expect(kb.uploadOk.value).toBe(false)                // UploadCard 据此走 muted
+    expect(kb.uploadErr.value).toBe('')                  // 正常生命周期，绝不显示成出错
+    expect(kb.uploadMsg.value).toContain('已被后续版本取代')
+    expect(kb.uploadMsg.value).not.toContain('已提交')   // 残留成功文案必须被覆盖
+  })
+
+  it('★「内容不符」：停轮询 + 失败态 + 可执行提示（不可自动重试）', { timeout: 30000 }, async () => {
+    const kb = await _drive('内容不符', k => String(k.uploadErr.value).includes('内容校验'))
+    expect(kb.uploadOk.value).toBe(false)
+    expect(kb.uploadErr.value).toContain('重新上传')
+    expect(kb.uploadErr.value).toContain('无法自动重试')
+    expect(kb.uploadMsg.value).toBe('')
+  })
+})

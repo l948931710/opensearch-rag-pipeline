@@ -2699,13 +2699,32 @@ _KB_MAX_OFFSET = 10000   # 文档列表分页 offset 上界（全库 ~1600 篇�
 _KB_BADGE_VOCAB = frozenset({
     "已退役", "已隔离", "未入索引", "已上线", "处理失败",
     "已驳回", "内容未变", "待审核", "排队中", "处理中",
-    "内容不符",
+    "内容不符", "历史版本",
 })
 
 
-def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None,
-                     publish_status=None, chunk_status=None, gate_status=None) -> str:
-    """把管线多字段折叠为用户可读态（输出恒 ∈ _KB_BADGE_VOCAB，封闭集测试锁定）。"""
+def _kb_status_badge(content_status, index_status, doc_status, *,
+                     version_status=None, publish_status=None,
+                     chunk_status=None, gate_status=None) -> str:
+    """把管线多字段折叠为用户可读态（输出恒 ∈ _KB_BADGE_VOCAB，封闭集测试锁定）。
+
+    ⚠️ **可选轴一律 keyword-only**（2026-08-06）。原先第 4 位是 `chunk_active`，
+    `routes/contribution.py` 是**位置调用** —— 删掉那一位后第 6 个位置实参会落到
+    `gate_status`，与其关键字实参撞成 `TypeError`，而该调用整个裹在
+    「徽章派生绝不拖垮主列表」的 `except → return None` 里 ⇒ 不是崩，是**贡献列表徽章
+    整片静默消失**。本 helper 是仓内私有契约，让旧位置调用 fail-loud 远比保签名兼容安全。
+
+    🔴 `chunk_active` 轴已**整个移除**（2026-08-06）。它此前只有 doc-status 传真值、
+    其余四处传 None ⇒ 同一行数据两个端点两个徽章（旧版本：doc-status「处理中」、
+    version-history「已上线」）。移除的依据是逐条枚举了所有会停用 chunk 的生产写路径：
+    升版停用只作用于旧版本且同事务置 superseded；文档退役同时改 `document_meta.status`
+    （先命中「已退役」）；改 restricted 同事务把版本索引态从 SUCCESS 改 PENDING_DELETE；
+    spot 隔离同时写 QUARANTINED（先命中「已隔离」）；0-chunk/死信/内容不符各有更早分支
+    ⇒ **不存在**「当前版本 SUCCESS + 0 活跃 chunk 且逃过全部更早分支」的现实路径。
+    而保留它等于永久保留一处 `_KB_BADGE_CASE_SQL` 原理上无法表达的分叉。
+    doc-status 的响应仍单独返回 `chunk_total/chunk_active/chunk_indexed` 三个计数字段，
+    「0 活跃 chunk」这个诊断信号不丢，只是不再折叠进徽章。
+    """
     cs = (content_status or "").upper()
     ix = (index_status or "").upper()
     if doc_status and str(doc_status).lower() not in ("active", ""):
@@ -2746,8 +2765,18 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
     #    运维会当成瞬断去重试，而它**不可自动重试**（唯一出路是重新上传形成新版本）。
     if cs == "CONTENT_MISMATCH":
         return "内容不符"
+    # 「历史版本」（2026-08-06，codex 共识）：必须排在「已上线」**之前**。
+    # 🔴 升版收尾 `node_deactivate_old_chunks` 对旧版本**只写 `document_version.status`
+    #    ='superseded'、不动 `index_status`**（该处注释自陈），于是旧版本行永远停在
+    #    `index_status='SUCCESS'` ⇒ 不拦就会命中「已上线」，把一个 chunk 全部
+    #    `is_active=0`、根本搜不到的历史版本显示成"在线"。
+    # 位置取「内容不符」之后而非更靠前：superseded 叠加 EMPTY/QUARANTINED/CONTENT_MISMATCH 时，
+    # 那些异常态对排障的信息量高于单纯的生命周期标签，且保留全部现有安全优先级不变。
+    # ⚠️ 判定源是 **document_version.status**，与第一条分支的 document_meta.status 是两条轴。
+    if str(version_status or "").lower() == "superseded":
+        return "历史版本"
     # 管线把 document_version.index_status 置 'SUCCESS'（非 'INDEXED'）作为上线成功值。
-    if ix in ("INDEXED", "SUCCESS") and (chunk_active is None or chunk_active > 0):
+    if ix in ("INDEXED", "SUCCESS"):
         return "已上线"
     if cs == "FAILED" or ix == "FAILED":
         return "处理失败"
@@ -2769,8 +2798,12 @@ def _kb_status_badge(content_status, index_status, doc_status, chunk_active=None
 # _kb_status_badge 的判定顺序/取值时必须同步改这里**，parity 测试
 # test_kb_badge_case_sql_parity 会守卫二者一致。约定：
 #   · 引用 m（document_meta）/ v（document_version）别名——my-docs / browse 两处调用都用这对别名。
-#   · list 路径 chunk_active 恒 None（列表不查活跃 chunk 数），故此处不含「SUCCESS 但 0 chunk→处理中」
-#     分支，与 _kb_status_badge 在 chunk_active=None 时的行为一致（ix∈(INDEXED,SUCCESS) 即已上线）。
+#   · 两条 status 轴**不可混**：`m.status`（文档级，→「已退役」）与 `v.status`（版本级，
+#     →「历史版本」）。真库 parity 测试此前自连同一张表（`FROM t m JOIN t v ON v.i=m.i`）
+#     导致 `m.status ≡ v.status`，两轴的交叉是**盲区**——已改为两张表做独立交叉积。
+#   · `chunk_active` 轴已于 2026-08-06 整个移除（理由见 _kb_status_badge docstring）；
+#     此前这里注明"镜像不含 SUCCESS 但 0 chunk 分支、与 Python 在 chunk_active=None 时一致"，
+#     那条声明性差异现已不存在，两侧无条件同义。
 #   · SKIPPED 前缀用 LEFT(...,7)='SKIPPED'（**不用 LIKE 'SKIPPED%%'**）——查询带 %s 参数时
 #     SQL 里的字面 % 会被 pymysql paramstyle 误读，LEFT 规避这个坑。
 _KB_BADGE_CASE_SQL = (
@@ -2785,6 +2818,11 @@ _KB_BADGE_CASE_SQL = (
     " WHEN UPPER(COALESCE(v.chunk_status,'')) = 'NEEDS_REVIEW' THEN '未入索引'"
     # C8：与 _kb_status_badge 同位（在「已上线」之前）——parity 测试守着两者同序同义
     " WHEN UPPER(COALESCE(v.content_process_status,'')) = 'CONTENT_MISMATCH' THEN '内容不符'"
+    # 「历史版本」：与 _kb_status_badge 同位（「内容不符」之后、「已上线」之前）。
+    # 用 v.status（版本级）——**不是**第一支的 m.status（文档级）。列表路径只 JOIN
+    # current 版本，故该分支在 my-docs/browse/stats 上恒不命中，行为零变化；它服务的是
+    # 版本历史与 doc-status 这两个会看到旧版本行的面。
+    " WHEN LOWER(COALESCE(v.status,'')) = 'superseded' THEN '历史版本'"
     " WHEN UPPER(COALESCE(v.index_status,'')) IN ('INDEXED','SUCCESS') THEN '已上线'"
     " WHEN UPPER(COALESCE(v.content_process_status,'')) = 'FAILED'"
     "      OR UPPER(COALESCE(v.index_status,'')) = 'FAILED' THEN '处理失败'"

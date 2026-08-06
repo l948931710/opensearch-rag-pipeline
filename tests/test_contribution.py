@@ -1247,6 +1247,37 @@ def _reg_row(cid, doc_id):
             doc_id, None, None, None, None, None, None)
 
 
+def test_contrib_badges_never_silently_all_none(monkeypatch):
+    """★ 防吞守卫（codex 2026-08-06 点名）：`_contrib_doc_badges` 的调用**整个**裹在
+    「徽章派生绝不拖垮主列表」的 `except → return None` 里 —— 任何签名/列数不匹配都不会报错，
+    只会让**整片 doc_badge 变成 None**，看起来像"这批就是算不出"。
+
+    本条正是那个失效形态的钉子：正常输入下 doc_badge 必须**全部非空**。
+    （实证：2026-08-06 给 helper 加 version_status 列时，桩少喂一列即触发本形态。）
+    """
+    rows = [_reg_row("C1", "D1")]
+    _install_conn(monkeypatch, _FakeConn(list_rows=rows, dv_badge_rows=[
+        ("D1", "DONE", "SUCCESS", None, None, "active", None, "active"),
+    ]))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    got = [i.doc_badge for i in resp.items]
+    assert all(got), f"徽章派生被 fail-open 吞成 None：{got}"
+    assert got == ["已上线"]
+
+
+def test_contrib_v1_superseded_shows_history_badge(monkeypatch):
+    """本函数固定读 v1；文档升版后 v1 会变 superseded ⇒「历史版本」在此**可达**，
+    不是理论分支（codex 明确指出这一点）。"""
+    rows = [_reg_row("C1", "D1")]
+    _install_conn(monkeypatch, _FakeConn(list_rows=rows, dv_badge_rows=[
+        ("D1", "DONE", "SUCCESS", None, None, "active", None, "superseded"),
+    ]))
+    from opensearch_pipeline import api
+    resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())
+    assert [i.doc_badge for i in resp.items] == ["历史版本"]
+
+
 def test_mine_doc_badge_three_way_distinguishable(monkeypatch):
     """同为 registering：PENDING_APPROVAL→待审核（卡 kb_admin 放行）、QUARANTINED→已隔离、
     EMPTY/SKIPPED→未入索引（死链）、NOT_STARTED→排队中（正常）——四者徽章互异（复用
@@ -1256,12 +1287,15 @@ def test_mine_doc_badge_three_way_distinguishable(monkeypatch):
     rows = [_reg_row("C1", "D1"), _reg_row("C2", "D2"), _reg_row("C3", "D3"),
             _reg_row("C4", "D4"), _reg_row("C5", "D5")]
     # 第 7 列 = dv.gate_status（渲染侧 gate 轴，2026-08-04 独立核验 B2）；D5 = gate-only 隔离
+    # 第 8 列 = dv.status（版本级，2026-08-06）——本函数固定读 v1，升版后 v1 会变 superseded。
+    # ⚠️ 少喂这一列时表现是**整片 doc_badge=None**（IndexError 被「徽章派生绝不拖垮主列表」
+    # 的 except 吞掉），不是报错——下面 test_contrib_badges_never_silently_all_none 即其守卫。
     conn = _install_conn(monkeypatch, _FakeConn(list_rows=rows, dv_badge_rows=[
-        ("D1", "PENDING_APPROVAL", "NOT_INDEXED", None, None, "active", None),
-        ("D2", "DONE", "SUCCESS", "QUARANTINED", None, "active", None),
-        ("D3", "DONE", "NOT_INDEXED", "SKIPPED_EXPLOSION", "EMPTY", "active", None),
-        ("D4", "NOT_STARTED", "NOT_INDEXED", None, None, "active", None),
-        ("D5", "DONE", "SUCCESS", None, None, "active", "quarantined"),
+        ("D1", "PENDING_APPROVAL", "NOT_INDEXED", None, None, "active", None, "active"),
+        ("D2", "DONE", "SUCCESS", "QUARANTINED", None, "active", None, "active"),
+        ("D3", "DONE", "NOT_INDEXED", "SKIPPED_EXPLOSION", "EMPTY", "active", None, "active"),
+        ("D4", "NOT_STARTED", "NOT_INDEXED", None, None, "active", None, "active"),
+        ("D5", "DONE", "SUCCESS", None, None, "active", "quarantined", "active"),
     ]))
     from opensearch_pipeline import api
     resp = api.kb_contributions_mine(request=None, limit=20, offset=0, identity=_ident())

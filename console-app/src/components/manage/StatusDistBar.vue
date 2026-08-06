@@ -17,7 +17,9 @@ const TONE_BG: Record<string, string> = {
   warn: 'bg-st-warn', fail: 'bg-st-fail', muted: 'bg-st-muted', hold: 'bg-st-hold',
 }
 // 稳定展示顺序（未列出的徽章排末尾）。
-const ORDER = ['已上线', '处理中', '排队中', '待审核', '已驳回', '已隔离', '处理失败', '内容未变', '已退役']
+// 2026-08-06 补齐三个此前漏登记的词（漏登记不会消失，只会被排到末尾）。
+const ORDER = ['已上线', '处理中', '排队中', '待审核', '已驳回', '未入索引', '已隔离',
+               '处理失败', '内容不符', '内容未变', '历史版本', '已退役']
 
 const segs = computed(() => {
   const bb = props.byBadge || {}
