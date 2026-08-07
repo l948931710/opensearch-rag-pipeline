@@ -160,11 +160,30 @@ jobs:
         # test_pagination_stability（2026-08-06 加）：它的真库分页 + EXPLAIN 用例在无 MySQL 的
         # 普通 CI 里 skip，而此前又**没进**本清单 ⇒ CI 实际只跑了词法守卫、从不执行 EXPLAIN
         # （codex 补评审指出）。加进来后那两条才真正在 CI 上承重。
+        # ⚠️ 本清单是**显式枚举**，不是「所有 requires_local_db 模块」——新写的真库模块
+        # 不加进来就只在开发机 `make test` 里跑，而开发机的库是活的、会漂（见下），
+        # 等于那部分覆盖谁也没在承重。加新 `tests/*_db.py` 时三件一起做：
+        # ① 进 conftest._LOCAL_STACK_SERIAL_MODULES（带 .py 后缀）② 进本清单
+        # ③ 跨 collation 组的 JOIN 加 preflight skip。
+        # 三个 node 轴模块（2026-08-07 一并加）：
+        #   · test_approval_history_node_axis_db —— access 段用例依赖
+        #     `kb_access_request ⋈ document_meta`，这类跨 collation 组的 JOIN 在漂移过的
+        #     库上直接 1267。开发机 2026-08-07 实测漂了 22 张表（库默认 _0900_ai_ci，
+        #     建表时没写显式 COLLATE 的旧表全拿了它，与 schema/001:91 不符），当天已按
+        #     权威 DDL 全量转回 unicode_ci；**但开发机的库是活的、随时能再漂**，只有从零
+        #     建库的本 job 才是这几条的稳定承重点。
+        #   · test_contribution_node_axis_db（schema/067）/ test_acl_version_axis_db
+        #     （C3′ 投影版本轴）—— 随 f9257fe / 291f539 落地时漏进本清单，补上。
+        # 本地已用一次性 throwaway MySQL 8.0.46 + scripts/ci_load_schema.sh 复跑全清单：
+        # 单进程 113 passed / 0 skipped（2026-08-07）。
         run: >-
           python -m pytest tests/test_pipeline.py tests/test_classification.py
           tests/test_concurrency.py tests/test_image_funnel.py
           tests/test_kb_db_integration.py
           tests/test_pagination_stability.py
+          tests/test_approval_history_node_axis_db.py
+          tests/test_contribution_node_axis_db.py
+          tests/test_acl_version_axis_db.py
           -q --tb=short -p no:cacheprovider
 
   # 供应链/密钥门（P2-03）：secret 扫描 + 依赖 CVE 审计。此前 CI 完全无安全门。

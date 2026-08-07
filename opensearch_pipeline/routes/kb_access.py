@@ -27,7 +27,9 @@ from opensearch_pipeline.api import (
     _kb_can_manage,
     _kb_can_manage_doc,
     _kb_db,
+    _kb_managed_descendants,
     _kb_node_capability,
+    _kb_owner_scope_sql,
     _require_kb_admin,
     _require_kb_console,
     current_identity,
@@ -895,11 +897,17 @@ class KbApprovalHistoryItem(BaseModel):
     action: str = ""          # approved|rejected|revoked|accepted|granted
     title: str = ""           # 文档标题 / 贡献问题 / 目标用户
     owner_dept: str = ""      # 作用域部门（contribution=category_dept；admin_grant 无）
+    # 贡献行的 node 归属（schema/067 `kb_contribution.category_dept_id`）。None = 组码轴
+    # 历史行；非空 = node 轴行，此时 owner_dept 里的组码可能是 M8 迁移**有意保留**的留痕
+    # 残值（'hr'），既不是权威也不该当展示口径 —— 故 node 行同时带下面的 owner_key/label。
+    category_dept_id: Optional[int] = None
     # 归属 DTO —— 与 KbDocItem 同形（key=`legacy:<code>` | `node:<id>`，label 为展示名）。
-    # 只有 access / upload 两类填：它们的作用域是**文档归属**，而 node 文档的 owner_dept
-    # 按契约恒为空串 ⇒ 不带这两个字段，审批历史里 799 篇 node 文档的「归属」整段消失
+    # access / upload 两类的作用域是**文档归属**，而 node 文档的 owner_dept 按契约恒为
+    # 空串 ⇒ 不带这两个字段，审批历史里 799 篇 node 文档的「归属」整段消失
     # （metaOf 是 `if (r.owner_dept)`，2026-08-05 台账口径对账实测）。
-    # contribution 的 category_dept 是**贡献分类**（另一根轴，本就是组码）⇒ 有意不填；
+    # contribution 的 category_dept 是**贡献分类**（另一根轴）——2026-08-07 起该轴同样
+    # 有 node 形态（067），node 贡献行也填这两个字段，否则前端只剩组码残值/空白可显；
+    # 组码轴的贡献行仍不填，回退口径与改动前逐字节一致。
     # admin_grant 无文档作用域 ⇒ 不填。前端一律走 docOwnerText，缺字段回退组码口径。
     owner_key: str = ""
     owner_label: str = ""
@@ -915,33 +923,87 @@ class KbApprovalHistoryResponse(BaseModel):
     items: List[KbApprovalHistoryItem] = Field(default_factory=list)
 
 
+def _approval_access_scope_sql(kb, cap: str) -> tuple:
+    """审批历史 access 段的 dept_admin 作用域（**严格互斥**双腿）→ (clause, params)。
+
+    轴判别取自**文档现状**（`document_meta.acl_mode`）；组码腿的谓词沿用 `r.owner_dept`
+    （申请行落库时的归属快照，与待审队列 `kb_access_requests_list` 同源），未改一字节。
+      · cap='absent'  → 只有组码腿（060 未 apply 的环境行为完全不变）；
+      · cap='unknown' → `AND 1=0`（探测失败仅 kb_admin，与 `_kb_doc_owner_scope_sql`
+        的裁决同款——把探测失败当 absent 会违反「未知 mode 仅 kb_admin」）；
+      · cap='present' → legacy 文档看组码、node 文档看管辖后代集，**绝不 OR 交叉**。
+        node 文档的 `r.owner_dept` 是迁 node **之前**落的申请行留下的组码残值，无条件
+        OR 会让它继续命中旧组码管理员（060 设计稿 §3.5 的越权洞）。
+    后代集不可得（组织快照过期/读失败）⇒ node 腿整腿去掉（fail-closed，绝不回落组码残值）。
+
+    ⚠️ 两腿都没有时返回 `AND 1=0` 而**不是**让调用方早退整个端点：只持
+    `dept_admin_node_grant`、零组码 grant 的管理员（2026-08-07 现网 27 人全部）在旧实现里
+    被「owners 为空即 return items=[]」吞掉了**整页**历史——连他自己部门的 access 记录
+    都看不到。缺陷来源：codex 双盲评审 C2（2026-08-07）。
+    """
+    from opensearch_pipeline.kb_authz import expand_managed_owner_depts, managed_owner_depts
+    owners = expand_managed_owner_depts(managed_owner_depts(kb))
+    if cap == "absent":
+        if not owners:
+            return "AND 1=0", []
+        ph = ",".join(["%s"] * len(owners))
+        return f"AND r.owner_dept IN ({ph})", list(owners)
+    if cap != "present":
+        logger.warning("node capability 探测失败——审批历史 access 段 fail-closed（仅 kb_admin）")
+        return "AND 1=0", []
+    descendants = _kb_managed_descendants(kb)
+    if descendants is None:
+        logger.warning("管辖后代集不可得（快照过期/读失败）——审批历史 access 段 node 腿失效")
+    legs: List[str] = []
+    params: List = []
+    if owners:
+        ph = ",".join(["%s"] * len(owners))
+        legs.append(f"(m.acl_mode='legacy' AND r.owner_dept IN ({ph}))")
+        params.extend(owners)
+    if descendants:
+        idph = ",".join(["%s"] * len(descendants))
+        legs.append(f"(m.acl_mode='node' AND m.owner_dept_id IN ({idph}))")
+        params.extend(sorted(descendants))
+    if not legs:
+        return "AND 1=0", []
+    return "AND (" + " OR ".join(legs) + ")", params
+
+
+def _approval_contrib_scope_sql(kb, axis: bool) -> tuple:
+    """审批历史 contribution 段的 dept_admin 作用域 → (clause, params)。
+
+    **单一来源 = 贡献域自己的轴判定**（`routes.contribution._contrib_scope_sql`，与审核队列
+    /accept/reject 同一个函数）：「队列按 node 轴收窄、历史按组码收窄」这类两口径分裂正是
+    067 要消灭的东西，此处绝不另写一份谓词。
+    `axis=False`（067 未 apply / 探测失败）→ 回到与改动前逐字节一致的组码谓词；此时列不存在，
+    引用 `category_dept_id` 会 1054 打挂整段。
+    """
+    if axis:
+        from opensearch_pipeline.routes import contribution as _CT
+        return _CT._contrib_scope_sql(kb)
+    return _kb_owner_scope_sql(kb, "category_dept")
+
+
 @router.get("/api/kb/approval-history", response_model=KbApprovalHistoryResponse)
 def kb_approval_history(request: Request,
                         identity: Optional[Identity] = Depends(current_identity)):
     """审批历史（只读聚合，owner 作用域）。dept_admin 见本部门 access+contribution；kb_admin 见全库四类。
+
+    dept_admin 的两段作用域**各自按轴分流**（2026-08-07，codex 双盲评审 C2）：
+      · access —— 文档归属轴（`_approval_access_scope_sql`：legacy 看组码 / node 看后代集）；
+      · contribution —— 贡献分类轴（`_approval_contrib_scope_sql`，与审核队列同一份谓词）。
+    两段**分别**降级：某段无腿只让那一段空（`AND 1=0`），绝不早退整个端点——旧实现的
+    「无组码 grant 即 return items=[]」会把只持 node 授权的管理员整页历史吞掉。
 
     各子查询独立降级（单流取数失败只让该流缺失，不拖垮整块）；跑过的子查询【全部】失败 → 诚实 500。
     跨用户自由文本（申请理由/贡献问题/审批备注/审计 message）一律 redact_query_text 脱敏。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
-    from opensearch_pipeline.kb_authz import (
-        ROLE_KB_ADMIN, expand_managed_owner_depts, managed_owner_depts,
-    )
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
     is_admin = (kb.role == ROLE_KB_ADMIN)
     scope_owner, scope_owner_params = "", []
     scope_cat, scope_cat_params = "", []
-    if not is_admin:
-        # production 伞组展开：子线 owner 文档的审批历史归 production 管理员可见。
-        # category_dept 侧复用同一集合是无害超集（贡献类目恒为伞组码，子线值匹配不到行）。
-        owners = expand_managed_owner_depts(managed_owner_depts(kb))
-        if not owners:
-            return KbApprovalHistoryResponse(items=[])   # 无管理部门 → 空（fail-closed，绝不当全量）
-        ph = ",".join(["%s"] * len(owners))
-        scope_owner = f"AND r.owner_dept IN ({ph})"
-        scope_owner_params = list(owners)
-        scope_cat = f"AND category_dept IN ({ph})"
-        scope_cat_params = list(owners)
     lim = _APPROVAL_HISTORY_LIMIT
     from opensearch_pipeline import contribution as _C
 
@@ -968,10 +1030,22 @@ def kb_approval_history(request: Request,
         # 共享 buffered 游标跑多条子查询（pymysql 默认 Cursor，非 SSCursor）：某条异常后结果已缓冲，
         # 下一句 execute 不会 "Commands out of sync"。与 /api/kb/insights 同型。
         with conn.cursor() as cur:
-            # 1) access —— kb_access_request 的已决行（两角色，owner_dept 作用域）
+            # 两根轴的 capability 各探一次（库不同、迁移号不同）：060 管
+            # document_meta.acl_mode/owner_dept_id（_kb_db），067 管
+            # kb_contribution.category_dept_id（_op_db）。**先探测后引用**，
+            # 「先部署后 apply」与「先 apply 后部署」都安全。
+            # 067 探测走 routes.contribution 的模块属性（惰性 import：避免 routes→routes
+            # 模块级耦合，且 tests 的 monkeypatch 仍生效），与队列侧共用同一份正向缓存。
+            from opensearch_pipeline.routes import contribution as _CT
             _cap = _kb_node_capability(cur)
+            _axis = _CT._contrib_axis_present(cur)
             _nc = ", m.acl_mode, m.owner_dept_id" if _cap == "present" else ""
-            # (out 下标, owner_dept_id) —— 节点名统一在四段跑完后**一次**批量解析（见下方）。
+            _cc = ", category_dept_id" if _axis else ""
+            if not is_admin:
+                scope_owner, scope_owner_params = _approval_access_scope_sql(kb, _cap)
+                scope_cat, scope_cat_params = _approval_contrib_scope_sql(kb, _axis)
+            # 1) access —— kb_access_request 的已决行（两角色，文档归属轴作用域）
+            # (out 下标, dept_id) —— 节点名统一在四段跑完后**一次**批量解析（见下方）。
             pending_nodes: List[tuple] = []
             ran += 1
             try:
@@ -1002,21 +1076,29 @@ def kb_approval_history(request: Request,
             except Exception as e:
                 fails += 1
                 logger.warning("approval_history access 失败: %s", e)
-            # 2) contribution —— kb_contribution 的已决行（两角色，category_dept 作用域；库=_op_db）
+            # 2) contribution —— kb_contribution 的已决行（两角色，贡献分类轴作用域；库=_op_db）
             ran += 1
             try:
                 cur.execute(
                     "SELECT question, category_dept, author_name, review_status, review_note,"
                     " ingestion_status, reviewed_by,"
                     f" COALESCE(CONVERT_TZ(reviewed_at,{_TZ_PACIFIC_TO_BJ}), reviewed_at)"
+                    f"{_cc}"
                     f" FROM {_op_db()}.kb_contribution"
                     " WHERE review_status IN ('accepted','rejected') " + scope_cat +
                     " ORDER BY reviewed_at DESC LIMIT %s",
                     tuple(scope_cat_params + [lim]))
                 for x in cur.fetchall():
+                    # node 轴行：归属权威是 category_dept_id，展示也必须走它——M8 迁移的 4 行
+                    # 保留了 category_dept='hr' 留痕，照它显示会指向一个**已经无权审**的部门。
+                    _cid = x[8] if _axis else None
+                    if _cid:
+                        pending_nodes.append((len(out), int(_cid)))
                     out.append(KbApprovalHistoryItem(
                         kind="contribution", action=(x[3] or ""), title=_rq(x[0]),
                         owner_dept=(x[1] or ""), subject=(x[2] or ""), detail=_rq(x[4]),
+                        category_dept_id=(int(_cid) if _cid else None),
+                        owner_key=(f"node:{int(_cid)}" if _cid else ""),
                         extra=(x[5] or ""), decided_by=(x[6] or ""),
                         decided_at=str(x[7]) if x[7] else ""))
                     if x[6]:
@@ -1074,7 +1156,10 @@ def kb_approval_history(request: Request,
                 except Exception as e:
                     fails += 1
                     logger.warning("approval_history admin_grant 失败: %s", e)
-            # node 归属节点 id → 现名（一次往返，四段共用）。**懒导入 kb_console**：
+            # node 节点 id → 现名（一次往返，四段共用；access/upload 是文档归属轴、
+            # contribution 是贡献分类轴，两根轴的 id 同属 dept_dim，共用一次批量解析即可。
+            # 不用 admin_notify._node_label：那是**逐 id 各开一条连接**的单点实现，
+            # 这里最多 3×limit 行）。**懒导入 kb_console**：
             # ① 避免 routes→routes 的模块级耦合（本包约定是各自向 api 取共享件）；
             # ② 走模块属性而非拷贝绑定，tests 对 kb_console._kb_node_names 的 monkeypatch 仍生效。
             # enrichment 语义：失败则 label 留空，前端 docOwnerText 回退成 `#<id> ⚠️`，不影响主列表。

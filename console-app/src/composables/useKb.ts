@@ -60,9 +60,13 @@ export interface ApprovalHistoryItem {
   kind: string            // 'access' | 'contribution' | 'upload' | 'admin_grant'
   action: string          // approved | rejected | revoked | accepted | granted
   title: string; owner_dept: string; subject: string
-  // 归属 DTO（与 DocItem 同形）：仅 access/upload 两类填 —— node 文档 owner_dept 恒空串。
-  // contribution 的 owner_dept 是**贡献分类**组码（另一根轴），后端有意不填这两个字段。
+  // 归属 DTO（与 DocItem 同形）：access/upload 走文档归属轴（node 文档 owner_dept 恒空串），
+  // contribution 走**贡献分类**轴 —— 后者自 schema/067 起也有 node 形态，node 行同样带这
+  // 两个字段；组码轴的贡献行不带，回退 owner_dept 组码口径（与 067 之前一致）。
   owner_key?: string; owner_label?: string
+  // 贡献行的 node 归属 id（null = 组码轴历史行）。node 行的 owner_dept 可能是迁移留痕的
+  // 组码残值，不是权威 —— 展示一律走 owner_key/owner_label。
+  category_dept_id?: number | null
   detail: string; extra: string
   decided_by: string; decided_by_name: string; decided_at: string
 }
