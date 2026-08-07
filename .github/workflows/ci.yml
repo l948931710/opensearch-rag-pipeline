@@ -235,7 +235,8 @@ jobs:
         run: python -m pip_audit -r requirements-prod.lock --desc
       # ①c requirements-dataworks-py37.txt = DataWorks py3.7 节点钉版集镜像（Majors δ3/M13）。
       #    节点每次运行 pip install 现场解析传递闭包 → 本步带解析审计=pod 真实暴露面。
-      #    基线（59 条，py3.7 兼容上限不可升版，逐条评估见 deploy/dataworks_py37_audit_baseline.txt）
+      #    基线（64 条，py3.7 兼容上限不可升版，逐条评估见 deploy/dataworks_py37_audit_baseline.txt；
+      #    ⚠️ 这个数字历史上漂过——2026-08-07 实测 63 条而注释仍写 59，加条目时请一并更新）
       #    拼 --ignore-vuln 放行；**新 ID 仍红**（先逐条评估补基线才准过——勿 continue-on-error）。
       - name: DataWorks py3.7 pins CVE audit (pip-audit — BLOCKING beyond baseline)
         run: |
