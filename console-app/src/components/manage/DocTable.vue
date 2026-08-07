@@ -121,6 +121,8 @@ const chips = ledgerBadgeChips
 
 // 自愈：当前筛选的徽章不在可选集里（如换 scope 后徽章分布变化）→ 回退「全部」并重载，避免死角。
 // 仅在 chips 真正就绪（>1 项）后生效——首帧只有「全部」时会把 URL 恢复的筛选误清掉。
+// 依赖 ledgerBadgeChips 侧的不变量「chip 不在集里 ⟺ 该筛选真的没有内容」：伪徽章「异常」的
+// 去冗余显示条件已在那边让位给「当前选中」，故这里不需要（也不该）为它开特例。
 watch(chips, (c) => { if (c.length > 1 && filter.value && !c.includes(filter.value)) setBadgeFilter('') })
 
 // ── 筛选状态 ←→ URL（P2：刷新/深链不再丢筛选；replace 不产生历史）──

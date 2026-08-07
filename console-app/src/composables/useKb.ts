@@ -570,8 +570,18 @@ const ledgerBadgeChips = computed<string[]>(() => {
     : fullScopeCounts.value
       ? Object.keys(kbStats.value!.by_badge || {}).filter((k) => (kbStats.value!.by_badge || {})[k] > 0)
       : Array.from(new Set(docs.value.map((d) => d.status_badge).filter(Boolean)))
-  // 坏徽章 ≥2 种才值得一枚聚合 chip（只有一种时与单徽章 chip 重复）
-  return ['', ...base, ...(anomalyCount.value > 0 && base.filter((b) => BAD_BADGES.includes(b)).length > 1 ? [ANOMALY_FILTER] : [])]
+  // 「异常」是**伪徽章**（聚合筛选），它的【显示条件】与【有效性】是两回事：
+  //   显示条件 = 坏徽章 ≥2 种才值得单独一枚聚合 chip（只剩一种时与那枚单徽章 chip 重复）；
+  //   有效性   = 只剩一种坏徽章时它照样筛得对（filtered / ledgerTotal / 服务端 badge=异常
+  //              三处都按 BAD_BADGES 整集算），不因「不值得显示」而失效。
+  // 2026-08-07 现网：待办条「异常文档」→ 台账，faceted 计数到达时坏徽章只剩一种 ⇒ chip 退出
+  // 可选集 ⇒ DocTable 的自愈 watcher 判「当前筛选值失效」⇒ 弹回「全部」。故【当前选中】压过
+  // 去冗余规则：选中项永不从自己的选项列表里消失（否则用户看不出自己正处在什么筛选下）。
+  // anomalyCount === 0 时仍然收起——那是「这个筛选真空了」，与真徽章计数归零同款，自愈回
+  // 「全部」正是它该做的事；自愈的不变量因此仍成立：chip 不在集里 ⟺ 该筛选真的没有内容。
+  const showAnomaly = anomalyCount.value > 0
+    && (filter.value === ANOMALY_FILTER || base.filter((b) => BAD_BADGES.includes(b)).length > 1)
+  return ['', ...base, ...(showAnomaly ? [ANOMALY_FILTER] : [])]
 })
 // 状态 chip 计数：faceted 口径优先（跟随筛选）；退 stats 全库；再退已加载页计数（countOf）。
 function ledgerBadgeCount(badge: string): number {
