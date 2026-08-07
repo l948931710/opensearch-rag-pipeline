@@ -382,7 +382,64 @@ AND dv.status='active'` —— **不看 `document_meta.status`**。
 **验收**：C1/C4 有单测；C2/C3 是 flag 翻默认 ⇒ 需 staging 压测；C5 需构造 zip bomb 样本。
 **为什么和批 B 分开**：这批改的是摄取/钉钉侧，与控制台事务面零重叠，可并行推进。
 
-### 批 D — 检索热路径（一次重构，别切碎）
+### 🔴 批 D 重新定型（2026-08-06 双盲复核：报告 §5.1/§5.2 的**前提**不成立）
+
+开工前我和 codex **各自独立**读了一遍 `retriever.py` 的调用链，两边都判定报告这两条的
+事实描述对、但**前提被放大了**，其中一条让报告的目标**物理上做不到**。
+
+#### 双方独立撞出的同一结论
+
+| | 报告的说法 | 实际 |
+|---|---|---|
+| §5.2 | 「默认检索按请求创建 HA3/**多查询**/**预取**子线程池」 | 只有 HA3 fusion 是默认（`config.py:268` True）。`multi_query_mode` 默认 **"off"**（`config.py:427`）⇒ fan-out 与主路预取两个池**默认根本不建**。cosurface 预取的 `cosurface_images` 参数默认 **False**（`retriever.py:2827-2830`，`/api/ask` 传 false）⇒ 只在图文 SSE 路径。**默认纯文本查询 = 1 个池 / 3 worker，不是 4 个** |
+| §5.1 | 「建立 request-scoped connection，把 8 处 checkout 降到 ≤2」 | `_conn_scope` 是 `threading.local()`（`retriever.py:1689`）。`search_chunks`（含 3 个 authority 策略）在 multi-query 开启时跑在 `_px` / fan-out 的 **worker 线程**上；pymysql 连接**非线程安全**，跨线程共享是数据损坏不是优化 ⇒ **「8 处合并」在物理上做不到** |
+
+#### codex 另外找到、**我漏掉**的三条（都已核）
+
+1. **8 处 checkout ≠ 每请求 8 次**：`:618`（node ACL）与 `:713`（legacy 跨部门）**互斥**
+   （有 `acl_ctx` 时 `:679-680` 直接 return）；`:1706`/`:1709` 也互斥（scope active 与否）。
+   我在自己的模型里**照抄了报告的「8」而没查互斥性**——这是我的错。
+2. **`_get_db_conn()` 每次显式 `begin()`**（`db.py:32-55`）⇒ 请求级单连接会把本来分处
+   多个时间点的读**塞进同一个事务边界**，改变 TOCTOU 的可见方式。这不是性能改动，是**语义改动**。
+3. **expand 会产出原命中里不存在的 sibling chunk**（`retriever.py:2213-2229`，各带 `image_refs`）
+   ⇒ 报告要的「一次批量 authority 快照」**对 expand 后的载荷不封闭**。
+   现有代码在 expand 之后**再走一次**版本门（`:2988-2996`）正是为此。
+
+另有两条边界：`AclContext` 在进入 `retrieve_and_enrich` **之前**就读 RDS
+（`api.py:950-958`、`dingtalk_identity.py:973-1037`）⇒「每请求 ≤2」若指端到端则前提也不成立；
+分解 timeout 8s、rerank timeout 15s ⇒ 把连接跨这些外部等待持有会**恶化**池压而非改善。
+
+#### 重新定型后的批 D
+
+**D0（新增，且必须最先做）—— 先量，再谈重构。**
+现在**没有任何测量**：仓内零处断言每请求 checkout 数或 executor 生命周期，
+上面所有"收益"都是推的。用 `db._get_db_conn` 包装器记录线程名/次数/连接对象 id，
+跑六种路径（默认单查询 / 含非 public 命中 / 含图 / SSE cosurface / multi-query 开 / rerank probe）。
+⚠️ SIM 模式量不出来：`_deny_stale_version_images`、`_attach_doc_dates` 等在 `simulate_db` 下直接早退。
+必须用真库栈或既有测试的 `_get_db_conn` 打桩范式（`tests/test_main_hit_revalidate.py:68-100`）。
+
+**D1（收窄）** 只合并**同一线程、顺序执行、中间无外部等待**的 authority SQL
+（请求线程上的 stitch/expand + expand 后版本门 + 探测 + doc_date）。
+**绝不**跨 `_px` / fan-out / `_cx` 的 worker。收益 = 少几次 checkout，**不减少 SQL 往返**。
+
+**D2（升级为独立项，本批不做）** 报告要的「合并成一次批量 authority 查询」——
+它改的是**裁决输入**不是 transport，且被上面第 3 条证明「一次快照不封闭」。
+要做必须先定义每根轴独立的「成功 / 空集 / 缺行 / 失败」四态，把现有
+fail-open/fail-closed 逐条锁死（node ACL 丢全部非 public / legacy 丢跨部门 /
+主命中默认保留 / 版本门丢图保正文），**不能用一个空 dict 代替四态**。
+
+**D3** executor 收敛照做，但按实际默认面定规模（1 个池 / 3 worker 是主战场）。
+⚠️ 换长活池必须同时处理：删掉 `shutdown(wait=False)`（`:2898`/`:2959`，对共享池调用会毒化进程）、
+每 task 的 TLS 清理（worker 跨请求复用 ⇒ 残留 scope 会泄漏连接）、队列上限与背压。
+
+**D4** 指标（并入 D0 的探针，落成常驻断言）。
+
+#### 判据：D 值不值得做，取决于 D0 的数字
+
+若默认路径实测只有 2–3 次 checkout（互斥性使然，很可能），
+则 D1 的收益接近噪声，**整批应降级或取消**，只保留 D3 与 D4。这一步没有捷径。
+
+### 批 D — 检索热路径（原始拆分，已被上面重新定型取代）
 
 §5.1 / §5.2 **必须一起做**：都是「请求级共享 vs 每消费点自取」的同一个问题，
 分两次改会让第二次把第一次的 scope 又切开。
