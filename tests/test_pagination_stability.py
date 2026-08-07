@@ -29,12 +29,19 @@ import pytest
 #     换成一对多 JOIN 就不再唯一，而列名毫无变化。
 # 故改为**显式站点契约**：每个 OFFSET 分页点登记 (端点, 臂, 唯一项, 唯一性依据, 是否方向敏感)。
 #
-# `direction_sensitive`（方向敏感）**只登记 conversations**：
-#   `qa_conversation` 的索引 `(user_id, hidden_at, last_message_at)` + PK
-#   `(user_id, conversation_id)` 恰好覆盖同向复合排序 —— InnoDB 二级索引隐含主键后缀，
-#   固定前缀后正扫得 `last_message_at ASC, conversation_id ASC`、反扫得两者皆 DESC；
-#   混向无法由该索引单次扫描满足，通常退化 filesort。
-#   ⚠️ 这**不是全仓普适规则**：document_meta / kb_contribution 没有覆盖完整排序键的复合索引，
+# `direction_sensitive`（方向敏感）**当前一个站点都没有**，规则处于 dormant。
+#   ⚠️ 2026-08-06 修正：这段原本写的是「`qa_conversation` 的索引
+#   `(user_id, hidden_at, last_message_at)` + PK `(user_id, conversation_id)` **恰好覆盖**
+#   同向复合排序 —— InnoDB 二级索引隐含主键后缀……混向才退化 filesort」。
+#   **那是推理，不是实测，而且实测把它推翻了**（同文件
+#   `test_tiebreaker_plan_cost_is_governed_by_index_coverage_not_direction`，
+#   MySQL 8.0.46 / FORCE INDEX / 2000 行 / ANALYZE）：在该查询形态下 MySQL **没有**用隐含
+#   主键后缀去满足 ORDER BY —— 加了 tiebreaker 之后**同向也 filesort**，只有索引**显式**
+#   含 conversation_id 时才恢复 backward index scan。
+#   ⇒ 「方向必须跟随」只在索引显式含 tiebreaker 列时才有适用对象；现状下无对象。
+#   （措辞边界：这只支持「该形态下不消除排序」，**不**支持「MySQL 普遍不用隐含 PK 后缀」，
+#    也**不**断言生产实际选定计划已切换 —— 探针用了 FORCE INDEX，不测优化器自主选路。）
+#   ⚠️ 这**也不是全仓普适规则**：document_meta / kb_contribution 没有覆盖完整排序键的复合索引，
 #   本来就要排序；browse 的 `owner_dept ASC, updated_at DESC, doc_id DESC` 与 gaps 的
 #   `days_ago ASC, rid DESC` 都是**合法**混向 —— 把"方向必须跟随"当全仓规则会误伤它们
 #   （codex 2026-08-06 指出，我原提案正是这个错）。
@@ -53,21 +60,28 @@ SITES = {
         basis="kb_contribution.uk_contribution_id（全局唯一）", direction_sensitive=False, lexical=True),
     ("opensearch_pipeline/routes/contribution.py", "kb_contributions_pending", 1): dict(
         unique="contribution_id",
-        basis="同上", direction_sensitive=False, lexical=True),
+        basis="kb_contribution.uk_contribution_id（全局唯一）；本臂 scope_clause 动态但不引入 JOIN",
+        direction_sensitive=False, lexical=True),
     ("opensearch_pipeline/routes/kb_console.py", "kb_my_docs", 1): dict(
         unique="m.doc_id",
         basis="document_meta.uk_doc_id；LEFT JOIN 由 uk_doc_version 保证不扇出",
         direction_sensitive=False, lexical=True),
     ("opensearch_pipeline/routes/kb_console.py", "kb_browse", 1): dict(
         unique="m.doc_id",
-        basis="同上", direction_sensitive=False, lexical=True),
+        basis="document_meta.uk_doc_id；LEFT JOIN 由 uk_doc_version 保证不扇出",
+        direction_sensitive=False, lexical=True),
     # lexical=False：ORDER BY 在动态变量 `order` 里（两条分支），词法扫描解析不出，
-    # 强行扫会把变量后面的整段代码当成子句。改由「捕获最终 cursor.execute SQL」的
-    # 行为测试 test_review_tasks_both_arms_end_with_task_id 覆盖（codex 2026-08-06 的分工建议）。
+    # 强行扫会把变量后面的整段代码当成子句。改由「捕获最终 cursor.execute SQL」的行为测试覆盖。
+    # ⚠️ `behavior_test` 不是注释而是**契约**：`test_lexical_false_sites_name_a_real_backstop`
+    # 会去被点名的模块里查这个函数真的存在。2026-08-06 收尾复核发现原注释点名的
+    # `test_review_tasks_both_arms_end_with_task_id` **全仓根本不存在** —— 逃生口指着一个
+    # 幽灵兜底，等于无兜底。真实覆盖者是下面这个。
     ("opensearch_pipeline/routes/kb_console.py", "kb_review_tasks", 1): dict(
         unique="t.task_id",
-        basis="review_task.task_id NOT NULL UNIQUE；JOIN document_meta 一对一不扇出",
-        direction_sensitive=False, lexical=False),
+        basis="review_task.task_id NOT NULL UNIQUE（schema/001:305 uk_task_id）；"
+              "LEFT JOIN document_meta ON m.doc_id=t.doc_id，doc_id 唯一 ⇒ 一对零/一不扇出",
+        direction_sensitive=False, lexical=False,
+        behavior_test=("tests.test_kb_approval", "test_review_tasks_order_by_has_unique_tiebreaker")),
     ("opensearch_pipeline/api.py", "history", 1): dict(
         unique="id",
         basis="qa_session_log.id AUTO_INCREMENT PK", direction_sensitive=False, lexical=True),
@@ -135,7 +149,10 @@ def _paginated_order_bys():
         放宽则跨查询污染（实测 2000 字符时 pending 抓到了 mine 的 ORDER BY）。
 
     ⚠️ **本守卫的词法边界**（抓删除、不抓等价改写；下列写法它看不见）：
-      · `LIMIT %s, %s` 两参形式、`OFFSET %(offset)s` 具名占位符 —— 本仓风格禁止，未专门封堵；
+      · `LIMIT %s, %s` 两参形式、`OFFSET %(offset)s` 具名占位符 —— 2026-08-06 收尾复核前
+        这里只写「本仓风格禁止，未专门封堵」。**「禁止」当时没有任何东西在执行**，
+        等于给新分页查询留了一个合法 MySQL 语法的静默逃生口（codex 指出）。
+        现由 `test_no_alternate_offset_spellings_bypass_the_scanner` **强制**；
       · 刻意拆词 `"OFF" + "SET"`、任意元编程拼 SQL；
       · 窗口内注释/无关字符串里的假 `ORDER BY`（会被当成真子句 ⇒ 守卫**偏严**，红了看一眼即可）。
     动态拼接的两个端点（pending 的 scope_clause、review-tasks 的 order 分支）不靠词法覆盖，
@@ -212,8 +229,13 @@ def test_unique_tiebreaker_is_present_and_last():
 def test_direction_rule_applies_only_to_direction_sensitive_sites():
     """★ tiebreaker 方向跟随前项 —— **只对登记为方向敏感的站点**生效。
 
-    仅 conversations 有覆盖完整排序键的复合索引（`(user_id,hidden_at,last_message_at)`
-    + PK 后缀 conversation_id），混向用不上单次索引扫描 ⇒ filesort。
+    ⚠️ 当前 `direction_sensitive` 一个站点都没有 ⇒ 本测试是 **dormant** 的（空转）。
+    原先这里写「仅 conversations 有覆盖完整排序键的复合索引（PK 后缀 conversation_id），
+    混向才用不上单次索引扫描」—— **实测推翻**：现状 3 列索引下同向也 filesort，
+    只有索引**显式**含 conversation_id 才恢复 backward index scan
+    （见 `test_tiebreaker_plan_cost_is_governed_by_index_coverage_not_direction`）。
+    等 `idx_user_visible_recent` 扩列（user-gated，F-35）后把 conversations 翻回 True，
+    本测试才重新有对象。
     ⚠️ 绝不能推广成全仓规则：browse 的 `owner_dept ASC, updated_at DESC, doc_id DESC`
     与 gaps 的 `days_ago ASC, rid DESC` 都是**合法**混向，全仓化会把它们误判成缺陷
     （codex 2026-08-06 拦下的正是这个提案）。
@@ -231,6 +253,156 @@ def test_direction_rule_applies_only_to_direction_sensitive_sites():
     assert not bad, (
         "方向敏感站点的 tiebreaker 方向与前项不一致 —— 会用不上二级索引的隐含主键序、"
         "退化成 filesort：\n  " + "\n  ".join(bad))
+
+
+def test_no_alternate_offset_spellings_bypass_the_scanner():
+    """★ 收尾复核（2026-08-06，codex）：扫描器只认 `OFFSET %s`，而 MySQL 还有别的合法写法。
+
+    `LIMIT %s, %s`（逗号两参）和 `OFFSET %(offset)s`（具名占位符）都是**标准语法**，
+    写出来的新分页查询完全不会进 `seen` ⇒ 「未登记站点」「唯一项收尾」「有 OFFSET 无
+    ORDER BY」三道检查**全部跳过**、照样全绿。原文件把这条记成「本仓风格禁止，未专门封堵」，
+    但**没有任何东西在执行那条「禁止」** —— 一句约定不是守卫。
+
+    这里把约定变成硬门：这两种写法在 `opensearch_pipeline/` 里一出现就红，
+    作者要么改成 `OFFSET %s` 并去 SITES 登记，要么显式扩本守卫。
+
+    ⚠️ 第一版只列了四条正则，被 codex 一句话破了：`LIMIT /* offset */ %s, %s` 仍是合法分页，
+    但 `LIMIT\\s+%s` 匹配不到 —— **黑名单遇上可插注释的语法就是筛子**。现改为两步：
+      ① 先剥掉 `/*…*/` 与 `-- …` 注释（用等长空格替换，行号不漂）；
+      ② 在剥净的源码上，不再枚举"坏写法"，而是**正向要求**：
+         每个 `OFFSET` 必须恰好是主扫描器认得的 `OFFSET %s`，且任何 `LIMIT <参数>,` 逗号
+         两参形式一律禁止。这样约束的是"主扫描器看得见"这个性质本身，而不是某几种拼法。
+    """
+    def _blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    def _strip_sql_comments(s: str) -> str:
+        # 等长替换（保留换行）⇒ 行号与原文一一对应，报错能直接点到人。
+        # 三种都要剥：`/*…*/`、`--…`、以及 MySQL 的 `#…`（codex 第 3 轮补的第三种 ——
+        # `LIMIT %s OFFSET # offset\n %s` 同时躲过主扫描器和只剥前两种的这里）。
+        # ⚠️ 剥 `#` 会**误伤字符串字面量里的 `#`**（`LIKE '%#%' … OFFSET %(off)s` 同行时，
+        # 整行剩下的部分连同 OFFSET 一起被抹掉）。我原本写「剥除只会少扫、不会误红」——
+        # **那句话是错的，少扫在这里就是漏检**（codex 第 4 轮）。补法见 `_starts`：两边都扫。
+        s = re.sub(r"/\*.*?\*/", _blank, s, flags=re.S)
+        s = re.sub(r"--[^\n]*", _blank, s)
+        return re.sub(r"#[^\n]*", _blank, s)
+
+    def _starts(pattern: str, raw: str, src: str) -> set:
+        """在**原文和剥净文本上都扫**，取并集（等长替换 ⇒ 偏移一一对应，可直接合）。
+
+        两边都扫，缺一不可：
+          · 只扫原文 ⇒ 注释隔断的（`OFFSET /*x*/ %s`、`OFFSET # 跳过\\n %s`）躲掉；
+          · 只扫剥净 ⇒ 字符串字面量里的 `#` 造成的误剥把真 OFFSET 一起吃掉。
+        """
+        return ({m.start() for m in re.finditer(pattern, raw, flags=re.I)}
+                | {m.start() for m in re.finditer(pattern, src, flags=re.I)})
+
+    hits = []
+    for path in sorted(pathlib.Path("opensearch_pipeline").rglob("*.py")):
+        raw = path.read_text(encoding="utf-8")
+        src = _strip_sql_comments(raw)
+        # ① 正向要求：每个**像 SQL 子句的** OFFSET 都必须是主扫描器认得的形态。
+        # 候选条件必须带「后面跟参数」这个前瞻——否则 `\bOFFSET\b`+re.I 会命中
+        # Python 变量名 `offset`（`offset = max(0, ...)`、`int(offset or 0)`），
+        # 基线直接全红（第一版就是这么翻的车）。
+        # ⚠️ 候选取原文 ∪ 剥净（见 `_starts`），但「主扫描器看不看得见」一律拿**原文**判 ——
+        # 拿剥净文本判等于替扫描器把注释也剥了，`OFFSET /*x*/ %s` 就成了"合规"。
+        for pos in sorted(_starts(r"\bOFFSET\b(?=\s*[%\d])", raw, src)):
+            if not re.match(r"OFFSET\s+%s", raw[pos:], flags=re.I):
+                line = raw[:pos].count("\n") + 1
+                hits.append(f"{path}:{line}  OFFSET 不是 `OFFSET %s` 形态 "
+                            f"⇒ `_paginated_order_bys` 扫不到：{raw[pos:pos + 40]!r}")
+        # ② LIMIT 的逗号两参形式一律禁（它整个绕开 OFFSET 关键字）
+        for pos in sorted(_starts(r"\bLIMIT\s*(?:%s|%\(\w+\)s|\d+)\s*,", raw, src)):
+            line = raw[:pos].count("\n") + 1
+            hits.append(f"{path}:{line}  `LIMIT <a>, <b>` 两参形式 —— 无 OFFSET 关键字，"
+                        f"分页守卫会静默放行：{raw[pos:pos + 40]!r}")
+    assert not hits, (
+        "检出主扫描器识别不了的分页写法（改用 `LIMIT %s OFFSET %s` 并在 SITES 登记，"
+        "或显式扩 `_paginated_order_bys` 的匹配）：\n  " + "\n  ".join(hits))
+
+
+def test_lexical_false_sites_name_a_real_backstop():
+    """★ 收尾复核（2026-08-06，codex）：`lexical=False` 是逃生口，必须有人兜底。
+
+    登记 `lexical=False` 会让三道词法检查全部跳过该站点。原实现里这个口子**完全不受约束**：
+    新加一个「有 OFFSET、无 ORDER BY」的查询再标 `lexical=False`，就永久隐身。
+
+    这里要求每个 `lexical=False` 站点点名一个**真实存在、会被 pytest 收集、且确实针对该站点**
+    的行为测试 —— 三个条件缺一不可：
+      ① 模块在 `tests.` 下且函数名 `test_` 开头 ⇒ pytest 会收集它
+         （只验 `callable` 不够：`_review_tasks` 那种 helper 也 callable，
+          填进去照样全绿 —— codex 破的正是这一版）；
+      ② 函数**代码里**（`ast.unparse` 后，docstring 与注释均已剥除）必须出现该站点登记的
+         唯一项（如 `t.task_id`）⇒ 兜底测试与站点真的挂钩，而不是随便点一个存在的测试凑数。
+         剥 docstring 是必要的：codex 第 3 轮给的伪兜底就是「函数体只有一个把唯一项
+         原样写进去的 docstring + `assert True`」—— 四项检查全过、零覆盖。
+
+    ⚠️ 这条不是形式主义：写它的时候发现原注释点名的
+    `test_review_tasks_both_arms_end_with_task_id` **全仓根本不存在** ——
+    逃生口指着一个幽灵兜底，等于无兜底（真实覆盖者是 test_kb_approval 里那个）。
+
+    ⚠️ **能力边界（明说，不假装）**：这是**纪律守卫，不是对抗守卫**。
+    静态检查无法证明一个测试真的执行并断言了那条 SQL；铁了心的作者永远能写
+    `x = "t.task_id"` 这种形式合规的假兜底。它防的是**漂移与疏忽**——正是实际发生过的
+    那种（点名了一个不存在的测试，没人发现）。真要证明覆盖，得让兜底测试捕获
+    `cursor.execute` 的最终 SQL（review-tasks 现在的那条就是这么做的）。
+    """
+    import ast
+    # ⚠️ **不 import 被点名的测试模块**：`importlib.import_module("tests.test_kb_approval")`
+    # 会在当前 xdist worker 里执行那个模块的导入副作用，而本仓已知存在跨测试模块互踩的
+    # flake 家族（backlog §C.3；实测本守卫用 importlib 那一版跑 make test 时，
+    # 另一模块的 `get_config.cache_clear()` 报 AttributeError）。纯 AST 读文件即可，
+    # 零副作用、也不依赖被点名模块能否在本 worker 里成功导入。
+    missing = []
+    for key, meta in SITES.items():
+        if meta["lexical"]:
+            continue
+        ref = meta.get("behavior_test")
+        if not ref:
+            missing.append(f"{key}  lexical=False 但未点名 behavior_test")
+            continue
+        mod_name, fn_name = ref
+        # 收集性判据必须对齐 pytest 的**真实**规则：`pyproject.toml:65` 只设了
+        # `testpaths=["tests"]`，没设 `python_files` ⇒ 用默认的 `test_*.py` / `*_test.py`。
+        # 只查包前缀 `tests.` 是不够的：`tests/pagination_backstop.py` 里放一个
+        # `def test_x()` 能过前缀检查，但**永远不会被收集**（codex 第 5 轮的命名漂移构造）。
+        stem = mod_name.rsplit(".", 1)[-1]
+        collectible = (mod_name.startswith("tests.")
+                       and (stem.startswith("test_") or stem.endswith("_test"))
+                       and fn_name.startswith("test_"))
+        if not collectible:
+            missing.append(f"{key}  {mod_name}.{fn_name} 不会被 pytest 收集"
+                           f"（模块须在 tests. 下且文件名匹配 test_*.py / *_test.py、"
+                           f"函数名须 test_ 开头）")
+            continue
+        mod_path = pathlib.Path(mod_name.replace(".", "/") + ".py")
+        if not mod_path.is_file():
+            missing.append(f"{key}  behavior_test 模块文件 {mod_path} 不存在")
+            continue
+        try:
+            tree = ast.parse(mod_path.read_text(encoding="utf-8"))
+        except SyntaxError as e:
+            missing.append(f"{key}  {mod_path} 解析失败，无法核对覆盖面：{e}")
+            continue
+        node = next((n for n in tree.body
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                     and n.name == fn_name), None)
+        if node is None:
+            missing.append(f"{key}  点名的 {mod_name}.{fn_name} **不存在** —— 幽灵兜底")
+            continue
+        want = meta["unique"]
+        if (node.body and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)):
+            node.body = node.body[1:] or [ast.Pass()]   # 去 docstring
+        body = ast.unparse(node)                        # 注释天然不进 AST
+        if want not in body:
+            missing.append(f"{key}  {fn_name} 源码里没有出现唯一项 {want!r} "
+                           f"⇒ 它没在替本站点兜底")
+    assert not missing, (
+        "`lexical=False` 站点必须点名真实存在、会被收集、且针对本站点的行为测试：\n  "
+        + "\n  ".join(missing))
 
 
 def test_strict_term_parser_rejects_non_injective_expressions():
