@@ -3867,7 +3867,9 @@ def kb_set_visibility(req: KbSetVisibilityRequest, request: Request,
                 record_acl_projection_invalidation(cur, req.doc_id, reason="set_visibility")
                 if get_config().rag.allowed_depts_acl:
                     try:
-                        materialize_doc_allowed_depts(cur, req.doc_id)
+                        materialize_doc_allowed_depts(cur, req.doc_id, all_versions=False)  # G12：交互请求只做 current 快路，
+                        # 全版本轴交 outbox drain / reconcile —— 否则该请求持有的 chunk X 锁面
+                        # 随 active 版本数放大（`routes/kb_access.py` 在 commit 前就调它）。
                     except Exception as _pe:
                         logger.warning("set_visibility allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
                                        req.doc_id, _pe)
@@ -4287,7 +4289,9 @@ def kb_doc_meta_save(req: KbDocMetaSaveRequest, request: Request,
                 # ACL 相关变更内联 best-effort 物化（outbox 兜底）
                 if {"mode", "owner", "visible_nodes"} & set(changed):
                     try:
-                        materialize_doc_allowed_depts(cur, req.doc_id)
+                        materialize_doc_allowed_depts(cur, req.doc_id, all_versions=False)  # G12：交互请求只做 current 快路，
+                        # 全版本轴交 outbox drain / reconcile —— 否则该请求持有的 chunk X 锁面
+                        # 随 active 版本数放大（`routes/kb_access.py` 在 commit 前就调它）。
                     except Exception as _pe:   # noqa: BLE001
                         logger.warning("doc-meta 内联标脏失败（outbox 兜底）doc=%s: %s",
                                        req.doc_id, _pe)

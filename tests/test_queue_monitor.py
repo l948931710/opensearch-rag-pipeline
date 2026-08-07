@@ -205,3 +205,95 @@ def test_op_db_is_stable_across_env_labels(monkeypatch):
     monkeypatch.setattr(cfg.rds, "database", "fuling_knowledge")
     b = qm._op_db()
     assert a == b == cfg.rds.operation_database, f"心跳库随 rds.database 漂了：{a} vs {b}"
+
+
+# ── C3′ G10（2026-08-07）：acl_projection —— ACL 投影收敛度（纯 SQL 判据）──────────
+
+_ACL_OK = {
+    "acl_epoch IS NULL OR": (0, None),          # unconverged_docs
+    "cm.acl_epoch > dm.acl_epoch": (0, None),   # invariant_violations
+    "attempts >=": (0, None),                   # outbox_retrying
+    "o.enqueued_at": (0, None),                 # outbox_stale_serving_hours（判据）
+    "COUNT(*), NULL FROM": (0, None),           # outbox_pending
+    "enqueued_at, NOW()": (0, None),            # outbox_oldest_hours（仅指标）
+}
+
+
+def _acl(**over):
+    d = dict(_ACL_OK)
+    d.update(over)
+    return d
+
+
+def test_acl_projection_clean_is_green(real_mode, monkeypatch):
+    from opensearch_pipeline.queue_monitor import run_acl_projection_check
+    _wire(monkeypatch, _acl())
+    r = run_acl_projection_check(alert=False)
+    assert r["ok"] is True and r["breaches"] == [], r
+
+
+def test_acl_projection_backlog_without_active_chunks_is_not_a_breach(real_mode, monkeypatch):
+    """★ 真空期形态：outbox 积压 2201 条、**总龄期已超阈**，但没有一篇有 active chunk。
+
+    没有 active chunk 就没有投影对象，materialize 本来就是空操作 ⇒ 不该 page。
+    按总龄期告警会制造一条已知成因的每日红，"训练出对红色的免疫"比不告警更糟
+    （同 plist 把 reconcile_raw 排除在日常集之外的理由）。
+
+    ⚠️ 夹具的总龄期**必须超过阈值**（72 > 48）。第一版照现实写了 30h ——
+    那在 48h 阈值下无论用哪个口径都不 breach，**断言是空转的**（2026-08-07 变异验证
+    当场抓出：把判据换回总龄期，本用例照样绿）。同族教训见
+    tests/test_acl_version_axis_db.py 里预算那条。
+    """
+    from opensearch_pipeline.queue_monitor import run_acl_projection_check
+    from opensearch_pipeline.ops_monitor import _job_exit
+    _wire(monkeypatch, _acl(**{"COUNT(*), NULL FROM": (2201, None),   # pending 很多
+                               "enqueued_at, NOW()": (72, None),      # 总龄期 72h（> 48 阈值）
+                               "o.enqueued_at": (0, None)}))          # 但 serving 口径 0
+    r = run_acl_projection_check(alert=False)
+    assert r["breaches"] == [], f"真空期积压被误判为 breach：{r}"
+    assert r["metrics"]["outbox_pending"] == 2201, "积压本身必须仍作为指标可见"
+    assert r["metrics"]["outbox_oldest_hours"] == 72, "总龄期必须仍作为指标可见"
+    assert _job_exit("acl_projection", r) == 0
+
+
+def test_acl_projection_stale_intent_that_affects_serving_does_breach(real_mode, monkeypatch):
+    """🔴 上一条的**反证锚**：同样的积压，只要其中有文档还带 active chunk 且滞留超阈 ⇒ 必须 page。
+
+    没有这一条，上面那条在"判据被整个改瞎了"时照样绿。
+    """
+    from opensearch_pipeline.queue_monitor import run_acl_projection_check
+    from opensearch_pipeline.ops_monitor import _job_exit
+    sent = []
+    monkeypatch.setattr("opensearch_pipeline.alerting.send_ops_alert",
+                        lambda *a, **k: sent.append((a, k)))
+    _wire(monkeypatch, _acl(**{"COUNT(*), NULL FROM": (2201, None),
+                               "enqueued_at, NOW()": (72, None),
+                               "o.enqueued_at": (72, None)}))         # serving 口径也 72h
+    r = run_acl_projection_check(alert=True)
+    assert [b["kind"] for b in r["breaches"]] == ["outbox_stale"], r
+    assert _job_exit("acl_projection", r) == 2
+    assert sent, "breach 未发告警"
+
+
+def test_acl_projection_missing_column_is_skipped_not_error(real_mode, monkeypatch):
+    """062 未 apply ⇒ 能力降级（skipped_probes），**不是**探针坏了（errors ⇒ exit 3）。
+
+    两者必须可辨——把"schema 没上"读成"数据漂移"或反之都会误导排查（附录B 假绿同族）。
+    """
+    from opensearch_pipeline.queue_monitor import run_acl_projection_check
+    from opensearch_pipeline.ops_monitor import _job_exit
+    _wire(monkeypatch, _acl(**{"acl_epoch IS NULL OR": RuntimeError("(1054, \"Unknown column 'acl_epoch'\")")}))
+    r = run_acl_projection_check(alert=False)
+    assert "errors" not in r, f"能力降级被当成探针失败：{r}"
+    assert r.get("skipped_probes"), r
+    assert _job_exit("acl_projection", r) == 0
+
+
+def test_acl_projection_probe_failure_yields_exit_3(real_mode, monkeypatch):
+    """探针真失败（非缺列）必须进顶层 errors ⇒ exit 3，绝不降级成 exit 2 或 0。"""
+    from opensearch_pipeline.queue_monitor import run_acl_projection_check
+    from opensearch_pipeline.ops_monitor import _job_exit
+    _wire(monkeypatch, _acl(**{"attempts >=": RuntimeError("connection reset")}))
+    r = run_acl_projection_check(alert=False)
+    assert r["ok"] is False and r.get("errors"), r
+    assert _job_exit("acl_projection", r) == 3

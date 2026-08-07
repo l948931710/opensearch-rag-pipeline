@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 _JOBS = ("reconcile_ha3", "reconcile_oss", "reconcile_raw", "qa_rollup",
          "queue_aging", "ingest_funnel",
+         # C3′ G10（2026-08-07）：ACL 投影收敛度。**纯 SQL 判据**——reconcile 只在
+         # DataWorks stage-3 里跑，它的 partially_locked/capped 是进程内计数器，
+         # 本机作业读不到；收敛失败必须表达成库里查得到的状态。
+         # ⚠️ 与 raw_inventory 同样**尚未接调度**：现网节点只跑
+         #    `--only reconcile_ha3 reconcile_oss`，接调度属 ops owner 待办。
+         "acl_projection",
          # B10+B11（2026-07-25）：raw/ 对象四桶盘点（自助上传孤儿 / B14 有意拒绝 /
          # 该注册未注册 / 被准入策略挡掉）。**只读只报数，绝不删**。
          # ⚠️ 尚未接调度：现网节点只跑 --only reconcile_ha3 reconcile_oss，
@@ -60,6 +66,9 @@ def run_all(*, alert: bool = True, only: Optional[List[str]] = None) -> dict:
     if "ingest_funnel" in sel:
         from opensearch_pipeline.queue_monitor import run_ingest_funnel_check
         out["ingest_funnel"] = run_ingest_funnel_check(alert=alert)
+    if "acl_projection" in sel:
+        from opensearch_pipeline.queue_monitor import run_acl_projection_check
+        out["acl_projection"] = run_acl_projection_check(alert=alert)
     if "raw_inventory" in sel:
         from opensearch_pipeline.raw_inventory import run_raw_inventory
         out["raw_inventory"] = run_raw_inventory(alert=alert)

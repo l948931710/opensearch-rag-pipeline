@@ -291,7 +291,9 @@ def kb_doc_node_grants_save(req: KbNodeGrantsSave, request: Request,
                 # ⑤⑥ 投影:持久入队(不吞异常)+ 内联标脏 best-effort
                 record_acl_projection_invalidation(cur, req.doc_id, reason="node_grants_save")
                 try:
-                    materialize_doc_allowed_depts(cur, req.doc_id)
+                    materialize_doc_allowed_depts(cur, req.doc_id, all_versions=False)  # G12：交互请求只做 current 快路，
+                    # 全版本轴交 outbox drain / reconcile —— 否则该请求持有的 chunk X 锁面
+                    # 随 active 版本数放大（`routes/kb_access.py` 在 commit 前就调它）。
                 except Exception as _pe:   # noqa: BLE001 — outbox + reconcile 兜底
                     logger.warning("node 授权内联标脏失败（outbox 兜底）doc=%s: %s", req.doc_id, _pe)
 
@@ -684,7 +686,9 @@ def kb_access_grant_create(req: KbAccessGrantCreate, request: Request,
                     record_acl_projection_invalidation(cur, req.doc_id, reason="direct_grant")
                     if get_config().rag.allowed_depts_acl:
                         try:
-                            materialize_doc_allowed_depts(cur, req.doc_id)
+                            materialize_doc_allowed_depts(cur, req.doc_id, all_versions=False)  # G12：交互请求只做 current 快路，
+                            # 全版本轴交 outbox drain / reconcile —— 否则该请求持有的 chunk X 锁面
+                            # 随 active 版本数放大（`routes/kb_access.py` 在 commit 前就调它）。
                         except Exception as _pe:
                             logger.warning("direct_grant allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
                                            req.doc_id, _pe)
@@ -1330,7 +1334,9 @@ def _kb_access_decide(req: KbAccessDecisionRequest, request: Request,
                     # ⚠️ 消费侧（materialize）仍按 flag 门控 —— 只有上面的 bump+入队不受门控。
                     if get_config().rag.allowed_depts_acl:
                         try:
-                            materialize_doc_allowed_depts(cur, doc_id)
+                            materialize_doc_allowed_depts(cur, doc_id, all_versions=False)  # G12：交互请求只做 current 快路，
+                            # 全版本轴交 outbox drain / reconcile —— 否则该请求持有的 chunk X 锁面
+                            # 随 active 版本数放大（`routes/kb_access.py` 在 commit 前就调它）。
                         except Exception as _pe:
                             logger.warning("decide allowed_depts 内联标脏失败（outbox+reconciler 兜底）doc=%s: %s",
                                            doc_id, _pe)

@@ -198,6 +198,10 @@ _LOCAL_STACK_SERIAL_MODULES = {
     # 整表清空**同表 —— 不进组就会被它连坐清掉种子，症状是"断言看到 0 行"而非报错。
     "test_retire_owner_change_convergence_db.py",
     "test_skip_gate_prior_version_status_db.py",
+    # C3′ ACL 投影版本轴（2026-08-07）：真库、同表夹具，必须与其余真库模块串行。
+    # ⚠️ 本集合的两个消费者都拿 `os.path.basename(nodeid)` 去比（即带 .py），漏写后缀
+    # 不报错、只是永远匹配不上 —— 该模块会静默掉出串行组，与真库模块并发跑。
+    "test_acl_version_axis_db.py",
     # 贡献域 node 轴（2026-08-07，schema/067）：dept_dim/staff_dim/user_role/
     # dept_admin_*_grant/kb_contribution/document_meta/document_version/kb_doc_node_grant
     # 全是真实 DML，且与 test_pipeline 的**无 WHERE 整表清空**同表 —— 不进组就会被连坐清掉

@@ -19,18 +19,40 @@
   <key>Label</key><string>com.fuling.ops-monitor</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>-m</string>
-    <string>opensearch_pipeline.ops_monitor</string>
-    <string>--only</string>
-    <string>reconcile_ha3</string>
-    <string>reconcile_oss</string>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <!-- 🔴 两段式，不是一条命令（2026-08-07）。为什么必须这样：
+         这个 agent 跑在 RAG_ENV=prod_ro，而 .env.prod_ro 设了 RAG_READONLY=true ⇒
+         `run_all` 收尾那次 write_heartbeat() **每次都被 ENV GUARD 挡掉、从未成功过**
+         （日志逐行可证）。于是看板读到的"新鲜心跳"其实来自 com.fuling.qa-rollup
+         （RAG_ENV=metrics，02:50，可写）—— 死人开关证明的是"调度器活着"，
+         **测不出"只有 ops-monitor 这一个 agent 坏了"**，而 ops-monitor 正是漂移探测器本身。
+         处置：对账器继续跑 prod_ro（只读保护一个字不动），心跳作为**第二条命令**用可写
+         env 单独盖章 —— 于是它只在 ops-monitor 进程真的跑完之后才落，终于名副其实。
+         `exit $rc` 保证退出码仍来自对账器（launchd 按它判红绿）；心跳写自身 fail-open
+         （write_heartbeat 内部吞异常），失败只会让看板龄期变老 = 朝安全方向报警。
+         ⚠️ 依赖 fuling_metrics 对 fuling_operation.rag_runtime_contract 的 INSERT/UPDATE
+            授权（2026-08-06 已 GRANT）；qa-rollup 每晚走同一条路径，已验证。 -->
+    <string>/usr/bin/python3 -m opensearch_pipeline.ops_monitor --only reconcile_ha3 reconcile_oss acl_projection; rc=$?; RAG_ENV=metrics /usr/bin/python3 -c 'from opensearch_pipeline.queue_monitor import write_heartbeat; write_heartbeat()'; exit $rc</string>
+    <!-- acl_projection (C3′ G10, 2026-08-07): ACL-projection convergence, pure-SQL predicates.
+         Safe for the daily set because the stale-intent breach is scoped to docs that still have
+         active chunks: during the corpus vacuum the outbox holds 2200+ un-drained intents whose
+         docs have ZERO active chunks — real but with zero serving impact, so it must NOT go red
+         (same anti-RED-blindness reasoning as the reconcile_raw exclusion below).
+         Knobs: RAG_ACL_UNCONVERGED_MAX / RAG_ACL_OUTBOX_RETRY_MAX / RAG_ACL_OUTBOX_STALE_HOURS. -->
     <!-- reconcile_raw intentionally NOT in the daily set: it exit-2's on the 1 known benign raw_key
          gap (DOC_ADMIN_…14D1C1), which would train RED-blindness. Daily = recall-critical ha3+oss
          (green-when-healthy → RED means a real new problem). Run reconcile_raw ad-hoc:
-           RAG_ENV=prod_ro /usr/bin/python3 -m opensearch_pipeline.reconcile --check raw
+         the exact command lives in the _AdHocReconcileRaw key below — it cannot be written
+         here because **XML comments may not contain a double hyphen**, and the flag has one.
+         (This file was in fact malformed XML for weeks because of exactly that: `plutil -lint`
+         is lenient, but Python's plistlib / any strict parser rejects it. Caught 2026-08-07 by
+         tests/test_ops_monitor.py::test_ops_monitor_agent_stamps_its_own_heartbeat.)
          (or add a separate weekly agent once that 1 doc's raw is triaged). -->
   </array>
+  <key>_AdHocReconcileRaw</key>
+  <string>RAG_ENV=prod_ro /usr/bin/python3 -m opensearch_pipeline.reconcile --check raw</string>
+  <!-- ↑ 惰性键：launchd 忽略不认识的键；放这里是为了让命令**原样可复制**而不破坏 XML。 -->
   <key>WorkingDirectory</key><string>/Users/laijunchen/Projects/opensearch-rag-pipeline</string>
   <key>EnvironmentVariables</key>
   <dict>

@@ -161,10 +161,13 @@ class _Conn:
         pass
 
 
-def _run(monkeypatch, st, flag=True, commit=True):
+def _run(monkeypatch, st, flag=True, commit=True, axis=False):
+    """`axis` = C3′ 版本轴 flag（`RAG_ACL_VERSION_AXIS`）。**默认 False** —— 既有用例
+    全部断言的是 flag off 下的行为，默认值一变就会把它们悄悄搬到另一条语义上。"""
     from opensearch_pipeline.config import get_config
     from opensearch_pipeline import pipeline_nodes
     monkeypatch.setattr(get_config().rag, "allowed_depts_acl", flag, raising=False)
+    monkeypatch.setattr(get_config().rag, "acl_version_axis", axis, raising=False)
     monkeypatch.setattr(pipeline_nodes, "_get_db_conn", lambda *a, **k: _Conn(st))
     from opensearch_pipeline.allowed_depts_reconcile import reconcile_allowed_depts
     return reconcile_allowed_depts(commit=commit)
@@ -377,6 +380,9 @@ def test_epoch_null_doc_becomes_a_candidate(monkeypatch):
     这正是 C3′ 要修的那类（diff 在无上次结果时恒为空 ⇒ 永远判 unchanged），
     而原四路候选（approved / 已有投影 / node 授权 / node stale-owner）**一条都覆盖不到**
     —— 062 落了两列却零消费。没有这一路，sweep 根本选不到这些文档。
+
+    ⚠️ 2026-08-07 一度把本候选源收进 `RAG_ACL_VERSION_AXIS` 闸（G4），已撤销：
+       零收益（同类文档也命中 have_ad）且会让退役→恢复链路静默失去自愈。
     """
     seen = _spy_targets(monkeypatch)
     st = {"approved": {}, "have": {}, "ver": {"DE": 1},
@@ -464,17 +470,19 @@ def test_materialize_reports_wrote_orthogonally_to_status():
 
     MySQL 对**匹配到的行**取 X 锁，与值是否改变无关 ⇒ 报 unchanged 却持着锁。
     单靠 status 表达不了「报 unchanged 但写过」，故必须有第二维 `wrote`。
+
+    ⚠️ C3′ 版本轴（2026-08-07）：certify 下沉为 `_materialize_one_version` 内的 `_certify`
+    闭包，它把 wrote 作为返回值的第二元素**无条件**给 `True` —— 结构上比旧的
+    「UPDATE 之后立刻置 `_wrote`」更强（不存在"忘了置"的形态）。断言随之改写。
     """
     import inspect
     from opensearch_pipeline import access_grants
-    src = inspect.getsource(access_grants.materialize_doc_allowed_depts)
-    # 两条臂的 certify UPDATE 之后都必须立刻置 _wrote（不能等 rowcount 判断）
-    for seg in src.split("SET acl_epoch=%s")[1:]:
-        head = seg[:seg.index("if cursor.rowcount")]
-        assert "_wrote = True" in head, (
-            "certify 的 UPDATE 之后没有立刻置 _wrote —— rowcount==0 时会穿透成 unchanged 且不带 wrote")
-    # unchanged 的返回必须携带 _wrote 变量而非硬编码 False
-    assert '"unchanged", "reset_chunks": 0, "version_no": ver, "wrote": _wrote}' in src
+    src = inspect.getsource(access_grants._materialize_one_version)
+    # 盖章 UPDATE 的返回里，wrote 元素必须与 rowcount **无关**（恒 True）
+    assert 'else "unchanged"), True' in src, (
+        "certify 的 wrote 依赖了 rowcount —— rowcount==0 时会穿透成 unchanged 且不带 wrote")
+    # 两条臂的 unchanged/certified 返回都必须携带 `_certify` 给出的 wrote，而非硬编码 False
+    assert src.count('"wrote": _w}') == 2, "有分支没把 certify 的 wrote 透传出去"
 
 
 def test_reconcile_settles_transaction_for_every_doc(monkeypatch):

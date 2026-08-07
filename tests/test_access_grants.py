@@ -436,19 +436,29 @@ def test_materialize_has_certify_path_before_returning_unchanged():
 
     这正是 72c9e22 落码时的缺口：两个分支都在 stamp 之前 return，
     「值对但 acl_epoch IS NULL」的文档永远盖不上章、永久 dirty。
+
+    ⚠️ C3′ 版本轴（2026-08-07）把判定/写下沉到**单版本核** `_materialize_one_version`，
+    certify 由其内的 `_certify` 闭包唯一实现（两个模式分支共用）。检查对象随之搬家；
+    不变量本身未变。
     """
     import inspect
     from opensearch_pipeline import access_grants
-    src = inspect.getsource(access_grants.materialize_doc_allowed_depts)
-    assert src.count('"certified"') == 2, "node 与 legacy 两个分支都必须有 certify 路径"
+    src = inspect.getsource(access_grants._materialize_one_version)
+    # 只数**调用点**（`def _certify(want, _owner):` 那行也含同样字面，会多算一次）
+    assert src.count("_st, _w = _certify(want, _owner)") == 2, (
+        "node 与 legacy 两个分支都必须走 certify 路径")
     assert "projection_rows_all_match" in src, "certify 未用逐行校验（并集口径会误认证）"
     # certify 只写 epoch，绝不置 NOT_INDEXED（否则会无谓触发全量重推 HA3）。
     # ⚠️ 用「回溯到最近一条 cursor.execute」定位，**不用固定字符窗口** ——
     # 窗口式断言会被中间新增的注释挤爆（2026-08-04 B1 加 `_wrote` 注释时就撞过）。
-    for seg in src.split('"certified"')[:-1]:
+    _stamp_writes = [s for s in src.split("SET acl_epoch=%s")[:-1] if "cursor.execute(" in s]
+    assert _stamp_writes, "找不到 certify 的盖章写语句"
+    for seg in _stamp_writes:
         stmt = seg[seg.rindex("cursor.execute("):]
-        assert "SET acl_epoch=%s" in stmt, "certify 分支的写语句不是只写 acl_epoch"
         assert "index_status" not in stmt, "certify 绝不能顺手置 NOT_INDEXED（会触发全量重推）"
+    # G8（2026-08-07）：预览必须真正零写 —— 盖章写语句必须在 `if not apply:` 之后
+    assert src.index("if not apply:") < src.index("SET acl_epoch=%s"), (
+        "certify 的盖章写语句排在 `if not apply` 之前 ⇒ apply=False 仍会写（G8 回归）")
 
 
 def test_reconcile_commits_certified_status():
@@ -461,11 +471,24 @@ def test_reconcile_commits_certified_status():
     """
     import inspect
     from opensearch_pipeline import access_grants, allowed_depts_reconcile
-    m_src = inspect.getsource(access_grants.materialize_doc_allowed_depts)
-    assert '"certified", "reset_chunks": 0, "version_no": ver, "wrote": True' in m_src, (
-        "certified 未报 wrote=True ⇒ 按 wrote 分派的调用方不会提交，epoch 会丢")
+    # C3′（2026-08-07）：certify 下沉到 `_materialize_one_version` 内的 `_certify` 闭包。
+    # 新形态比旧的**更强**：wrote 元素是无条件字面 `True`，不再依赖 rowcount 分支。
+    m_src = inspect.getsource(access_grants._materialize_one_version)
+    assert 'return ("certified" if cursor.rowcount else "unchanged"), True' in m_src, (
+        "certify 的写路径未无条件报 wrote=True ⇒ 按 wrote 分派的调用方不会提交，epoch 会丢")
     r_src = inspect.getsource(allowed_depts_reconcile.reconcile_allowed_depts)
-    assert 'status == "certified"' in r_src, "reconcile 未识别 certified（计数仍需要它）"
-    i = r_src.index('outcome.get("wrote")')
-    seg = r_src[i:i + 300]
+    # C3′：计数改为遍历 per_version，逐条状态变量名为 `_s`（语义不变）
+    assert '_s == "certified"' in r_src, "reconcile 未识别 certified（计数仍需要它）"
+    # C3′：`wrote` 现在只从 outcome 读一次（`_wrote_any`），预算与事务分派共用同一判据。
+    # ⚠️ 定位方式两次踩坑（`outcome.get("wrote")` 与 `if _wrote_any:` 都出现了两处、
+    #    `index()` 各误定位一次）。教训与本文件既有那条一致：**别猜字符窗口**。
+    #    现在锚在事务分派块 `if commit:` 上，并**先断言锚点唯一** —— 锚点变多时守卫必须
+    #    大声失败，而不是悄悄挪到另一处去检查。
+    assert 'outcome.get("wrote")' in r_src, "reconcile 不再读 wrote 维度"
+    assert r_src.count("if commit:") == 1, (
+        "事务分派锚点 `if commit:` 不再唯一 —— 本守卫的定位失效，请改用 AST 或收窄锚点")
+    seg = r_src[r_src.index("if commit:"):]
+    seg = seg[:seg.index("except Exception")]
     assert "conn.commit()" in seg, "wrote 分派处未提交 —— certified 的 epoch 会丢"
+    assert "conn.rollback()" in seg, "纯读路径未 rollback —— 读视图会拖给下一篇（B1）"
+    assert "_wrote_any" in seg, "事务分派未用 wrote 维度（改回按 status 分派会漏掉穿透那一格）"

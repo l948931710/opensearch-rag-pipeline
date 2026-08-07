@@ -369,6 +369,16 @@ class RAGConfig:
     # allowed_depts、入库按 approved 授权聚合写 chunk_meta.allowed_depts。默认关；需先 HA3 加
     # allowed_depts 字段(Step 2) + 回填(Step 3) 再开。flag 关时全链路与现状逐字节一致。
     allowed_depts_acl: bool = False         # RAG_ALLOWED_DEPTS_ACL
+    # C3′ ACL 投影版本轴（方案 docs/ops/c3prime_version_axis_plan_2026-08-04_DRAFT.md，
+    # codex 三轮共识 + Sam 2026-08-07 拍板政策1/A）。开启后 materializer 对该文档**全部
+    # `is_active=1` 版本**投影（各自按本版本 permission_level gate、各自判 PROCESSING 锁），
+    # 且 reconcile 的 `epoch_dirty` 候选源生效。
+    # ⚠️ **flag off ≠ 完全等价于 062 apply 之后的今天**：off 时 `epoch_dirty` 被**有意抑制**
+    #    —— 062 已在 prod apply，该候选源今天是生效的，但 materializer 修不了非 current 版本，
+    #    喂进去只会每轮空转取锁 + 报 `unchanged` 假绿。抑制它是安全回退，不是回归。
+    # ⚠️ 翻 on 前需 Sam 点头：on 之后混级文档的旧 dept_internal 版本会拿到 approved 组码
+    #    （方案 §8.1 的 A），可见面扩大。
+    acl_version_axis: bool = False           # RAG_ACL_VERSION_AXIS
     # node-ACL（组织树节点授权，设计稿 docs/permission_node_acl_design_2026-07-27_DRAFT.md）。
     # **双开关且不可合并**：投影未收敛时 HA3 里可能仍是旧真实 owner、legacy approved 组码
     # 也可能还在，只关正向分支反而让旧通道复活 ⇒ ENFORCE 必须常开。
@@ -1044,6 +1054,7 @@ def load_config() -> PipelineConfig:
             # 相关度标签阈值（高/中/低）；可经 RAG_SCORE_THRESHOLD_HIGH / _MEDIUM 覆盖。
             conversation_history=_env_bool("CONVERSATION_HISTORY", False),
             allowed_depts_acl=_env_bool("ALLOWED_DEPTS_ACL", False),            # RAG_ALLOWED_DEPTS_ACL
+            acl_version_axis=_env_bool("ACL_VERSION_AXIS", False),              # RAG_ACL_VERSION_AXIS
             node_acl_grant=_env_bool("NODE_ACL_GRANT", False),                  # RAG_NODE_ACL_GRANT
             node_acl_enforce=_env_bool("NODE_ACL_ENFORCE", True),               # RAG_NODE_ACL_ENFORCE
             main_hit_revalidate=_env_bool("MAIN_HIT_REVALIDATE", True),         # RAG_MAIN_HIT_REVALIDATE

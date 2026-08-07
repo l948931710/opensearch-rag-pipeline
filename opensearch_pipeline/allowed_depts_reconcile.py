@@ -30,7 +30,7 @@ def _kb_db() -> str:
 _LIMIT = 200
 
 
-def _prescreen_unchanged(cur, targets) -> set:
+def _prescreen_unchanged(cur, targets, *, all_versions: bool = False) -> set:
     """批量预筛出【确定无漂移】的 doc 子集（perf E#36，消除常态轮次逐 doc 4×SQL 的 N+1）。
 
     两条聚合查询：① resolve_allowed_depts 一条 IN 拉全部 approved grants（白名单净化同口径）；
@@ -45,6 +45,16 @@ def _prescreen_unchanged(cur, targets) -> set:
     `kb_doc_node_grant` 投影的 `d:/dx:` 值、且要一并比 owner 投影轴。想在预筛里复刻这几维，
     等于把唯一写实现的判定逻辑抄第二份 —— 而"两份判定逻辑漂移"正是本条缺陷的根因。
     node 直接交给单一注入点复核；legacy 保留预筛（perf E#36 的 N+1 收益）。
+
+    **C3′ 版本轴（`all_versions`，2026-08-07）** —— 两处随 flag 切换，flag off 时逐字等于改动前：
+      · **分组键**：off ⇒ `doc_id`（今天的跨版本口径）；on ⇒ `(doc_id, version_no)`。
+        G5：gate 必须逐版本，否则混级文档（v1=dept_internal / v2=public）的跨版本
+        permission 集合是 `{dept_internal, public}` ⇒ 整篇 `want=[]` ⇒ **判 unchanged 直接跳过**，
+        materializer 根本进不到（方案 §0 实测四）。**没有 G5 就没有版本轴。**
+      · **epoch 门**（G6，codex BLOCKER-1）：on 时任一版本 `cm.acl_epoch IS NULL` 或
+        `< dm.acl_epoch` ⇒ **不得判 unchanged**。否则 `epoch_dirty` 选进来的文档被预筛拦回、
+        certify 盖章路径永远到不了 ⇒ 每轮进候选每轮空转，G4 承诺的收敛不成立。
+        判定顺序：**epoch 门排在 want/owner 比较之前**（值对但章落后同样要复核）。
     """
     import json as _json
     from opensearch_pipeline.access_grants import _node_acl_columns_present, resolve_allowed_depts
@@ -75,72 +85,96 @@ def _prescreen_unchanged(cur, targets) -> set:
     # 旧口径只看 current 版本 ⇒「current 干净、旧 active 版 dirty」会被提前判 unchanged，
     # materialize 永不执行、旧版本带着错投影继续被检索（旧版本 chunk 仍 is_active=1 时可服务）。
     # 现在**全部 active 版本**都进预筛，任一版本不符即交逐 doc 复核。
-    cur.execute(                                         # ② 现存投影 + 版本限定权限（一条查询）
-        f"SELECT DISTINCT cm.doc_id, cm.version_no, cm.allowed_depts, cm.permission_level, "
-        f"       cm.owner_dept, dm.owner_dept "
-        f"FROM {_kb_db()}.chunk_meta cm "
-        f"JOIN {_kb_db()}.document_meta dm ON dm.doc_id=cm.doc_id "
-        f"WHERE cm.is_active=1 AND cm.doc_id IN ({placeholders})",
-        tuple(targets),
-    )
+    # C3′ G6：flag on 时额外取两侧 acl_epoch（062 未 apply ⇒ 1054 ⇒ 整体放弃预筛，全量复核）
+    _epoch_cols = ", cm.acl_epoch, dm.acl_epoch" if all_versions else ""
+    try:
+        cur.execute(                                     # ② 现存投影 + 版本限定权限（一条查询）
+            f"SELECT DISTINCT cm.doc_id, cm.version_no, cm.allowed_depts, cm.permission_level, "
+            f"       cm.owner_dept, dm.owner_dept{_epoch_cols} "
+            f"FROM {_kb_db()}.chunk_meta cm "
+            f"JOIN {_kb_db()}.document_meta dm ON dm.doc_id=cm.doc_id "
+            f"WHERE cm.is_active=1 AND cm.doc_id IN ({placeholders})",
+            tuple(targets),
+        )
+    except Exception as e:  # noqa: BLE001 — 062 未 apply / 列缺失 ⇒ 保守全量复核
+        logger.warning("预筛投影批查失败（acl_epoch 列缺失?），本轮放弃预筛、全量复核: %s", e)
+        return set()
     rows = cur.fetchall()
     # B2-②：`have_rows[d]` 是**逐行**的集合列表，**不是并集**。
     # 并集是有损的：current=[a,b]、旧版=[] 时并集仍等于 want ⇒ 旧版的漂移被 current 盖住、
     # 判成 unchanged。与 certify 侧 `projection_rows_all_match()` 的逐行哲学统一：
     # 判「要不要复核」宁可宽（多跑一次 materialize 无害），绝不漏。
     have_rows: dict = {}
-    have_map: dict = {}
     perm_map: dict = {}
-    owner_map: dict = {}          # doc → chunk 投影轴 owner 集合（集合语义，见下）
+    owner_map: dict = {}          # 键 → chunk 投影轴 owner 集合（集合语义，见下）
     want_owner: dict = {}         # doc → 应有 owner（legacy = document_meta 真实 owner）
+    keys_of_doc: dict = {}        # doc → 该 doc 的全部分组键（flag off 时就是 {doc}）
+    epoch_dirty_docs: set = set()  # G6：任一版本章落后/为 NULL 的 doc
     bad: set = set()
     for row in rows:
         try:
-            d, ad, perm = row[0], row[2], row[3]
+            d, ver, ad, perm = row[0], row[1], row[2], row[3]
             cm_owner, dm_owner = row[4], row[5]
+            if all_versions:
+                _cm_ep, _dm_ep = row[6], row[7]
         except Exception:  # noqa: BLE001 — 行形状异常（桩/驱动差异）→ 整体放弃预筛，全量复核
             return set()
-        owner_map.setdefault(d, set()).add(cm_owner or "")
+        # C3′：分组键随 flag 切换。off ⇒ 键=doc（今天的跨版本口径，逐字等价）；
+        #      on  ⇒ 键=(doc, version)，gate/have/owner 三维全部逐版本判（G5）。
+        k = (d, ver) if all_versions else d
+        keys_of_doc.setdefault(d, set()).add(k)
+        if all_versions:
+            # G6：epoch 门。NULL 章 = 从未投影；章 < 水位 = 投影落后于失效代次。
+            # 两者都必须复核 —— 值/owner 恰好正确时，只有走到 materializer 才能盖上章。
+            try:
+                if _cm_ep is None or (_dm_ep is not None and int(_cm_ep) < int(_dm_ep)):
+                    epoch_dirty_docs.add(d)
+            except (TypeError, ValueError):
+                epoch_dirty_docs.add(d)          # 章不可解析 ⇒ 保守复核
+        owner_map.setdefault(k, set()).add(cm_owner or "")
         want_owner[d] = dm_owner or ""
-        perm_map.setdefault(d, set())
+        perm_map.setdefault(k, set())
         if perm is not None:                     # 与 GROUP_CONCAT 同口径：NULL 权限不计入 gate 判定
-            perm_map[d].add(perm)
+            perm_map[k].add(perm)
         # ⚠️ NULL/空 allowed_depts **也要记一行空集**（旧实现 `continue` 直接跳过 ⇒ 该行
         # 对判定完全隐形：want 非空而某版本为 NULL 时照样判 unchanged，与并集是同族泄漏）。
         if not ad:
-            have_rows.setdefault(d, []).append(set())
+            have_rows.setdefault(k, []).append(set())
             continue
         if isinstance(ad, list):
-            have_rows.setdefault(d, []).append(set(ad))
-            have_map.setdefault(d, set()).update(ad)
+            have_rows.setdefault(k, []).append(set(ad))
             continue
         try:
-            _parsed = set(_json.loads(ad) or [])
-            have_rows.setdefault(d, []).append(_parsed)
-            have_map.setdefault(d, set()).update(_parsed)
+            have_rows.setdefault(k, []).append(set(_json.loads(ad) or []))
         except (ValueError, TypeError):
             bad.add(d)                           # 坏 JSON → 该 doc 不预筛，交 materialize 复核
 
     unchanged = set()
     for d in targets:
-        if d not in perm_map or d in bad:        # 无 current-version 明细 → 保守交逐 doc 复核
+        if d not in keys_of_doc or d in bad:     # 无投影明细 → 保守交逐 doc 复核
+            continue
+        if d in epoch_dirty_docs:                # G6：章落后 ⇒ 必须进 materializer 盖章
             continue
         raw_want = grants.get(d, [])
-        # 版本限定 gate（与 materialize 的 GROUP_CONCAT==‘dept_internal’ 等价）：
-        # 唯一权限级且为 dept_internal 才保留 want，否则 want=[]。
-        want = raw_want if perm_map[d] == {"dept_internal"} else []
-        # B2-②：**每一行**都必须等于 want（逐版本严格），不再拿并集比。
-        _rows_d = have_rows.get(d) or [set()]
-        if any(sorted(_r) != sorted(want) for _r in _rows_d):
-            continue
-        # owner 投影轴（C3）：allowed_depts 一致但 chunk owner 与应有值不符也是漂移，
-        # 此前预筛完全不看这一维 ⇒ stale-owner 文档被判 unchanged、materialize 永不执行。
-        # 这一维读的是【投影结果】(chunk_meta.owner_dept vs document_meta.owner_dept)，
-        # 不是重算权威，故不构成"判定逻辑抄第二份"。
-        # 集合相等而非首项相等：混合 owner（写到一半/并发）必须判漂移，与 materialize 同口径。
-        if owner_map.get(d, set()) != {want_owner.get(d, "")}:
-            continue
-        unchanged.add(d)
+        _ok = True
+        for k in keys_of_doc[d]:
+            # 版本限定 gate（与 materialize 的 GROUP_CONCAT=='dept_internal' 等价）：
+            # 唯一权限级且为 dept_internal 才保留 want，否则 want=[]。
+            want = raw_want if perm_map.get(k) == {"dept_internal"} else []
+            # B2-②：**每一行**都必须等于 want（逐行严格），不再拿并集比。
+            if any(sorted(_r) != sorted(want) for _r in (have_rows.get(k) or [set()])):
+                _ok = False
+                break
+            # owner 投影轴（C3）：allowed_depts 一致但 chunk owner 与应有值不符也是漂移，
+            # 此前预筛完全不看这一维 ⇒ stale-owner 文档被判 unchanged、materialize 永不执行。
+            # 这一维读的是【投影结果】(chunk_meta.owner_dept vs document_meta.owner_dept)，
+            # 不是重算权威，故不构成"判定逻辑抄第二份"。
+            # 集合相等而非首项相等：混合 owner（写到一半/并发）必须判漂移，与 materialize 同口径。
+            if owner_map.get(k, set()) != {want_owner.get(d, "")}:
+                _ok = False
+                break
+        if _ok:
+            unchanged.add(d)
     return unchanged
 
 
@@ -149,12 +183,30 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
 
     commit=False 为只读预览（统计 drift，不写）。Returns 统计 dict，**绝不抛**（失败进 errors）。
     flag 关 → 直接返回 skipped（投影路径全程惰性，零写）。
+
+    **C3′ 版本轴（`RAG_ACL_VERSION_AXIS`，默认 off）** 影响本函数三处：
+      · `epoch_dirty` 候选源受同一 flag 门控（G4）。**这不是"等价"而是有意抑制** ——
+        062 已在 prod apply，该候选源今天是生效的；但 flag off 时 materializer 修不了
+        非 current 版本，喂进去只会每轮空转取锁 + 报 `unchanged` 假绿。
+      · 预筛的分组键与 epoch 门随 flag 切换（G5/G6，见 `_prescreen_unchanged`）。
+      · 计数改为遍历 `outcome["per_version"]`；**写预算改用独立的文档级计数器**
+        `_docs_written`（`materialized`/`retracted` 现在是**版本数**，双版本文档会吃两份预算）。
     """
     result = {"approved": 0, "materialized": 0, "retracted": 0, "unchanged": 0, "certified": 0,
+              # C3′：这两项是"看起来收敛了其实没有"的唯一进程内信号。
+              # ⚠️ 它们**接不到 ops_monitor**（本函数只在 DataWorks stage-3 里跑，
+              #    ops_monitor 是本机作业、判据只能来自 SQL）⇒ 线上可观测性靠
+              #    `ops_monitor` 的 `acl_projection` job（纯 SQL 判据），不是靠这里的返回值。
+              "partially_locked": 0, "missing_version": 0,
               "reset_chunks": 0, "capped": False, "skipped": False, "errors": []}
-    if not get_config().rag.allowed_depts_acl:
+    _cfg = get_config()
+    if not _cfg.rag.allowed_depts_acl:
         result["skipped"] = True
         return result
+    # C3′ 版本轴总闸。用 getattr 而非直接取属性：老配置对象（测试桩/回滚镜像）缺该字段时
+    # 必须退化为 off，而不是 AttributeError 打挂整轮对账。
+    _axis = bool(getattr(_cfg.rag, "acl_version_axis", False))
+    result["version_axis"] = _axis
 
     from opensearch_pipeline.pipeline_nodes import _get_db_conn
     from opensearch_pipeline.access_grants import materialize_doc_allowed_depts
@@ -221,6 +273,14 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
             #   · `chunk_meta.acl_epoch < document_meta.acl_epoch` = 投影**落后于失效代次**。
             # 逐版本判（不限 current）：非 current 的旧 active 版同样要收敛。
             # capability 探测：062 未 apply 的环境降级为空集，绝不 1054 打挂整轮对账。
+            # ⚠️ G4（"把本候选源收进版本轴 flag"）**已撤销**（2026-08-07，被 make test 推翻）：
+            #    ① 零收益 —— 它想挡的"非 current 版本每轮空转"那类文档，同时也命中
+            #       `have_ad` 候选（v2 有投影、v1 是 NULL），关掉 epoch 源一点都挡不住；
+            #    ② 有副作用 —— 退役→改归属→恢复→收敛链路（`test_retire_owner_change_
+            #       convergence_db.py`，2026-08-06）的自愈**正是靠这一路**：restore 之后
+            #       chunk 的章落后于 doc 水位，只有 epoch 候选够得着。gate 掉它 = 那条链路
+            #       在 flag off（默认）时静默失去自愈。
+            #    ⇒ 本候选源保持**不受版本轴门控**，仍只受 capability 探测（062 未 apply 降级）。
             epoch_dirty: set = set()
             try:
                 cur.execute(
@@ -274,34 +334,59 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
             # 写语义不变）。预筛异常 → 退回全量逐 doc 复核（现状行为，graceful degradation）。
             prescreen_unchanged: set = set()
             try:
-                prescreen_unchanged = _prescreen_unchanged(cur, targets)
+                prescreen_unchanged = _prescreen_unchanged(cur, targets, all_versions=_axis)
             except Exception as pe:  # noqa: BLE001 — 预筛失败绝不影响对账本体
                 logger.warning("allowed_depts 预筛失败，退回全量逐 doc 复核: %s", pe)
             # B2-③：不变量破坏的文档**永不**享受预筛跳过（其 epoch 不可信）。
             prescreen_unchanged -= invariant_bad
             result["unchanged"] += len(prescreen_unchanged)
 
+            # C3′（2026-08-07，codex C4/我 R4）：写预算必须用**独立的文档级**计数器。
+            # 旧判据 `materialized + retracted` 在版本轴下变成了**版本数**（一篇双版本文档
+            # 吃两份预算）；而 `_LIMIT` 的语义一直是"每轮写入的文档数"——保持"漂移文档不被
+            # 一致文档挤出"那条性质，就必须按文档计。
+            # ⚠️ `_LIMIT` 只在**文档循环之间**截断，管不到单篇内部的版本工作量（codex 纠正）。
+            _docs_written = 0
+
             for doc_id in targets:
                 if doc_id in prescreen_unchanged:
                     continue                             # 预筛判定无漂移 → 零逐 doc SQL
-                if result["materialized"] + result["retracted"] >= _LIMIT:
+                if _docs_written >= _LIMIT:
                     result["capped"] = True
-                    logger.info("allowed_depts reconcile 单轮写达上限 _LIMIT=%d，剩余漂移下轮续（自清不饿死）",
+                    logger.info("allowed_depts reconcile 单轮写达上限 _LIMIT=%d 篇文档，剩余漂移下轮续（自清不饿死）",
                                 _LIMIT)
                     break
                 try:
-                    # helper：current version + 2h PROCESSING 反抢锁 → 版本限定 gate → diff → 写标脏。
-                    # 不提交、不写 HA3；apply=commit 支持只读预览（commit=False 只统计漂移不写）。
+                    # helper：版本集（flag off = current 单版本）→ 逐版本反抢锁 → 版本限定 gate
+                    # → diff → 写标脏。不提交、不写 HA3；apply=commit 支持只读预览。
                     outcome = materialize_doc_allowed_depts(cur, doc_id, apply=commit)
                     status = outcome["status"]
-                    if status == "unchanged":
-                        result["unchanged"] += 1
-                    elif status == "certified":
-                        result["certified"] = result.get("certified", 0) + 1
-                    elif status in ("materialized", "retracted"):
-                        result[status] += 1
-                        result["reset_chunks"] += outcome["reset_chunks"]
-                    # skipped / skipped_locked：current version 正在 stage-3 跑 → 本轮跳过、下轮再对
+                    # 计数走 `per_version`（每个版本各计一次，真实反映工作量与 drift 分布）；
+                    # 缺该键 ⇒ 退回按聚合 status 计（兼容老桩/回滚镜像）。
+                    _pv = outcome.get("per_version")
+                    for _one in (_pv if _pv else [{"status": status,
+                                                   "reset_chunks": outcome.get("reset_chunks", 0)}]):
+                        _s = _one.get("status")
+                        if _s == "unchanged":
+                            result["unchanged"] += 1
+                        elif _s == "certified":
+                            result["certified"] = result.get("certified", 0) + 1
+                        elif _s in ("materialized", "retracted"):
+                            result[_s] += 1
+                            result["reset_chunks"] += int(_one.get("reset_chunks") or 0)
+                        elif _s == "missing_version":
+                            # G11：该版本无 document_version 行 ⇒ stage-3 装载不到 ⇒ 不投影，
+                            # 保留 outbox 意图。计数用于暴露这类不可 drain 的版本。
+                            result["missing_version"] += 1
+                        # skipped / skipped_locked：该版本正在 stage-3 跑 → 本轮跳过、下轮再对
+                    # `wrote` 只读一次：预算与事务分派共用同一判据，杜绝两处口径漂移。
+                    _wrote_any = bool(outcome.get("wrote"))
+                    if _wrote_any:
+                        _docs_written += 1               # 文档级预算：本篇发出过写即算一份
+                    # C3′ G3：聚合态非完成（任一版本被锁/缺 dv 行）⇒ 这篇**没做完**。
+                    # 这是"看起来收敛了其实没有"的唯一进程内信号 —— 绝不能计成 unchanged。
+                    if status in ("skipped_locked", "missing_version"):
+                        result["partially_locked"] += 1
 
                     # ── B1（2026-08-04）：**每一篇都必须了结事务**，按 `wrote` 二选一 ──────
                     # 旧实现只在 certified / materialized / retracted 三支 commit，`unchanged`
@@ -314,7 +399,7 @@ def reconcile_allowed_depts(commit: bool = True) -> dict:
                     # 判据用 `wrote`（与 status 正交的第二维）而非 status：单靠 status 表达不了
                     # "报 unchanged 但写过"这种组合。
                     if commit:
-                        if outcome.get("wrote"):
+                        if _wrote_any:
                             conn.commit()                # 逐文档提交（单文档失败不连累其余）
                         else:
                             conn.rollback()              # 纯读：了结读视图，绝不把它拖给下一篇

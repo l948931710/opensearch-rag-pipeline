@@ -399,57 +399,69 @@ def _current_owner_set_for_doc(cursor, doc_id: str, version_no: int) -> set:
     return {(r[0] or "") for r in cursor.fetchall()}
 
 
-def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) -> Dict[str, object]:
-    """把单篇文档的 approved 授权【物化】到 chunk_meta.allowed_depts 投影——decide 端点与
-    allowed_depts_reconcile 对账共用的【唯一写实现】（与上面 resolve/gate/current 读原语配套）。
+# C3′ 版本轴（Sam 2026-08-07 拍板）：一篇文档 active 版本数的**告警**阈值。
+# ⚠️ 这是告警判据，**不是截断判据** —— 旧方案的"超限只处理最新 N 个"被 codex 推翻：
+# outbox 只存 doc_id、没有版本游标（`schema/009_acl_projection_outbox.sql`），
+# 静默截断 ⇒ 重试永远重复命中最新 N 个 ⇒ N 之外的版本**永不收敛**，
+# 那正是本单要修的那类缺陷，不能用同款手法解决。故全部处理、超阈值只报警。
+# ⚠️ 单篇文档的版本工作量**没有上界**；`_LIMIT` 只限制 reconcile 每轮写入的**文档数**
+#    （`allowed_depts_reconcile.py` 的文档循环之间），管不到单篇内部。>20 告警正是
+#    用来暴露这个性能风险的。
+_MAX_VERSIONS_ALARM = 20
 
-    单一注入点，绝不重复手写。流程：
-      1. 解析 current version，并施加 2h PROCESSING 反抢锁（与 stage-3 loader 同约定）——current
-         version 正在 stage-3 跑（PROCESSING < 2h）→ 返回 skipped_locked、本轮不动，交对账下轮重对。
-         **必须有这层**：否则在 stage-3 装载窗口内抢改 index_status，会被 stage-3 写回 INDEXED
-         覆盖、而 HA3 仍是旧 ACL → chunk_meta 已等于 authority 致对账判 unchanged 不再重推的【自愈
-         失败漂移】（Step 5 审计；decide 旧实现缺此守卫）。
-      2. 从 authority 重解析该 doc 应有 allowed_depts，并按【该 version】permission_level **版本限定**
-         gate 到 dept_internal（对账旧实现版本无关 GROUP_CONCAT → 双活混级误撤合法授权；此处统一）。
-      3. 与现存投影 diff；变更则 UPDATE chunk_meta.allowed_depts + 标脏 index_status='NOT_INDEXED'
-         （= stage-3 outbox，下次 drain 重推 HA3）。
+# 聚合优先级（保守优先）：非完成态压过完成态，"做了事"压过"什么都没做"。
+# skipped_locked / missing_version 都必须阻止 outbox 标 done（意图保留、下轮重试）。
+_AGG_ORDER = ("skipped_locked", "missing_version", "materialized", "retracted",
+              "certified", "unchanged", "skipped")
 
-    **不提交事务、不写 HA3**（连接/事务由调用方掌控；HA3 由 stage-3 drain 携带）。
-    apply=False：只算 want/have/status、不写（对账只读预览）。
 
-    Returns: {"status": "skipped"|"skipped_locked"|"unchanged"|"materialized"|"retracted",
+def _aggregate_versions(per_version: list, cur_ver) -> Dict[str, object]:
+    """把逐版本结果聚合成对外契约。`version_no` 保持 = current（既有调用方/测试不破）。"""
+    if not per_version:
+        return {"status": "skipped", "reset_chunks": 0, "version_no": cur_ver,
+                "wrote": False, "per_version": []}
+    seen = {p["status"] for p in per_version}
+    status = next((s for s in _AGG_ORDER if s in seen), "unchanged")
+    return {
+        "status": status,
+        "reset_chunks": sum(int(p.get("reset_chunks") or 0) for p in per_version),
+        "version_no": cur_ver,
+        "wrote": any(bool(p.get("wrote")) for p in per_version),
+        "per_version": per_version,
+    }
 
-              "reset_chunks": int, "version_no": int|None}
+
+def _version_processing_gate(cursor, doc_id: str, ver: int) -> str:
+    """单版本的 2h PROCESSING 反抢锁判定。返回 `"ok"` | `"locked"` | `"missing"`。
+
+    ⚠️ 无 `document_version` 行**不算锁**（保留原 LEFT JOIN 语义）——写成 INNER JOIN
+    会把这类版本判 locked，是静默回退。但它也**不是 ok**：stage-3 loader 是
+    `INNER JOIN document_version`（`dataworks_orchestrator.py:516-517`）⇒ 标脏了也没人 drain，
+    该 chunk 会永久停在 `NOT_INDEXED`、HA3 永不更新（RDS 对、HA3 旧、无人修）。
+    故单列 `"missing"`，由壳按 G11 处置：**不写不可 drain 的 chunk、保留 outbox 意图**。
+    （codex 2026-08-07 指出该路径对 current 版本今天就成立；本改动只在版本轴 flag 开启时
+      改变它，flag off 仍走原路径 —— 不借修缺陷之机改变默认行为。）
     """
-    import json as _json
-    if not doc_id:
-        return {"status": "skipped", "reset_chunks": 0, "version_no": None, "wrote": False}
-    # 1. current version + 2h PROCESSING 反抢锁（与 stage-3 loader / 对账同约定）
     cursor.execute(
-        f"SELECT dm.current_version_no FROM {_kb_db()}.document_meta dm "
-        f"LEFT JOIN {_kb_db()}.document_version dv "
-        "  ON dv.doc_id=dm.doc_id AND dv.version_no=dm.current_version_no "
-        "WHERE dm.doc_id=%s AND (dv.index_status IS NULL "
-        f"  OR dv.index_status!='{DocVersionIndexStatus.PROCESSING}' OR dv.updated_at < NOW() - INTERVAL 2 HOUR)",
-        (doc_id,),
+        f"SELECT (dv.index_status='{DocVersionIndexStatus.PROCESSING}' "
+        "        AND dv.updated_at >= NOW() - INTERVAL 2 HOUR) "
+        f"FROM {_kb_db()}.document_version dv WHERE dv.doc_id=%s AND dv.version_no=%s",
+        (doc_id, ver),
     )
     row = cursor.fetchone()
     if not row:
-        return {"status": "skipped_locked", "reset_chunks": 0, "version_no": None, "wrote": False}
+        return "missing"
+    return "locked" if row[0] else "ok"
 
-    # B1（2026-08-04）：`wrote` 是**与 status 正交**的第二维 —— status 说"结果是什么"，
-    # wrote 说"本调用有没有发出过写语句"。调用方据此决定 commit 还是 rollback。
-    # 单靠 status 表达不了这两维：certify 的 `UPDATE … SET acl_epoch` 在 rowcount==0
-    # （epoch 已相等 ⇒ changed-rows=0）时会**穿透**成 status="unchanged"，而 MySQL 对
-    # **匹配到的行**取的 X 锁与 rowcount 无关 ⇒ 报 unchanged 却持着锁。
-    _wrote = False
-    ver = int(row[0] or 1)
 
-    # C3′/062：**同一事务快照**内读权威 epoch，供下方两处 UPDATE stamp。
-    # projection_complete 不变量（Sam 2026-08-03 拍板）：只有在
-    #   ①062 已 apply（列存在）② acl_mode 判定确定（非 fail-loose 退化）
-    # 两条同时成立时才 stamp；否则 acl_epoch 保持原值（NULL/旧值）⇒ 下轮仍判 dirty。
-    # ⚠️ 刻意"照常投影、只是不 stamp" —— 不改既有 materializer 的投影行为，只约束盖章。
+def _resolve_epoch_and_mode(cursor, doc_id: str):
+    """(doc 级) 读权威 epoch + 判定 acl_mode 是否确定。原 materializer 内联逻辑下沉，语义不变。
+
+    C3′/062：**同一事务快照**内读权威 epoch，供 stamp 使用。
+    projection_complete 不变量（Sam 2026-08-03 拍板）：只有在
+      ①062 已 apply（列存在）② acl_mode 判定确定（非 fail-loose 退化）
+    两条同时成立时才 stamp；否则 acl_epoch 保持原值（NULL/旧值）⇒ 下轮仍判 dirty。
+    """
     _auth_epoch = None
     try:
         cursor.execute(
@@ -464,7 +476,173 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         _mode_certain = _node_acl_columns_present(cursor, strict=True) or True
     except Exception:   # noqa: BLE001 — 列探测失败 ⇒ 模式不确定 ⇒ 绝不 stamp
         _mode_certain = False
+    return _auth_epoch, _mode_certain
+
+
+def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True,
+                                  all_versions=None) -> Dict[str, object]:
+    """把单篇文档的 approved 授权【物化】到 chunk_meta 投影——decide 端点与
+    allowed_depts_reconcile 对账共用的【唯一写实现】（与上面 resolve/gate/current 读原语配套）。
+
+    单一注入点，绝不重复手写。本函数是**外壳**：枚举版本 + 聚合；每版本的判定/写全在
+    `_materialize_one_version`（逐字沿用改动前的 gate/diff/certify 语义，只把 `ver` 从
+    "恒 current" 变成"由壳传入"）。
+
+    **版本轴（C3′，`RAG_ACL_VERSION_AXIS`，默认 off）**：
+      · off ⇒ 版本集恒 `[current_version_no]`，且**走与改动前完全相同的那一条 LEFT JOIN
+        查询**（既取 current 又施加锁）⇒ 行为逐字节一致。
+      · on  ⇒ 版本集 = 该文档全部 `is_active=1` 版本，逐版本各自判锁、各自按本版本
+        `permission_level` gate。权威侧本来就是文档级（`kb_access_request` /
+        `kb_doc_node_grant` 都不带 version），所以这不是"权威按版本拆"，而是
+        "同一份权威要投到每个在服版本上"。
+
+    🔴 **政策1（Sam 2026-08-07 拍板）**：版本轴开启后，被标脏的旧 active 版本会被
+    **不限版本**的 stage-3 loader 装载（`dataworks_orchestrator.py:520-521`）；若同批含更高
+    版本，`node_deactivate_old_chunks` 会按 `max(批内版本)` 退役更旧版本
+    （`pipeline_nodes.py:7392-7396`、`:7507`）—— RDS `is_active=0` **且 HA3 PK 制
+    `cmd:delete`**（`pipeline_nodes.py:7250-7252`）。**这是被授权的行为**（ACL 刷新顺带
+    治好「双活滞留」），但它**不可逆**：关掉 flag 不能恢复已退役的版本。安全性依赖既有
+    04b parity 闸（v2 不健康则 raise ⇒ 05 不执行 ⇒ 旧版本保留）。
+    ⚠️ 留痕：04b 的 drift 检查只比 `chunk_text`、**不比 ACL 字段**（`pipeline_nodes.py:9631-9653`）。
+
+    **不提交事务、不写 HA3**（连接/事务由调用方掌控；HA3 由 stage-3 drain 携带）。
+    `apply=False`：只算 want/have/status、**不发任何写语句**（含 certify 的 stamp —— 见 G8）。
+    `all_versions`：显式覆盖 flag（decide 端点传 False 走 current 内联快路，见 G12）。
+
+    Returns: {"status": 聚合态, "reset_chunks": 各版本之和, "version_no": current（既有键）,
+              "wrote": 各版本 OR, "per_version": [{version_no,status,reset_chunks,wrote}, …]}
+    其中 status ∈ skipped | skipped_locked | missing_version | unchanged | certified |
+                  materialized | retracted
+    """
+    if not doc_id:
+        return {"status": "skipped", "reset_chunks": 0, "version_no": None,
+                "wrote": False, "per_version": []}
+    if all_versions is None:
+        try:
+            from opensearch_pipeline.config import get_config as _gc
+            all_versions = bool(_gc().rag.acl_version_axis)
+        except Exception:   # noqa: BLE001 — 配置不可用 ⇒ 保守走单版本（= 改动前行为）
+            all_versions = False
+
+    if not all_versions:
+        # ── 单版本路径：SQL 序列与改动前逐字一致（同一条 LEFT JOIN 既取 current 又施加锁）──
+        cursor.execute(
+            f"SELECT dm.current_version_no FROM {_kb_db()}.document_meta dm "
+            f"LEFT JOIN {_kb_db()}.document_version dv "
+            "  ON dv.doc_id=dm.doc_id AND dv.version_no=dm.current_version_no "
+            "WHERE dm.doc_id=%s AND (dv.index_status IS NULL "
+            f"  OR dv.index_status!='{DocVersionIndexStatus.PROCESSING}' OR dv.updated_at < NOW() - INTERVAL 2 HOUR)",
+            (doc_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {"status": "skipped_locked", "reset_chunks": 0, "version_no": None,
+                    "wrote": False, "per_version": []}
+        ver = int(row[0] or 1)
+        _auth_epoch, _mode_certain = _resolve_epoch_and_mode(cursor, doc_id)
+        one = _materialize_one_version(cursor, doc_id, ver, apply=apply,
+                                       auth_epoch=_auth_epoch, mode_certain=_mode_certain)
+        return _aggregate_versions([one], ver)
+
+    # ── 多版本路径（flag on）────────────────────────────────────────────────
+    cursor.execute(
+        f"SELECT current_version_no FROM {_kb_db()}.document_meta WHERE doc_id=%s", (doc_id,))
+    row = cursor.fetchone()
+    if not row:
+        return {"status": "skipped", "reset_chunks": 0, "version_no": None,
+                "wrote": False, "per_version": []}
+    cur_ver = int(row[0] or 1)
+    _auth_epoch, _mode_certain = _resolve_epoch_and_mode(cursor, doc_id)
+    # 版本集用 `chunk_meta.is_active` 而非 `document_version.status`：投影的**写入对象**就是
+    # chunk_meta，且 is_active=1 正是 stage-3 deactivate 的翻转位、与 HA3 在服集对齐
+    # （modulo 已知的 RDS↔HA3 无 2PC 缺口）。
+    cursor.execute(
+        f"SELECT DISTINCT version_no FROM {_kb_db()}.chunk_meta "
+        "WHERE doc_id=%s AND is_active=1 ORDER BY version_no", (doc_id,))
+    vers = [int(r[0]) for r in cursor.fetchall() if r and r[0] is not None]
+    if not vers:
+        # 无 active 版本（文档全下线）——与改动前"无 chunk 可投"同义
+        return {"status": "skipped", "reset_chunks": 0, "version_no": cur_ver,
+                "wrote": False, "per_version": []}
+    if len(vers) > _MAX_VERSIONS_ALARM:
+        logger.error("🔴 doc=%s 有 %d 个 is_active=1 版本（阈值 %d）——**全部照常处理、绝不截断**，"
+                     "但这远超设计上界（双活是失败态，正常 ≤2）：请排查 deactivate 是否长期被"
+                     "04b parity / LIMIT 边界闸挡住。单篇版本工作量无上界，可能拖长本轮。",
+                     doc_id, len(vers), _MAX_VERSIONS_ALARM)
+
+    per_version = []
+    for _v in vers:
+        gate = _version_processing_gate(cursor, doc_id, _v)
+        if gate == "locked":
+            # 该版本正在 stage-3 跑 → 只跳这一版，其余照做；聚合态阻止 outbox 标 done
+            per_version.append({"version_no": _v, "status": "skipped_locked",
+                                "reset_chunks": 0, "wrote": False})
+            continue
+        if gate == "missing":
+            # G11：无 dv 行 ⇒ stage-3 的 INNER JOIN 装不到 ⇒ 标脏也没人 drain。
+            # 不写不可 drain 的 chunk，作为非完成态保留 outbox 意图。
+            logger.warning("doc=%s v=%s 无 document_version 行：stage-3 装载不到该版本，"
+                           "跳过投影以免留下永久 NOT_INDEXED 的不可 drain chunk", doc_id, _v)
+            per_version.append({"version_no": _v, "status": "missing_version",
+                                "reset_chunks": 0, "wrote": False})
+            continue
+        per_version.append(dict(
+            _materialize_one_version(cursor, doc_id, _v, apply=apply,
+                                     auth_epoch=_auth_epoch, mode_certain=_mode_certain),
+            version_no=_v))
+    return _aggregate_versions(per_version, cur_ver)
+
+
+def _materialize_one_version(cursor, doc_id: str, ver: int, *, apply: bool,
+                             auth_epoch, mode_certain: bool) -> Dict[str, object]:
+    """单版本投影核 —— 判定/diff/certify/写全在这里，语义与改动前逐字一致。
+
+    流程：
+      1. 从 authority 重解析该 doc 应有 allowed_depts，并按【该 version】permission_level
+         **版本限定** gate 到 dept_internal。
+      2. 与该版本现存投影 diff（allowed_depts 集合 + owner 集合）。
+      3. 变更则 UPDATE chunk_meta + 标脏 index_status='NOT_INDEXED'（= stage-3 outbox）；
+         值已对但 epoch 落后 ⇒ certify-only（只盖章、不动 index_status）。
+    """
+    import json as _json
+    # B1（2026-08-04）：`wrote` 是**与 status 正交**的第二维 —— status 说"结果是什么"，
+    # wrote 说"本调用有没有发出过写语句"。调用方据此决定 commit 还是 rollback。
+    # 单靠 status 表达不了这两维：certify 的 `UPDATE … SET acl_epoch` 在 rowcount==0
+    # （epoch 已相等 ⇒ changed-rows=0）时会**穿透**成 status="unchanged"，而 MySQL 对
+    # **匹配到的行**取的 X 锁与 rowcount 无关 ⇒ 报 unchanged 却持着锁。
+    # （本核内 `wrote` 由 `_certify` 与两条写分支各自返回，不再用外层可变量累积。）
+    _auth_epoch, _mode_certain = auth_epoch, mode_certain
     _stamp = ", acl_epoch=%s" if (_auth_epoch is not None and _mode_certain) else ""
+
+    def _certify(want, _owner):
+        """certify-only 分支的唯一实现（两个模式分支共用）。返回 (status, wrote)。
+
+        G8（codex 2026-08-07，**当前 main 的既有缺陷**）：改动前这段 `UPDATE … SET acl_epoch`
+        在检查 `apply` **之前**就发出（`if not apply: return` 在它下游）⇒
+        `materialize(..., apply=False)` / `reconcile(commit=False)` 宣称的"只读预览"其实会写，
+        而 `reconcile` 在 `commit=False` 时连 rollback 都不做（`if commit:` 同时门控两者）
+        ⇒ 锁一路持到 `conn.close()`。现在 `apply=False` 改走一条**纯读**的等价判据。
+        """
+        if not (_stamp and projection_rows_all_match(cursor, doc_id, ver, want, _owner)):
+            return "unchanged", False
+        if not apply:
+            # 预览：用只读查询回答"是否需要盖章"，绝不发写语句
+            cursor.execute(
+                f"SELECT COUNT(*) FROM {_kb_db()}.chunk_meta "
+                "WHERE doc_id=%s AND version_no=%s AND is_active=1 "
+                "  AND (acl_epoch IS NULL OR acl_epoch<>%s)",
+                (doc_id, ver, _auth_epoch),
+            )
+            _r = cursor.fetchone()
+            return ("certified" if (_r and _r[0]) else "unchanged"), False
+        cursor.execute(
+            f"UPDATE {_kb_db()}.chunk_meta SET acl_epoch=%s "
+            "WHERE doc_id=%s AND version_no=%s AND is_active=1",
+            (_auth_epoch, doc_id, ver),
+        )
+        # 🔴 语句一旦发出就**必须**认作"写过"——MySQL 对匹配到的行取 X 锁，与值是否改变无关；
+        # rowcount==0 只说明 changed-rows 为 0（epoch 已相等），锁仍在、事务仍需被显式了结。
+        return ("certified" if cursor.rowcount else "unchanged"), True
 
     # 2a. node-ACL:模式决定投影形态(唯一注入点 acl_policy.project_doc_acl)。
     #     ⚠️ 本函数是 ACL 变更的【唯一写实现】(decide 端点 + reconcile 共用),node 文档
@@ -486,19 +664,8 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
             # 永久 dirty（这是 72c9e22 落码时的缺口：此处在 stamp 之前就 return 了）。
             # ⚠️ 认证判据必须**逐行全等**，不能用上面 `have` 的并集口径（并集会掩盖
             #    「一行 ["finance"]、一行 NULL」这种一半没投影的情况）。
-            if _stamp and projection_rows_all_match(cursor, doc_id, ver, want, _owner):
-                cursor.execute(
-                    f"UPDATE {_kb_db()}.chunk_meta SET acl_epoch=%s "
-                    "WHERE doc_id=%s AND version_no=%s AND is_active=1",
-                    (_auth_epoch, doc_id, ver),
-                )
-                # 🔴 语句一旦发出就**必须**认作"写过"——MySQL 对匹配到的行取 X 锁，
-                # 与值是否改变无关；rowcount==0 只说明 changed-rows 为 0（epoch 已相等），
-                # 锁仍在、事务仍需被显式了结。漏了这一句，调用方会把它当纯读而不 commit/rollback。
-                _wrote = True
-                if cursor.rowcount:
-                    return {"status": "certified", "reset_chunks": 0, "version_no": ver, "wrote": True}
-            return {"status": "unchanged", "reset_chunks": 0, "version_no": ver, "wrote": _wrote}
+            _st, _w = _certify(want, _owner)
+            return {"status": _st, "reset_chunks": 0, "version_no": ver, "wrote": _w}
         status = "materialized" if want else "retracted"
         if not apply:
             return {"status": status, "reset_chunks": 0, "version_no": ver, "wrote": False}
@@ -541,16 +708,8 @@ def materialize_doc_allowed_depts(cursor, doc_id: str, *, apply: bool = True) ->
         # 永久 dirty（这是 72c9e22 落码时的缺口：此处在 stamp 之前就 return 了）。
         # ⚠️ 认证判据必须**逐行全等**，不能用上面 `have` 的并集口径（并集会掩盖
         #    「一行 ["finance"]、一行 NULL」这种一半没投影的情况）。
-        if _stamp and projection_rows_all_match(cursor, doc_id, ver, want, _owner):
-            cursor.execute(
-                f"UPDATE {_kb_db()}.chunk_meta SET acl_epoch=%s "
-                "WHERE doc_id=%s AND version_no=%s AND is_active=1",
-                (_auth_epoch, doc_id, ver),
-            )
-            _wrote = True      # 同上：语句发出即取锁，与 rowcount 无关
-            if cursor.rowcount:
-                return {"status": "certified", "reset_chunks": 0, "version_no": ver, "wrote": True}
-        return {"status": "unchanged", "reset_chunks": 0, "version_no": ver, "wrote": _wrote}
+        _st, _w = _certify(want, _owner)
+        return {"status": _st, "reset_chunks": 0, "version_no": ver, "wrote": _w}
     status = "materialized" if want else "retracted"
     if not apply:
         return {"status": status, "reset_chunks": 0, "version_no": ver, "wrote": False}

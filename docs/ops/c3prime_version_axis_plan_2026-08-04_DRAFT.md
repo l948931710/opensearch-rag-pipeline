@@ -1,6 +1,9 @@
 # C3′ ACL 投影版本轴 · 实施方案（2026-08-04，_DRAFT）
 
-> **状态**：待 codex 评审（额度 2026-08-07 20:45 恢复）。**代码一行未动**，本单是方案。
+> **状态（2026-08-07 更新）**：✅ **评审完成 + 已实施**。codex 三轮（误报 0 / 12 条主张全部成立），
+> Claude 误驳 3 条已记账；Sam 拍板 **政策1**（ACL 刷新可顺带退役旧 active 版本）与 **§8.1 方案 A**
+> （逐版本 gate）。相对本稿的全部变更见 §10「实施记录」——**§10 与本稿正文冲突时以 §10 为准**。
+> 原状态：待 codex 评审。代码一行未动。
 > 上游：`docs/ops/c3prime_acl_projection_convergence_signoff_2026-08-03.md`（拍板单）。
 > 本单只覆盖拍板单 §3「多版本 materializer」那一格，**不含** certify 的 strict resolver、
 > 全量 fingerprint 审计、`never_projected` 指标、全库 permission-sweep（各自另立）。
@@ -74,6 +77,43 @@ _prescreen_unchanged               = {'C3P_DOC_1'}      ← 判 unchanged
 3. **outbox 的持久保证在这条路径上失效**：`materialize` 返回 `unchanged`，
    drain 归入「意图已落实」标 done。
 4. **预筛的跨版本 gate 会拦住修复**（实测四）⇒ 本批范围必须含预筛，否则等于没修。
+
+---
+
+## 0.5 生产实测（2026-08-07 00:37 PDT，prod-ro 只读）——补 §6.1 那一验
+
+§6.1 原文「本会话在 SIM，未查；需要 Sam 给只读一验」。已查，**答案改变了 §6 的前提**：
+
+| 查项 | 实测 |
+|---|---|
+| `chunk_meta.acl_epoch` / `document_meta.acl_epoch`（062） | ✅ **两列都在 = prod 已 apply** |
+| `document_meta.acl_mode`（060） | ✅ 在 |
+| `chunk_meta` active / 总 | **6 / 63,888** |
+| C3′ population：有 ≥2 个 `is_active=1` 版本的文档 | **0** |
+| 有 `is_active=1` 且 `version_no <> current_version_no` 的文档 | **0** |
+| §8.1 混级 population（多版本 且 跨版本 permission 混级） | **0** |
+| legacy 权威 `kb_access_request status='approved'` | **0** 篇 |
+
+**两条结论，方向相反：**
+
+1. 🟢 **今天影响面为 0** —— 不是缺陷不成立（§0 的夹具复现照样成立），而是
+   **语料真空期**（2026-08-03 软退役 1562 篇 + HA3 清除）把 population 清空了。
+   ⇒ C3′ 现在**不产生任何线上损害**，也不 page。「E1 最紧急因为它每天 page」这个
+   说法（我 08-07 早先的判断）**不成立**，据此更正。
+2. 🔴 **§6.1 的窗口已经错过** —— 062 **已 apply**，所以 `epoch_dirty` 候选源的闸
+   **已经通电**，只是库里现在没东西喂它。原文「若尚未 apply —— 那么在 C3′ 落地前
+   不要 apply」已无从执行。
+   ⚠️ 本稿原来的补救是 §6.2 的 G4（把候选源收进同一 flag）——**G4 已撤销**，见 §10.2：
+   它零收益（同类文档也命中 `have_ad` 候选）且会让退役→恢复链路静默失去自愈。
+
+⇒ **落地时机的真正理由换了**（结论不变、更强）：不是「止血」，而是
+**必须早于语料重灌**。下一幕正是「部门组织树重传 + 重灌 + 金集重标」，population
+一回来，空转取锁 + `unchanged` 假绿 + outbox 误标 done 三件事同时成立。
+而**现在是唯一能以零爆炸半径翻 flag 验证的窗口**（active chunk 只有 6 条）。
+
+⚠️ 附带影响 §8.1：混级 population = 0 ⇒ 那条语义裁决**当前无实例**，
+不构成本批的阻塞项（但 A 方案一旦落地，重灌后会对新产生的混级文档生效 ⇒ 仍需 Sam 点头，
+只是可以与实施并行、不必前置）。
 
 ---
 
@@ -335,3 +375,75 @@ capability 探测门控**。它一旦生效（= 062 apply 后），会把「从�
   若 C9 先落地会改变 `permission_level` 的可信度，届时需复核本单 §3.2 的 gate 假设
 - **C3**（`c3prime` 的前身，已修）留下的 `:201` 注释「非 current 的旧服务版本…那是
   materializer 版本轴问题（C3′，另立）」正是本单要销掉的那行
+
+---
+
+## 10. 实施记录（2026-08-07）——与本稿正文冲突时以本节为准
+
+### 10.1 双盲评审结果
+
+`.claude-review/{claude-model,plan}.md` 是过程留痕。三轮下来：
+
+| 来源 | 主张 | 结论 |
+|---|---|---|
+| Codex | 预筛不读 epoch ⇒ G4 承诺的收敛到不了（`allowed_depts_reconcile.py:78-85,124-143`） | CONFIRMED → **G6** |
+| Codex | 版本上限截断破坏 outbox 必达（`access_grants.py:693-710` 只有 `skipped_locked` 留 pending） | CONFIRMED → **移除上限** |
+| Codex | `commit=False` 不是只读预览（certify 写在 `if not apply` 之前） | CONFIRMED → **G8**（**当前 main 的既有缺陷**） |
+| Codex | flag-off「逐字节等价」措辞不成立（062 已 apply） | CONFIRMED → 措辞作废 |
+| Codex | 上限无版本游标 ⇒ 重试永远重复命中同一批（`schema/009` 只有 doc_id） | CONFIRMED → **移除上限**而非加游标 |
+| Codex | `partially_locked` 接不到 ops_monitor（`ops_monitor.py:29-35` 无 ACL job） | CONFIRMED → **G10** 纯 SQL job |
+| Claude | §7「无不可逆写」不成立（标脏旧版本 → loader 不限版本装载 → 按 `max(批内版本)` 退役 + HA3 删除） | CONFIRMED；**机制被 Codex 纠正为 PK 制 `cmd:delete`**（`pipeline_nodes.py:7250-7252`），我引的 `:7360-7364` docstring 与实现不符 |
+| Claude | decide 端点是第二调用点、事务放大未评估 | CONFIRMED → **G12** |
+| Claude | 无 dv 行的版本标脏后无人 drain（loader 是 INNER JOIN） | CONFIRMED → **G11**；Codex 指出**current 版本那一路今天就成立** |
+| Claude | epoch 候选可覆盖 `node_stale_owner` 缺口 | **REFUTED**（equal-epoch stale-owner 无候选路径；`schema/062:81-86` 自己承认） |
+| Claude | 「装载旧版本会导致停用更新版本」 | **自我推翻**（`:7507` 严格小于） |
+
+**Codex 误报 0 / Claude 误驳 3。**
+
+### 10.2 相对本稿的变更
+
+- **G9 撤销**（Codex 驳回 + Sam 政策1）：非 current 版本**照常**标 `NOT_INDEXED`。
+  退役副作用是**被授权的行为**，安全性依赖 04b parity 闸。
+  ⇒ §7 的「无不可逆写」改为：**配置可回滚，但已发生的旧版本退役不可逆**。
+  ⚠️ 留痕：04b 的 drift 检查只比 `chunk_text`、**不比 ACL 字段**（`pipeline_nodes.py:9631-9653`）。
+- **E3 版本上限撤销**：`_MAX_VERSIONS_ALARM=20` 只作**告警**，全部版本照常处理。
+  连带撤销 `capped_incomplete` 状态与 §3.2 里的相应一格。
+- **G4 撤销**（被 `make test` 推翻）：一度把 `epoch_dirty` 收进版本轴 flag，实测两点不成立 ——
+  ①零收益：它想挡的"非 current 版本每轮空转"同时命中 `have_ad` 候选，关掉 epoch 源挡不住；
+  ②有副作用：退役→改归属→恢复→收敛链路（`test_retire_owner_change_convergence_db.py`）
+  的自愈**正是靠这一路**，gate 掉它 = 该链路在默认 flag off 时静默失去自愈。
+  ⇒ 候选源保持不受版本轴门控。**这条是我的方案缺陷，由测试而非评审抓出。**
+- 新增 **G6**（预筛读 epoch）/ **G8**（预览零写）/ **G11**（`missing_version`）/
+  **G12**（decide 只做 current）/ **G10**（ops_monitor `acl_projection` job）。
+- 写预算改用独立文档级计数器 `_docs_written`（`materialized`/`retracted` 现在是版本数）。
+- `config.py` 进修改范围：`RAGConfig.acl_version_axis` / `RAG_ACL_VERSION_AXIS`，默认 **off**。
+
+### 10.3 落地文件
+
+`config.py`（flag）· `access_grants.py`（壳+核拆分、`_certify`、`_version_processing_gate`、
+`_aggregate_versions`）· `allowed_depts_reconcile.py`（预筛分组键+epoch 门、per_version 计数、
+`_docs_written`、`partially_locked`/`missing_version`）· `queue_monitor.py`（`run_acl_projection_check`）·
+`ops_monitor.py`（作业集）· `routes/kb_access.py` + `routes/kb_console.py`（G12，5 处）·
+`tests/test_acl_version_axis_db.py`（新，9 用例）+ 4 个既有测试面适配。
+
+### 10.4 验证
+
+- `tests/test_acl_version_axis_db.py` **9/9 绿**（真库；缺 062 则 skip 不假绿）
+- **变异反证 5/5 转红**：版本集退回 `[current]` / 预筛不读 epoch / certify 无视 `apply` /
+  `missing` 当 `ok` / 预算按版本计。⚠️ 其中「预算」那条**第一版断言是空转的**——
+  单篇文档时预算检查只在任何写之前跑一次，两种实现都不 capped；改成两篇文档夹具后才抓得住。
+- `tests/test_access_grants.py` + `tests/test_allowed_depts_reconcile.py` **56/56 绿**
+- 我改动面的 `ruff` 全绿；`make test` 4420 passed，**8 条失败全部落在另一 session
+  正在重写的 `routes/contribution.py` 及其测试上**（当前带 F821），与本批无关。
+
+### 10.5 仍待办（user-gated）
+
+1. **翻 `RAG_ACL_VERSION_AXIS=true`** —— 现在是零爆炸半径窗口（active chunk 仅 6 条、
+   C3′ population 0）。**必须早于语料重灌**，否则空转+假绿+outbox 误标 done 三件事同时成立。
+2. **G10 的调度与告警路由**：`acl_projection` job 已实现但**未接调度**（现网节点仍只跑
+   `--only reconcile_ha3 reconcile_oss`）。
+3. **独立立单**：`kb_acl_projection_outbox` 未 done **2201 行**、最老 30h、`attempts` 全 0
+   且一小时内从 2182 涨上来 ⇒ 形态是"有人入队、没人 drain"。成因未定（Codex 正确指出
+   我"与 C3′ 无因果"的断言属 UNPROVEN）。新加的龄期探针 48h 阈值会在约 18 小时后 page。
+4. **残留盲区（本批不修）**：`node_stale_owner` 的 equal-epoch stale-owner（`:205-211` 仍
+   current-only）；`schema/062:81-86` 要求的语义 fingerprint 审计。
