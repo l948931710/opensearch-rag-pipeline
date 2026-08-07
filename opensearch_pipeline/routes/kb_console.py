@@ -1344,6 +1344,11 @@ class KbReviewTaskItem(BaseModel):
 class KbReviewTasksResponse(BaseModel):
     items: List[KbReviewTaskItem] = Field(default_factory=list)
     has_more: bool = False        # P2-11：此前只回 items，前端无从知道被 limit 截了
+    # B7 补评审（2026-08-06）：fail-open 早于 has_more 存在，于是查询失败时端点会**顺带断言
+    # 「没有更多」**——前端据此撤掉「加载更多」、渲染「安全网干净」，且因为是 200 连错误横幅
+    # 都不出。degraded 是那条断言的撤销键。
+    # **不变量：degraded=True ⇒ items/has_more 不是业务数据，消费方一律不得当真。**
+    degraded: bool = False
 
 
 _KB_REVIEW_DONE = ("RESOLVED", "DISMISSED")
@@ -1432,7 +1437,11 @@ def kb_review_tasks(request: Request, limit: int = 20, offset: int = 0,
         # 001 权威 review_task 表，1146 冒泡把 kb_admin 管理台整页打 500）。
         trace_id = get_request_id()
         logger.warning("kb_review_tasks 查询失败（空列表，non-fatal）[trace=%s]: %s", trace_id, e)
-        return KbReviewTasksResponse()
+        # ⚠️ 只回空列表**不够**：`has_more=False` 会被前端读成「没有更多」。带 degraded=True
+        # 让消费方把这次响应整体判为无效（B7 补评审 2026-08-06，codex BLOCKER）。
+        # 不改 HTTP 状态码：仓外消费者无证据可排除（查网关日志属 prod-gated），
+        # 200+纯增字段对旧客户端是严格向后兼容的超集。「是否该改 500」升级给 Sam。
+        return KbReviewTasksResponse(degraded=True)
     out = KbReviewTasksResponse()
     # 多取一条判 has_more（与 my-docs / contributions 同款），本页只渲染 limit 条。
     out.has_more = len(rows) > limit

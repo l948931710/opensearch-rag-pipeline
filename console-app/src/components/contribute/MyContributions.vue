@@ -140,7 +140,9 @@ function reopen(c: ContributionItem) {
           class="mt-2 whitespace-pre-wrap rounded-[10px] bg-panel/60 px-3 py-2.5 text-[12px] leading-relaxed text-muted-foreground"
         >{{ c.content }}</div>
       </div>
-      <p v-if="!myContribs.length" class="px-[18px] py-8 text-center text-[12.5px] text-muted-foreground">还没有贡献，去「待回答」挑一个问题回答吧。</p>
+      <!-- 拉取失败时不得说「还没有贡献」——那是一句对数据的断言，此刻我们并不知道
+           （B7 补评审 2026-08-06；横幅在 :72，这里只负责不谎报）。 -->
+      <p v-if="!myContribs.length && !loadErrors['mine']" class="px-[18px] py-8 text-center text-[12.5px] text-muted-foreground">还没有贡献，去「待回答」挑一个问题回答吧。</p>
       <!-- P2-11：>50 条时后端 has_more 此前被丢弃（假满员）——与审核队列/GapList 同款 -->
       <div v-if="mineHasMore" class="border-t border-border p-3 text-center">
         <button

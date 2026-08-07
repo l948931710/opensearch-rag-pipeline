@@ -89,3 +89,6 @@ opensearch_pipeline/webconsole/next-dist/
 *.bak
 *.bak_*
 .venv/
+
+# codex-review skill 的工作目录（双盲模型 + 方案，每次运行重生成）
+.claude-review/

@@ -331,6 +331,50 @@ def test_review_tasks_cache_key_includes_offset(monkeypatch):
     assert keys[0] != keys[1], f"两页 cache key 相同 ⇒ 第 2 页会吃第 1 页缓存：{keys}"
 
 
+def _review_tasks_raising(monkeypatch, offset):
+    """桩：cursor.execute 抛异常（现网形态：1146 review_task 表缺失）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    from opensearch_pipeline.routes import kb_console
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None):
+            raise RuntimeError("1146 Table 'fuling_knowledge.review_task' doesn't exist")
+        def fetchall(self): return []
+        def fetchone(self): return None
+
+    class _Cn:
+        def cursor(self): return _C()
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr("opensearch_pipeline.db._get_db_conn", lambda *a, **k: _Cn())
+    monkeypatch.setattr(kb_console, "_dashboard_cache_get", lambda k: None)
+    monkeypatch.setattr(kb_console, "_dashboard_cache_put", lambda k, v: None)
+    from opensearch_pipeline import api
+    return api.kb_review_tasks(request=None, limit=20, offset=offset,
+                               include_closed=False, identity=api.Identity(user_id="kb1"))
+
+
+@pytest.mark.parametrize("offset", [0, 20])
+def test_review_tasks_failopen_marks_itself_degraded(monkeypatch, offset):
+    """🔴 B7 补评审（2026-08-06，codex BLOCKER）：fail-open 早于 has_more 存在，于是
+    查询失败时端点会**顺带断言「没有更多」**——前端据此撤掉「加载更多」、把截断的列表
+    当成全部，还因为是 200 连错误横幅都不出（实测：offset=0 与 20 都返回 items=0/has_more=False）。
+
+    契约：仍 fail-open（2026-07-15 现网：漏建 review_task 表把 kb_admin 管理台整页打 500），
+    但必须自陈 `degraded=True`，让消费方把 items/has_more 整体判为非业务数据。
+
+    ⚠️ 这条与前端那条（`review-task-degraded.spec.ts`）**互不可伪造**：这条钉后端在真异常下
+    确实发 degraded，那条钉前端拿到 degraded 后确实不当真。少任一条都能造出假绿。
+    """
+    out = _review_tasks_raising(monkeypatch, offset)
+    assert out.items == [] and out.has_more is False
+    assert out.degraded is True, "fail-open 必须自陈降级，否则空响应=「没有更多」的断言"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

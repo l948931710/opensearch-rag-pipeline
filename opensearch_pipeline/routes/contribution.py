@@ -712,6 +712,10 @@ def kb_contributions_mine(request: Request, limit: int = 20, offset: int = 0,
     _enforce_rate_limit(request, identity, scope="aux")
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="需要登录")
+    # ⚠️ offset **无上界**，与 kb_console 的 `_KB_MAX_OFFSET=10000` 静默钳位口径相反
+    # （B7 补评审 2026-08-06 记录的接口策略不对称）。这里**有意不加**上界：本列表按
+    # author_id 限定，深 offset 不构成全表扫风险，而加上限会把原本可达的数据变成不可达
+    # —— 与本仓 "no silent caps" 反向。cap 的最终协议见 backlog §F 第 2 项（待裁决）。
     limit = max(1, min(int(limit or 20), 100)); offset = max(0, int(offset or 0))
     trace_id = get_request_id()
     try:

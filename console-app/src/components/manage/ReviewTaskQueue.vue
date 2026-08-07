@@ -10,9 +10,9 @@ import LoadError from './LoadError.vue'
 // PENDING 任务此前全仓无人出队——被标记"实时权限比 LLM 建议更宽松"的文档持续投放。
 // kb_admin 专属。处置只写复审终态：实际整改用既有工具（可见范围/退役/重灌）。
 const {
-  reviewTasks, loadReviewTasks, loadErrors,
+  reviewTasks, loadReviewTasks, retryReviewTasks, loadErrors,
   showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
-  reviewTasksHasMore, reviewTasksLoadBusy,
+  reviewTasksHasMore, reviewTasksLoadBusy, reviewTasksDegraded,
 } = useKb()
 const { promptText } = useDialog()
 
@@ -49,12 +49,18 @@ const TYPE_LABEL: Record<string, string> = {
       >{{ showClosedReviewTasks ? '只看未处理' : '显示已处理' }}</button>
     </div>
 
-    <LoadError :message="loadErrors['reviewTasks']" @retry="loadReviewTasks()" />
+    <LoadError :message="loadErrors['reviewTasks']" @retry="retryReviewTasks()" />
     <div v-if="reviewTasks === null && !loadErrors['reviewTasks']" class="rounded-[14px] border border-dashed border-border bg-card/60 p-5 text-[12.5px] text-muted-foreground">
       复审任务拉取中…
     </div>
+    <!-- 空态的三种成因必须分开说（B7 补评审 2026-08-06）：此前一律说「安全网干净」，
+         而那是一句**对安全网状态的断言**——查询失败时它是谎报，处置光本页时它也是谎报
+         （队列里还有第 21 条起的任务，实测两条 v-if 链会同时渲染出「干净」和「加载更多」）。 -->
     <div v-else-if="reviewTasks && !reviewTasks.length" class="rounded-[14px] border border-border bg-card p-5 text-[12.5px] text-muted-foreground">
-      {{ showClosedReviewTasks ? '暂无复审任务。' : '没有待复审的安全任务 —— 安全网干净。' }}
+      <template v-if="reviewTasksDegraded">复审队列暂时不可用（服务端查询失败）—— <b>这不代表安全网干净</b>，请重试或联系运维。</template>
+      <template v-else-if="reviewTasksHasMore && !showClosedReviewTasks">本页任务已全部处理；队列里还有更多。</template>
+      <template v-else-if="reviewTasksHasMore">仅显示最近若干条，且本页已全部处理。「显示已处理」视图暂不支持翻页——请取消勾选后再查看。</template>
+      <template v-else>{{ showClosedReviewTasks ? '暂无复审任务。' : '没有待复审的安全任务 —— 安全网干净。' }}</template>
     </div>
     <div v-else-if="reviewTasks" class="overflow-hidden rounded-[14px] border border-border bg-card">
       <div
@@ -118,10 +124,13 @@ const TYPE_LABEL: Record<string, string> = {
          后第 2 页从 T08,T07 跳到 T06 起）。默认视图没有这个问题——处置即本地移除，
          offset 与服务端前缀同步收缩，实测处置 0~4 条第 2 页恒为 T05..T08。
          已处置视图暂不翻页，但**如实说明被截断**，绝不静默丢行。 -->
-    <div v-if="reviewTasksHasMore && showClosedReviewTasks" class="mt-2 text-center text-[11.5px] text-faint">
+    <!-- ⚠️ 条件里的 `reviewTasks.length` 不可省：列表为空时这两句已由上面的空态块负责，
+         留在这里会让 closed 视图的截断说明渲染两遍。而**默认视图**的按钮必须在空列表时
+         也保留——「本页处置光了但队列还有」正是最需要那个按钮的时刻。 -->
+    <div v-if="reviewTasksHasMore && showClosedReviewTasks && reviewTasks && reviewTasks.length" class="mt-2 text-center text-[11.5px] text-faint">
       仅显示最近若干条。「显示已处理」视图暂不支持翻页——请取消勾选后再翻页查看未处理任务。
     </div>
-    <div v-else-if="reviewTasksHasMore" class="mt-2 text-center">
+    <div v-else-if="reviewTasksHasMore && !showClosedReviewTasks" class="mt-2 text-center">
       <button
         type="button" data-testid="review-task-load-more" :disabled="reviewTasksLoadBusy"
         class="rounded-lg border border-border px-4 py-1.5 text-[12.5px] font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"

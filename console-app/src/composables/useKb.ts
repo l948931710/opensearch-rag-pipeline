@@ -284,6 +284,17 @@ const showClosedReviewTasks = ref(false)
 // 都走 offset=0 替换，旧的第 2 页回来仍会追加到**新视图**上 ⇒ 两种视图混在一起
 // （2026-08-06 codex 补评审确认，非仅测试不足）。替换时自增，追加回来发现代际变了就丢弃。
 let reviewTasksSeq = 0
+// 列表**基准**代际（B7 补评审 2026-08-06，codex MAJOR）：seq 只在 offset=0 替换时自增，
+// 挡不住「追加在途时处置本页一条」——处置让服务端开集前缀 -1，而客户端发的 offset 是
+// 点击瞬间的本地条数 ⇒ 那一页从**旧基准**取，边界后的第一条被静默跳过。
+// 实测（探针 T00..T40 / 每页 20）：追加在途处置 T05 后，返回页从 T21 起，**T20 永远看不到**。
+// 处置改动本地列表时自增；追加落地前发现基准变了就丢弃 + 用新条数重取一次。
+let reviewTasksBase = 0
+// 当前 `reviewTasks` 属于哪个视图（true=含已处理）。offset=0 拉取失败/降级时用它判断
+// 「保留旧列表」会不会把**上一个视图**的数据挂在新标题下（codex 第 2 轮 BLOCKER）。
+let reviewTasksView = false
+const reviewTasksDegraded = ref(false)   // 后端 fail-open 自陈：本次响应不是业务数据
+let reviewTasksRetryOffset = 0           // LoadError 的重试目标（追加失败不该退回第 1 页）
 const reviewTaskResolveBusy = ref<Set<string>>(new Set())
 // 共享目标可选项 = 10 个用户面 ACL 组码（与后端 sanitize 白名单同源；生产子线是 owner 粒度、非读者组）。
 const SHARE_TARGETS = Object.keys(GROUP_LABEL)
@@ -1606,6 +1617,14 @@ async function loadReviewTasks(offset = 0) {
   // 替换路径（offset=0，含 toggle 的 void 重载）完全不置忙也不受闸——替换本就 last-wins，
   // 且置忙会把「toggle 后立刻追加」误伤掉（既有契约测试钉着）。
   if (offset) {
+    // 服务端 offset 上界镜像（同 loadDocsPage:704 / DocTable.vue:29-35 的既有模式）：
+    // 后端把超界 offset **静默钳**到 KB_MAX_OFFSET（kb_console.py:1383）⇒ 不拦的话
+    // offset≥10020 会反复返回同一页（重复追加、`:key` 撞号），更深的行永不可达。
+    // ⚠️ 这只是 UI 缓解：后端仍会静默改写 offset 且不回 effective_offset（§F 第 2 项待裁决）。
+    if (offset > KB_MAX_OFFSET) {
+      void notice({ message: `最多可加载 ${KB_MAX_OFFSET} 条（服务端深分页上界）。请先处置一部分，或改用筛选缩小范围。` })
+      return
+    }
     if (reviewTasksLoadBusy.value) return
     reviewTasksLoadBusy.value = true
     try { await _loadReviewTasksInner(offset) } finally { reviewTasksLoadBusy.value = false }
@@ -1614,7 +1633,7 @@ async function loadReviewTasks(offset = 0) {
   await _loadReviewTasksInner(0)
 }
 
-async function _loadReviewTasksInner(offset = 0) {
+async function _loadReviewTasksInner(offset = 0, retried = false) {
   const s = useSession()
   if (s.role !== 'kb_admin') { reviewTasks.value = []; return }
   if (import.meta.env.DEV && s.token === 'dev-preview') {
@@ -1626,24 +1645,69 @@ async function _loadReviewTasksInner(offset = 0) {
     ]
     reviewTasks.value = showClosedReviewTasks.value ? all : all.filter((x) => !x.closed)
     reviewTasksHasMore.value = false
+    reviewTasksDegraded.value = false
+    reviewTasksView = showClosedReviewTasks.value
     return
   }
   clearLoadError('reviewTasks')
-  if (!offset) reviewTasksSeq++          // 替换 ⇒ 作废所有在途追加
+  if (!offset) { reviewTasksSeq++; reviewTasksDegraded.value = false }   // 替换 ⇒ 作废所有在途追加
   const seq = reviewTasksSeq
+  const base = reviewTasksBase
+  const view = showClosedReviewTasks.value
+  reviewTasksRetryOffset = offset
   try {
     // P2-11：后端 limit 默认 20 且此前不回 has_more —— 复审任务是「安全网承诺」，
     // 静默截断意味着第 21 条以后的隐患在界面上根本不存在。offset>0=追加，0=回首页替换。
-    const qs = showClosedReviewTasks.value ? '&include_closed=true' : ''
-    const r = await apiJson<{ items: ReviewTaskItem[]; has_more?: boolean }>(
+    const qs = view ? '&include_closed=true' : ''
+    const r = await apiJson<{ items: ReviewTaskItem[]; has_more?: boolean; degraded?: boolean }>(
       `/api/kb/review-tasks?offset=${offset}${qs}`, { auth: true })
-    if (seq !== reviewTasksSeq) return    // 期间列表已被替换（含换视图）→ 丢弃本页
+    // ① 先判 seq：列表/视图已被替换 ⇒ 丢弃，**绝不重试**（拿新视图的条数去重取旧视图的
+    //    那一页是错的 —— codex BLOCKER）。顺序不可与 ② 对调。
+    if (seq !== reviewTasksSeq) return
+    // ② 再判基准：仅追加路径。处置改了本地列表 ⇒ 这一页是按旧基准取的，丢弃并用**当下**
+    //    的本地条数重取一次；第二次仍失配就丢弃并保留 has_more（按钮还在，用户可再点）。
+    if (offset && base !== reviewTasksBase) {
+      if (retried) return
+      return await _loadReviewTasksInner((reviewTasks.value || []).length, true)
+    }
+    // ③ degraded：后端 fail-open 自陈本次不是业务数据 ⇒ items/has_more 一律不当真。
+    if (r.degraded) {
+      reviewTasksDegraded.value = true
+      if (!offset) {                       // 替换：必须清空，否则旧视图的数据会挂在新标题下
+        reviewTasks.value = []; reviewTasksHasMore.value = false; reviewTasksView = view
+      }                                    // 追加：保留已加载页 + **不覆盖** has_more
+      noteLoadError('reviewTasks', new Error('复审队列查询失败（服务端降级）'))
+      return
+    }
+    // 成功落地 ⇒ 清掉可能残留的降级标记。只在 offset=0 清是不够的：追加降级把它置 true 后，
+    // 同一 offset 重试成功不会复位 ⇒ 之后处置到空列表时空态仍说「服务端查询失败」。
+    reviewTasksDegraded.value = false
     reviewTasks.value = offset ? [...(reviewTasks.value || []), ...(r.items || [])] : (r.items || [])
     reviewTasksHasMore.value = !!r.has_more
+    reviewTasksView = view
   } catch (e) {
     if (seq !== reviewTasksSeq) return
-    reviewTasks.value = reviewTasks.value ?? []; noteLoadError('reviewTasks', e)
+    // 同视图刷新失败保留旧列表（不把可用数据抹掉）；**换视图**失败必须清空——
+    // toggle 先同步翻转标题，保留旧列表 = 把上一个视图的数据挂在新标题下（codex 第 2 轮）。
+    if (!offset && reviewTasksView !== view) {
+      reviewTasks.value = []; reviewTasksHasMore.value = false; reviewTasksView = view
+    } else {
+      reviewTasks.value = reviewTasks.value ?? []
+    }
+    noteLoadError('reviewTasks', e)
   }
+}
+
+/** LoadError 的重试：回到**失败的那一页**，而不是退回第 1 页（退回会让已加载的 2..N 页
+ *  从视图里消失，用户以为翻页把数据弄丢了）。首屏失败时 retryOffset 恒为 0，语义不变。
+ *
+ *  ⚠️ 重试**不得复用失败时那个 offset 数值**——追加失败后用户可能先处置了几条再点重试，
+ *  服务端开集前缀已收缩，旧 offset 会重新漏掉边界那一行（codex 末轮 BLOCKER）。
+ *  base 检查也兜不住：重试是在处置**之后**发起的，捕获的就是新 base，不会失配。
+ *  正解是只用 retryOffset 判「上次失败的是追加还是替换」，offset 数值一律现取本地条数
+ *  —— 那正是本端点分页的不变量（offset ≡ 本地条数）。 */
+function retryReviewTasks() {
+  void loadReviewTasks(reviewTasksRetryOffset ? (reviewTasks.value || []).length : 0)
 }
 
 function toggleShowClosedReviewTasks() {
@@ -1667,6 +1731,10 @@ async function resolveReviewTask(taskId: string, action: EscalationResolveAction
       })
     }
     const list = reviewTasks.value || []
+    // ⚠️ 处置改变了列表基准 ⇒ 在途的「加载更多」是按旧基准取的、会漏掉边界后那一条。
+    // 只在该条**确实在当前列表里**时才自增：处置在途期间用户换了视图的话，新视图的列表
+    // 里没有这条，`filter`/`map` 也只是产生等价新数组，自增会无谓丢弃新视图的追加页。
+    if (list.some((x) => x.task_id === taskId)) reviewTasksBase++
     if (done && !showClosedReviewTasks.value) {
       reviewTasks.value = list.filter((x) => x.task_id !== taskId)
     } else {
@@ -2062,7 +2130,7 @@ export function useKb() {
     visCtx, visExplain, visLoading, visErr, openVisibility, closeVisibility,
     feedbackReview, feedbackReviewTruncated, truncatedQueues, loadFeedbackReview, showResolvedFeedback, toggleShowResolvedFeedback, resolveFeedback, feedbackResolveBusy,
     feedbackReviewView, feedbackReviewViewTruncated, loadFeedbackReviewView, fbStats, loadFeedbackStats,
-    reviewTasks, loadReviewTasks, reviewTasksHasMore, reviewTasksLoadBusy, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
+    reviewTasks, loadReviewTasks, reviewTasksHasMore, reviewTasksLoadBusy, reviewTasksDegraded, retryReviewTasks, showClosedReviewTasks, toggleShowClosedReviewTasks, resolveReviewTask, reviewTaskResolveBusy,
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, accessNoteOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
@@ -2084,6 +2152,8 @@ export function __resetKb() {
   inflight.value = new Set(); retireBusy.value = false
   feedbackReview.value = null; showResolvedFeedback.value = false; feedbackResolveBusy.value = new Set()
   reviewTasks.value = null; showClosedReviewTasks.value = false; reviewTaskResolveBusy.value = new Set()
+  reviewTasksHasMore.value = false; reviewTasksLoadBusy.value = false; reviewTasksDegraded.value = false
+  reviewTasksSeq = 0; reviewTasksBase = 0; reviewTasksView = false; reviewTasksRetryOffset = 0
   docsOffset = 0; docsPage.value = 1; docsSeq = 0; trackSeq = 0
   for (const k of Object.keys(lastLoadedAt)) delete lastLoadedAt[k]   // 重开 staleness 门（#82）
   if (qTimer) { clearTimeout(qTimer); qTimer = null }

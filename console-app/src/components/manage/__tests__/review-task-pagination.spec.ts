@@ -20,23 +20,35 @@ import { useKb, __resetKb } from '@/composables/useKb'
  *
  * 结论：分页只在可证正确的分支开放；另一分支如实说明被截断，绝不静默丢行。
  */
-beforeEach(() => { vi.restoreAllMocks(); __resetKb() })
+beforeEach(() => {
+  vi.restoreAllMocks(); vi.unstubAllGlobals(); __resetKb()
+  // `toggleShowClosedReviewTasks` 会 fire-and-forget 一次真实 loadReviewTasks（useKb.ts:1651）。
+  // 不打桩的话这里会打真 fetch，靠 catch 兜住 —— 测试意图之外的副作用，会污染
+  // loadErrors/reviewTasks（2026-08-06 B7 补评审，codex MINOR）。显式打桩，不靠兜底。
+  vi.stubGlobal('fetch', vi.fn(async () => ({
+    ok: true, status: 200, json: async () => ({ items: [], has_more: false }), text: async () => '{}',
+  })))
+})
 
 function activate() {
   const id: Identity = { userId: 'k', name: '管', role: 'kb_admin', aclGroups: [], canManage: true, managedOwnerDepts: [] }
   setActivePinia(createTestingPinia({ createSpy: vi.fn, initialState: { session: { identity: id, token: 't', ready: true } } }))
 }
 
-function mountQueue(hasMore: boolean, showClosed: boolean) {
+const ONE = [
+  { task_id: 'T1', doc_id: 'D1', title: 'x', version_no: 1, review_type: 'spot_check_mismatch',
+    review_reason: 'r', owner_dept: 'hr', suggested_permission_level: 'restricted',
+    created_at: '2026-08-03', age_days: 1, status: 'PENDING', closed: false, reviewer_name: '' },
+]
+
+function mountQueue(hasMore: boolean, showClosed: boolean,
+                    { items = ONE as unknown[], degraded = false } = {}) {
   activate()
   const kb = useKb()
-  ;(kb as unknown as { reviewTasks: { value: unknown[] } }).reviewTasks.value = [
-    { task_id: 'T1', doc_id: 'D1', title: 'x', version_no: 1, review_type: 'spot_check_mismatch',
-      review_reason: 'r', owner_dept: 'hr', suggested_permission_level: 'restricted',
-      created_at: '2026-08-03', age_days: 1, status: 'PENDING', closed: false, reviewer_name: '' },
-  ]
+  if (showClosed) kb.toggleShowClosedReviewTasks()   // 先切视图（它会替换列表），再灌状态
+  ;(kb as unknown as { reviewTasks: { value: unknown[] } }).reviewTasks.value = items
   ;(kb as unknown as { reviewTasksHasMore: { value: boolean } }).reviewTasksHasMore.value = hasMore
-  if (showClosed) kb.toggleShowClosedReviewTasks()
+  ;(kb as unknown as { reviewTasksDegraded: { value: boolean } }).reviewTasksDegraded.value = degraded
   return mount(ReviewTaskQueue)
 }
 
@@ -59,5 +71,37 @@ describe('复审任务分页：只在排序稳定的分支开放', () => {
     const w = mountQueue(false, true)
     expect(w.find(MORE).exists()).toBe(false)
     expect(w.text()).not.toContain('暂不支持翻页')
+  })
+})
+
+/**
+ * B7 补评审（2026-08-06）：空态是一句**对安全网状态的断言**，此前一律说「安全网干净」。
+ * 实测两条 v-if 链互不排斥 ⇒ 把第 1 页 20 条全部处置后，界面同时渲染
+ * 「安全网干净」和「加载更多」——而队列里第 21 条起还有真隐患。
+ */
+describe('空列表的三种成因必须分开说', () => {
+  it('处置光本页但队列还有 → 不得说「干净」，且**保留**加载更多', () => {
+    const w = mountQueue(true, false, { items: [] })
+    expect(w.text()).not.toContain('安全网干净')        // ★ 反证锚：修复前为 true
+    expect(w.text()).toContain('队列里还有更多')
+    expect(w.find(MORE).exists()).toBe(true)
+  })
+
+  it('closed 视图空列表 + 还有更多 → 仍不给按钮，且截断说明只出现一次', () => {
+    const w = mountQueue(true, true, { items: [] })
+    expect(w.find(MORE).exists()).toBe(false)          // b8e11b4 刻意关掉的翻页不得被重新打开
+    expect(w.text().match(/暂不支持翻页/g) || []).toHaveLength(1)
+  })
+
+  it('服务端降级 → 明说「这不代表安全网干净」', () => {
+    const w = mountQueue(false, false, { items: [], degraded: true })
+    expect(w.text()).toContain('这不代表安全网干净')
+    expect(w.text()).not.toContain('没有待复审的安全任务')
+  })
+
+  it('真的空且没有更多 → 才允许说「安全网干净」', () => {
+    const w = mountQueue(false, false, { items: [] })
+    expect(w.text()).toContain('安全网干净')
+    expect(w.find(MORE).exists()).toBe(false)
   })
 })

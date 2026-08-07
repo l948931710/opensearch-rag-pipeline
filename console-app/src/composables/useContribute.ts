@@ -231,7 +231,10 @@ async function _loadMineInner(offset = 0) {
     mineHasMore.value = !!r.has_more
   } catch (e) {
     if (seq !== mineSeq) return
-    if (!offset) myContribs.value = []
+    // B7 补评审（2026-08-06）：清空列表却留着上一次的 `mineHasMore=true` ⇒
+    // MyContributions.vue 会同时渲染「还没有贡献」和「加载更多」——空态是一句
+    // **对数据的断言**，拉取失败时它是谎报。两者必须同生同灭。
+    if (!offset) { myContribs.value = []; mineHasMore.value = false }
     noteLoadError('mine', e)
   }
 }
