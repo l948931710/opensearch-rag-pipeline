@@ -262,6 +262,18 @@ body {
 .led-row[data-selected="1"], .led-row[data-selected="1"]:hover { background: color-mix(in srgb, var(--accent-soft) 70%, transparent); }
 .led-row[data-retired="1"] { opacity: .5; }
 .led-row[data-retired="1"]:hover { opacity: .85; }
+/* 🔴 菜单展开中必须恒亮 —— 这不是审美，是可点性。opacity<1 让整行成为 stacking context，
+   把行内 `absolute z-20` 的「更多操作」弹层**困在本行内**：z-20 只在行内排序，压不过后面的
+   兄弟行；而后续每一行的 .doc-actions 自带 opacity .75（见下方）同样是 stacking context、
+   DOM 顺序在后 ⇒ 绘制在弹层之上，把整个菜单（可见范围/编辑信息/升版/**恢复上线**）盖到
+   鼠标点不动（键盘 Tab+Enter 不受影响，因为遮挡只影响命中测试）。在线行没这问题正是因为
+   下方 `.doc-actions[data-open="1"] { opacity: 1 }` 取消了操作列的 stacking context，而行
+   本身 opacity 恒 1 —— 本行就是那条规则在**行**这一层的对称补齐。
+   ⚠️ 必须写在上面 :hover 之后：两者特异性同为 (0,2,0)，靠源序胜出。
+   ⚠️ 用显式 data-menu-open 而非 :has(.doc-actions[data-open="1"])：钉钉内嵌浏览器内核版本
+   不可控，:has() 不支持时整条规则被丢弃 = 静默退回缺陷态。 */
+.led-row[data-retired="1"][data-menu-open="1"],
+.led-row[data-retired="1"][data-menu-open="1"]:hover { opacity: 1; }
 /* 台账容器不再 overflow-hidden（「更多操作」菜单弹层要外溢容器）：末行 hover/选中底色的
    圆角由此兜底（容器 rounded-xl=12px，扣 1px 边框后 11px）。 */
 .led-row:last-child { border-radius: 0 0 11px 11px; }

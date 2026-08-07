@@ -398,6 +398,7 @@ async function onRestore(d: DocItem) {
         v-for="d in filtered" :key="d.doc_id"
         class="led-row" :data-retired="d.status_badge === '已退役' ? '1' : '0'" :data-foreign="d.can_manage === false ? '1' : '0'"
         :data-selected="isSelected(d.doc_id) ? '1' : '0'"
+        :data-menu-open="menuDocId === d.doc_id ? '1' : '0'"
       >
         <div class="led-cell led-cell-main flex min-w-0 items-start gap-2.5" data-label="文档名">
           <!-- 行选择框（仅可管理行；外部门只读行不给选框） -->
