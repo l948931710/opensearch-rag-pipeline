@@ -5,6 +5,13 @@
 > 审查结论：**REVISE / NO-GO**  
 > 文档状态：审查快照；不代表生产发布批准
 
+> **📌 2026-08-06 逐条核查已完成** —— 结论与修复批次见
+> [`main_code_review_verification_2026-08-06.md`](main_code_review_verification_2026-08-06.md)。
+> 23 条：**属实 21 / 属实但需纠偏 2（§3.1、§3.6）/ 推翻 0**。
+> 引用订正：§3.4 的 `schema/001_knowledge_base_schema.sql` **不存在**，真实文件是
+> `schema/001_opensearch_pipeline.sql`（行号 124 与内容都对）；本报告基准是 `133ad84`，
+> 而 HEAD 已到 `d967bee`（多 4 个提交），**其余行号普遍已漂移**，核查文档给了当前位置。
+
 ## 1. 执行摘要
 
 不建议将当前 `main` 直接提升到生产。
@@ -144,7 +151,8 @@
 
 证据：
 
-- `schema/001_knowledge_base_schema.sql:124`：`approval_status` 默认 `PENDING`。
+- `schema/001_opensearch_pipeline.sql:124`：`approval_status` 默认 `PENDING`。
+  （原文误写为 `001_knowledge_base_schema.sql`，该文件不存在；2026-08-06 核查订正。）
 - `opensearch_pipeline/pipeline_nodes.py:475-482`：普通版本写入未显式设置审批状态。
 - `opensearch_pipeline/dataworks_nodes/register_new_files.py:430-441`：另一普通写入路径也未显式设置审批状态。
 - `opensearch_pipeline/routes/kb_console.py:3406-3408`：退役把所有 `PENDING` 改为 `WITHDRAWN`。

@@ -3337,19 +3337,41 @@ def kb_reject(req: KbApprovalRequest, request: Request,
             with conn.cursor() as cur:
                 vfilter = "AND version_no=%s"   # C8 §4.1：入口已强制单版本，恒带该谓词
                 vargs = (req.version_no,) if req.version_no else ()
+                # B2（2026-08-06 补评审）：**前态谓词** `approval_status='PENDING'` 不可省。
+                # 退役有意不改 content_process_status（见 kb_retire:3419-3421），所以退役后
+                # 该版本仍满足 CPS 谓词 ⇒ 过期页面/并发的 reject 能把 WITHDRAWN 改写成
+                # REJECTED，而 kb_restore 的 `WITHDRAWN→PENDING` 还原从此永远匹配不上。
                 n = cur.execute(
                     f"UPDATE {_kb_db()}.document_version "
                     f"SET content_process_status='REJECTED', approval_status='REJECTED', "
                     f"    content_process_error=%s, updated_at=NOW() "
-                    f"WHERE doc_id=%s {vfilter} AND content_process_status='PENDING_APPROVAL'",
+                    f"WHERE doc_id=%s {vfilter} AND content_process_status='PENDING_APPROVAL' "
+                    f"  AND approval_status='PENDING'",
                     ((req.reason or "rejected")[:500], req.doc_id, *vargs),
                 )
             conn.commit()
         finally:
             conn.close()
+    except HTTPException:
+        # ⚠️ 必须在通用 handler **之前**（与 kb_retire:3448 同款）：下面那条 `except Exception`
+        # 会把任何 HTTPException 吞掉改写成 500。今天 try 内没有 raise，这条是**给后来人的**闸——
+        # 谁往 try 里加一个 4xx，没有它就会静默变成 500（codex 2026-08-06 补评审 BLOCKER）。
+        raise
     except Exception as e:
         logger.error("kb_reject 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"驳回失败 (trace: {trace_id})")
+    # B2：0 行 = 竞态输了（已退役撤销 / 已被处理 / 版本号不对），**必须让调用方看见**。
+    # 此前返回 200 + rejected:0 ⇒ 三个端（Vue / 小程序 / legacy）都把它当成功：
+    # Vue 本地移除、小程序 toast「已驳回」——与 2026-08-06 现网 20 个僵尸条目同一形态。
+    # ⚠️ 409 抛在 try **之外**，否则被上面的 except Exception 改写成 500。
+    # ⚠️ detail 不许承诺「会自动刷新」——刷不刷是各端自己的事（codex 措辞要求）。
+    if not n:
+        raise HTTPException(
+            status_code=409,
+            detail="未驳回：该版本当前状态不可驳回（可能已退役撤销、已被处理，或版本号已变）。"
+                   "请刷新待审批队列后重试。")
+    # ⚠️ 审计只在**真的改了行**之后写。此前 write_audit 是无条件执行的 ——
+    # 一次 0 行的驳回照样留下一条 REJECT 记录，等于把没发生的动作写进审计（codex MAJOR）。
     write_audit(doc_id=req.doc_id, version_no=req.version_no, action_type="REJECT",
                 operator_type="user", operator_id=kb.user_id, trace_id=trace_id,
                 message=(req.reason or "")[:200])
@@ -3419,14 +3441,28 @@ def kb_retire(req: KbRetireRequest, request: Request,
                 # _KB_BADGE_CASE_SQL、前端色调表一串地方；approval_status 是纯审批语义、
                 # 消费面仅 5 处，是正确的落点。且 PENDING_APPROVAL 保持原值 ⇒ 恢复上线后
                 # 那一版**确实**仍待审批，语义不撒谎。
-                # 覆盖面刻意按 doc 而非当前版本：kb_approve:3190 的注释记着「kb_retire 只把
-                # current 版本置 retired，更早的 pending 版本仍 status=active，放行后会被
-                # stage-1 认领复活」——按 doc 撤销顺带堵上那个洞。
+                # 覆盖面刻意按 doc 而非当前版本：kb_retire 只把 current 版本置 retired，
+                # 更早的 pending 版本仍 status=active，按 doc 撤销才能一并覆盖到它们。
+                # ⚠️ 2026-08-06 订正：原文写「顺带堵上 stage-1 认领复活那个洞」——**不成立**，
+                # 下面 B1 注释里有证据：stage-1 的认领谓词不读 approval_status。撤销审批状态
+                # 从来堵不住摄取认领，那是另一条独立缺陷（同见下）。
                 # ⚠️ 与 kb_restore 的还原**必须成对**，否则文档恢复后那一版卡在 WITHDRAWN：
                 # 既不进审批队列、也不被 stage-1 认领 = 一个没人会发现的隐形僵尸。
+                # B1（2026-08-06 补评审）：**必须带 CPS 谓词**，否则与 kb_restore 的还原不配平。
+                # `approval_status` 的 DDL 默认就是 'PENDING'（schema/001:124），而管线两条写入
+                # 路径（pipeline_nodes / register_new_files）都不显式设置 ⇒ **普通版本天然是
+                # PENDING + 非 PENDING_APPROVAL**。不带这个谓词就会把它们一起打成 WITHDRAWN，
+                # 而下面 kb_restore 的还原要求 `content_process_status='PENDING_APPROVAL'`
+                # ⇒ 永远匹配不上 = 上面那条注释自己担心的「隐形僵尸」，只是发生在普通版本上。
+                # ⚠️ 收窄的只是**版本**维；按 doc（而非 current version）的覆盖面不变，
+                #    那些「更早的 pending 版本」本来就是 PENDING_APPROVAL，仍在覆盖内。
+                # ⚠️ 曾以为宽谓词是在堵「stage-1 认领复活」——**证伪**：stage-1 的认领谓词
+                #    （pipeline_nodes.py:178-181）不读 approval_status，也不读 document_meta.status。
+                #    「退役后旧 active 版本仍会被 stage-1 认领」是**另一条独立缺陷**，已上报，本批不做。
                 cur.execute(f"UPDATE {_kb_db()}.document_version "
                             "SET approval_status='WITHDRAWN', updated_at=NOW() "
-                            "WHERE doc_id=%s AND approval_status='PENDING'", (req.doc_id,))
+                            "WHERE doc_id=%s AND approval_status='PENDING' "
+                            "  AND content_process_status='PENDING_APPROVAL'", (req.doc_id,))
                 # 真实检索下线不能只靠 RDS（盲区审计 P2-1）：HA3 行仍在且带原 permission_level，
                 # 检索照常命中。喂 PENDING_DELETE outbox——stage-3 每轮 reconcile_pending_deletes
                 # 自动 drain 删 HA3 后落 DELETED（全版本入队，顺带清双版本残留；与

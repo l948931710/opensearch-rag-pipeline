@@ -407,3 +407,76 @@ def test_review_tasks_is_the_only_paginated_dashboard_cache_user():
     assert paginated == ["/api/kb/review-tasks"], (
         f"带 offset 的 _dashboard_cache 使用者变成了 {paginated} —— "
         "新加的那个必须单独论证「缓存 TTL 内翻页看到跨时刻快照」的后果，不能沿用 review-tasks 的结论")
+
+
+# ── 批 B（2026-08-06 补评审）：审批状态机的三条谓词/竞态缺陷 ────────────────────
+
+def test_reject_requires_pending_approval_precondition_in_sql(monkeypatch, audit):
+    """B2：驳回必须同时要求 CPS 与 **approval_status='PENDING'** 前态。
+
+    退役**有意不改** `content_process_status`（kb_console.py:3419-3421），所以退役后
+    该版本仍满足 CPS 谓词 ⇒ 过期页面的 reject 能把 WITHDRAWN 改写成 REJECTED，
+    而 kb_restore 的 `WITHDRAWN→PENDING` 还原从此永远匹配不上。
+    """
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    conn = _install(monkeypatch, _Conn(rowcount=1))
+    _reject()
+    upd = [s for s, _ in _updates(conn) if "document_version" in s]
+    assert upd, "驳回没有发出 UPDATE"
+    sql = upd[0]
+    assert "content_process_status='PENDING_APPROVAL'" in sql
+    assert "approval_status='PENDING'" in sql, f"缺前态谓词 ⇒ 可覆盖 WITHDRAWN：{sql}"
+
+
+def test_reject_zero_rows_is_409_not_200_and_writes_no_audit(monkeypatch, audit):
+    """B2：0 行 = 竞态输了，必须让调用方看见。
+
+    此前返回 200 + `rejected:0`，**三个端**（Vue / 小程序 / legacy）都把它当成功
+    —— 与 approve 侧 2026-08-06 现网 20 个僵尸条目同一形态。
+    ⚠️ 同时钉两件事：
+      · **不是 500** —— 409 若写在 `try` 内会被 `except Exception` 吞掉改写成 500；
+      · **不写 REJECT 审计** —— 此前 write_audit 无条件执行，等于把没发生的动作写进审计。
+    """
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _install(monkeypatch, _Conn(rowcount=0))
+    # 用宽 Exception + _status（同文件既有范式）：这样「抛了别的异常」也会因 status 为 None 被抓到
+    with pytest.raises(Exception) as ei:
+        _reject()
+    assert _status(ei) == 409, f"0 行驳回必须 409（500 = 被 except Exception 吞了）：{ei.value!r}"
+    assert not [a for a in audit if a.get("action_type") == "REJECT"], \
+        "0 行驳回不得留下 REJECT 审计——那是记录了一个没发生的动作"
+
+
+def test_reject_success_still_200_and_audited(monkeypatch, audit):
+    """反向锚：正常驳回必须仍是 200 + rejected 计数 + 审计（别把 409 改成无差别拒绝）。"""
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    _install(monkeypatch, _Conn(rowcount=1))
+    out = _reject()
+    assert out == {"status": "ok", "rejected": 1}
+    assert [a for a in audit if a.get("action_type") == "REJECT"], "成功驳回必须留审计"
+
+
+def test_retire_withdraw_is_scoped_to_pending_approval_versions(monkeypatch, audit):
+    """B1：退役撤销审批时必须带 CPS 谓词，否则与 kb_restore 的还原不配平。
+
+    `approval_status` 的 DDL 默认就是 'PENDING'（schema/001:124），管线两条写入路径都不
+    显式设置 ⇒ **普通版本天然是 PENDING + 非 PENDING_APPROVAL**。不带谓词就会把它们一起
+    打成 WITHDRAWN，而恢复要求 `content_process_status='PENDING_APPROVAL'` ⇒ 永久僵尸。
+    """
+    _skip_if_not_sim()
+    monkeypatch.setenv("RAG_SIM_USER_ROLE", "kb_admin")
+    # meta_row 要够 kb_retire 解包（owner_dept, permission_level, status, current_version_no）
+    conn = _install(monkeypatch, _Conn(meta_row=("hr", "dept_internal", "active", 1), rowcount=1))
+    from opensearch_pipeline import api
+    try:
+        api.kb_retire(api.KbRetireRequest(doc_id="DOC_X"), request=None,
+                      identity=api.Identity(user_id="u1"))
+    except Exception:   # noqa: BLE001
+        pass          # 退役链路后段可能因桩不全而中断；本测试只看那条 UPDATE 的谓词
+    wd = [s for s, _ in _updates(conn) if "approval_status='WITHDRAWN'" in s]
+    assert wd, "退役没有发出审批撤销 UPDATE"
+    assert "content_process_status='PENDING_APPROVAL'" in wd[0], \
+        f"撤销面未收窄 ⇒ 普通版本被误伤且永远恢复不了：{wd[0]}"

@@ -208,7 +208,12 @@
   var GROUP_LABEL = { finance:'财务', it:'信息技术', marketing:'营销', production:'生产', pmc:'计划PMC', admin:'行政', hr:'人力资源', rd:'研发', quality:'品质技术', supply:'资材供应' };
   var PERM_LABEL = { dept_internal:'仅本部门', public:'全公司', restricted:'受限' };
   var BADGE_CLASS = { '已上线':'ok', '处理中':'busy', '排队中':'queue', '待审核':'warn', '已隔离':'fail', '处理失败':'fail', '已驳回':'fail', '已退役':'muted', '内容未变':'muted' };
-  var MAX_UPLOAD_MB = 50;   // 与后端 kb_upload.MAX_UPLOAD_BYTES 对齐：客户端先拦，省得 50MB 传完才 413
+  // ⚠️ 2026-08-06：这行原注释写着「与后端 kb_upload.MAX_UPLOAD_BYTES 对齐」——**已经不对齐了**。
+  // 后端上限 50 →(08-06) 150 →(08-05) **300MB**，本页仍硬编码 50 ⇒ 从 /console-legacy 进来的人
+  // 传 50–300MB 的**合法**文件会被本地预检拦下，还会看到一句与后端能力矛盾的错误话术。
+  // 本轮只订正注释、不动数值：改数值属能力变更（要连同 xhr.timeout、CORS、分片一起动），
+  // 正解是两端都从 /api/kb/config 取运行时上限，或按 console.py:26 的计划正式退役本页。
+  var MAX_UPLOAD_MB = 50;   // ⚠️ 与后端 300MB **不一致**（见上）；改动前先读 kb_upload.py 的五道闸联动注释
 
   function qs(name){ var m = new RegExp('[?&]' + name + '=([^&]+)').exec(location.search); return m ? decodeURIComponent(m[1]) : ''; }
 
@@ -221,7 +226,11 @@
       xhr.onload = function(){ (xhr.status >= 200 && xhr.status < 300) ? resolve() : reject(new Error('OSS PUT 失败 HTTP ' + xhr.status)); };
       xhr.onerror = function(){ reject(new Error('OSS PUT 网络错误（可能是 OSS 桶未对本页来源放行 CORS PUT）')); };
       xhr.ontimeout = function(){ reject(new Error('OSS PUT 超时')); };
-      xhr.timeout = 25 * 60 * 1000;   // 略小于 upload token 30min TTL，超时给明确提示而非静默
+      // ⚠️ 2026-08-06：原注释写「略小于 upload token 30min TTL」——**TTL 已是 60 分钟**
+      // （kb_upload.UPLOAD_TOKEN_TTL = 60*60，2026-08-05 随 300MB 上限一起调）。
+      // 25 分钟不再是"略小于"而是**只用了一半**：本页上限 50MB 时够用，但注释描述的关系已失效。
+      // 不改数值同上——本页的上限/超时是一组，要动一起动（或直接退役本页）。
+      xhr.timeout = 25 * 60 * 1000;   // ⚠️ upload token TTL 实为 60min，本值非"略小于"而是其 42%
       xhr.send(file);
     });
   }
@@ -369,7 +378,15 @@
         this.approvalBusy = true;   // 防连点重复提交（对齐 vanilla 的 btn.disabled）
         this.api('/api/kb/' + kind, { method: 'POST', auth: true, body: { doc_id: d.doc_id, version_no: d.version_no, reason: reason } })
           .then(function(){ self.approvalBusy = false; self.loadApprovals(); self.loadDocs(); })
-          .catch(function(e){ self.approvalBusy = false; self.diag(kind + ' FAIL: ' + e.message); alert('操作失败：' + e.message); });
+          .catch(function(e){
+            self.approvalBusy = false;
+            // 2026-08-06 补评审：后端对「0 行驳回/放行」改回 409（此前是 200+rejected:0，
+            // 三个端都当成功）。本页原来靠成功分支的 loadApprovals() 自我纠正，走了 catch
+            // 就再也不刷 ⇒ 已消失的单会一直留在队列里。补这一行把收敛能力还回来。
+            // 不补 loadDocs()：409 确认**没有改写任何行**，文档列表无需重拉。
+            self.loadApprovals();
+            self.diag(kind + ' FAIL: ' + e.message); alert('操作失败：' + e.message);
+          });
       },
 
       // ── 升版态：归属/可见范围继承原文档（不可改），仅替换文件 → 版本号 +1 ──
@@ -400,6 +417,9 @@
             self.uploadOk = true;
             self.uploadMsg = r.note || (r.already ? '该文档已退役' : '已申请退役');
             self.loadDocs();
+            // 2026-08-06 补评审：退役会撤销该文档全部待审批版本（kb_console.py:3427）
+            // ⇒ 队列里那些单已经不该在了。本页此前只刷文档列表（与新控制台同型缺陷）。
+            self.loadApprovals();
           })
           .catch(function(e){
             self.retireBusy = false; self.diag('retire FAIL: ' + e.message);

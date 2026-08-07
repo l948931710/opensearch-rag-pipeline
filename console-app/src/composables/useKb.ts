@@ -617,7 +617,8 @@ function clearSelection() { selectedIds.value = new Set(); bulkMsg.value = '' }
 
 // 批量执行器：顺序跑（aux 限流 30/分，串行最稳）+ 进度回填 bulkMsg；失败隔离，末尾一次 loadDocs。
 async function _bulkRun(docsToRun: DocItem[], label: string,
-                        one: (d: DocItem) => Promise<string | null>): Promise<void> {
+                        one: (d: DocItem) => Promise<string | null>,
+                        opts: { refreshApprovals?: boolean } = {}): Promise<void> {
   if (bulkBusy.value || !docsToRun.length) return
   bulkBusy.value = true
   bulkDone.value = 0; bulkTotal.value = docsToRun.length
@@ -636,7 +637,14 @@ async function _bulkRun(docsToRun: DocItem[], label: string,
     const more = fails.length > 8 ? `\n……另有 ${fails.length - 8} 篇失败未列出（共 ${fails.length} 篇，逐篇原因见台账状态）` : ''
     void notice({ title: `${label}部分失败`, message: fails.slice(0, 8).join('\n') + more, danger: true })
   }
-  if (ok) { clearSelectionKeepMsg(); void loadDocs() }   // 成功过 → 清选中 + 权威重拉
+  // B4：批量**退役**会撤销待审批版本 ⇒ 队列必须一起刷（单篇路径同款）。
+  // ⚠️ 用 opts 而不是无条件刷：`_bulkRun` 被 bulkSetVisibility 共用（:666），
+  //    改可见范围不动审批状态，顺带刷队列是多打一次 aux 限流的无谓请求（codex MINOR）。
+  // ⚠️ 已核实 loadApprovals(true) 在 :1213 / :1321 两条路径已有，别重复加；缺的是本条。
+  if (ok) {
+    clearSelectionKeepMsg(); void loadDocs()                     // 成功过 → 清选中 + 权威重拉
+    if (opts.refreshApprovals) void loadApprovals(true)
+  }
 }
 function clearSelectionKeepMsg() { selectedIds.value = new Set() }
 
@@ -654,7 +662,7 @@ async function bulkRetire(): Promise<void> {
       await apiJson('/api/kb/retire', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id }) })
       return null
     } catch (e: any) { return e && e.status === 403 ? (e.detail || '无权退役') : uploadErrText(e) }
-  })
+  }, { refreshApprovals: true })   // B4：退役撤销待审批版本 ⇒ 队列必须刷（改可见范围不刷）
 }
 
 /** 批量改可见范围（复用 set-visibility；public 涉全公司需 kb_admin，调用方按角色限制选项）。 */
@@ -1358,10 +1366,28 @@ async function approve(d: PendingItem) {
 async function reject(d: PendingItem, reason: string) {
   await withInflight(`appr:${d.doc_id}/${d.version_no}`, async () => {
     try {
-      await apiJson('/api/kb/reject', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no, reason }) })
+      // ⚠️ 与 approve 同款：**200 ≠ 驳回成功**。此前这里拿到 2xx 就本地移除，
+      // 后端的 `rejected: 0`（竞态输了：已退役撤销 / 已被处理）无人消费 ——
+      // 与 approve 侧 2026-08-06 现网 20 个僵尸条目**完全同型**，只是那边修了、这边没修。
+      // 后端现在 0 行会回 409（走 catch），这里仍**显式**判计数：409 只覆盖"全 0"，
+      // 未来多版本入口的"部分成功"还得靠计数。
+      const rr = await apiJson<{ rejected?: number; note?: string }>(
+        '/api/kb/reject', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id, version_no: d.version_no, reason }) })
+      if (!rr?.rejected) {
+        void notice({ title: '未驳回', message: rr?.note || '该版本当前状态不可驳回（可能已退役撤销或已被处理），队列将自动刷新。' })
+        await loadApprovals(true)     // force：拉服务端真值，绕过 30s staleness 门
+        return
+      }
       removeApproval(d)
       await loadDocs()
-    } catch (e: any) { void notice({ title: '驳回失败', message: uploadErrText(e), danger: true }) }
+    } catch (e: any) {
+      void notice({ title: '驳回失败', message: uploadErrText(e), danger: true })
+      // ⚠️ **只对 409 刷队列**，不是所有失败都刷。409 = 服务端明确告诉我们本地视图过期了；
+      // 而 500/网络错什么都没告诉我们，既有契约（useKb.spec.ts:636「失败不动队列」）是
+      // **有意**把单留着可重试 —— 第一版在这里无差别 `loadApprovals(true)`，直接被那条
+      // 契约测试打红（队列桩回 404 ⇒ 队列被清空 ⇒ 单没了，用户没法重试）。
+      if (e && e.status === 409) await loadApprovals(true)
+    }
   })
 }
 
@@ -2066,6 +2092,10 @@ async function retire(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
     const r = await apiJson<RetireResp>('/api/kb/retire', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id }) })
     d.status_badge = '已退役'                       // 即时反映行
     await loadDocs()                                // await 重拉，让服务端权威徽章纠正乐观值（对齐 approve/reject；G3）
+    // B4（2026-08-06 补评审）：退役会把该文档【全部】待审批版本撤销成 WITHDRAWN
+    // （kb_console.py:3427）⇒ 审批队列里那些单已经不该在了。此前只 loadDocs()，
+    // 用户会对着已消失的单重复操作。force 穿透 30s staleness 门。
+    void loadApprovals(true)
     return { ok: true, msg: r.note }
   } catch (e: any) {
     const msg = e && e.status === 403 ? (e.detail || '无权退役该文档') : uploadErrText(e)
@@ -2082,6 +2112,10 @@ async function restore(d: DocItem): Promise<{ ok: boolean; msg?: string }> {
     const r = await apiJson<{ note?: string }>('/api/kb/restore', { method: 'POST', auth: true, body: JSON.stringify({ doc_id: d.doc_id }) })
     d.status_badge = '排队中'                       // 即时反映（NOT_INDEXED → 待重索引）
     await loadDocs()                                // await 重拉，把乐观「排队中」纠正为服务端权威徽章（HA3 未删则即时「已上线」；G3）
+    // B4（2026-08-06 补评审）：退役会把该文档【全部】待审批版本撤销成 WITHDRAWN
+    // （kb_console.py:3427）⇒ 审批队列里那些单已经不该在了。此前只 loadDocs()，
+    // 用户会对着已消失的单重复操作。force 穿透 30s staleness 门。
+    void loadApprovals(true)         // restore 会把 WITHDRAWN 还原成 PENDING ⇒ 单又回来了
     return { ok: true, msg: r.note }
   } catch (e: any) {
     const msg = e && e.status === 403 ? (e.detail || '无权恢复该文档') : uploadErrText(e)

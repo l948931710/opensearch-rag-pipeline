@@ -235,8 +235,25 @@ Page({
         this._approving = true;
         const call = approve ? approveDoc : rejectDoc;
         call({ doc_id: docId, version_no: versionNo })
-          .then(() => {
+          .then((r) => {
             this._approving = false;
+            // ⚠️ 2026-08-06 补评审：**2xx ≠ 审批成功**。后端对「状态不匹配」返回
+            // 0 行（approve 的 approved:0 / reject 的 rejected:0，后者现已改 409）——
+            // 本页此前一律 toast「已放行/已驳回」，谎报了一个没发生的动作。
+            // 这与 Web 控制台 2026-08-06 修掉的「现网 20 个僵尸条目」是同一个 bug，
+            // 只是那边修了、小程序两条路径都还开着。必须看计数。
+            const n = r && (approve ? r.approved : r.rejected);
+            if (!n) {
+              dd.showToast({
+                type: 'none',
+                content: (r && r.note)
+                  || (approve ? '未放行：该文档当前状态不可放行（可能已退役）'
+                              : '未驳回：该版本当前状态不可驳回（可能已退役撤销）'),
+                duration: 2500,
+              });
+              this._reload();       // 拉服务端真值，别把已消失的单留在队列里
+              return;
+            }
             dd.showToast({
               type: 'success',
               content: approve ? '已放行，进入处理管线' : '已驳回',
@@ -250,6 +267,10 @@ Page({
             console.error('[kb-docs._decide]', err);
             const msg = (err && err.data && err.data.detail) || '操作失败，请稍后重试';
             dd.showToast({ type: 'none', content: String(msg).slice(0, 60), duration: 2500 });
+            // 409（驳回竞态）也走这里：刷新让队列收敛到服务端真值。
+            // ⚠️ 后端 409 会先于小程序发版上线，空窗期本页表现为「错误 toast + 刷新」——
+            // 比此前谎报「已驳回」好；发版后 detail 文案也会更准确。
+            this._reload();
           });
       },
     });

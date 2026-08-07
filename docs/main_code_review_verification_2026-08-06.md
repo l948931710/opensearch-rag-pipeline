@@ -272,6 +272,69 @@ docstring 自陈的前提「重启后内存从 0 重积」在异步 seed 下不�
 
 ---
 
+## 4-bis. Sam 拍板（2026-08-06）与执行结果
+
+| 问 | 拍板 | 状态 |
+|---|---|---|
+| 先动哪批 | **A + B 代码一起做** | ✅ 已落地（见下） |
+| 批 C 成本硬边界做到哪 | **接线做完但默认仍关** | 待做（C1 page-OCR 接 breaker 仍是唯一代码洞） |
+| DingTalk 无界线程 | **先在 staging 翻，观察后再定** | ✅ A2 已把两个开关暴露进 `.env.example`；staging 翻闸待 Sam |
+| B5 存量回填 | **先出 prod-ro dry-run 清单** | ✅ 已跑，**结论：无对象，本项撤销**（见下） |
+
+### 批 A 已落地
+A1 `.env.example:131` 幽灵变量 `RAG_REBUILD_COST_BREAKER` → 真名 `RAG_REBUILD_ENABLED`
+（并注明熔断器不覆盖 page-OCR）；A2 补 `RAG_DT_MAX_WORKERS` / `RAG_DT_ADMISSION_ENABLE`；
+A3 legacy console 两处失效注释（「与后端对齐」实为 50 vs 300MB、「略小于 30min TTL」实为 60min）；
+A4 报告头部加核查指引 + 订正 schema 文件名。
+
+### 批 B 已落地（过 codex 双盲，3 轮 APPROVE）
+
+codex 抓出 **2 BLOCKER + 3 MAJOR**，其中一条是**我方案里的假陈述**：
+我写「`/api/kb/reject` 唯一消费者是 `useKb.ts`，已 grep 确认」——那次 grep 加了
+`--include=*.ts --include=*.vue --include=*.py`，把小程序和 legacy 排除在外；
+而 legacy 还是**动态拼路径** `this.api('/api/kb/' + kind, ...)`，字面 grep 本来也抓不到。
+实际三个消费者：`useKb.ts:1361` / `fuling-rag-miniapp/utils/api.js:254` / `console.html:379`。
+
+| 项 | 落地内容 |
+|---|---|
+| B1 | 退役 WHERE 加 `AND content_process_status='PENDING_APPROVAL'`，与 kb_restore 配平。**并删掉我原来给的错误理由**——「宽谓词防 stage-1 认领复活」被 codex 推翻：stage-1 谓词（`pipeline_nodes.py:178-181`）不读 `approval_status` 也不读 `document_meta.status` |
+| B2 | reject WHERE 加 `AND approval_status='PENDING'`；0 行由 200 改 **409**；🔴 409 必须抛在 `try` **之外**（否则被 `except Exception` 改写成 500），并补 `except HTTPException: raise`；🔴 `write_audit` 移到 409 之后 —— 此前**无条件**执行，一次 0 行驳回照样留一条 REJECT 审计 |
+| B3 | 三端都改。Vue 消费 `rejected` 计数 + 409 刷队列；legacy 在 `.catch` 补 `loadApprovals()`（它今天靠 `.then` 自我纠正，409 后会丢）；小程序 `_decide` 改一处**同时覆盖 approve 与 reject**——Vue 侧 08-06 修掉的僵尸条目 bug，小程序两条路径都还开着 |
+| B4 | 四处补队列刷新：`useKb.ts` retire / restore / bulkRetire + legacy `doRetire()`。⚠️ `_bulkRun` 被 `bulkSetVisibility` 共用，刷新走 `opts.refreshApprovals` 而非无条件（codex MINOR） |
+
+**验证**：8 条变异全红 0 存活；`make test` 4393 passed / lint 0 / typecheck 0 /
+vitest 519 passed / build 0，全部显式回显退出码。
+⚠️ 测试第一版是**假绿**已修：`pending-approvals` 桩原本回空集，于是「本地乐观移除」与
+「拉了服务端真值」最终条数都是 0，断言等于空转。
+⚠️ 实施偏离方案一处：catch 里的刷新从「无差别」收窄为「只对 409」——
+无差别版本被既有契约 `useKb.spec.ts:636`（500 失败时**有意**留着单可重试）当场打红。
+
+### 🔴 B5 撤销：prod-ro dry-run 显示**无回填对象**
+
+`scratch/withdrawn_zombie_dryrun_20260806.py`（只读会话）：
+
+```
+① WITHDRAWN 全量分布
+   cps=PENDING_APPROVAL   meta=retired   ver=retired   n=20     （合计 20 行）
+② 疑似受害集（WITHDRAWN 且 cps<>PENDING_APPROVAL，kb_restore 还原不了）
+   —— 合计 0 行
+```
+
+⇒ 生产 20 行 WITHDRAWN **全部**是「合法撤销、恢复能还原」的那种。
+**§3.4 预测的损伤在生产尚未发生**，B1 是纯预防，**回填无对象、本项关闭**。
+⚠️ 脚本里写死了 codex 给的反例：`scripts/reset_for_rechunk.py` 只改 content/chunk 状态、
+不碰 `approval_status`，能把合法的 `WITHDRAWN/PENDING_APPROVAL` 变成 `WITHDRAWN/NOT_STARTED`
+⇒ 该谓词**不等价于**「被退役误伤」，输出只能当人工归因候选，**永远不许直接当回填目标**。
+
+### 顺带上报：一条独立的既存缺陷（本批不做）
+
+codex 在核 B1 时挖出来的：退役**只改当前版本**的 `dv.status`（`kb_console.py:3409`），
+而 stage-1 的认领谓词只看 `content_process_status='NOT_STARTED' AND canonical_json_key IS NULL
+AND dv.status='active'` —— **不看 `document_meta.status`**。
+⇒ 一篇已退役文档的**旧 active 版本**若满足那三条，**退役后仍会被 stage-1 认领摄取**。
+与 approval_status 无关，属「整篇退役是否该阻止旧活跃版本继续摄取」的独立业务问题。
+（本次 prod-ro 快照未查该形态的存量，如需可加一条只读查询。）
+
 ## 5. 修复批次（本文的拆分，**与报告 §8 不同**）
 
 报告 §8 按「问题类型」分批。我按**能不能一起验、会不会互相踩、需不需要你放行**重排 ——
