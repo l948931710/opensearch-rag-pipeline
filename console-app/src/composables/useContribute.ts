@@ -111,7 +111,9 @@ const loadErrors = ref<Record<string, string>>({})
 const inflight = ref<Set<string>>(new Set())
 
 // 提交端归属节点（node 轴，schema/067 + Sam 裁决 F/G）。三态与后端 available 对齐：
-//   myDeptsReady=false        → 还没问过后端（openModal 时按组码轴渲染，与改造前一致）
+//   myDeptsReady=false        → 还没问过后端 ⇒ **归属未定**：openModal 留空、禁用提交，
+//                               等答复到达再定轴（评审 C3：此前这一态被压进「算不出」，
+//                               加载中开弹窗即静默落 legacy 行）
 //   myDeptsReady && !myDepts  → 后端说「算不出」（flag 关 / 未在册 / 快照不可用）→ 组码轴
 //   myDeptsReady && myDepts   → node 轴：1 个只读展示、多个下拉选
 const myDepts = ref<MyDeptItem[]>([])
@@ -306,6 +308,9 @@ async function loadMyDepts() {
     myDepts.value = []   // 404（未上线）/网络失败 → 组码轴，静默
   } finally {
     myDeptsReady.value = true
+    // 弹窗可能在答复到达之前就被打开了（归属那时留空、提交被禁用）——此刻补定轴，
+    // 否则用户会卡在「归属加载中」永不解锁（评审 C3）。
+    if (modalOpen.value) applyOwnerDefaults(lastPrefill)
   }
 }
 
@@ -315,11 +320,23 @@ async function loadMyDepts() {
 // 方案 M11：`deptId` = 重开时的**原 node 归属**。legacy 行（deptId 空）一律回落 my-depts
 // 默认项，🔴 **绝不从 prefill.dept 反推 node 归属**（组码→dept_id 一对多，反推会把 M8
 // 明令禁止的推断性映射从前端绕回来）。
-function openModal(prefill?: { question?: string; content?: string; dept?: string; deptId?: number | null; sourceMessageId?: string; gapQuery?: string; warning?: string }) {
+type ContribPrefill = { question?: string; content?: string; dept?: string; deptId?: number | null; sourceMessageId?: string; gapQuery?: string; warning?: string }
+// 打开弹窗时的 prefill —— loadMyDepts 落地后要用它补定轴（见下），故必须留一份。
+let lastPrefill: ContribPrefill | undefined
+
+/** 定「归属轴」。**三态**，不是两态（评审 C3）——`ready=false` 与 `ready && 空` 必须分开。 */
+function applyOwnerDefaults(prefill?: ContribPrefill) {
   const s = useSession()
-  formQuestion.value = prefill?.question || ''
-  formContent.value = prefill?.content || ''
-  if (myDepts.value.length) {
+  if (!myDeptsReady.value) {
+    // 🔴 **加载中 ≠ 算不出**。/my-depts 是 onMounted 里 fire-and-forget 拉的，在它回来之前
+    // myDepts 恒为空数组——若此时就按空数组走组码分支，弹窗会渲染成组码轴、提交出去的是
+    // legacy 行，**静默降轴**：本该归 node 管理员审的贡献落到组码受众（现网多数组码已无人
+    // 持 grant ⇒ 实际落 kb_admin 孤儿兜底），提交人毫无察觉。
+    // :113-116 的三态注释一直写着这个区分，只是从前没有任何地方读 myDeptsReady——契约与实现脱节。
+    // 处置：归属留空 + modal 渲染「归属加载中」并禁用提交，待 loadMyDepts 落地后本函数被重调。
+    formDeptId.value = null
+    formDept.value = ''
+  } else if (myDepts.value.length) {
     // node 轴：原归属仍在可选集里就沿用，否则取默认（第一项）
     const keep = prefill?.deptId != null
       && myDepts.value.some((d) => d.dept_id === prefill.deptId)
@@ -333,6 +350,13 @@ function openModal(prefill?: { question?: string; content?: string; dept?: strin
     formDept.value = (prefill?.dept && valid(prefill.dept)) ? prefill.dept
       : (valid(own) ? own : (CONTRIB_DEPT_OPTS[0]?.id || ''))
   }
+}
+
+function openModal(prefill?: ContribPrefill) {
+  formQuestion.value = prefill?.question || ''
+  formContent.value = prefill?.content || ''
+  lastPrefill = prefill
+  applyOwnerDefaults(prefill)
   formSourceMsg.value = prefill?.sourceMessageId || ''
   formGapQuery.value = prefill?.gapQuery || ''
   formWarning.value = prefill?.warning || ''
@@ -343,6 +367,9 @@ function closeModal() { modalOpen.value = false }
 
 async function submitContribution(): Promise<boolean> {
   if (submitBusy.value) return false
+  // 评审 C3：归属轴未定就提交 = 静默落 legacy 行。按钮已 disabled，这里再堵一次——
+  // disabled 只是 UI，键盘回车 / 直调 composable / 竞态点击都绕得过去。
+  if (!myDeptsReady.value) { submitErr.value = '归属部门加载中，请稍候再提交'; return false }
   const q = formQuestion.value.trim(); const c = formContent.value.trim()
   if (!q) { submitErr.value = '请填写问题'; return false }
   if (!c) { submitErr.value = '请填写答案/知识内容'; return false }

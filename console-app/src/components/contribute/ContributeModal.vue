@@ -11,7 +11,7 @@ import { useContribute } from '@/composables/useContribute'
 // /api/kb/org-tree（employee 恒 403，且响应含管辖字段）。
 const {
   modalOpen, formQuestion, formContent, formDept, formDeptId, formWarning, submitBusy, submitErr,
-  myDepts, CONTRIB_DEPT_OPTS, closeModal, submitContribution,
+  myDepts, myDeptsReady, CONTRIB_DEPT_OPTS, closeModal, submitContribution,
 } = useContribute()
 
 const nodeAxis = computed(() => myDepts.value.length > 0)
@@ -93,10 +93,10 @@ const soleDeptName = computed(() => (myDepts.value.length === 1 ? myDepts.value[
             @click="closeModal"
           >取消</button>
           <button
-            type="button" :disabled="submitBusy"
+            type="button" :disabled="submitBusy || !myDeptsReady"
             class="rounded-lg bg-primary px-4 py-2 text-[13px] font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
             @click="submitContribution"
-          >{{ submitBusy ? '提交中…' : '提交贡献' }}</button>
+          >{{ submitBusy ? '提交中…' : (!myDeptsReady ? '归属加载中…' : '提交贡献') }}</button>
         </div>
       </div>
     </div>

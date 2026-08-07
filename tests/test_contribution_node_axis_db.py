@@ -435,6 +435,56 @@ def test_submit_rejects_inactive_node(db, monkeypatch):
         assert cur.fetchone()[0] == 0, "被拒的提交绝不能留下 pending 行"
 
 
+# ── 评审 C1：提交端的**归属越界**校验（服务端不信客户端传值，Sam 2026-08-07 裁决）──
+@requires_local_db
+def test_submit_rejects_node_outside_own_depts(db, monkeypatch):
+    """`my-depts` 的收窄若只做在前端，构造 POST 就能把贡献投进任意部门的待审队列。
+
+    _AUTHOR 直属 _D2，而 _D2 有活跃子节点 _D3 ⇒ 按裁决 G 他的可选集恰为 {_D3}。
+    _D1 同样 active、且是他的**上级**——正因为「active」和「跟我有关系」是两回事，
+    只查 active 的老实现会放行它。
+    """
+    from fastapi import HTTPException
+
+    from opensearch_pipeline import api
+    from opensearch_pipeline.routes import contribution as CT
+    _kb_db, op_db = _dbs()
+    _seed(db)
+    _no_rate_limit(monkeypatch)
+    monkeypatch.setattr(CT, "_node_acl_grant_on", lambda: True)
+    _clear_caches()
+
+    for target, why in ((_D1, "上级中心（active 但不是我的可选集）"),
+                        (_ORPHAN, "无关的另一个一级中心")):
+        with pytest.raises(HTTPException) as ei:
+            api.kb_contribution_submit(
+                req=api.KbContributionSubmitRequest(
+                    question=f"越界提交测试问题 {target}？",
+                    content="正文正文正文正文正文正文正文正文。",
+                    category_dept_id=target),
+                request=None, identity=_become(monkeypatch, _AUTHOR))
+        assert ei.value.status_code == 403, why
+    db.commit()
+    with db.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {op_db}.kb_contribution"
+                    " WHERE question LIKE '越界提交测试%%'")
+        assert cur.fetchone()[0] == 0, "被拒的越界提交绝不能留下 pending 行"
+
+    # 反证锚：同一条路径上，**自己可选集内**的节点必须照常放行——否则上面的 403
+    # 可能只是「node 提交整条挂了」，而不是「越界被挡住」。
+    _clear_caches()
+    api.kb_contribution_submit(
+        req=api.KbContributionSubmitRequest(
+            question="可选集内提交应当成功？", content="正文正文正文正文正文正文正文正文。",
+            category_dept_id=_D3),
+        request=None, identity=_become(monkeypatch, _AUTHOR))
+    db.commit()
+    with db.cursor() as cur:
+        cur.execute(f"SELECT category_dept_id FROM {op_db}.kb_contribution"
+                    " WHERE question LIKE '可选集内提交应当成功%%'")
+        assert [r[0] for r in cur.fetchall()] == [_D3]
+
+
 # ── 用例 7：flag 关 ⇒ 提交 node 贡献 400（裁决 E，不静默回落组码轴）────────
 @requires_local_db
 def test_submit_node_contribution_rejected_when_flag_off(db, monkeypatch):

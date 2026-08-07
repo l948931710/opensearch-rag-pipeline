@@ -530,15 +530,21 @@ def _materialize_contribution_node(conn, *, doc_id: str, owner_dept_id: int, raw
     appr = "PENDING" if requires_approval else "APPROVED"
     oid = int(owner_dept_id)
 
+    # ⚠️ capability 检查**必须早于 put_object**（评审 R2）：060 未 apply 时这条路径是
+    # **确定性**失败（capability 不会自愈），而 docstring 那句「raw_key 固定、重试写同一对象、
+    # 不产生孤儿」的免责只对**可恢复**失败成立——永远等不到成功的那一次覆盖，每次 accept/retry
+    # 都留一个再也不会被写第二次的 OSS 对象。检查前移是纯顺序调整，正常路径语义零变化。
+    with conn.cursor() as cur:
+        if _kb_node_capability(cur) != "present":
+            # 060 未 apply ⇒ 写不出合法的 node 文档；宁可失败可重试，也不退化成 legacy
+            # （退化 = owner_dept 落 NULL/空 + 无 grant，文档谁都搜不到且归属不可判）
+            raise RuntimeError("node-ACL schema 未就绪（060 未 apply），拒绝以 node 归属登记")
+
     if not put_object(raw_key, data, "text/markdown; charset=utf-8"):
         raise RuntimeError("OSS 写入合成文档失败")
 
     try:
         with conn.cursor() as cur:
-            if _kb_node_capability(cur) != "present":
-                # 060 未 apply ⇒ 写不出合法的 node 文档；宁可失败可重试，也不退化成 legacy
-                # （退化 = owner_dept 落 NULL/空 + 无 grant，文档谁都搜不到且归属不可判）
-                raise RuntimeError("node-ACL schema 未就绪（060 未 apply），拒绝以 node 归属登记")
             # 幂等：固定 raw_key 已登记 → 直接返回（续跑/竞态安全；谓词同 legacy 版走 raw_key_hash 索引）
             cur.execute(f"SELECT doc_id, version_no FROM {_kb_db()}.document_version "
                         "WHERE raw_key=%s AND (raw_key_hash=%s OR raw_key_hash IS NULL) LIMIT 1",
@@ -723,6 +729,79 @@ class KbMyDeptsResponse(BaseModel):
 
 
 _MY_DEPTS_CAP = 200
+# 单人直属部门数上限。超过即判「算不出」而**不是**取前 N 个（评审 R3，Codex 建议）：
+# 静默取前 8 会让第 9 个部门的人**永远选不到自己的部门**且无任何痕迹，排查时看到的现象是
+# 「下拉里就是没有」。现网实测最大 5（1164 名在册员工，>8 者 0 人）⇒ 这是潜伏闸，不是活跃截断。
+_MY_DEPTS_DIRECT_MAX = 8
+
+
+def _resolve_my_dept_ids(cur, user_id: str) -> Optional[Dict[int, str]]:
+    """调用者可选的贡献归属节点 → `{dept_id: name}`，或 **None**（= 算不出，≠ 没得选）。
+
+    **提交端与查询端的唯一真相**（评审 C1）：`/api/kb/my-depts` 渲染它，
+    `kb_contribution_submit` 用它**拒绝**不在集合内的 `category_dept_id`。
+    两边必须同源——否则前端收窄了、后端没收窄，等于只在 UI 上"限制"，
+    任一登录员工构造 POST 即可把贡献投进任意部门的待审队列并触发钉钉通知给对方管理员。
+    （legacy 组码轴历来同样不校验成员身份，故这是**平权修复**；Sam 2026-08-07 裁决补校验。）
+
+    返回规则（裁决 G —— 直挂上级节点者可选下级）。对调用者所在的每个节点 N：
+      · N **无**活跃子节点（叶子）⇒ 收 `N` 自己
+      · N **有**活跃子节点       ⇒ 收 **N 的直接子节点集**（不含 N 自己）
+    ⚠️ 有意**不做**任何向上/向下的多级推导——只看一层，与 `_contrib_can_manage` 的
+    「代码不做归属推导」同一纪律。
+
+    None 的四种来源（一律 fail-closed，调用方**绝不**当成"随便选"）：flag 关 / 不在册 /
+    直属部门数超 `_MY_DEPTS_DIRECT_MAX` / 快照读失败。
+    """
+    if not _node_acl_grant_on():
+        return None
+    from opensearch_pipeline.dingtalk_identity import _load_direct_dept_ids
+    raw = _load_direct_dept_ids(user_id)
+    if not raw:
+        return None            # staff_dim 不可用 / 该人不在册 ⇒ 算不出
+    # dept_id<=1 = 虚拟根，全仓既有约定即排除（dept_ancestry.py:222-224 的祖先链、
+    # kb_authz.authorize_upload_node 的 oid<=1 门槛都是同一门槛），不是本函数的静默丢弃。
+    direct = [d for d in dict.fromkeys(int(x) for x in raw) if d > 1]
+    if not direct:
+        return None
+    if len(direct) > _MY_DEPTS_DIRECT_MAX:
+        logger.warning("user=%s 直属部门 %d 个，超过 %d ⇒ 贡献归属判为「算不出」"
+                       "（不截断取前 N：静默取前 N 会让其余部门永远选不到且无痕迹）",
+                       user_id, len(direct), _MY_DEPTS_DIRECT_MAX)
+        return None
+    try:
+        ph = ",".join(["%s"] * len(direct))
+        cur.execute(
+            f"SELECT dept_id, parent_id, name FROM {_kb_db()}.dept_dim"
+            f" WHERE is_active=1 AND (dept_id IN ({ph}) OR parent_id IN ({ph}))",
+            tuple(direct) * 2)
+        rows = cur.fetchall() or []
+    except Exception as e:   # noqa: BLE001 — 快照读失败 ⇒ 算不出（fail-closed）
+        logger.warning("_resolve_my_dept_ids 组织快照读取失败（算不出）user=%s: %s", user_id, e)
+        return None
+    direct_set = set(direct)
+    self_by_id = {int(r[0]): (r[2] or "") for r in rows if int(r[0]) in direct_set}
+    children: Dict[int, List[tuple]] = {}
+    for r in rows:
+        pid = int(r[1] or 0)
+        if pid in direct_set and int(r[0]) != pid:
+            children.setdefault(pid, []).append((int(r[0]), r[2] or ""))
+    picked: Dict[int, str] = {}
+    for d in direct:
+        kids = children.get(d)
+        if kids:
+            for kid_id, kid_name in kids:
+                picked.setdefault(kid_id, kid_name)
+        elif d in self_by_id:
+            picked.setdefault(d, self_by_id[d])
+    if not picked:
+        return None            # 直属部门全不在活跃快照里 ⇒ 同样是「算不出」
+    if len(picked) > _MY_DEPTS_CAP:
+        # 同上：宁可判「算不出」也不静默截断（这里是子节点数爆炸，同样不该悄悄少给）
+        logger.warning("user=%s 可选归属节点 %d 个，超过 %d ⇒ 判为「算不出」",
+                       user_id, len(picked), _MY_DEPTS_CAP)
+        return None
+    return picked
 
 
 @router.get("/api/kb/my-depts", response_model=KbMyDeptsResponse)
@@ -745,49 +824,21 @@ def kb_my_depts(request: Request, identity: Optional[Identity] = Depends(current
         raise HTTPException(status_code=401, detail="需要登录")
     if not _node_acl_grant_on():
         return KbMyDeptsResponse(items=[], available=False)
-    from opensearch_pipeline.dingtalk_identity import _load_direct_dept_ids
-    direct = _load_direct_dept_ids(identity.user_id)
-    if not direct:
-        # staff_dim 不可用 / 该人不在册 ⇒ 算不出（≠ 无部门）
-        return KbMyDeptsResponse(items=[], available=False)
-    direct = [d for d in dict.fromkeys(int(x) for x in direct) if d > 1][:8]
-    if not direct:
-        return KbMyDeptsResponse(items=[], available=False)
     try:
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                ph = ",".join(["%s"] * len(direct))
-                cur.execute(
-                    f"SELECT dept_id, parent_id, name FROM {_kb_db()}.dept_dim"
-                    f" WHERE is_active=1 AND (dept_id IN ({ph}) OR parent_id IN ({ph}))",
-                    tuple(direct) * 2)
-                rows = cur.fetchall() or []
+                picked = _resolve_my_dept_ids(cur, identity.user_id)
         finally:
             conn.close()
     except Exception as e:
         logger.warning("kb_my_depts 组织快照读取失败（算不出）: %s", e)
         return KbMyDeptsResponse(items=[], available=False)
-    self_by_id = {int(r[0]): (r[2] or "") for r in rows if int(r[0]) in set(direct)}
-    children: Dict[int, List[tuple]] = {}
-    for r in rows:
-        pid = int(r[1] or 0)
-        if pid in set(direct) and int(r[0]) != pid:
-            children.setdefault(pid, []).append((int(r[0]), r[2] or ""))
-    picked: Dict[int, str] = {}
-    for d in direct:
-        kids = children.get(d)
-        if kids:
-            for kid_id, kid_name in kids:
-                picked.setdefault(kid_id, kid_name)
-        elif d in self_by_id:
-            picked.setdefault(d, self_by_id[d])
     if not picked:
-        # 直属部门全不在活跃快照里 ⇒ 同样是「算不出」，不是「没得选」
         return KbMyDeptsResponse(items=[], available=False)
     items = [KbMyDeptItem(dept_id=i, name=(n or f"节点 {i}"))
-             for i, n in sorted(picked.items())][:_MY_DEPTS_CAP]
+             for i, n in sorted(picked.items())]
     return KbMyDeptsResponse(items=items, available=True)
 
 
@@ -798,8 +849,12 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
 
     两根归属轴（方案 M9/M10，Sam 裁决 A/E）：
       · `category_dept_id` 给出 ⇒ **node 轴**。要求 `RAG_NODE_ACL_GRANT` 开 + schema/067 已
-        apply + 该节点在 `dept_dim` 里 active（M5 第 1 处：服务端不信客户端传值——否则会存下
-        指向已停用/不存在节点的 pending 行，要等 accept 才失败）。任一不满足 ⇒ **400 拒绝**，
+        apply + 该节点在 `dept_dim` 里 active（M5 第 1 处）+ **该节点在提交人自己的可选集内**
+        （评审 C1，Sam 2026-08-07 裁决）。前两道挡的是脏数据落库（否则存下指向死节点的
+        pending 行，要等 accept 才失败）；第三道挡的是**越界投稿**——`my-depts` 的收窄若只做在
+        前端，任一登录员工构造 POST 即可把贡献投进任意部门的待审队列并触发钉钉通知给对方管理员。
+        可选集与 `/api/kb/my-depts` **同源**（`_resolve_my_dept_ids`），杜绝两处口径分裂。
+        任一不满足 ⇒ **400/403 拒绝**，
         **绝不静默回落组码轴**（裁决 E；对齐 `kb_console.py:2658-2663` 的上传行为）。
         组码列写空串哨兵——理由同 060 给 node 文档写 `owner_dept=NULL`：留组码残值 =
         node 行会被旧组码管理员的作用域命中（越权），见 `_contrib_axis_present` 头注。
@@ -860,6 +915,17 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
                         raise HTTPException(status_code=400,
                                             detail="贡献归属节点通道未就绪（schema/067 未 apply）")
                     _assert_node_active(cur, node_id)
+                    # 评审 C1：归属必须落在提交人自己的可选集内（与 /api/kb/my-depts 同源）。
+                    # 「算不出」（None）同样拒绝——fail-closed：宁可让这个人退回组码轴提交，
+                    # 也不能因为查不出他的部门就放行任意节点。
+                    _allowed = _resolve_my_dept_ids(cur, identity.user_id)
+                    if not _allowed or node_id not in _allowed:
+                        logger.warning("越界贡献归属被拒 user=%s node=%s allowed=%s",
+                                       identity.user_id, node_id,
+                                       sorted(_allowed) if _allowed else None)
+                        raise HTTPException(
+                            status_code=403,
+                            detail="只能把贡献挂在自己所在的部门下（归属节点不在你的可选范围内）")
                     cur.execute(
                         f"""
                         INSERT INTO {_op_db()}.kb_contribution
@@ -1375,6 +1441,16 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
                 conn.rollback()
                 raise HTTPException(status_code=400,
                                     detail="贡献归属节点通道未就绪（schema/067 未 apply）")
+            # 📌 **跨轴迁移契约是刻意单向的**（评审 R5，Sam 2026-08-07 确认为设计意图）：
+            #   · legacy 行 + 传 `category_dept_id` ⇒ **升轴**为 node 归属，**允许**——
+            #     这是存量 legacy 贡献逐条迁到 node 轴的唯一在线入口（M8 那种批量脚本
+            #     只处理已知白名单，日常行只能靠审核人在采纳时指定）。
+            #     升轴后该行同时留有 `category_dept` 旧值与 `category_dept_id`（M8 同形），
+            #     判定上安全：轴隔离规定 id 非空即**只**看 node，组码腿永不命中它。
+            #   · node 行改回组码 ⇒ **拒绝**（下方显式 400）——降轴会让已按 node 授权过的
+            #     归属悄悄回到组码受众，且审核人以为改成功了。
+            # 两个方向都要走下面的双端管辖（源 `_contrib_can_manage` + 目标 authorize_*），
+            # 所以「允许升轴」不等于「谁都能把别人的贡献捞进自己子树」。
             final_dept_id = req_dept_id if req_dept_id is not None else cur_dept_id
             if final_dept_id is not None and req.category_dept:
                 conn.rollback()
@@ -1402,7 +1478,14 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
             # kb_admin 自己采纳 public 的 decision 本就不带该标记 → 照旧直通（其即终审）。
             if final_dept_id is not None:
                 # M5 第 2 处：节点可能在提交之后被停用 —— can_manage_doc 只判后代集、不判 active
-                _assert_node_active(cur, final_dept_id, status=403)
+                # 显式 rollback 后再抛（评审 R4）：本块内其余每个出口都显式回滚，只有这里
+                # 曾靠 `finally: conn.close()` 的隐式回滚兜底。403/503 都会带着 FOR UPDATE
+                # 的行锁一路持到 close，与相邻分支的写法也不一致。
+                try:
+                    _assert_node_active(cur, final_dept_id, status=403)
+                except HTTPException:
+                    conn.rollback()
+                    raise
                 decision = kb_authz.authorize_upload_node(
                     kb, final_dept_id, chosen_perm, descendants=_kb_managed_descendants(kb))
                 _target_label = f"节点 {final_dept_id}"

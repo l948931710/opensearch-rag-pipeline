@@ -25,6 +25,15 @@ function withSession(over: Record<string, any> = {}) {
 
 beforeEach(() => { vi.restoreAllMocks(); __resetContribute() })
 
+// 评审 C3 起 `myDeptsReady` 是**门**而不只是标志位：三态里的「还没问过后端」会让归属留空、
+// 提交被拒。下面这些用例断言的是**组码轴**行为，对应的是第三态「问过了、后端说算不出」——
+// 必须显式摆到那一态，不能靠「反正初值是空数组」蒙混（那正是被修掉的缺陷）。
+function markMyDeptsResolvedUnavailable() {
+  const { myDeptsReady, myDepts } = useContribute()
+  myDepts.value = []
+  myDeptsReady.value = true
+}
+
 describe('lib/kb — 贡献状态/缺口词表', () => {
   it('5 态徽章 label/tone', () => {
     expect(contribStateLabel('pending')).toBe('待审核')
@@ -85,6 +94,7 @@ describe('useContribute', () => {
 
   it('openModal 默认归属取本部门，prefill 优先', () => {
     withSession({ aclGroups: ['finance'] })
+    markMyDeptsResolvedUnavailable()
     const { openModal, formDept, formQuestion } = useContribute()
     openModal()
     expect(formDept.value).toBe('finance')          // 本部门兜底
@@ -93,8 +103,42 @@ describe('useContribute', () => {
     expect(formQuestion.value).toBe('如何报销')
   })
 
+  // ── 评审 C3 回归锚：加载中 ≠ 算不出 ─────────────────────────────────────────
+  it('my-depts 未落地时：归属留空、提交被拒、不发 POST（防静默降轴）', async () => {
+    withSession({ aclGroups: ['finance'] })
+    const fetchSpy = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}), text: async () => '{}' }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { openModal, formDept, formDeptId, submitContribution, submitErr, formQuestion, formContent } = useContribute()
+    // 刻意**不**调 loadMyDepts —— 复刻 onMounted 的请求尚未返回
+    openModal()
+    expect(formDept.value).toBe('')      // 不落组码轴
+    expect(formDeptId.value).toBe(null)  // 也不落 node 轴 —— 归属未定
+    formQuestion.value = '丧假可以分开请吗'
+    formContent.value = '可以，按人事规定分次申请。'
+    expect(await submitContribution()).toBe(false)
+    expect(submitErr.value).toContain('加载中')
+    expect(fetchSpy).not.toHaveBeenCalled()   // 反证锚：一个 POST 都不许漏出去
+  })
+
+  it('my-depts 落地后自动补定轴：弹窗已开着也要解锁成 node 轴', async () => {
+    withSession({ aclGroups: ['finance'] })
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ items: [{ dept_id: 34265162, name: '人力资源部' }], available: true }),
+      text: async () => '{}',
+    })))
+    const { openModal, loadMyDepts, formDept, formDeptId, myDeptsReady } = useContribute()
+    openModal()                       // 先开弹窗（此时 ready=false）
+    expect(formDeptId.value).toBe(null)
+    await loadMyDepts()               // 答复到达
+    expect(myDeptsReady.value).toBe(true)
+    expect(formDeptId.value).toBe(34265162)   // 自动补定成 node 轴，不用用户重开弹窗
+    expect(formDept.value).toBe('')           // 组码留空（两轴互斥）
+  })
+
   it('submit 空问题不发请求、给错误提示', async () => {
     withSession()
+    markMyDeptsResolvedUnavailable()
     const fetchSpy = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}), text: async () => '{}' }))
     vi.stubGlobal('fetch', fetchSpy)
     const { openModal, formContent, submitContribution, submitErr } = useContribute()
@@ -179,6 +223,7 @@ describe('MyContributions — 重交/失败原因/原稿展开（批次ε-2）',
   }
 
   it('rejected 行显「修改重交」→ 弹窗带旧稿+原归属，提交体继承溯源；空驳回理由有兜底句', async () => {
+    markMyDeptsResolvedUnavailable()
     const w = mountMine([{ ...BASE, state: 'rejected', review_status: 'rejected', review_note: '', source_message_id: 'm9', gap_query: '报销凭证保存年限' }])
     expect(w.text()).toContain('未填写驳回理由')
     await w.find('[data-testid="mycontrib-reopen"]').trigger('click')
