@@ -170,3 +170,38 @@ def test_ops_monitor_includes_new_jobs(monkeypatch):
     # 模拟态下两作业 no-op（skipped），但心跳挂点仍被调用
     assert all(r.get("skipped") == "simulate" for r in reports.values())
     assert beats == [1]
+
+
+# ── 2026-08-07：心跳库必须钉死，不得随 RAG_ENV 漂移 ─────────────────────────
+
+def test_heartbeat_db_is_pinned_to_operation_db_not_rds_database():
+    """🔴 原实现用 `cfg.rds.database` ⇒ 心跳库随 `RAG_ENV` 漂移，实测后果：
+
+    qa-rollup 跑 `RAG_ENV=metrics`（RAG_RDS_DATABASE=fuling_operation）⇒ 写 fuling_operation；
+    ops-monitor/serving 跑 prod_ro/production（=fuling_knowledge）⇒ 读 fuling_knowledge。
+    **写的表没人读、读的表没人写**，死人开关空转 —— 生产两个库里各有一行互不相干的心跳，
+    时间戳差 13 小时。任何 GRANT 都修不了这个（它不是权限问题）。
+    """
+    import ast
+    import pathlib
+    src = pathlib.Path("opensearch_pipeline/queue_monitor.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for fn_name in ("write_heartbeat", "read_heartbeat_age_hours"):
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+        body = ast.unparse(fn)
+        assert "_op_db()" in body, f"{fn_name} 必须用 _op_db() 钉死心跳库"
+        assert "cfg.rds.database" not in body, (
+            f"{fn_name} 又用回了 cfg.rds.database —— 心跳库会随 RAG_ENV 漂移，读写分叉")
+
+
+def test_op_db_is_stable_across_env_labels(monkeypatch):
+    """行为锚：`RAG_RDS_DATABASE` 变了，心跳库**不变**。"""
+    from opensearch_pipeline import queue_monitor as qm
+    from opensearch_pipeline.config import get_config
+    cfg = get_config()
+    monkeypatch.setattr(cfg.rds, "database", "fuling_operation")
+    a = qm._op_db()
+    monkeypatch.setattr(cfg.rds, "database", "fuling_knowledge")
+    b = qm._op_db()
+    assert a == b == cfg.rds.operation_database, f"心跳库随 rds.database 漂了：{a} vs {b}"

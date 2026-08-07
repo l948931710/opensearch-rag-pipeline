@@ -44,6 +44,11 @@ def _dbs():
     return cfg.rds.database, cfg.rds.operation_database
 
 
+def _op_db() -> str:
+    """运营库名。心跳表钉在这里（与 `runtime_contract.py` 同库同表），**不随 RAG_ENV 漂移**。"""
+    return _dbs()[1]
+
+
 def _one(cur, sql: str, params=()) -> tuple:
     cur.execute(sql, params)
     row = cur.fetchone()
@@ -218,13 +223,20 @@ def write_heartbeat() -> bool:
         cfg = get_config()
         if cfg.simulate or cfg.simulate_db:
             return False
-        kb_db = cfg.rds.database
+        # 🔴 2026-08-07：心跳库**必须钉死**，不能用 `cfg.rds.database`。
+        # 原实现随 `RAG_ENV` 漂移：qa-rollup 跑 `RAG_ENV=metrics`（RAG_RDS_DATABASE=
+        # fuling_operation）⇒ 写 fuling_operation；ops-monitor 跑 prod_ro / serving 跑 production
+        # （=fuling_knowledge）⇒ 读 fuling_knowledge。**写的表没人读、读的表没人写**，
+        # 死人开关等于空转。实测两个库里各有一行互不相干的心跳，时间戳相差 13 小时。
+        # 钉到 `_op_db()`：`rag_runtime_contract` 的既有主人就是它
+        # （runtime_contract.py:49 的 embedding 契约行同表同库），心跳是运维产物、本就该在运营库。
+        hb_db = _op_db()
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn(select_db=False)
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"INSERT INTO {kb_db}.rag_runtime_contract (contract_key, contract_value)"
+                    f"INSERT INTO {hb_db}.rag_runtime_contract (contract_key, contract_value)"
                     " VALUES (%s, DATE_FORMAT(UTC_TIMESTAMP(), '%%Y-%%m-%%dT%%H:%%i:%%sZ'))"
                     " ON DUPLICATE KEY UPDATE contract_value = VALUES(contract_value)",
                     (_HEARTBEAT_KEY,))
@@ -249,14 +261,15 @@ def read_heartbeat_age_hours() -> Optional[float]:
         cfg = get_config()
         if cfg.simulate or cfg.simulate_db:
             return None
-        kb_db = cfg.rds.database
+        # 与 write_heartbeat 同库（见那边的说明）——读写必须钉同一个库，否则死人开关空转。
+        hb_db = _op_db()
         from opensearch_pipeline.db import _get_db_conn
         conn = _get_db_conn(select_db=False)
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT TIMESTAMPDIFF(MINUTE, STR_TO_DATE(contract_value, '%%Y-%%m-%%dT%%H:%%i:%%sZ'),"
-                    f" UTC_TIMESTAMP()) FROM {kb_db}.rag_runtime_contract WHERE contract_key = %s",
+                    f" UTC_TIMESTAMP()) FROM {hb_db}.rag_runtime_contract WHERE contract_key = %s",
                     (_HEARTBEAT_KEY,))
                 row = cur.fetchone()
                 if not row:
