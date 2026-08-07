@@ -119,6 +119,14 @@ def _slo_thresholds() -> Dict[str, float]:
         # 无历史（全新部署/qa_daily_metrics 空）→ 不判（bootstrap 不误报）。
         "traffic_drop_ratio": _f("RAG_SLO_TRAFFIC_DROP_RATIO", 0.3),
         "traffic_min_base": _f("RAG_SLO_TRAFFIC_MIN_BASE", 10),
+        # 2026-08-06：比率型 SLO 的**最小样本量**。现网实测日均 ~7 条查询
+        # （qa_session_log 近 30 天 n=207，峰值 0.05 QPS），n=3 时一条 no-result 就把
+        # no_result_rate 打到 1.000 —— 阈值 0.15 必然击穿。这不是服务劣化，是样本量噪声：
+        # 08-04(n=3) / 07-27(n=5) 的历史 breach 全属此类，把 exit=2 变成了日常。
+        "min_sample": _f("RAG_SLO_MIN_SAMPLE", 20),
+        # 但**全军覆没不是噪声**：应答率恰好 0 / 无结果率恰好 1.0 是定性信号（"一条都没成"），
+        # 与 0.6 vs 0.75 这种边缘值不同 —— 低样本下仍按真 breach 报。
+        "total_failure_min_n": _f("RAG_SLO_TOTAL_FAILURE_MIN_N", 3),
     }
 
 
@@ -155,19 +163,51 @@ def evaluate_slos(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> Dict
             breaches.append({"slo": "traffic_collapse",
                              "threshold": round(thresholds.get("traffic_drop_ratio", 0.3) * base, 1),
                              "value": total_q})
+    # ── 比率/分位型 SLO：受最小样本量门槛约束 ────────────────────────────────
+    # 🔴 **低样本下不静默丢弃**：够不到样本量的击穿进 `low_confidence`，仍出现在报告里、
+    # 仍随真 breach 一起发出去，只是**不单独触发 page**。silently dropping 会把
+    # "指标失效" 伪装成 "服务健康"，那与本仓一路在修的静默截断是同一族错误。
+    # ⚠️ `total_queries` **缺失 = unknown，不是 0**。按 0 处理等于"没给这个字段 ⇒ 所有比率
+    # SLO 静音"，那是把门槛做成了全局静音开关（既有单测
+    # `test_evaluate_slos_breach_and_clean` 当场抓到）。同仓「缺 assets 键=unknown≠空集」纪律。
+    n = metrics.get("total_queries")
+    min_n = thresholds.get("min_sample", 20)
+    tf_n = thresholds.get("total_failure_min_n", 3)
+    low_conf: List[Dict[str, Any]] = []
+
+    def _ratio(slo, value, threshold, breached, *, total_failure=False):
+        """total_failure=True ⇒ 定性信号（一条都没成），低样本下**仍是真 breach**。"""
+        if value is None or not breached:
+            return
+        item = {"slo": slo, "threshold": threshold, "value": value, "sample": n}
+        if n is None or n >= min_n or (total_failure and n >= tf_n):
+            if total_failure and n < min_n:
+                item["note"] = "全军覆没（低样本但定性成立）"
+            breaches.append(item)
+        else:
+            item["note"] = f"样本量 {n} < {min_n:.0f}，比率不可信，不单独告警"
+            low_conf.append(item)
+
     ar = metrics.get("answer_rate")
-    if ar is not None and ar < thresholds["answer_rate_min"]:
-        breaches.append({"slo": "answer_rate_min", "threshold": thresholds["answer_rate_min"], "value": ar})
+    _ratio("answer_rate_min", ar, thresholds["answer_rate_min"],
+           ar is not None and ar < thresholds["answer_rate_min"],
+           total_failure=(ar == 0.0))
     nrr = metrics.get("no_result_rate")
-    if nrr is not None and nrr > thresholds["no_result_rate_max"]:
-        breaches.append({"slo": "no_result_rate_max", "threshold": thresholds["no_result_rate_max"], "value": nrr})
-    p95 = metrics.get("p95_latency_ms")
-    if p95 is not None and p95 > thresholds["p95_latency_ms_max"]:
-        breaches.append({"slo": "p95_latency_ms_max", "threshold": thresholds["p95_latency_ms_max"], "value": p95})
+    _ratio("no_result_rate_max", nrr, thresholds["no_result_rate_max"],
+           nrr is not None and nrr > thresholds["no_result_rate_max"],
+           total_failure=(nrr == 1.0))
     er = metrics.get("error_rate")
-    if er is not None and er > thresholds["error_rate_max"]:
-        breaches.append({"slo": "error_rate_max", "threshold": thresholds["error_rate_max"], "value": er})
-    return {"ok": not breaches, "breaches": breaches}
+    _ratio("error_rate_max", er, thresholds["error_rate_max"],
+           er is not None and er > thresholds["error_rate_max"],
+           total_failure=(er == 1.0))
+    p95 = metrics.get("p95_latency_ms")
+    # p95 没有"全军覆没"对应物：n=3 的 p95 就是最大值，纯噪声，只受样本量门槛。
+    _ratio("p95_latency_ms_max", p95, thresholds["p95_latency_ms_max"],
+           p95 is not None and p95 > thresholds["p95_latency_ms_max"])
+
+    # ⚠️ 已知局限，写下来而不是假装没有：低样本下**持续**劣化（如连续两周应答率 0.6）
+    # 不会由日级告警发现——它落在周报/看板的趋势上。日级告警只负责"今天出事了"。
+    return {"ok": not breaches, "breaches": breaches, "low_confidence": low_conf}
 
 
 def compute_daily_metrics(rows: List[Dict[str, Any]],
@@ -253,6 +293,9 @@ def compute_daily_metrics(rows: List[Dict[str, Any]],
     verdict = evaluate_slos(metrics, thresholds)
     metrics["slo_ok"] = 1 if verdict["ok"] else 0
     metrics["slo_breaches"] = verdict["breaches"]
+    # 低置信项必须一路带到 report：只要它在结构里，看板/周报/告警正文就都能消费到，
+    # 不会因为"没 page"而彻底消失（否则就是把指标失效伪装成服务健康）。
+    metrics["low_confidence"] = verdict.get("low_confidence", [])
     return metrics
 
 
@@ -423,8 +466,16 @@ def _alert_on_slo(report: Dict[str, Any]) -> None:
             dk = f"qa-slo:error:{report.get('metric_date') or 'unknown'}"
         else:
             lines = "\n".join(f"- {b['slo']}: {b['value']} (threshold {b['threshold']})"
+                              + (f"  ⚠️{b['note']}" if b.get("note") else "")
                               for b in report.get("breaches", []))
             text = f"SLO breach on {report.get('metric_date')}:\n{lines}"
+            # 低置信项**随真 breach 一起发出去**：它们不单独 page，但排查时是上下文
+            # （"今天还有哪些指标其实也击穿了，只是样本量不够"）。绝不静默丢。
+            lc = report.get("low_confidence") or []
+            if lc:
+                text += ("\n\n低置信（样本量不足，未单独告警）:\n"
+                         + "\n".join(f"- {b['slo']}: {b['value']} "
+                                     f"(threshold {b['threshold']}, n={b.get('sample')})" for b in lc))
             title = "QA serving SLO breach"
             dk = f"qa-slo:{report.get('metric_date')}"
         send_ops_alert(title, text, severity="critical", dedup_key=dk)
