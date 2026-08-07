@@ -619,6 +619,22 @@ const anomalyCount = computed<number>(() => {
   }
   return docs.value.filter((d) => BAD_BADGES.includes(d.status_badge)).length
 })
+// 「异常」此刻该表达成**哪个筛选值** —— 待办条与台账 chip 的**单一来源**。
+//
+// 2026-08-07 现网判例：这两处历来各有一套【存在条件】——待办条只问「有没有异常」
+// （`ManageView.vue` 的 `anomalyCount > 0`），台账 chip 还要问「值不值得单独一枚」
+// （坏徽章 ≥2 种，否则与那枚单徽章 chip 语义完全重复）。坏徽章恰好只有 1 种时两者分叉：
+// 待办条给出一个台账不承认的筛选值。现网当时正是 `已驳回 1`（坏徽章仅此一种）⇒
+// 点「异常文档」后台账同时显示 `已驳回 1` 与 `异常 1`——两枚 chip、同一篇文档、同一个数字；
+// 切回「全部」时那枚伪徽章又消失。（更早的形态是被自愈 watcher 判失效、直接弹回「全部」。）
+//
+// 根治 = 让分叉消失而不是给它打补丁：只剩一种坏徽章时，「异常」**就是**那枚真徽章，
+// 直接筛它 —— 少一层无信息量的间接，chip 不冗余、切换不闪现。≥2 种才需要聚合值。
+// 0 种时返回聚合值即可（此时 `anomalyCount===0`，待办条根本不渲染，取不到这个分支）。
+const anomalyFilterTarget = computed<string>(() => {
+  const present = BAD_BADGES.filter((b) => ledgerBadgeCount(b) > 0)
+  return present.length === 1 ? present[0] : ANOMALY_FILTER
+})
 
 // ── 多选 / 批量 ──────────────────────────────────────────────────
 // 当前可见【且可管理】的行（批量只作用于这些；外部门只读行不可批量操作）。
@@ -2208,7 +2224,7 @@ export function useKb() {
     // 状态
     docs, filtered, approvals, accessRequests, queuesSettled, accessGrants, approvalHistory, adminGrants, grantableDepts, loadingDocs, loadingMoreDocs, hasMoreDocs, docScope, q, filter, permFilter, ownerFilter, citedFilter, ownerOptions, sortKey, sortDir,
     // #7 全库口径 + 服务端筛选 setter
-    ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, anomalyCount, ledgerTotal,
+    ledgerBadgeChips, ledgerBadgeCount, ledgerOwnerOptions, anomalyCount, anomalyFilterTarget, ledgerTotal,
     setBadgeFilter, setPermFilter, setOwnerFilter, setCitedFilter, clearLedgerFilters,
     // 页码翻页器（DocTable 尾部 QueuePager）
     docsPage, docsTotal, docsPerPage: DOCS_PAGE, docsMaxPage: DOCS_MAX_PAGE, loadDocsPage,

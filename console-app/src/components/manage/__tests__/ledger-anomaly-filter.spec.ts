@@ -140,3 +140,38 @@ describe('台账「异常」筛选不会自己弹回「全部」', () => {
     expect(kb.ledgerBadgeCount('异常')).toBe(5)                    // 3 + 2（BAD_BADGES 整集求和）
   })
 })
+
+// ── anomalyFilterTarget：待办条与台账 chip 的单一来源（2026-08-07 现网第二形态）──
+// 现象：坏徽章只剩一种（现网 `已驳回 1`）时，点待办条「异常文档」后台账同时出现
+// `已驳回 1` 与 `异常 1` —— 两枚 chip、同一篇文档、同一个数字；切回「全部」那枚又消失。
+// 根因是待办条（只问「有没有异常」）与台账 chip（还问「值不值得单独一枚」）**两套存在条件**。
+describe('anomalyFilterTarget — 语义冗余消除', () => {
+  it('坏徽章只剩一种 ⇒ 目标就是那枚真徽章（不再绕伪徽章）', () => {
+    activate()
+    const { anomalyFilterTarget, anomalyCount } = useKb()
+    ;(useKb() as any).kbStats = undefined
+    const kb = useKb() as any
+    kb.docs.value = [doc({ doc_id: 'a', status_badge: '已驳回' }), doc({ doc_id: 'b', status_badge: '排队中' })]
+    expect(anomalyCount.value).toBe(1)
+    expect(anomalyFilterTarget.value).toBe('已驳回')
+  })
+
+  it('坏徽章 ≥2 种 ⇒ 目标回到聚合值「异常」', () => {
+    activate()
+    const kb = useKb() as any
+    kb.docs.value = [doc({ doc_id: 'a', status_badge: '已驳回' }), doc({ doc_id: 'b', status_badge: '已隔离' })]
+    expect(kb.anomalyFilterTarget.value).toBe('异常')
+  })
+
+  it('单一坏徽章下按目标筛选：台账不出现同物两名的冗余 chip', () => {
+    activate()
+    const kb = useKb() as any
+    kb.docs.value = [doc({ doc_id: 'a', status_badge: '已驳回' }), doc({ doc_id: 'b', status_badge: '排队中' })]
+    // 模拟待办条点击（ManageView 用的就是这个值）
+    kb.filter.value = kb.anomalyFilterTarget.value
+    expect(kb.filter.value).toBe('已驳回')
+    // 反证锚：此时 chips 里**不该**再有「异常」——它没被选中，且坏徽章只有一种
+    expect(kb.ledgerBadgeChips.value).not.toContain('异常')
+    expect(kb.ledgerBadgeChips.value).toContain('已驳回')
+  })
+})

@@ -29,7 +29,7 @@ import OpsMetricsPanel from '@/components/manage/OpsMetricsPanel.vue'
 // AppShell 仅在 ready 后渲染，故身份已解析。
 const { canManage, identity } = storeToRefs(useSession())
 // reviewCount（侧栏红点口径）不再在本视图使用——「审批」tab 角标改用 approvalsBadge（见下）。
-const { isKbAdmin, anomalyCount, approvals, accessRequests, queuesSettled, accessGrants, loadErrors, isLoading, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadReviewTasks, applyPendingVersion } = useKb()
+const { isKbAdmin, anomalyCount, anomalyFilterTarget, approvals, accessRequests, queuesSettled, accessGrants, loadErrors, isLoading, setBadgeFilter, loadDocs, loadStats, loadConfig, loadInsights, loadGovernance, loadOpsMetrics, loadApprovals, loadAccessRequests, loadAccessGrants, loadApprovalHistory, loadAdminGrants, loadFeedbackReview, loadReviewTasks, applyPendingVersion } = useKb()
 const { hotQuestions, loadHotQuestions, fillInput } = useAsk()
 const router = useRouter()
 const route = useRoute()
@@ -52,7 +52,9 @@ function scrollToSec(id: string) { document.getElementById(id)?.scrollIntoView({
 // 审批类 chip（appr/req）：队列已迁「审批」tab → 点击直达该 tab（activeTab watcher 会同步 URL）；
 // 异常 chip 仍留台账：滚动 + 顺带设「异常」聚合筛选（原先只滚动，还得自己再挑一个坏徽章点）。
 function onTodoChip(c: TodoChip) {
-  if (c.key === 'anom') { setBadgeFilter('异常'); scrollToSec('kb-sec-ledger'); return }
+  // 筛选值取自 useKb 的单一来源（`anomalyFilterTarget`）而非字面 '异常'：坏徽章只剩一种时
+  // 它就是那枚真徽章，避免台账里出现「已驳回 1 / 异常 1」这种同物两名的冗余 chip。
+  if (c.key === 'anom') { setBadgeFilter(anomalyFilterTarget.value); scrollToSec('kb-sec-ledger'); return }
   activeTab.value = 'approvals'
 }
 
