@@ -457,6 +457,25 @@ fail-open/fail-closed 逐条锁死（node ACL 丢全部非 public / legacy 丢�
 ⇒ 现有 `_conn_scope` **已经把最大的一块合并掉了**（stitch+expand 两阶段共用 1 次）。
 D1 的剩余头寸 = **3~5 → 1~2，即每请求省 2~3 次 checkout**。
 
+#### 🔴 D0 数据订正（2026-08-06 晚，codex 指出）
+
+第一版探针里写的 `try: get_config.cache_clear() except AttributeError: pass`
+**静默什么也没做** —— `get_config` 不是 `lru_cache`，是模块级 `_config` 单例
+（`config.py:1292-1300`）。于是 **`multi-query 开` 与 `rerank probe 开` 两行的环境变量从未生效**，
+量到的还是默认配置。**那两行数据作废。** 这是我自己测量里的一次假绿。
+
+改成直接 `config._config = None` 后重测，multi-query 那行**变了**：
+
+```
+【multi-query 开 · 全链】 checkout = 3
+  按线程 : {'ThreadPoolExecutor-2_0': 1, 'MainThread': 2}
+```
+
+⇒ **`_revalidate_main_hits` 确实会落到 worker 线程上**（经 `_px` 主路预取，
+`retriever.py:2886-2898` —— 只要 mode 是 auto/llm 就起，不要求真的产出子查询）。
+原先标注的「worker 分支仍是静态推断」**现已证实**，这反过来**加强**了 D1 的撤销理由：
+跨线程共享一条 pymysql 连接不安全，那部分 checkout 本来就不可合并。
+
 #### 判据结论：D1 建议**不做**，D3/D4 保留
 
 - **D1 收益**：省 2~3 次 checkout/请求。**代价**：`_get_db_conn()` 每次显式 `begin()`
@@ -473,6 +492,40 @@ D1 的剩余头寸 = **3~5 → 1~2，即每请求省 2~3 次 checkout**。
 
 若默认路径实测只有 2–3 次 checkout（互斥性使然，很可能），
 则 D1 的收益接近噪声，**整批应降级或取消**，只保留 D3 与 D4。这一步没有捷径。
+
+#### D4-① 已落地：`tests/test_retrieval_checkout_budget.py`（4 条）
+
+把 D0 的数字固化成**预算断言**（不是性能断言）：默认全链 3 次、含图 3 次、
+消费点集合固定、stitch/expand 必须仍共享一条连接、默认路径全在调用线程。
+变异反证：破坏 `_conn_scope` ⇒ 红；新增一个自取连接的消费点 ⇒ 红。
+
+⚠️ **该测试第一版是假绿**：fixture 全是 `text` chunk，而 `expand_step_context:1961-1966`
+的 `need_expand` 为假时**整段早退**、连 `_stitch_expand_conn` 都不调 ⇒
+「stitch/expand 共享连接」那条恒为 1，把 `_conn_scope` 关掉照样绿。
+加了一条 `step_card` 后变异才打红。
+
+#### 🔴 D3 未实施：codex 找出 5 条 BLOCKER + 一条无法在本会话解决的定值依赖
+
+| # | BLOCKER | 位置 |
+|---|---|---|
+| 1 | **P→P 自等待**：`_one(0)` 在 P worker 里 `primary_supplier()` 等的是**同属 P** 的 `_primary_future` ⇒ 「P→F 单向无环」不成立 | `retriever.py:2757` / `:2893` / `:2905` |
+| 2 | fusion 的 fail-open **只包 `fut.result()` 不包 `ex.submit()`** ⇒ `PoolSaturated` 会在提交第一个臂时同步抛出，**落不进**既有单臂降级 | `retriever.py:1381` vs `:1385` |
+| 3 | 进程级池**没有关闭点**：`api.py` lifespan 的 `yield` 后无 `finally` ⇒ 只删 retriever 里的 shutdown 会留下不可控常驻 worker | `api.py:123` / `:179` |
+| 4 | 我方案里的 `as_completed` **会破坏顺序**：`ex.map` 保证 `lists` 与 query 同序，而交错合并依赖它 | `retriever.py:2776` / `:2798` |
+| 5 | permit 生命周期未定义完整：submit 失败 / future 运行前取消 / 任务抛异常都不得泄漏 permit，否则「有界」会永久缩成 0；TLS 清理还必须**关掉**残留的 `_conn_scope.conn` 而不只是置空 | `retriever.py:1689` / `:1703` / `:2978` |
+
+另有三条 REMAINING：`rejected` 单一计数不够（须按池/调用点/降级原因分类+分母+阈值）；
+长活 worker **不继承 ContextVar** ⇒ 需每次 submit `copy_context()`（`request_context.py:4,41`）；
+「含图=3」的 fixture 未证明图真的过了两次版本复核。
+
+**定值依赖（本会话无法解决）**：F/P 的默认 worker 数**不能由静态代码推出**。
+codex 与我独立同意：本批应只提供旋钮 + 每进程上限 + 指标，
+**默认值必须由 staging 的 HA3/DashScope 配额、P95/P99、实例数与可接受降级率决定**。
+在拿到这些数据前，把 24/12 当"有依据的默认值"上线是拍脑袋；
+而「维持旧的每请求等效并发」又等于没限流、失去 D3 的意义。
+
+⇒ **D3 挂起，等 staging 压测数据。** 五条 BLOCKER 的修法已明确（见 codex 输出），
+不是设计不通，是**默认值缺证据**。
 
 ### 批 D — 检索热路径（原始拆分，已被上面重新定型取代）
 
