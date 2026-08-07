@@ -167,10 +167,11 @@ jobs:
         # ③ 跨 collation 组的 JOIN 加 preflight skip。
         # 三个 node 轴模块（2026-08-07 一并加）：
         #   · test_approval_history_node_axis_db —— access 段用例依赖
-        #     `kb_access_request ⋈ document_meta`，而**开发机本地库有 collation 漂移**
-        #     （库默认 _0900_ai_ci，建表时没写显式 COLLATE 的 19 张旧表都拿了它，与
-        #     schema/001:91 权威 DDL 不符）⇒ 那三条在本地恒 skip，只有从零按权威 DDL
-        #     建库的本 job 能真正执行它们。
+        #     `kb_access_request ⋈ document_meta`，这类跨 collation 组的 JOIN 在漂移过的
+        #     库上直接 1267。开发机 2026-08-07 实测漂了 22 张表（库默认 _0900_ai_ci，
+        #     建表时没写显式 COLLATE 的旧表全拿了它，与 schema/001:91 不符），当天已按
+        #     权威 DDL 全量转回 unicode_ci；**但开发机的库是活的、随时能再漂**，只有从零
+        #     建库的本 job 才是这几条的稳定承重点。
         #   · test_contribution_node_axis_db（schema/067）/ test_acl_version_axis_db
         #     （C3′ 投影版本轴）—— 随 f9257fe / 291f539 落地时漏进本清单，补上。
         # 本地已用一次性 throwaway MySQL 8.0.46 + scripts/ci_load_schema.sh 复跑全清单：

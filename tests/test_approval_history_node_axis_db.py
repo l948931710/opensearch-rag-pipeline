@@ -212,12 +212,16 @@ def _require_access_join(conn):
     """access 段的 `kb_access_request ⋈ document_meta` 在**本地库 collation 漂移**时会
     1267 打挂整段 —— 那是环境缺陷，不是产品行为，不能记成红。
 
-    漂移形态（2026-08-07 本机实测）：`fuling_knowledge` 的库默认 collation 是 MySQL 8 的
-    `utf8mb4_0900_ai_ci`，凡**建表时没写显式 COLLATE 的旧表**（document_meta 等 19 张）
-    都拿了它；而带显式 `COLLATE=utf8mb4_unicode_ci` 的新表（kb_access_request 等 9 张）
-    是对的。schema/001:91 与 schema/008 两份权威 DDL 都写的是 utf8mb4_unicode_ci
-    ⇒ 从零建库（`scripts/ci_load_schema.sh`）的环境不会有这条漂移，本 skip 不会命中。
+    漂移形态：库默认 collation 是 MySQL 8 的 `utf8mb4_0900_ai_ci`，凡**建表时没写显式
+    COLLATE 的旧表**都拿了它；而带显式 `COLLATE=utf8mb4_unicode_ci` 的新表
+    （kb_access_request 等）是对的。schema/001:91 与 schema/008 两份权威 DDL 都写的是
+    utf8mb4_unicode_ci ⇒ 从零建库（`scripts/ci_load_schema.sh`）的环境没有这条漂移。
     同一根因在 2026-06-27 生产上炸过三个 JOIN 端点（见 schema/008 头注）。
+
+    ⚠️ 本守卫**不是**为某一台机器写的，别因为「现在没人命中」就删：开发机 2026-08-07
+    实测漂了 22 张表（已按权威 DDL 全量转回 unicode_ci，本 skip 在该机上不再命中），
+    但任何不是从 ci_load_schema.sh 建出来的库——快照恢复、老 worktree、手工建的
+    第二套库——都可能再漂回来，届时这里给的是一句能直接照做的修法，不是一条看不懂的红。
     """
     from opensearch_pipeline.api import _kb_db
     with conn.cursor() as cur:
