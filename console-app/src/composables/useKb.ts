@@ -90,6 +90,19 @@ export type AccessState = 'none' | 'pending' | 'approved_pending_sync' | 'projec
 // 评审实测：3 个文件卡在「申请上传地址」时 3 行全渲染 aria-valuenow=0 的条，批量失败终态后
 // 条还冻在 0 不消失。那正是 redline③ 禁的假条，只是从单文件路径漏到了队列路径。
 export interface QueueRow { name: string; status: string; pct: number | null; msg: string; dupMsg?: string }
+
+/** 失败项留痕（2026-08-07）。
+ *
+ * 为什么要独立于 `uploadQueue`：`onFileSelected` 的第一行就 `uploadQueue.value = []`，
+ * 而选文件的三个入口（file input / dropzone / 清空按钮）在批量结束后都可点。现网事故：
+ * 用户批量传一批、失败 50 个，接着去选另一批文件准备继续传 —— 失败清单当场被清空，
+ * 他再也查不到是哪 50 个，只能把整批重传，于是在库里造出 117 份重复文档。
+ * 故失败项必须活得比单轮队列长，且**只由用户主动清除**。
+ *
+ * 带上 `file`：重传时不必让用户回文件夹里重新挑（他恰恰已经分不清是哪些了）。
+ * File 对象本身是浏览器管理的 blob 引用，不额外占内存。
+ */
+export interface FailedUpload { name: string; msg: string; file: File }
 // owner_key/owner_label 与 DocItem 同义：升版态标题行走 docOwnerText，node 文档的
 // owner_dept 恒空串，只带 owner_dept 会渲染出「· 归属 」半截文案（深链合成态无此二字段
 // ⇒ 显示「未归属」，是诚实降级，不是回到空白）。
@@ -310,6 +323,8 @@ const uploadOk = ref(false)
 const dupWarn = ref('')                // 文件名级预查重
 const contentDupMsg = ref('')          // ETag 内容级查重
 const uploadQueue = ref<QueueRow[]>([])
+// 跨轮存活的失败清单（见 FailedUpload 注释）。**绝不在 onFileSelected 里清**。
+const failedUploads = ref<FailedUpload[]>([])
 const selectedNames = ref<string[]>([])
 // 在途互斥（按行/按用户 key）：一行审批/撤销不再禁用其他不相关按钮（B5）。
 const inflight = ref<Set<string>>(new Set())
@@ -1285,11 +1300,20 @@ async function uploadBatch(files: File[]) {
         catch { if (!principalChangedSince(epoch0)) row.msg += ' · 共享失败可稍后重试' }
       }
       const dm = buildDupMsg(r.content_dups, r.content_dups_other); if (dm) row.dupMsg = dm
+      // 这一份成功了 ⇒ 从跨轮失败清单里摘掉（重传成功后不该还挂在"待处理失败"里）
+      if (failedUploads.value.some((x) => x.name === f.name)) {
+        failedUploads.value = failedUploads.value.filter((x) => x.name !== f.name)
+      }
       okN++
     } catch (e: any) {
       row.pct = null                                // PUT 中途失败也要撤条，否则冻在原值不消失
       if (principalChangedSince(epoch0)) return     // 旧身份的失败不写新身份 UI
       row.status = '失败'; row.msg = uploadErrText(e, { detail: true, maxMb: maxUploadMb.value }); badN++   // 同上：批量行也要能看见真原因
+      // 同步进跨轮失败清单：`uploadQueue` 会被下一次 onFileSelected 清掉，这份不会。
+      // 同名去重（重传同一文件再次失败时只保留最新原因，不堆重复行）。
+      const _fu = failedUploads.value.filter((x) => x.name !== f.name)
+      _fu.push({ name: f.name, msg: row.msg, file: f })
+      failedUploads.value = _fu
     }
   }
   // 小并发池：worker 共享游标领任务，按队列顺序开工（uploadOne 自吞异常，Promise.all 不会中途 reject）。
@@ -1336,6 +1360,32 @@ function doUpload() {
   if (verCtx.value || selectedFiles.length === 1) void uploadSingle(selectedFiles[0])
   else void uploadBatch(selectedFiles)
 }
+
+// ── 跨轮失败清单的三个出口（2026-08-07）────────────────────────────────────────
+// 与 uploadBatch 批末那段「selectedFiles 收敛成失败集」是**互补**的两层，别混：
+//   · 批末收敛  = 当轮便捷重试（不离开上传卡时，直接点「上传」即重试失败项）；
+//   · 本清单    = 跨轮留痕（一旦用户去选了别的文件，收敛结果就被覆盖，只剩这里还记得）。
+// 现网事故正是后者：失败 50 个 → 去选另一批 → 失败集与队列双双清空 → 只能整批重传
+// → 117 份重复文档。
+
+/** 把失败清单恢复成当前选择；随后点「上传」即重试（刻意复用既有上传入口，不新增第二条上传路径）。 */
+function restoreFailedSelection() {
+  if (!failedUploads.value.length) return
+  selectedFiles = failedUploads.value.map((x) => x.file)
+  selectedNames.value = selectedFiles.map((f) => f.name)
+  uploadErr.value = ''; uploadOk.value = false
+  uploadMsg.value = `已恢复 ${selectedFiles.length} 个失败文件到选择列表，点「上传」重试`
+}
+
+/** 复制失败文件名（每行一个）——用户要回文件夹里人工挑拣时用。 */
+async function copyFailedNames(): Promise<boolean> {
+  const text = failedUploads.value.map((x) => x.name).join('\n')
+  if (!text) return false
+  try { await navigator.clipboard.writeText(text); return true } catch { return false }
+}
+
+/** 只由用户主动调用——绝不在 onFileSelected/上传流程里自动清。 */
+function clearFailedUploads() { failedUploads.value = [] }
 
 // 审批后定向更新（#82）：成功即本地移除该单（reviewCount 红点由 approvals.length 派生，随之同步），
 // 免一次全量审批队列重拉；文档列表真受影响（放行/驳回改变该文档徽章）→ 保留一次权威 loadDocs。
@@ -2168,6 +2218,7 @@ export function useKb() {
     loadAdminGrants, grantDeptAdmin, revokeAdminGrant,
     openAccessRequest, closeAccessRequest, submitAccessRequest, accessStateOf, accessNoteOf, loadMyAccessRequests,
     enterVersionMode, exitVersionMode, applyPendingVersion, onFileSelected, doUpload,
+    failedUploads, restoreFailedSelection, copyFailedNames, clearFailedUploads,
     maybeAutoSeedOwner, resetUploadDraft, autoSeedDoneFor,
     approve, reject, retire, restore,
   }

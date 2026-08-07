@@ -14,6 +14,7 @@ const {
   shareTargets, uploadTargetDepts, selectedNames, isDeptAdmin, kbConfig,
   dupWarn, uploadBusy, uploadMsg, uploadPct, uploadErr, uploadOk, contentDupMsg, uploadQueue,
   onFileSelected, doUpload, exitVersionMode, maxUploadMb, maybeAutoSeedOwner,
+  failedUploads, restoreFailedSelection, copyFailedNames, clearFailedUploads,
 } = useKb()
 const session = useSession()
 
@@ -110,6 +111,15 @@ function onDrop(e: DragEvent) {
   dragging.value = false
   const files = e.dataTransfer?.files
   if (files && files.length) onFileSelected(files)   // 升版态由 onFileSelected 自动只取首个
+}
+
+// 复制失败文件名：clipboard 在非安全上下文/无权限时会 reject，此时按钮如实报"复制失败"
+// 而不是假装成功（用户会照着不存在的剪贴板内容去找文件）。
+const copiedTip = ref('')
+async function onCopyFailed() {
+  const ok = await copyFailedNames()
+  copiedTip.value = ok ? '已复制' : '复制失败'
+  setTimeout(() => { copiedTip.value = '' }, 2000)
 }
 </script>
 
@@ -299,6 +309,42 @@ function onDrop(e: DragEvent) {
         </div>
         <p v-if="row.dupMsg" class="mt-1 text-xs text-st-warn">{{ row.dupMsg }}</p>
       </div>
+    </div>
+
+    <!-- 跨轮失败清单（2026-08-07）：uploadQueue 会被下一次选文件清空，这块不会。
+         现网事故——失败 50 个后去选别的文件，失败清单当场消失、只能整批重传 → 117 份重复。 -->
+    <div
+      v-if="failedUploads.length" data-testid="failed-uploads"
+      class="mt-3 rounded-lg border border-st-fail/35 bg-st-fail/5 px-3 py-2.5"
+    >
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="text-[13px] font-semibold text-foreground">
+          {{ failedUploads.length }} 个文件未上传成功
+        </span>
+        <span class="text-xs text-muted-foreground">选择其他文件不会清空这份清单</span>
+        <div class="flex-1" />
+        <button
+          type="button" data-testid="failed-restore"
+          class="rounded-md border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition hover:border-border-strong disabled:opacity-50"
+          :disabled="uploadBusy" @click="restoreFailedSelection()"
+        >重选这些文件</button>
+        <button
+          type="button" data-testid="failed-copy"
+          class="rounded-md border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition hover:border-border-strong"
+          @click="onCopyFailed"
+        >{{ copiedTip || '复制文件名' }}</button>
+        <button
+          type="button" data-testid="failed-clear"
+          class="rounded-md px-2 py-1 text-xs text-muted-foreground transition hover:bg-secondary hover:text-foreground"
+          @click="clearFailedUploads()"
+        >清除</button>
+      </div>
+      <ul class="mt-2 max-h-40 space-y-1 overflow-y-auto">
+        <li v-for="(f, i) in failedUploads" :key="i" class="flex items-baseline gap-2 text-xs">
+          <span class="min-w-0 flex-1 truncate text-foreground">{{ f.name }}</span>
+          <span class="shrink-0 text-muted-foreground">{{ f.msg }}</span>
+        </li>
+      </ul>
     </div>
   </section>
 </template>
