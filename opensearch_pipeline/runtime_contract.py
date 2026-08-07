@@ -56,7 +56,7 @@ def upsert_embedding_contract(model: Any, dimension: Any) -> bool:
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001 — 契约行是辅助治理，绝不阻断摄取
-        logger.warning("embedding 契约行 UPSERT 失败（fail-open；schema/018 未 apply?）: %s", e)
+        logger.warning("embedding 契约行 UPSERT 失败（fail-open；1054/1146=schema/018 未 apply，**1142=账号缺 INSERT/UPDATE 授权**）: %s", e)
         return False
 
 

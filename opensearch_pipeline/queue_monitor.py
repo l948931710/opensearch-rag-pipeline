@@ -233,7 +233,12 @@ def write_heartbeat() -> bool:
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001
-        logger.warning("ops 心跳写入失败（fail-open；schema/018 未 apply?）: %s", e)
+        # ⚠️ 2026-08-06 实地：这里连续两个月报的其实是 **1142 缺授权**（fuling_metrics 对
+        # rag_runtime_contract 没有 INSERT/UPDATE），而原文案只写「schema/018 未 apply?」，
+        # 把排查方向带偏。后果不小：心跳一直没写进去，而 `_monitor_dead` 的判据是
+        # 「期望有心跳而完全缺席 → 判死」——这条监控链实际上是断的。授权已补（GRANT）。
+        logger.warning("ops 心跳写入失败（fail-open；1054/1146=schema/018 未 apply，"
+                       "**1142=账号缺 INSERT/UPDATE 授权**）: %s", e)
         return False
 
 

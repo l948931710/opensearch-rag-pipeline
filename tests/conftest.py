@@ -320,3 +320,22 @@ def _reset_ready_probe_cache():
     if _mod is not None and hasattr(_mod, "_READY_CACHE"):
         _mod._READY_CACHE.update({"t": 0.0, "body": None, "ok": True})
     yield
+
+
+# ── 🔴 告警出口在测试期必须断开（2026-08-06 实地事故）────────────────────────
+# 事故经过：`RAG_OPS_ALERT_WEBHOOK` 一配进 `.env`，`get_config()` 就把它灌进 `os.environ`；
+# 而 `alerting.send_ops_alert` 是**调用时**读 env 的。于是接下来的几轮 `make test` /
+# 变异测试**真的往生产钉钉群发了一批告警**（test_alerting / test_queue_monitor /
+# test_rate_limiter / test_reconcile 等多处会走到真实告警路径且未打桩）。
+#
+# ⚠️ 这个地雷在 webhook 未配时**完全不可见** —— 与本仓一路在修的「flag 关着掩盖缺陷」同族。
+# ⚠️ 靠 `_LAST_SENT` 的 60s 去重挡不住：它是**进程内**的，每次 pytest / 每个 xdist worker
+#    都是新进程，去重槽全新。
+#
+# 断在 env 这一层（而不是打桩 send_ops_alert）：alerting 每次调用都现读 env，
+# 清掉它就等于让所有路径统一回到"未配 = 记账 no-op"，与生产未配时的行为完全一致。
+@pytest.fixture(autouse=True, scope="session")
+def _never_alert_from_tests():
+    for k in ("RAG_OPS_ALERT_WEBHOOK", "RAG_OPS_ALERT_SECRET", "RAG_OPS_ALERT_WEBHOOK_ALLOW"):
+        os.environ.pop(k, None)
+    yield

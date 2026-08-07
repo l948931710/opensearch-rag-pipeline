@@ -376,7 +376,7 @@ def _fetch_rejected(conn, target: str) -> Dict[str, int]:
             out[str(reason)] = out.get(str(reason), 0) + int(cnt or 0)
         return out
     except Exception as e:  # noqa: BLE001
-        logger.warning("qa_rollup: 读取 qa_admission_reject 失败（按无拒绝处理；schema/017 未 apply?）: %s", e)
+        logger.warning("qa_rollup: 读取 qa_admission_reject 失败（按无拒绝处理；1146=schema/017 未 apply，**1142=账号缺 SELECT 授权**）: %s", e)
         return {}
 
 
