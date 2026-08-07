@@ -1,14 +1,21 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { X, Plus } from '@lucide/vue'
 import { useContribute } from '@/composables/useContribute'
 
 // 贡献弹窗：问题 / 你的答案·知识内容 / 归属分类。提交后需部门管理员采纳才会入库。
 // ε-5 R1：入库受阻行重投时带成因警示（formWarning）——警示色条挂表单顶部，
 // 与 submitErr 的失败红分开（这是提交前的注意事项，不是错误）。
+// 归属选择两轴（方案 M9，Sam 裁决 F/G）：myDepts 非空 ⇒ node 轴（1 个只读展示、多个下拉），
+// 否则回落组码轴下拉（与改造前一致）。**不复用 OrgTreeSelect**——它固定请求
+// /api/kb/org-tree（employee 恒 403，且响应含管辖字段）。
 const {
-  modalOpen, formQuestion, formContent, formDept, formWarning, submitBusy, submitErr,
-  CONTRIB_DEPT_OPTS, closeModal, submitContribution,
+  modalOpen, formQuestion, formContent, formDept, formDeptId, formWarning, submitBusy, submitErr,
+  myDepts, CONTRIB_DEPT_OPTS, closeModal, submitContribution,
 } = useContribute()
+
+const nodeAxis = computed(() => myDepts.value.length > 0)
+const soleDeptName = computed(() => (myDepts.value.length === 1 ? myDepts.value[0].name : ''))
 </script>
 
 <template>
@@ -52,9 +59,23 @@ const {
             v-model="formContent" rows="5" placeholder="写下步骤或要点，越具体越容易被采纳…"
             class="mb-4 w-full resize-none rounded-[10px] border border-border bg-bg px-3 py-2.5 text-[13px] leading-relaxed text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/15"
           />
-          <label class="mb-1.5 block text-[11px] font-bold uppercase tracking-[0.04em] text-faint">归属分类</label>
+          <label class="mb-1.5 block text-[11px] font-bold uppercase tracking-[0.04em] text-faint">归属部门</label>
+          <!-- node 轴：只能在【自己所在部门】里选（裁决 F/G）——直挂上级节点的人看到的是
+               自己上级的直接下级集，避免把贡献挂在无人管辖的中心节点上 -->
+          <template v-if="nodeAxis">
+            <p
+              v-if="soleDeptName" data-testid="contribute-dept-sole"
+              class="w-full rounded-[9px] border border-border bg-panel/60 px-[11px] py-[9px] text-[13.5px] text-foreground"
+            >{{ soleDeptName }}</p>
+            <select
+              v-else v-model="formDeptId" data-testid="contribute-dept-node"
+              class="ui-select w-full cursor-pointer rounded-[9px] border border-border bg-bg px-[11px] py-[9px] text-[13.5px] text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/15"
+            >
+              <option v-for="d in myDepts" :key="d.dept_id" :value="d.dept_id">{{ d.name }}</option>
+            </select>
+          </template>
           <select
-            v-model="formDept"
+            v-else v-model="formDept" data-testid="contribute-dept-legacy"
             class="ui-select w-full cursor-pointer rounded-[9px] border border-border bg-bg px-[11px] py-[9px] text-[13.5px] text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/15"
           >
             <option v-for="d in CONTRIB_DEPT_OPTS" :key="d.id" :value="d.id">{{ d.name }}</option>

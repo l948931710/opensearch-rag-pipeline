@@ -278,3 +278,64 @@ def test_scope_narrowing_sites_are_not_converted_to_rejection():
     assert keep >= 3, (
         f"作用域收窄分支只剩 {keep} 处（原有 3 处：kb_access 两处授权列表 + kb_console 差评守卫）"
         "——是不是被误统一成拒绝式了？")
+
+
+# ── authorize_upload_node（贡献域 node 落库契约，方案 M4 / Codex C1-C2）────────
+def _node_admin(roots=(920001,)):
+    from opensearch_pipeline.kb_authz import KbIdentity
+    return KbIdentity.build(user_id="u-node", role="dept_admin", granted_node_roots=list(roots))
+
+
+def test_authorize_upload_node_requires_descendant_membership():
+    """归属节点必须落在管辖后代集里；不在 ⇒ 硬拒（不是"转审批"）。"""
+    from opensearch_pipeline.kb_authz import authorize_upload_node
+    kb = _node_admin()
+    ok = authorize_upload_node(kb, 930001, "dept_internal", descendants={920001, 930001})
+    assert ok.allowed and not ok.requires_kb_admin_approval
+    bad = authorize_upload_node(kb, 940001, "dept_internal", descendants={920001, 930001})
+    assert not bad.allowed and bad.reason == "owner_node_not_managed"
+
+
+def test_authorize_upload_node_fail_closed_when_descendants_unavailable():
+    """🔴 后代集不可得（快照过期/读失败）⇒ **拒绝**，绝不回退组码残值判定。
+
+    这与 can_manage_doc 对 descendant_ids=None 的 fail-closed 是同一条纪律（阶段 B 评审核心洞）：
+    node 归属的判定只有一个信息源，它不可得时"放行"等于凭空发明授权。"""
+    from opensearch_pipeline.kb_authz import authorize_upload_node
+    d = authorize_upload_node(_node_admin(), 930001, "dept_internal", descendants=None)
+    assert not d.allowed and d.reason == "owner_node_not_managed"
+
+
+def test_authorize_upload_node_public_needs_kb_admin_but_kb_admin_self_passes():
+    """public 影响全公司 ⇒ dept_admin 转审批；kb_admin 自身即终审 ⇒ 直通（与组码轴同款不对称）。"""
+    from opensearch_pipeline.kb_authz import KbIdentity, authorize_upload_node
+    dept = authorize_upload_node(_node_admin(), 930001, "public", descendants={920001, 930001})
+    assert dept.allowed and dept.requires_kb_admin_approval
+    kba = KbIdentity.build(user_id="u-kb", role="kb_admin")
+    top = authorize_upload_node(kba, 930001, "public", descendants=None)
+    assert top.allowed and not top.requires_kb_admin_approval
+
+
+def test_authorize_upload_node_rejects_bad_inputs():
+    from opensearch_pipeline.kb_authz import KbIdentity, authorize_upload_node
+    kb = _node_admin()
+    assert authorize_upload_node(kb, None, "dept_internal", descendants={1}).reason \
+        == "invalid_owner_dept_id"
+    # ≤1 = 空/钉钉虚拟根：授权到根 = 全库，那是 kb_admin 的语义，不该由归属节点表达
+    assert authorize_upload_node(kb, 1, "dept_internal", descendants={1}).reason \
+        == "invalid_owner_dept_id"
+    assert authorize_upload_node(kb, 930001, "垃圾级别", descendants={930001}).reason \
+        == "invalid_permission_level"
+    emp = KbIdentity.build(user_id="u-emp", role="employee")
+    assert authorize_upload_node(emp, 930001, "dept_internal", descendants={930001}).reason \
+        == "not_admin"
+
+
+def test_authorize_upload_group_code_path_untouched_by_node_addition():
+    """并列新增不得改组码轴：authorize_upload 对同一组入参的裁决逐字不变（回归锚）。"""
+    from opensearch_pipeline.kb_authz import KbIdentity, authorize_upload
+    kb = KbIdentity.build(user_id="u1", role="dept_admin", granted_owner_depts="hr")
+    assert authorize_upload(kb, "hr", "dept_internal") .allowed
+    assert authorize_upload(kb, "finance", "dept_internal").reason == "owner_dept_not_managed"
+    pub = authorize_upload(kb, "hr", "public")
+    assert pub.allowed and pub.requires_kb_admin_approval

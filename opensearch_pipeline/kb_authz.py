@@ -398,6 +398,51 @@ def authorize_upload(
     return AuthzDecision(True, needs_approval, reason)
 
 
+def authorize_upload_node(
+    identity: KbIdentity,
+    owner_dept_id: Optional[int],
+    permission_level: str,
+    *,
+    descendants: Optional[Set[int]],
+) -> AuthzDecision:
+    """裁决一次 **node 归属** 的入库请求（贡献采纳/续跑；schema/067 方案 M4，Codex C1/C2）。
+
+    🔴 与 `authorize_upload` **并列新增，绝不改后者**：组码轴的白名单/伞形展开语义对上传/
+    升版/共享/贡献 legacy 行仍是权威，动它 = 全域回归面。
+
+    判定复用 `can_manage_doc(identity, "node", None, owner_dept_id, descendants)`：
+      - 非管理员                → allowed=False（not_admin）
+      - owner_dept_id 缺失/非法  → allowed=False（invalid_owner_dept_id）
+      - permission_level 非法    → allowed=False（invalid_permission_level）
+      - dept_admin 且节点不在其管辖后代集（含 descendants=None ⇒ 快照不可得）
+                                → allowed=False（owner_node_not_managed，fail-closed）
+      - `public` 且非 kb_admin   → allowed=True + requires_kb_admin_approval（与组码轴同款
+                                   不对称：公开影响全公司，kb_admin 自身即终审故免审批）
+    共享目标（share_owner_depts）**刻意不在本函数**：node 归属的可见范围走
+    `kb_doc_node_grant`，不经组码共享面。纯函数、无副作用（后代集由调用方解析后传入）。
+    """
+    if not is_admin(identity):
+        return AuthzDecision(False, False, "not_admin")
+    try:
+        oid = int(owner_dept_id or 0)
+    except (TypeError, ValueError):
+        oid = 0
+    if oid <= 1:                     # ≤1 = 空/虚拟根，与 kb_upload.node_storage_segment 同门槛
+        return AuthzDecision(False, False, "invalid_owner_dept_id")
+
+    level = (permission_level or "").strip().lower()
+    level = _PERMISSION_ALIAS.get(level, level)
+    if level not in _VALID_PERMISSION_LEVELS:
+        return AuthzDecision(False, False, "invalid_permission_level")
+
+    if not can_manage_doc(identity, ACL_MODE_NODE_KB, None, oid, descendants):
+        return AuthzDecision(False, False, "owner_node_not_managed")
+
+    if level == PERM_PUBLIC and identity.role != ROLE_KB_ADMIN:
+        return AuthzDecision(True, True, "public_requires_kb_admin")
+    return AuthzDecision(True, False, "ok")
+
+
 # 退役/恢复【无】独立 authorize_* 纯函数：退役授权 = managed_owner_depts 作用域
 # （_kb_can_manage）+「公开文档需 kb_admin」的端点内不对称规则，刻意内联于
 # api.py::kb_retire（dept_admin 可退役本部门非 public 文档；public 影响全公司故需

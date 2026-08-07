@@ -19,7 +19,7 @@
 
 import os
 import threading
-from typing import List
+from typing import List, Optional
 
 import requests
 
@@ -125,6 +125,66 @@ def _dept_admin_ids(owner_dept: str) -> List[str]:
         conn.close()
 
 
+def _node_admin_ids(dept_id: int):
+    """覆盖该组织节点的管理员 user_id 列表 → `(ids, unavailable)`（方案 M6）。
+
+    "覆盖" = 该节点的**祖先链（含自身）** ∩ `dept_admin_node_grant.managed_dept_id`（active）
+    —— 与读侧 node 通道同一套展开（`resolve_ancestor_chains`），不另建名单。
+
+    `unavailable=True` = 组织快照过期/链解析失败/DB 读失败 ⇒ **算不出收件人**（≠ 无人管辖）。
+    调用方据此走 kb_admin 兜底：与 `_contrib_orphan_sql` 的 node 支 fail-open 对齐——队列
+    对 kb_admin 可见了，就必须有人被叫到，否则「看得见但没人知道」。
+    """
+    try:
+        from opensearch_pipeline.dept_ancestry import resolve_ancestor_chains
+        from opensearch_pipeline.dingtalk_identity import _load_org_snapshot
+        snap = _load_org_snapshot()
+        if not snap.get("fresh"):
+            logger.warning("admin_notify: 组织快照过期 ⇒ node 收件人算不出（走 kb_admin 兜底）")
+            return [], True
+        parents = snap.get("parents") or {}
+        chain, ok = resolve_ancestor_chains([int(dept_id)], lambda d: parents.get(d))
+        if not ok or not chain:
+            logger.warning("admin_notify: 节点 %s 祖先链不可得 ⇒ 走 kb_admin 兜底", dept_id)
+            return [], True
+    except Exception as e:   # noqa: BLE001
+        logger.warning("admin_notify: node 祖先链解析失败（走 kb_admin 兜底）: %s", e)
+        return [], True
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                ph = ",".join(["%s"] * len(chain))
+                cur.execute(f"SELECT DISTINCT user_id FROM {_kb_db()}.dept_admin_node_grant "
+                            f"WHERE is_active=1 AND managed_dept_id IN ({ph})", tuple(chain))
+                return [r[0] for r in (cur.fetchall() or []) if r and r[0]], False
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 — 060 未 apply / 读失败 ⇒ 算不出，不是"无人管辖"
+        logger.warning("admin_notify: dept_admin_node_grant 读取失败（走 kb_admin 兜底）: %s", e)
+        return [], True
+
+
+def _node_label(dept_id: int) -> str:
+    """节点 id → 部门名（dept_dim 现查；查不到回落 `节点 <id>`——通知文案降级可读，绝不空）。"""
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT name FROM {_kb_db()}.dept_dim WHERE dept_id=%s LIMIT 1",
+                            (int(dept_id),))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0])
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001
+        logger.debug("admin_notify: dept_dim 名字解析失败 dept_id=%s: %s", dept_id, e)
+    return f"节点 {int(dept_id)}"
+
+
 def _kb_admin_ids() -> List[str]:
     from opensearch_pipeline.db import _get_db_conn
     conn = _get_db_conn()
@@ -182,23 +242,44 @@ def notify_access_request(owner_dept: str, doc_id: str, requester_depts: str) ->
         logger.warning("admin_notify: access_request 通知失败（忽略）: %s", e)
 
 
-def notify_contribution(category_dept: str, question: str) -> None:
-    """新知识贡献待审核 → 通知归属部门管理员；孤儿部门（无 dept_admin）→ kb_admin 兜底。
+def notify_contribution(category_dept: str, question: str,
+                        category_dept_id: Optional[int] = None) -> None:
+    """新知识贡献待审核 → 通知归属管理员；无人管辖 → kb_admin 兜底。
 
     批次δ-3 顺带修复的既有缺口：此前孤儿部门收件人为空即静默跳过——兜底审核队列既已
-    归 kb_admin（contributions/pending 的孤儿作用域），新单必须有人被叫到。"""
+    归 kb_admin（contributions/pending 的孤儿作用域），新单必须有人被叫到。
+
+    方案 M6/M7（2026-08-07）：`category_dept_id` 非空 ⇒ **node 轴**，按覆盖该节点的管辖根
+    持有者取收件人；文案也按轴分支（Codex C10 推翻了 v2 的全局统一文案）——
+      · node 无人覆盖 → 「归属节点不在任何部门管理员的管辖范围内」
+      · legacy 无人管辖 → 保留原组码语义文案
+      · 收件人算不出（快照过期等）→ 通用兜底句，不谎称"无人管辖"
+    """
     if not _enabled():
         return
     try:
-        ids = _dept_admin_ids(category_dept)
+        unavailable = False
+        if category_dept_id:
+            ids, unavailable = _node_admin_ids(int(category_dept_id))
+            label = _node_label(int(category_dept_id))
+        else:
+            ids = _dept_admin_ids(category_dept)
+            label = _dept_label(category_dept)
         fallback = not ids
         if fallback:
             ids = _kb_admin_ids()
         q = (question or "").strip()
         q = q[:40] + ("…" if len(q) > 40 else "")
-        suffix = "（该部门暂无部门管理员，由你兜底审核）" if fallback else ""
+        if not fallback:
+            suffix = ""
+        elif unavailable:
+            suffix = "（该贡献当前未匹配到可审核的部门管理员，由你兜底审核）"
+        elif category_dept_id:
+            suffix = "（归属节点不在任何部门管理员的管辖范围内，由你兜底审核）"
+        else:
+            suffix = "（该部门暂无部门管理员，由你兜底审核）"
         _dispatch(ids, f"【富岭知识库】新知识贡献待审核：「{q}」"
-                       f"（归属 {_dept_label(category_dept)}）{suffix}。请到控制台「知识贡献」审核采纳。")
+                       f"（归属 {label}）{suffix}。请到控制台「知识贡献」审核采纳。")
     except Exception as e:   # noqa: BLE001
         logger.warning("admin_notify: contribution 通知失败（忽略）: %s", e)
 
@@ -243,13 +324,18 @@ def notify_contribution_result(contribution_id: str, outcome: str, note: str = "
         logger.warning("admin_notify: contribution_result 通知失败（忽略）: %s", e)
 
 
-def notify_upload_approval(owner_dept: str, title: str) -> None:
-    """上传/升版进入待审批（涉公开等）→ 通知 kb_admin。"""
+def notify_upload_approval(owner_dept: str, title: str,
+                           owner_dept_id: Optional[int] = None) -> None:
+    """上传/升版进入待审批（涉公开等）→ 通知 kb_admin。
+
+    `owner_dept_id` 非空 ⇒ node 归属，标签走 `dept_dim`（组码标签词表里没有节点，
+    直接喂 `_dept_label` 会把空串原样印进文案）。"""
     if not _enabled():
         return
     try:
         ids = _kb_admin_ids()
+        label = _node_label(int(owner_dept_id)) if owner_dept_id else _dept_label(owner_dept)
         _dispatch(ids, f"【富岭知识库】新上传待审批：《{title or '未命名文档'}》"
-                       f"（归属 {_dept_label(owner_dept)}）。请到控制台「待审批」处理。")
+                       f"（归属 {label}）。请到控制台「待审批」处理。")
     except Exception as e:   # noqa: BLE001
         logger.warning("admin_notify: upload_approval 通知失败（忽略）: %s", e)

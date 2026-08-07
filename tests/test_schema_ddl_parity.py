@@ -66,23 +66,34 @@ def test_qa_session_log_columns_union_across_files():
 
 
 def test_kb_contribution_insert_columns_exist_in_ddl():
-    """提交端点 INSERT 的每一列都必须在 schema/010 权威 DDL 里（F-35 主修复回归）。"""
-    ddl_cols = _ddl_columns(SCHEMA / "010_kb_contribution.sql", "kb_contribution")
-    assert "normalized_gap_query" in ddl_cols, "F-35：权威 DDL 必须含 normalized_gap_query"
+    """提交端点 INSERT 的每一列都必须在权威 DDL 里（F-35 主修复回归）。
+
+    ⚠️ 判据用**跨文件联合集**而非单看 010（2026-08-07）：kb_contribution 已开始跨文件演进
+    （067 加 category_dept_id），单文件版会把「列在 067 里、代码用了」误判成漂移。F-35 要防的
+    是「代码读写的列在 schema/ 全集里找不到」，联合集才是那条判据；010 自身的基线断言另置。"""
+    ddl_cols = _table_columns_across_schema("kb_contribution")
+    assert "normalized_gap_query" in _ddl_columns(
+        SCHEMA / "010_kb_contribution.sql", "kb_contribution"), \
+        "F-35：权威 DDL 必须含 normalized_gap_query"
 
     src = (REPO / "opensearch_pipeline" / "routes" / "contribution.py").read_text(encoding="utf-8")
-    m = re.search(r"INSERT INTO \{_op_db\(\)\}\.kb_contribution\s*\((.*?)\)", src, re.S)
-    assert m, "找不到 kb_contribution 的 INSERT 列清单"
-    insert_cols = {c.strip() for c in m.group(1).replace("\n", " ").split(",")}
+    # findall（非 search）：提交端点自 2026-08-07 起有 **两条**字面 INSERT（组码轴 / node 轴），
+    # 只看第一条会让 node 轴那条的列清单逃过 F-35 守卫。
+    blocks = re.findall(r"INSERT INTO \{_op_db\(\)\}\.kb_contribution\s*\((.*?)\)", src, re.S)
+    assert len(blocks) >= 2, "找不到 kb_contribution 的两条 INSERT 列清单（组码轴 / node 轴）"
+    insert_cols = {c.strip() for b in blocks for c in b.replace("\n", " ").split(",")}
     missing = insert_cols - ddl_cols
-    assert not missing, f"代码 INSERT 的列不在权威 DDL：{sorted(missing)}（先改 schema/010 再改代码）"
+    assert "category_dept_id" in insert_cols, "node 轴 INSERT 必须写 category_dept_id（方案 M1/M9）"
+    assert not missing, f"代码 INSERT 的列不在权威 DDL：{sorted(missing)}（先改 schema/ 再改代码）"
 
 
 def test_kb_contribution_select_columns_exist_in_ddl():
-    """_CONTRIB_COLS（列表/详情 SELECT 列清单）同样受权威 DDL 约束。"""
-    from opensearch_pipeline.routes.contribution import _CONTRIB_COLS
-    ddl_cols = _ddl_columns(SCHEMA / "010_kb_contribution.sql", "kb_contribution")
-    select_cols = {c.strip() for c in _CONTRIB_COLS.split(",")}
+    """_CONTRIB_COLS（列表/详情 SELECT 列清单）同样受权威 DDL 约束（同上，判据=跨文件联合集）。
+
+    node 轴清单 `_CONTRIB_COLS_NODE` 一并覆盖——它才是 067 已 apply 环境实际下发的 SELECT。"""
+    from opensearch_pipeline.routes.contribution import _CONTRIB_COLS, _CONTRIB_COLS_NODE
+    ddl_cols = _table_columns_across_schema("kb_contribution")
+    select_cols = {c.strip() for c in (_CONTRIB_COLS + "," + _CONTRIB_COLS_NODE).split(",")}
     missing = select_cols - ddl_cols
     assert not missing, f"_CONTRIB_COLS 引用的列不在权威 DDL：{sorted(missing)}"
 

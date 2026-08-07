@@ -5,6 +5,9 @@ import { useSession } from '@/stores/session'
 import { deptLabel, fmtTs } from '@/lib/kb'
 import { useContribute, CONTRIB_DEPT_OPTS, type ContributionItem, type ContributionRevision } from '@/composables/useContribute'
 import LoadError from '@/components/manage/LoadError.vue'
+import OrgTreeSelect from '@/components/manage/OrgTreeSelect.vue'
+import type { PickedNode } from '@/components/manage/OrgTreePicker.vue'
+import { fetchOrgSnapshot } from '@/composables/useOrgSnapshot'
 import { useDialog } from '@/composables/useDialog'
 
 // 贡献审核队列（审批人侧）：本部门/全库待采纳的员工贡献 → 采纳即合成文档走管线入库，或驳回。
@@ -55,22 +58,61 @@ watch(pendingContribs, () => { void nextTick(measureOverflow) })
 // 已展开的行 clamp 已移除（量测不再溢出），控件靠 expanded 兜底继续显示以便收起
 function toggleExpand(id: string) { expanded.value = { ...expanded.value, [id]: !expanded.value[id] } }
 
+// ── 归属显示（两轴）：node 行的名字来自组织快照（审核人是管理员，org-tree 鉴权本就满足）；
+// 组码行沿用 deptLabel。快照未回/查不到 → 「节点 <id>」，绝不显空。
+const nodeNames = ref<Record<number, string>>({})
+async function ensureNodeNames() {
+  if (!pendingContribs.value.some((c) => c.category_dept_id)) return
+  try {
+    const snap = await fetchOrgSnapshot()
+    const m: Record<number, string> = {}
+    for (const n of snap.nodes) m[n.dept_id] = n.name
+    nodeNames.value = m
+  } catch { /* 快照不可用 → 回落「节点 <id>」，不打断审核动线 */ }
+}
+onMounted(() => { void ensureNodeNames() })
+watch(pendingContribs, () => { void ensureNodeNames() })
+function ownerLabel(c: ContributionItem): string {
+  const id = c.category_dept_id
+  if (id) return nodeNames.value[id] || `节点 ${id}`
+  return deptLabel(c.category_dept)
+}
+function isNodeAxis(c: ContributionItem): boolean { return !!c.category_dept_id }
+
 // ── 采纳前修订（批次ε-1 B2）：后端 KbContributionAcceptRequest 既有契约（缺省=保留原值）。
 // 行内表单（问题/正文/归属），仅下发实际变更的字段；空文本前置禁采纳（后端 strip 后会 400）。
-const editing = ref<Record<string, { q: string; c: string; dept: string }>>({})
+// 方案 M9/M11：node 行的归属改用 OrgTreeSelect（管理员身份，鉴权本就满足）；两轴**互斥**，
+// 一行只渲染一种控件——跨轴改归属后端会 400（不支持 node→组码）。
+const editing = ref<Record<string, { q: string; c: string; dept: string; deptId: number | null }>>({})
 function startRevise(c: ContributionItem) {
   if (isBusy(`ct:${c.contribution_id}`)) return
-  editing.value = { ...editing.value, [c.contribution_id]: { q: c.question, c: c.content, dept: c.category_dept } }
+  editing.value = {
+    ...editing.value,
+    [c.contribution_id]: {
+      q: c.question, c: c.content,
+      dept: c.category_dept, deptId: c.category_dept_id ?? null,
+    },
+  }
 }
 function cancelRevise(id: string) {
   const n = { ...editing.value }; delete n[id]; editing.value = n
 }
-// 归属下拉：dept_admin 只列自己管辖的部门（∪ 原归属，保「不改」可选——改到不管的部门
+// 组码轴归属下拉：dept_admin 只列自己管辖的部门（∪ 原归属，保「不改」可选——改到不管的部门
 // 只会吃 authorize_upload 403 空转）；kb_admin 全量（孤儿兜底终审者）。
 function deptOptsFor(c: ContributionItem) {
   if (isKbAdminRole.value) return CONTRIB_DEPT_OPTS
   const ids = new Set([...(session.identity?.managedOwnerDepts || []), c.category_dept].filter(Boolean))
   return CONTRIB_DEPT_OPTS.filter((o) => ids.has(o.id))
+}
+// OrgTreeSelect 用 PickedNode[]；归属是单选，subtree 语义在归属侧不存在（固定 true 占位）。
+function ownerPick(id: string): PickedNode[] {
+  const v = editing.value[id]?.deptId
+  return v ? [{ dept_id: v, subtree: true }] : []
+}
+function setOwnerPick(id: string, v: PickedNode[]) {
+  const e = editing.value[id]
+  if (!e) return
+  editing.value = { ...editing.value, [id]: { ...e, deptId: v.length ? v[0].dept_id : e.deptId } }
 }
 function reviseValid(id: string): boolean {
   const e = editing.value[id]
@@ -83,18 +125,33 @@ async function onAcceptRevised(c: ContributionItem) {
   const revised: ContributionRevision = {}
   if (e.q.trim() !== c.question) revised.question = e.q.trim()
   if (e.c.trim() !== c.content) revised.content = e.c.trim()
-  if (e.dept !== c.category_dept) revised.category_dept = e.dept
+  if (isNodeAxis(c)) {
+    if (e.deptId && e.deptId !== c.category_dept_id) revised.category_dept_id = e.deptId
+  } else if (e.dept !== c.category_dept) {
+    revised.category_dept = e.dept
+  }
   const ok = await acceptContribution(c, scopeOf(id), Object.keys(revised).length ? revised : undefined)
   if (ok) cancelRevise(id)          // 失败保留编辑内容不丢稿（错误提示走 composable 的 notice）
 }
 // 改了归属时按钮文案显式带出目标部门（不可逆入库前的零点击确认线索）
 function acceptRevisedLabel(c: ContributionItem): string {
   const e = editing.value[c.contribution_id]
-  return e && e.dept !== c.category_dept ? `采纳到「${deptLabel(e.dept)}」` : '采纳修订'
+  if (!e) return '采纳修订'
+  if (isNodeAxis(c)) {
+    return e.deptId && e.deptId !== c.category_dept_id
+      ? `采纳到「${nodeNames.value[e.deptId] || `节点 ${e.deptId}`}」` : '采纳修订'
+  }
+  return e.dept !== c.category_dept ? `采纳到「${deptLabel(e.dept)}」` : '采纳修订'
 }
 
+// 方案 M11 配套规则（Sam 认可）：**归属错误不作为驳回理由**——员工端归属已收窄为
+// 「只有自己部门」（裁决 F），因「挂错部门」驳回 ⇒ 员工改不了归属、重交回来还是同一个
+// 部门 ⇒ 死循环。挂错就在采纳前直接改归属；驳回只留给「只有作者能修」的问题。
+// 这条必须落在弹窗文案里，否则规则只存在于文档中。
+const REJECT_HINT = '归属挂错请直接用「修订」改归属后采纳，不要驳回（员工改不了归属，重交仍是同一部门）。驳回请留给内容质量、信息过时、答非所问。'
+
 async function onReject(c: ContributionItem) {
-  const reason = await promptText({ title: '驳回贡献', message: `驳回「${c.author_name || c.author_id}」提交的《${c.question}》？`, placeholder: '驳回原因（可空）', confirmText: '驳回', danger: true })
+  const reason = await promptText({ title: '驳回贡献', message: `驳回「${c.author_name || c.author_id}」提交的《${c.question}》？\n${REJECT_HINT}`, placeholder: '驳回原因（可空）', confirmText: '驳回', danger: true })
   if (reason === null) return
   void rejectContribution(c, reason || '')
 }
@@ -143,7 +200,7 @@ async function onReject(c: ContributionItem) {
             <span class="inline-flex items-center gap-1 text-[11px] text-faint">
               <User :size="11" :stroke-width="2" /> {{ c.author_name || c.author_id }}
             </span>
-            <span class="text-[11px] text-faint">· {{ deptLabel(c.category_dept) }}</span>
+            <span class="text-[11px] text-faint" data-testid="contrib-owner-label">· {{ ownerLabel(c) }}</span>
             <span v-if="c.created_at" class="text-[11px] text-faint">· {{ fmtTs(c.created_at) }}</span>
             <!-- 批次ε-1 B3：缺口溯源徽标（tooltip=原提问）；老后端无字段 → 自隐 -->
             <span
@@ -200,8 +257,18 @@ async function onReject(c: ContributionItem) {
           />
           <div class="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
             <label class="text-[11px] font-bold uppercase tracking-[0.04em] text-faint">归属</label>
+            <!-- node 轴：组织树选择器（dept_admin 限管辖子树；后端仍双端管辖现查） -->
+            <div v-if="isNodeAxis(c)" class="min-w-[220px] flex-1" data-testid="contrib-revise-node">
+              <OrgTreeSelect
+                mode="owner" :restrict-to-managed="!isKbAdminRole"
+                :model-value="ownerPick(c.contribution_id)"
+                :disabled="isBusy(`ct:${c.contribution_id}`)"
+                placeholder="选择归属部门…"
+                @update:model-value="(v) => setOwnerPick(c.contribution_id, v)"
+              />
+            </div>
             <select
-              v-model="editing[c.contribution_id].dept" data-testid="contrib-revise-dept"
+              v-else v-model="editing[c.contribution_id].dept" data-testid="contrib-revise-dept"
               class="ui-select cursor-pointer rounded-lg border border-border bg-card px-2 py-[6px] text-[12px] text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/15"
             >
               <option v-for="d in deptOptsFor(c)" :key="d.id" :value="d.id">{{ d.name }}</option>

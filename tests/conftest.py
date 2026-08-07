@@ -198,6 +198,11 @@ _LOCAL_STACK_SERIAL_MODULES = {
     # 整表清空**同表 —— 不进组就会被它连坐清掉种子，症状是"断言看到 0 行"而非报错。
     "test_retire_owner_change_convergence_db.py",
     "test_skip_gate_prior_version_status_db.py",
+    # 贡献域 node 轴（2026-08-07，schema/067）：dept_dim/staff_dim/user_role/
+    # dept_admin_*_grant/kb_contribution/document_meta/document_version/kb_doc_node_grant
+    # 全是真实 DML，且与 test_pipeline 的**无 WHERE 整表清空**同表 —— 不进组就会被连坐清掉
+    # 种子（症状是「断言看到 0 行」而非报错）。
+    "test_contribution_node_axis_db.py",
 }
 
 

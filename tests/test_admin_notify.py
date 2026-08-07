@@ -262,3 +262,118 @@ def test_contribution_result_unknown_outcome_or_missing_row_silent(monkeypatch):
     _wire(monkeypatch, _Conn())          # fetchone 走不到 kb_contribution 分支 → None
     an.notify_contribution_result("C_MISSING", "accepted")
     assert sent == []
+
+
+# ── 贡献域 node 轴收件人（方案 M6/M7，schema/067）─────────────────────────────
+class _NodeCur(_Cur):
+    """在 _Cur 之上认三条 node 轴查询：管辖根持有者 / 节点名 / kb_admin。"""
+
+    def fetchall(self):
+        if "dept_admin_node_grant" in self._last:
+            return self.conn.node_admins
+        return super().fetchall()
+
+    def fetchone(self):
+        if "dept_dim" in self._last:
+            return self.conn.dept_row
+        return super().fetchone()
+
+
+class _NodeConn(_Conn):
+    def __init__(self, node_admins=(), dept_row=("三级班组",), **kw):
+        super().__init__(**kw)
+        self.node_admins = list(node_admins)
+        self.dept_row = dept_row
+
+    def cursor(self):
+        return _NodeCur(self)
+
+
+def _wire_org(monkeypatch, *, fresh=True, parents=None):
+    """组织快照替身：node 收件人 = 该节点祖先链 ∩ 管辖根。"""
+    monkeypatch.setattr(an, "_kb_db", lambda: "kb")
+    monkeypatch.setattr(
+        "opensearch_pipeline.dingtalk_identity._load_org_snapshot",
+        lambda: {"fresh": fresh, "parents": parents if parents is not None
+                 else {930001: 920001, 920001: 910001, 910001: 1}})
+
+
+def test_contribution_node_axis_notifies_covering_node_admins(monkeypatch):
+    """node 贡献 ⇒ 收件人来自覆盖该节点的管辖根持有者（**不是** dept_admin_grant 组码表），
+    文案里的归属名来自 dept_dim。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    conn = _NodeConn(node_admins=[("u-node",)], dept_admins=[("u-legacy",)], kb_admins=[("u-kb",)])
+    _wire(monkeypatch, conn)
+    _wire_org(monkeypatch)
+
+    an.notify_contribution("", "节点贡献问题？", category_dept_id=930001)
+
+    assert len(sent) == 1
+    payload = sent[0][1]
+    assert payload["userid_list"] == "u-node", "组码表的管理员绝不能因 node 贡献被叫到"
+    text = payload["msg"]["text"]["content"]
+    assert "三级班组" in text and "兜底" not in text
+    # 祖先链必须整条参与匹配（授权在 920001/910001 的人也该收到）
+    node_sql = [c for c in conn.calls if "dept_admin_node_grant" in c[0]]
+    assert node_sql and set(node_sql[0][1]) == {930001, 920001, 910001}
+
+
+def test_contribution_node_axis_falls_back_to_kb_admin_when_unmanaged(monkeypatch):
+    """node 无人覆盖 ⇒ kb_admin 兜底，且文案说的是「归属节点不在任何部门管理员的管辖范围内」
+    （Codex C10：文案必须按轴分支，不能复用组码那句「该部门暂无部门管理员」）。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    conn = _NodeConn(node_admins=[], kb_admins=[("u-kb",)])
+    _wire(monkeypatch, conn)
+    _wire_org(monkeypatch)
+
+    an.notify_contribution("", "孤儿节点问题？", category_dept_id=930001)
+    text = sent[0][1]["msg"]["text"]["content"]
+    assert sent[0][1]["userid_list"] == "u-kb"
+    assert "归属节点不在任何部门管理员的管辖范围内" in text
+
+
+def test_contribution_node_axis_snapshot_unavailable_uses_generic_wording(monkeypatch):
+    """快照不可用 ⇒ 收件人**算不出**（≠无人管辖）：仍叫 kb_admin，但文案用通用兜底句，
+    不谎称「不在任何管辖范围内」。与 _contrib_orphan_sql 的 node 支 fail-open 对齐——
+    队列对 kb_admin 可见了，就必须有人被叫到。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    conn = _NodeConn(node_admins=[("u-node",)], kb_admins=[("u-kb",)])
+    _wire(monkeypatch, conn)
+    _wire_org(monkeypatch, fresh=False)
+
+    an.notify_contribution("", "快照过期问题？", category_dept_id=930001)
+    text = sent[0][1]["msg"]["text"]["content"]
+    assert sent[0][1]["userid_list"] == "u-kb"
+    assert "未匹配到可审核的部门管理员" in text
+    assert "不在任何部门管理员" not in text
+    assert not [c for c in conn.calls if "dept_admin_node_grant" in c[0]], \
+        "快照不可得时不该再去查管辖表（祖先链算不出，查了也是错的集合）"
+
+
+def test_contribution_group_code_path_unchanged_by_node_addition(monkeypatch):
+    """回归锚：不传 category_dept_id 时，收件人与文案与改动前逐字不变。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    conn = _NodeConn(node_admins=[("u-node",)], dept_admins=[("u-legacy",)], kb_admins=[("u-kb",)])
+    _wire(monkeypatch, conn)
+    _wire_org(monkeypatch)
+
+    an.notify_contribution("hr", "组码贡献问题？")
+    assert sent[0][1]["userid_list"] == "u-legacy"
+    assert not [c for c in conn.calls if "dept_admin_node_grant" in c[0]]
+
+
+def test_upload_approval_node_label_comes_from_dept_dim(monkeypatch):
+    """node 归属的待审批通知：标签走 dept_dim（组码标签词表里没有节点，
+    直接喂 _dept_label 会把空串原样印进文案）。"""
+    monkeypatch.setenv("RAG_ADMIN_NOTIFY", "1")
+    sent = _spy_http(monkeypatch)
+    conn = _NodeConn(kb_admins=[("u-kb",)])
+    _wire(monkeypatch, conn)
+    _wire_org(monkeypatch)
+
+    an.notify_upload_approval("", "员工手册", owner_dept_id=930001)
+    assert "（归属 三级班组）" in sent[0][1]["msg"]["text"]["content"]

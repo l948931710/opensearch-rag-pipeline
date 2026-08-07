@@ -1,6 +1,19 @@
 # 贡献域迁到 node 轴 — 实施方案（终版，2026-08-06）
 
-**状态**：已过 Claude-Codex 双盲评审四轮，`VERDICT: APPROVE` / `REMAINING BLOCKERS: NONE` / `ESCALATE: NONE`。**待实施**。
+**状态**：已过 Claude-Codex 双盲评审四轮，`VERDICT: APPROVE` / `REMAINING BLOCKERS: NONE` / `ESCALATE: NONE`。
+
+**实施状态（2026-08-07）**：M1-M11 代码全部落地，`make test`（4450 passed，连续 5 轮）+ `make lint` + console `npm run test/typecheck/build` 全绿。三件 user-gated 的事里 **①② 已于 2026-08-07 收口，只剩发镜像**：
+
+| 事项 | 现状 | 谁来做 |
+|---|---|---|
+| `schema/067` apply 生产 + staging | ✅ **2026-08-07 02:57 已 apply**（Sam 当日授权 `PROD-RW:2026-08-07`）。台账 checksum `ea3b9440`；生产 5 行 / staging 2 行存量 `category_dept_id` 全 NULL ⇒ 行为不变 | 已完成 |
+| M8 存量迁移 | ✅ **2026-08-07 已执行**（Sam 亲手跑）：4 条白名单行 → `category_dept_id=34265162`（人力资源部），第 5 行 finance/rejected 未动，白名单外误伤 0 —— 事后 prod-ro 独立复核，非采信脚本自报。组码列 `category_dept='hr'` 保留作审计留痕 | 已完成 |
+| 发新镜像 / 开 `RAG_NODE_ACL_GRANT` | ⏳ **唯一剩余项**。现网 flag 本就是 on（2026-08-03 起，现查：27 active 管辖根 / 2228 篇 node 文档 / 16757 条有效 kb_doc_node_grant），缺的只是带新代码的镜像。⚠️ ①② 做完对现网**零效果**——老镜像读不到 `category_dept_id` 列 | Sam |
+
+实施期新增的三处（方案未写、按仓规补的，均为收紧方向）：
+1. **067 capability 探测**（`_contrib_axis_present`，正向缓存 + 探测失败按未 apply）——未 apply 的环境全域逐字节回到组码行为，**先部署后 apply 也安全**（方案原文只承诺了「先 apply 后部署安全」）。
+2. **node 贡献行的 `category_dept` 落空串哨兵**——理由同 060 给 node 文档写 `owner_dept=NULL`：留组码残值 = node 行会被旧组码管理员的作用域命中。M8 迁移的 4 行是唯一例外（保留 `hr` 留痕），其降级受众恰是它们今天的管理员，无扩权。
+3. **跨轴改归属显式 400**（node 行不支持在采纳时改回组码分类）——静默保留旧轴会让审核人以为改成功了。
 
 **评审记账**：Codex 提出 17 条，全部经 `文件:行` 核验 CONFIRMED，0 条 REFUTED；Claude 独有 5 条（均源自 prod-ro 现网核查，Codex 在 read-only 沙箱不可见）全部成立。Codex 误报 0 / Claude 误驳 0。
 

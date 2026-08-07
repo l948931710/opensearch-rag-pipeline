@@ -27,6 +27,7 @@ from opensearch_pipeline.api import (
     _enforce_rate_limit,
     _kb_can_manage,
     _kb_db,
+    _kb_managed_descendants,
     _kb_owner_scope_sql,
     _require_kb_console,
     current_identity,
@@ -47,6 +48,9 @@ _CONTRIB_COLS = ("contribution_id, question, content, category_dept, author_id, 
                  "review_status, ingestion_status, doc_id, review_note, created_at, reviewed_at, "
                  "source_message_id, gap_query, "   # 缺口溯源透出（批次ε-1，写侧一直在存）
                  "ingestion_error")                 # 失败原因透出（批次ε-2——作者不再瞎重试）
+# node 轴列清单（schema/067 已 apply 时才用）：**独立常量**而非直接扩 _CONTRIB_COLS——
+# 067 未 apply 的环境引用该列会 1054 打挂全部贡献列表。行长度差异由 _contrib_item 吸收。
+_CONTRIB_COLS_NODE = _CONTRIB_COLS + ", category_dept_id"
 # 批次ε-4 拍板解耦：缺口列表与 asks 热度是两套口径，绝不共享常量——
 #   缺口窗 365 天（去「老缺口静默过期」；当下=系统 QA 全量历史，长期保留为增长边界；
 #   真·无窗需 qa_session_log 加 hash 列/缺口物化表=远期立项）；cap 随窗放大。
@@ -194,6 +198,9 @@ class KbContributionItem(BaseModel):
     question: str = ""
     content: str = ""
     category_dept: str = ""
+    # 归属组织节点（node 轴权威，schema/067）：None=组码轴历史行 ⇒ 判定回落 category_dept。
+    # ⚠️ 前端**不得**由 category_dept 反推本字段（组码→dept_id 一对多，见方案 M8/M11）。
+    category_dept_id: Optional[int] = None
     author_id: str = ""
     author_name: str = ""
     review_status: str = "pending"
@@ -229,16 +236,21 @@ class KbContributionListResponse(BaseModel):
 class KbContributionSubmitRequest(BaseModel):
     question: str
     content: str
-    category_dept: str
+    # 组码轴归属（node 轴提交时不传/忽略）。node 轴提交给 category_dept_id。
+    category_dept: str = ""
+    # 归属组织节点（Sam 裁决 A：提交人选，默认=其所在部门；来源只能是 /api/kb/my-depts）。
+    # 给了它就走 node 轴——服务端不信客户端传值，另查 dept_dim is_active（方案 M5 第 1 处）。
+    category_dept_id: Optional[int] = None
     source_message_id: Optional[str] = None
     gap_query: Optional[str] = None
 
 
 class KbContributionAcceptRequest(BaseModel):
-    # 采纳前可选修订（改 category_dept 必按新部门重做写授权）
+    # 采纳前可选修订（改归属必按新归属重做写授权；node 轴改归属须**双端管辖**，方案 M5）
     question: Optional[str] = None
     content: Optional[str] = None
     category_dept: Optional[str] = None
+    category_dept_id: Optional[int] = None
     # 部门领导采纳时决定可见范围：dept_internal=部门公开（默认）/ public=全员公开。
     # P2-16（2026-07-04 拍板「kb_admin 只管入库」，取代 2026-06-29「public 直通」裁决）：
     # dept_admin 选 public → 登记为 PENDING_APPROVAL 进 kb_admin 待审批队列，放行后才入库；
@@ -312,13 +324,18 @@ class KbHeroesResponse(BaseModel):
 
 
 def _contrib_item(row) -> "KbContributionItem":
-    """把 _CONTRIB_COLS 顺序的 DB 行映射为响应项（state 由两条生命周期折叠）。"""
+    """把 _CONTRIB_COLS（或 _CONTRIB_COLS_NODE）顺序的 DB 行映射为响应项（state 由两条生命周期折叠）。
+
+    多出的第 16 列 = category_dept_id（067 已 apply 时才被 SELECT）；缺席 ⇒ None ⇒ 组码轴行。
+    """
     from opensearch_pipeline import contribution as C
     (cid, q, content, dept, aid, aname, rs, ing, did, note, created, reviewed,
-     src_msg, gapq, ing_err) = row
+     src_msg, gapq, ing_err) = row[:15]
+    dept_id = row[15] if len(row) > 15 else None
     return KbContributionItem(
         contribution_id=cid or "", question=q or "", content=content or "",
-        category_dept=dept or "", author_id=aid or "", author_name=aname or "",
+        category_dept=dept or "", category_dept_id=(int(dept_id) if dept_id else None),
+        author_id=aid or "", author_name=aname or "",
         review_status=rs or "pending", ingestion_status=ing or "none",
         state=C.contribution_state(rs, ing), doc_id=did, review_note=note or "",
         created_at=(created.isoformat() if created else ""),
@@ -476,16 +493,118 @@ def _materialize_contribution(conn, *, doc_id: str, owner_dept: str, raw_key: st
     conn.commit()
 
 
+def _materialize_contribution_node(conn, *, doc_id: str, owner_dept_id: int, raw_key: str,
+                                   bucket: str, title: str, reviewer_id: str, reviewer_name: str,
+                                   md_text: str, permission_level: str = "dept_internal",
+                                   requires_approval: bool = False) -> None:
+    """**node 归属**的物化+登记（方案 M4，Codex C7 BLOCKER）。
+
+    与上面的 legacy 版**并列**，后者逐字不动 —— legacy 物化只写 `owner_dept`，对 node 归属
+    的贡献而言那是「登记了一篇谁都搜不到、且组码残值可能命中别的管理员」的文档。
+
+    同一事务内原子完成 5 件事（任一失败 ⇒ **数据库侧整笔回滚**，`ingestion_status` 保持可重试态）：
+      1. `document_meta`：`owner_dept=NULL` + `acl_mode='node'` + `owner_dept_id` + active/v1
+      2. `document_version`：与 legacy 版同形（cps/appr 沿用现有 public 审批语义）
+      3. `kb_doc_node_grant (doc_id, owner_dept_id, scope='subtree')` —— **Sam 裁决 D**。
+         🔴 缺这条则可见集为空 ⇒ 文档谁都搜不到（node 文档的可见性**完全**来自这张表）
+      4. `record_acl_projection_invalidation`（acl_epoch bump + 投影 outbox 入队）
+      5. raw_key 由调用方按 `kb_upload.node_storage_segment` 编好（防 stage-1 按路径段重派归属）
+
+    ⚠️ **这不是跨 OSS+DB 的原子事务**（Codex 三轮 NEW CONCERN）：与 legacy 版一样先写 OSS 再开
+    DB 写入，DB 回滚撤不回已落的对象。清理沿用既有的「同 raw_key 重试覆盖」策略——raw_key 由
+    `(doc_id, upload_id)` 固定，重试写同一对象，不产生孤儿。
+    """
+    import hashlib
+
+    from opensearch_pipeline.access_grants import record_acl_projection_invalidation
+    from opensearch_pipeline.api import _kb_node_capability
+    from opensearch_pipeline.oss_url import put_object
+
+    data = md_text.encode("utf-8")
+    size = len(data)
+    etag = hashlib.sha256(data).hexdigest()[:32].upper()
+    raw_key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    oss_filename = raw_key.rsplit("/", 1)[-1]
+    kb_type = "public" if permission_level == "public" else "private"
+    cps = "PENDING_APPROVAL" if requires_approval else "NOT_STARTED"
+    appr = "PENDING" if requires_approval else "APPROVED"
+    oid = int(owner_dept_id)
+
+    if not put_object(raw_key, data, "text/markdown; charset=utf-8"):
+        raise RuntimeError("OSS 写入合成文档失败")
+
+    try:
+        with conn.cursor() as cur:
+            if _kb_node_capability(cur) != "present":
+                # 060 未 apply ⇒ 写不出合法的 node 文档；宁可失败可重试，也不退化成 legacy
+                # （退化 = owner_dept 落 NULL/空 + 无 grant，文档谁都搜不到且归属不可判）
+                raise RuntimeError("node-ACL schema 未就绪（060 未 apply），拒绝以 node 归属登记")
+            # 幂等：固定 raw_key 已登记 → 直接返回（续跑/竞态安全；谓词同 legacy 版走 raw_key_hash 索引）
+            cur.execute(f"SELECT doc_id, version_no FROM {_kb_db()}.document_version "
+                        "WHERE raw_key=%s AND (raw_key_hash=%s OR raw_key_hash IS NULL) LIMIT 1",
+                        (raw_key, raw_key_hash))
+            if cur.fetchone():
+                conn.rollback()
+                return
+            cur.execute(
+                f"""
+                INSERT INTO {_kb_db()}.document_meta
+                  (doc_id, title, original_filename, owner_dept, owner_user_id, owner_name,
+                   category_l1, category_l2, permission_level, kb_type, status,
+                   current_version_no, acl_mode, owner_dept_id)
+                VALUES (%s,%s,%s,NULL,%s,%s,'reference','others',%s,%s,'active',1,'node',%s)
+                ON DUPLICATE KEY UPDATE current_version_no=GREATEST(current_version_no,1),
+                                        updated_at=NOW()
+                """,
+                (doc_id, (title or "")[:200], oss_filename,
+                 reviewer_id, reviewer_name or "", permission_level, kb_type, oid),
+            )
+            try:
+                # cps/appr 是本函数内的二值常量（非用户输入），直接内插无注入风险（同 legacy 版）
+                cur.execute(
+                    f"""
+                    INSERT INTO {_kb_db()}.document_version
+                      (doc_id, version_no, bucket_name, raw_key, raw_key_hash, etag, file_ext,
+                       mime_type, file_size_bytes, content_process_status, approval_status,
+                       status, received_at)
+                    VALUES (%s,1,%s,%s,%s,%s,'md','text/markdown',%s,'{cps}','{appr}','active',NOW())
+                    """,
+                    (doc_id, bucket, raw_key, raw_key_hash, etag, size),
+                )
+            except Exception as ins_err:
+                if (getattr(ins_err, "args", None) or (None,))[0] != 1062:
+                    raise
+                logger.info("contribution[node] 物化并发幂等命中：raw_key=%s", raw_key)
+            # Sam 裁决 D：默认可见范围 = 归属节点 subtree（与摄取侧 node 默认授权一致）
+            cur.execute(
+                f"INSERT INTO {_kb_db()}.kb_doc_node_grant "
+                "(doc_id, dept_id, scope, granted_by, note) VALUES (%s,%s,'subtree',%s,%s) "
+                "ON DUPLICATE KEY UPDATE revoked_at=NULL, revoked_by=NULL, "
+                "granted_by=VALUES(granted_by), granted_at=NOW(), note=VALUES(note)",
+                (doc_id, oid, reviewer_id, "contribution_adopt"))
+            record_acl_projection_invalidation(cur, doc_id, reason="contribution_node_adopt")
+        conn.commit()
+    except Exception:
+        # 「整笔回滚」是本函数的契约：半截 node 文档（有 meta 无 grant）= 谁都搜不到且不可判归属
+        try:
+            conn.rollback()
+        except Exception as rb:   # noqa: BLE001 — 回滚失败只记日志，异常仍按原样上抛
+            logger.warning("contribution[node] 物化回滚失败 doc=%s: %s", doc_id, rb)
+        raise
+
+
 def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner_dept: str,
                                    question: str, content: str, reviewer_id: str,
                                    reviewer_name: str, trace_id: str,
-                                   requires_kb_admin_approval: bool = False):
+                                   requires_kb_admin_approval: bool = False,
+                                   owner_dept_id: Optional[int] = None):
     """采纳后的物化+登记（独立事务，幂等可重试）：成功→registered，失败→failed+ingestion_error。
 
     返回 (ingestion_status, error_or_None)。绝不假设跨系统原子——OSS 与 RDS 任一失败都记 failed，
     固定键留存，retry-ingestion 用同键续跑。
     P2-16：requires_kb_admin_approval=True → 登记为 PENDING_APPROVAL（见 _materialize_contribution），
     并 best-effort 通知 kb_admin（notify_upload_approval，no-raise）。
+    方案 M4：`owner_dept_id` 非空 ⇒ 走 node materializer（组码 materializer 逐字不动）。
     """
     from opensearch_pipeline import contribution as C
     from opensearch_pipeline.config import get_config
@@ -502,11 +621,18 @@ def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner
         assert_metadata_write_allowed("kb_contribution_materialize", cfg.rds.host, kind="rds")
         conn = _get_db_conn()
         try:
-            _materialize_contribution(
-                conn, doc_id=doc_id, owner_dept=owner_dept, raw_key=raw_key,
-                bucket=cfg.oss.bucket_name, title=question, reviewer_id=reviewer_id,
-                reviewer_name=reviewer_name, md_text=md, permission_level=permission_level,
-                requires_approval=requires_kb_admin_approval)
+            if owner_dept_id is not None:
+                _materialize_contribution_node(
+                    conn, doc_id=doc_id, owner_dept_id=int(owner_dept_id), raw_key=raw_key,
+                    bucket=cfg.oss.bucket_name, title=question, reviewer_id=reviewer_id,
+                    reviewer_name=reviewer_name, md_text=md, permission_level=permission_level,
+                    requires_approval=requires_kb_admin_approval)
+            else:
+                _materialize_contribution(
+                    conn, doc_id=doc_id, owner_dept=owner_dept, raw_key=raw_key,
+                    bucket=cfg.oss.bucket_name, title=question, reviewer_id=reviewer_id,
+                    reviewer_name=reviewer_name, md_text=md, permission_level=permission_level,
+                    requires_approval=requires_kb_admin_approval)
             with conn.cursor() as cur:
                 cur.execute(
                     f"UPDATE {_op_db()}.kb_contribution SET ingestion_status='registered', "
@@ -514,15 +640,17 @@ def _finish_contribution_ingestion(cid: str, *, doc_id: str, raw_key: str, owner
             conn.commit()
         finally:
             conn.close()
+        _owner_label = f"node:{int(owner_dept_id)}" if owner_dept_id is not None else owner_dept
         write_audit(doc_id=doc_id, version_no=1, action_type="CONTRIB_ADOPT",
                     operator_type="user", operator_id=reviewer_id, oss_key=raw_key,
                     trace_id=trace_id,
-                    message=f"contribution={cid} owner={owner_dept}"
+                    message=f"contribution={cid} owner={_owner_label}"
                             + (" pending_kb_approval" if requires_kb_admin_approval else ""))
         if requires_kb_admin_approval:
             # P2-16：进待审批队列后即时告知 kb_admin（既有挂点，内部 no-raise，失败只记 warning）
             from opensearch_pipeline.admin_notify import notify_upload_approval
-            notify_upload_approval(owner_dept=owner_dept, title=question)
+            notify_upload_approval(owner_dept=owner_dept, title=question,
+                                   owner_dept_id=owner_dept_id)
         _gaps_cache_clear()   # 采纳物化完成 → 缺口徽标状态变化即时可见
         return C.INGEST_REGISTERED, None
     except Exception as e:
@@ -581,10 +709,102 @@ def _requeue_failed_doc(doc_id: str, *, trace_id: str) -> None:
                        trace_id, doc_id, e)
 
 
+class KbMyDeptItem(BaseModel):
+    dept_id: int = 0
+    name: str = ""
+
+
+class KbMyDeptsResponse(BaseModel):
+    """提交端归属来源（Sam 裁决 F/G）。**极小只读面**：不返回整棵树，不返回任何管辖/授权字段。"""
+    items: List[KbMyDeptItem] = Field(default_factory=list)
+    # 三态纪律（「缺键=unknown≠空集」，同 asset-diff 教训）：available=False = 算不出
+    # （flag 关 / 未在册 / 快照不可用），**不是**「你没有可选部门」。前端据此回落组码轴。
+    available: bool = True
+
+
+_MY_DEPTS_CAP = 200
+
+
+@router.get("/api/kb/my-depts", response_model=KbMyDeptsResponse)
+def kb_my_depts(request: Request, identity: Optional[Identity] = Depends(current_identity)):
+    """调用者可选的贡献归属节点（Sam 裁决 F + 补充裁决 G）。
+
+    **为什么不能复用 `/api/kb/org-tree`**（Codex 三轮 B1，已核验）：贡献提交只要求登录
+    （`employee` 可提交），而 org-tree 挂 `_require_kb_console` ⇒ employee 恒 403；且该响应含
+    `my_managed_owner_depts` / `my_managed_node_roots`，放开会泄露管理结构。
+
+    返回规则（裁决 G —— 直挂上级节点者可选下级）。对调用者所在的每个节点 N：
+      · N **无**活跃子节点（叶子）⇒ 返回 `N` 自己
+      · N **有**活跃子节点       ⇒ 返回 **N 的直接子节点集**（不含 N 自己）
+    这条直接消解 L1 盲区的主体：直挂 depth1 的人不再被迫把贡献挂在无人管辖的中心节点上。
+    ⚠️ 有意**不做**任何向上/向下的多级推导——只看一层，与 `_contrib_can_manage` 的
+    「代码不做归属推导」同一纪律。
+    """
+    _enforce_rate_limit(request, identity, scope="aux")
+    if not identity or not identity.user_id:
+        raise HTTPException(status_code=401, detail="需要登录")
+    if not _node_acl_grant_on():
+        return KbMyDeptsResponse(items=[], available=False)
+    from opensearch_pipeline.dingtalk_identity import _load_direct_dept_ids
+    direct = _load_direct_dept_ids(identity.user_id)
+    if not direct:
+        # staff_dim 不可用 / 该人不在册 ⇒ 算不出（≠ 无部门）
+        return KbMyDeptsResponse(items=[], available=False)
+    direct = [d for d in dict.fromkeys(int(x) for x in direct) if d > 1][:8]
+    if not direct:
+        return KbMyDeptsResponse(items=[], available=False)
+    try:
+        from opensearch_pipeline.db import _get_db_conn
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                ph = ",".join(["%s"] * len(direct))
+                cur.execute(
+                    f"SELECT dept_id, parent_id, name FROM {_kb_db()}.dept_dim"
+                    f" WHERE is_active=1 AND (dept_id IN ({ph}) OR parent_id IN ({ph}))",
+                    tuple(direct) * 2)
+                rows = cur.fetchall() or []
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("kb_my_depts 组织快照读取失败（算不出）: %s", e)
+        return KbMyDeptsResponse(items=[], available=False)
+    self_by_id = {int(r[0]): (r[2] or "") for r in rows if int(r[0]) in set(direct)}
+    children: Dict[int, List[tuple]] = {}
+    for r in rows:
+        pid = int(r[1] or 0)
+        if pid in set(direct) and int(r[0]) != pid:
+            children.setdefault(pid, []).append((int(r[0]), r[2] or ""))
+    picked: Dict[int, str] = {}
+    for d in direct:
+        kids = children.get(d)
+        if kids:
+            for kid_id, kid_name in kids:
+                picked.setdefault(kid_id, kid_name)
+        elif d in self_by_id:
+            picked.setdefault(d, self_by_id[d])
+    if not picked:
+        # 直属部门全不在活跃快照里 ⇒ 同样是「算不出」，不是「没得选」
+        return KbMyDeptsResponse(items=[], available=False)
+    items = [KbMyDeptItem(dept_id=i, name=(n or f"节点 {i}"))
+             for i, n in sorted(picked.items())][:_MY_DEPTS_CAP]
+    return KbMyDeptsResponse(items=items, available=True)
+
+
 @router.post("/api/kb/contributions", response_model=KbContributionItem)
 def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
                            identity: Optional[Identity] = Depends(current_identity)):
-    """员工提交知识贡献（问答文本）。仅要求登录（员工即可）；status=pending 待部门管理员采纳。"""
+    """员工提交知识贡献（问答文本）。仅要求登录（员工即可）；status=pending 待部门管理员采纳。
+
+    两根归属轴（方案 M9/M10，Sam 裁决 A/E）：
+      · `category_dept_id` 给出 ⇒ **node 轴**。要求 `RAG_NODE_ACL_GRANT` 开 + schema/067 已
+        apply + 该节点在 `dept_dim` 里 active（M5 第 1 处：服务端不信客户端传值——否则会存下
+        指向已停用/不存在节点的 pending 行，要等 accept 才失败）。任一不满足 ⇒ **400 拒绝**，
+        **绝不静默回落组码轴**（裁决 E；对齐 `kb_console.py:2658-2663` 的上传行为）。
+        组码列写空串哨兵——理由同 060 给 node 文档写 `owner_dept=NULL`：留组码残值 =
+        node 行会被旧组码管理员的作用域命中（越权），见 `_contrib_axis_present` 头注。
+      · 否则 ⇒ 组码轴，逐字节保持既有语义。
+    """
     _enforce_rate_limit(request, identity, scope="aux")
     if not identity or not identity.user_id:
         raise HTTPException(status_code=401, detail="需要登录")
@@ -596,10 +816,15 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
     verr = C.validate_contribution_text(q_clean, c_clean)
     if verr:
         raise HTTPException(status_code=400, detail=verr)
-    depts = kb_authz.sanitize_owner_depts(req.category_dept)
-    if not depts:
-        raise HTTPException(status_code=400, detail="归属分类无效")
-    category_dept = depts[0]
+    node_id = int(req.category_dept_id or 0) or None
+    category_dept = ""
+    if node_id is None:
+        depts = kb_authz.sanitize_owner_depts(req.category_dept)
+        if not depts:
+            raise HTTPException(status_code=400, detail="归属分类无效")
+        category_dept = depts[0]
+    elif not _node_acl_grant_on():
+        raise HTTPException(status_code=400, detail="组织树授权通道未开启（RAG_NODE_ACL_GRANT）")
     cid = C.new_contribution_id()
     qhash = C.question_hash(q_clean)
     nq = C.normalize_question(q_clean)
@@ -612,32 +837,56 @@ def kb_contribution_submit(req: KbContributionSubmitRequest, request: Request,
         conn = _get_db_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    INSERT INTO {_op_db()}.kb_contribution
-                      (contribution_id, question, content, normalized_question, question_hash,
-                       category_dept, suggested_dept, author_id, author_name,
-                       review_status, ingestion_status, source_message_id, gap_query,
-                       normalized_gap_query, gap_query_hash)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending','none',%s,%s,%s,%s)
-                    """,
-                    (cid, q_clean, c_clean, nq, qhash,
-                     category_dept, category_dept, identity.user_id, identity.name or "",
-                     (req.source_message_id or None), gq, ngq, gqhash),
-                )
+                # 两条**字面** INSERT（而非拼列名变量）：列清单要能被
+                # tests/test_schema_ddl_parity.py 静态扫到——F-35 的 010 漂移就是靠这条守住的。
+                params = [cid, q_clean, c_clean, nq, qhash,
+                          category_dept, (category_dept or None), identity.user_id,
+                          identity.name or "",
+                          (req.source_message_id or None), gq, ngq, gqhash]
+                if node_id is None:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {_op_db()}.kb_contribution
+                          (contribution_id, question, content, normalized_question, question_hash,
+                           category_dept, suggested_dept, author_id, author_name,
+                           review_status, ingestion_status, source_message_id, gap_query,
+                           normalized_gap_query, gap_query_hash)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending','none',%s,%s,%s,%s)
+                        """,
+                        tuple(params),
+                    )
+                else:
+                    if not _contrib_axis_present(cur):
+                        raise HTTPException(status_code=400,
+                                            detail="贡献归属节点通道未就绪（schema/067 未 apply）")
+                    _assert_node_active(cur, node_id)
+                    cur.execute(
+                        f"""
+                        INSERT INTO {_op_db()}.kb_contribution
+                          (contribution_id, question, content, normalized_question, question_hash,
+                           category_dept, suggested_dept, author_id, author_name,
+                           review_status, ingestion_status, source_message_id, gap_query,
+                           normalized_gap_query, gap_query_hash, category_dept_id)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending','none',%s,%s,%s,%s,%s)
+                        """,
+                        tuple(params + [node_id]),
+                    )
             conn.commit()
         finally:
             conn.close()
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("kb_contribution_submit 失败 [trace=%s]: %s", trace_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"提交失败 (trace: {trace_id})")
     _gaps_cache_clear()   # 缺口的「等待入库」徽标即时可见，不等 TTL
-    # 钉钉工作通知（RAG_ADMIN_NOTIFY 门控，best-effort no-raise）：归属部门管理员即时知晓待审核贡献
+    # 钉钉工作通知（RAG_ADMIN_NOTIFY 门控，best-effort no-raise）：归属管理员即时知晓待审核贡献
     from opensearch_pipeline.admin_notify import notify_contribution
-    notify_contribution(category_dept=category_dept, question=q_clean)
+    notify_contribution(category_dept=category_dept, question=q_clean, category_dept_id=node_id)
     return KbContributionItem(
         contribution_id=cid, question=q_clean, content=c_clean,
-        category_dept=category_dept, author_id=identity.user_id, author_name=identity.name or "",
+        category_dept=category_dept, category_dept_id=node_id,
+        author_id=identity.user_id, author_name=identity.name or "",
         review_status="pending", ingestion_status="none", state="pending",
         source_message_id=(req.source_message_id or None), gap_query=gq)
 
@@ -727,8 +976,10 @@ def kb_contributions_mine(request: Request, limit: int = 20, offset: int = 0,
     try:
         _reconcile_contributions_searchable(conn)
         with conn.cursor() as cur:
+            # 067 已 apply 才带 category_dept_id（「修改重交」预填原归属要用；M11）
+            _cols = _CONTRIB_COLS_NODE if _contrib_axis_present(cur) else _CONTRIB_COLS
             cur.execute(
-                f"SELECT {_CONTRIB_COLS} FROM {_op_db()}.kb_contribution WHERE author_id=%s"
+                f"SELECT {_cols} FROM {_op_db()}.kb_contribution WHERE author_id=%s"
                 " ORDER BY created_at DESC, contribution_id DESC LIMIT %s OFFSET %s",
                 (identity.user_id, limit + 1, offset))
             rows = cur.fetchall() or []
@@ -754,25 +1005,217 @@ def kb_contributions_mine(request: Request, limit: int = 20, offset: int = 0,
     return KbContributionListResponse(items=items, has_more=has_more)
 
 
-def _contrib_pending_scope_sql(kb) -> tuple:
+# ═══════════════════════════════════════════════════════════════════════════
+# 贡献域 node 轴（schema/067；方案 docs/contribution_node_axis_migration_2026-08-06.md）
+#
+# 背景：贡献域的八个消费点原本只认组码 `category_dept`（dept_admin_grant），而
+# 2026-07-27 起的节点授权（dept_admin_node_grant）是**另一根轴** ⇒ 只被 node 授权的
+# 管理员在贡献域完全失明。本组函数是贡献域**专属**的单一判定入口。
+#
+# 🔴 **绝不改** `api.py:_kb_owner_scope_sql/_kb_can_manage`（组码域 generic 入口，被上传/
+#    退役/共享/Agent/本体 20+ 处复用）——它们仍是本组函数 legacy 分支的实现。
+# 🔴 **轴隔离**（Codex C3 + `api.py::_kb_doc_owner_scope_sql` 范式）：
+#    `category_dept_id IS NOT NULL` ⇒ **只**走 node；`IS NULL` ⇒ **只**走组码。
+#    两支互斥、**不 OR 交叉**——交叉即 node 行的 `category_dept` 残值继续命中旧组码
+#    管理员（与 060 阶段 A 的 owner_dept 残值越权同型）。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 067 capability 正向缓存（同 access_grants._NODE_SCHEMA_PRESENT 形态）：一旦探到列在册
+# 就不再探；未 apply/探测失败 ⇒ False ⇒ 全域**逐字节回到组码行为**（先部署后 apply 安全）。
+_CONTRIB_AXIS_PRESENT: Set[str] = set()
+_contrib_axis_lock = threading.Lock()
+
+
+def _contrib_axis_present(cur) -> bool:
+    """schema/067 是否已 apply（`kb_contribution.category_dept_id` 列在册）。
+
+    探测失败按「未 apply」处理是**安全**的：node 贡献行的 `category_dept` 恒为空串哨兵
+    （见 `kb_contribution_submit` 的 node 分支——理由同 060 给 node 文档写 owner_dept=NULL），
+    组码腿的 `IN (...)` 永不命中空串 ⇒ 降级方向是「落 kb_admin 孤儿兜底」，绝不会把 node 行
+    的组码残值喂给旧组码管理员。M8 迁移的 4 行是例外（保留 category_dept='hr'），其降级
+    受众恰是它们今天的管理员，无扩权。
+    """
+    key = _op_db()
+    if key in _CONTRIB_AXIS_PRESENT:
+        return True
+    try:
+        cur.execute(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='kb_contribution' "
+            "  AND COLUMN_NAME='category_dept_id'", (key,))
+        row = cur.fetchone()
+        present = bool(row and row[0])
+    except Exception as e:   # noqa: BLE001 — 探测失败 ⇒ 组码语义（收紧方向，见 docstring）
+        logger.warning("贡献 node 轴列探测失败，按 067 未 apply 处理（全域组码）: %s", e)
+        return False
+    if present:
+        with _contrib_axis_lock:
+            _CONTRIB_AXIS_PRESENT.add(key)
+    return present
+
+
+def _node_acl_grant_on() -> bool:
+    """`RAG_NODE_ACL_GRANT` 现值。单一来源=`kb_console._node_acl_grant_enabled`（惰性 import
+    避免两个路由模块的导入序耦合）。取不到一律 False —— fail-safe 到组码轴（现状可用）。"""
+    try:
+        from opensearch_pipeline.routes.kb_console import _node_acl_grant_enabled
+        return _node_acl_grant_enabled()
+    except Exception as e:   # noqa: BLE001
+        logger.warning("读取 node_acl_grant 失败，按未开启处理: %s", e)
+        return False
+
+
+def _assert_node_active(cur, dept_id: int, *, status: int = 400) -> None:
+    """归属节点必须在 `dept_dim` 里 active（方案 M5；提交 / accept / retry **三处共用**）。
+
+    ⚠️ `kb_authz.can_manage_doc` **不校验节点 active**（只做 `owner_dept_id ∈ descendant_ids`），
+    active 校验历来是 `kb_console.py:2681` 在上传路径上**单独**做的。贡献域三处一个都不能省：
+    提交入口挡的是脏数据落库（否则存下指向死节点的 pending 行，要等 accept 才失败），
+    accept/retry 挡的是「提交之后节点被停用」的时间差。
+    读失败 ⇒ **抛 503**（fail-closed），绝不把「查不出来」当成 active 放过。
+    """
+    try:
+        cur.execute(f"SELECT 1 FROM {_kb_db()}.dept_dim WHERE dept_id=%s AND is_active=1 LIMIT 1",
+                    (int(dept_id),))
+        ok = bool(cur.fetchone())
+    except Exception as e:   # noqa: BLE001
+        logger.warning("dept_dim active 校验失败（fail-closed）dept_id=%s: %s", dept_id, e)
+        raise HTTPException(status_code=503, detail="组织节点校验暂不可用，请稍后重试") from e
+    if not ok:
+        raise HTTPException(status_code=status, detail=f"归属节点不存在或已停用：{int(dept_id)}")
+
+
+def _all_managed_node_descendants(cur) -> Optional[Set[int]]:
+    """全局「被**任何** active `dept_admin_node_grant` 覆盖」的节点集 → set[int] 或 None。
+
+    Codex C4/C9：`api._kb_managed_descendants` 是 **per-identity**（按调用者自己的
+    granted_node_roots 展开），不可复用——kb_admin 的孤儿判定问的是「有没有【任何人】
+    管这个节点」。
+
+    None = 不可得（组织快照过期/读失败/展开超限）。调用方的处置**按轴不同**：
+      · node 分支（kb_admin 孤儿兜底）→ fail-**open** 取全集（宁多看不丢件）；
+      · legacy 分支 → 原组码孤儿规则**分毫不变**；
+      · dept_admin 一律 fail-closed（`_contrib_scope_sql` / `_contrib_can_manage`）。
+    """
+    try:
+        cur.execute(f"SELECT DISTINCT managed_dept_id FROM {_kb_db()}.dept_admin_node_grant"
+                    " WHERE is_active=1")
+        roots = [int(r[0]) for r in (cur.fetchall() or []) if r and r[0]]
+    except Exception as e:   # noqa: BLE001 — 060 未 apply / 读失败
+        logger.warning("dept_admin_node_grant 读取失败，node 管辖全集不可得: %s", e)
+        return None
+    if not roots:
+        return set()          # 无人持 node 管辖根：合法状态，全部 node 行都是孤儿
+    try:
+        from opensearch_pipeline.dept_ancestry import resolve_descendant_ids
+        from opensearch_pipeline.org_sync import load_children_index
+        _rev, fresh, children = load_children_index()
+        if not fresh:
+            logger.warning("组织快照过期 ⇒ node 管辖全集不可得（贡献孤儿判定降级）")
+            return None
+        got, ok = resolve_descendant_ids(children, roots)
+        return got if ok else None
+    except Exception as e:   # noqa: BLE001 — OrgSnapshotUnavailable 等
+        logger.warning("node 管辖全集展开失败（贡献孤儿判定降级）: %s", e)
+        return None
+
+
+def _contrib_can_manage(kb, category_dept_id, category_dept, *, cur) -> bool:
+    """单条贡献的管理判定（队列可见 / accept / reject / retry 共用**唯一**入口）。
+
+    kb_admin → True（救急兜底通道，与批次δ-3 一致：队列收窄到孤儿，但权限面不收紧）。
+    dept_admin：
+      · node 行（category_dept_id 非空）→ `category_dept_id ∈ 管辖后代集`；后代集不可得
+        （快照过期/读失败）⇒ **False**（kb_authz.can_manage_doc 对 descendant_ids=None
+        fail-closed，绝不回退组码残值判定）；
+      · legacy 行（category_dept_id 为空）→ 组码语义**逐字节不变**（_kb_can_manage）。
+    `cur` 用于 067 capability 探测：未 apply 的环境即便调用方传了 id 也一律按组码判，
+    与 SQL 侧（同样探测后才敢引用该列）保持**同一根轴**，杜绝「列表按组码、accept 按 node」
+    这类两口径分裂。
+    """
+    from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN, can_manage_doc
+    if kb.role == ROLE_KB_ADMIN:
+        return True
+    if category_dept_id is not None and _contrib_axis_present(cur):
+        return can_manage_doc(kb, "node", None, int(category_dept_id),
+                              _kb_managed_descendants(kb))
+    return _kb_can_manage(kb, category_dept or "")
+
+
+def _contrib_scope_sql(kb) -> tuple:
+    """dept_admin 的贡献队列作用域（两支互斥）→ (clause, params)。
+
+    node 腿在后代集不可得/为空时**整腿去掉**（fail-closed：node 贡献对该管理员隐身），
+    组码腿在无 managed 时同样去掉；两腿都没有 ⇒ `AND 1=0`。
+    """
+    from opensearch_pipeline.kb_authz import expand_managed_owner_depts, managed_owner_depts
+    owners = expand_managed_owner_depts(managed_owner_depts(kb))
+    descendants = _kb_managed_descendants(kb)
+    if descendants is None:
+        logger.warning("管辖后代集不可得（快照过期/读失败）——贡献队列 node 腿失效（fail-closed）")
+    legs, params = [], []
+    if descendants:
+        ph = ",".join(["%s"] * len(descendants))
+        legs.append(f"(category_dept_id IS NOT NULL AND category_dept_id IN ({ph}))")
+        params.extend(sorted(descendants))
+    if owners:
+        ph = ",".join(["%s"] * len(owners))
+        legs.append(f"(category_dept_id IS NULL AND category_dept IN ({ph}))")
+        params.extend(owners)
+    if not legs:
+        return " AND 1=0", []
+    return " AND (" + " OR ".join(legs) + ")", params
+
+
+def _contrib_orphan_sql(cur) -> tuple:
+    """kb_admin 的**孤儿兜底**作用域（两支互斥）→ (clause, params)。
+
+    · legacy 支：`category_dept` 无任何 active dept_admin 管辖 —— 谓词与改动前**逐字节一致**
+      （含跨库 COLLATE 钉死：category_dept 在 fuling_operation / dept_admin_grant 在
+      fuling_knowledge，2026-07-15 现网因 collation 漂移让 kb_admin 队列全 500）。
+    · node 支：`category_dept_id` 不在「全局被管辖节点集」内。该集不可得（None）时
+      **fail-open 取全集**（Codex C9：kb_admin 宁多看不丢件），并记 WARN——注意
+      fail-open **只作用于 node 支**，legacy 支的孤儿规则分毫不动。
+    """
+    legacy = ("(category_dept_id IS NULL AND category_dept NOT IN"
+              " (SELECT DISTINCT managed_owner_dept COLLATE utf8mb4_unicode_ci"
+              f" FROM {_kb_db()}.dept_admin_grant WHERE is_active=1))")
+    all_managed = _all_managed_node_descendants(cur)
+    params: List[Any] = []
+    if all_managed is None:
+        logger.warning("node 管辖全集不可得 ⇒ kb_admin 贡献队列 node 支 fail-open（全部 node 行可见）")
+        node = "(category_dept_id IS NOT NULL)"
+    elif not all_managed:
+        node = "(category_dept_id IS NOT NULL)"
+    else:
+        ph = ",".join(["%s"] * len(all_managed))
+        node = f"(category_dept_id IS NOT NULL AND category_dept_id NOT IN ({ph}))"
+        params.extend(sorted(all_managed))
+    return f" AND ({legacy} OR {node})", params
+
+
+def _contrib_pending_scope_sql(kb, cur=None) -> tuple:
     """贡献审核队列作用域（批次δ-3 拍板：业务采纳/驳回归 dept_admin——业务标准在部门）。
 
-    dept_admin：本部门 category_dept ∈ managed（不变，复用共享 helper）。
-    kb_admin：**仅孤儿部门**（无任何 active dept_admin 管辖的 category_dept）——日常动线上
-    裁决权移交对应 dept_admin；accept/reject 的权限面**不收紧**（kb_admin 保留经 API 的
-    救急兜底通道，与 2026-07-04 access-request「kb_admin 只管入库、后端留救急通道」拍板同构）。
-    贡献专属函数：绝不改 _kb_owner_scope_sql/_kb_can_manage 共享入口（它们被上传/退役/共享/
-    Agent/本体 20+ 处复用，改了=静默收窄 kb_admin 无关模块的全权能力）。
-    category_dept 恒为 15 伞组之一（authorize_upload 白名单校验，子线进不来）——与
+    dept_admin：本部门（组码 managed ∪ node 管辖后代集，两轴互斥）。
+    kb_admin：**仅孤儿**（无任何 active 管理员管辖的归属）——日常动线上裁决权移交对应
+    dept_admin；accept/reject 的权限面**不收紧**（kb_admin 保留经 API 的救急兜底通道，与
+    2026-07-04 access-request「kb_admin 只管入库、后端留救急通道」拍板同构）。
+
+    `cur=None`（或 067 未 apply）⇒ 走**与改动前逐字节相同**的组码语句：列不存在时引用
+    `category_dept_id` 会 1054 打挂整个队列。
+    category_dept 恒为伞组之一（authorize_upload 白名单校验，子线进不来）——与
     dept_admin_grant.managed_owner_dept 同枚举域，精确匹配即可，无需伞形展开。
     """
     from opensearch_pipeline.kb_authz import ROLE_KB_ADMIN
+    axis = bool(cur is not None and _contrib_axis_present(cur))
     if kb.role == ROLE_KB_ADMIN:
-        # 跨库比较（category_dept 在 fuling_operation / dept_admin_grant 在 fuling_knowledge）：
-        # 显式 COLLATE 钉死子查询输出为 unicode_ci，防任一表 collation 漂移触发 1267
-        # （2026-07-15 现网：生产 dept_admin_grant 历史建于 0900_ai_ci，kb_admin 看审核队列全 500）。
+        if axis:
+            return _contrib_orphan_sql(cur)
         return (" AND category_dept NOT IN (SELECT DISTINCT managed_owner_dept COLLATE utf8mb4_unicode_ci"
                 f" FROM {_kb_db()}.dept_admin_grant WHERE is_active=1)"), []
+    if axis:
+        return _contrib_scope_sql(kb)
     return _kb_owner_scope_sql(kb, "category_dept")
 
 
@@ -827,7 +1270,6 @@ def kb_contributions_pending(request: Request, limit: int = 20, offset: int = 0,
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
     limit = max(1, min(int(limit or 20), 100)); offset = max(0, int(offset or 0))
-    scope_clause, scope_params = _contrib_pending_scope_sql(kb)
     trace_id = get_request_id()
     try:
         from opensearch_pipeline.db import _get_db_conn
@@ -838,11 +1280,16 @@ def kb_contributions_pending(request: Request, limit: int = 20, offset: int = 0,
     try:
         _reconcile_contributions_searchable(conn)
         with conn.cursor() as cur:
+            # 作用域与列清单都在**同一个游标**上定 axis（先探测再引用列）：分开定会出现
+            # 「列清单按 067 已 apply、作用域按未 apply」的半截状态。
+            _axis = _contrib_axis_present(cur)
+            _cols = _CONTRIB_COLS_NODE if _axis else _CONTRIB_COLS
+            scope_clause, scope_params = _contrib_pending_scope_sql(kb, cur)
             cur.execute(
-                f"SELECT {_CONTRIB_COLS} FROM {_op_db()}.kb_contribution"
+                f"SELECT {_cols} FROM {_op_db()}.kb_contribution"
                 " WHERE review_status='pending' " + scope_clause
                 + " ORDER BY created_at ASC, contribution_id ASC LIMIT %s OFFSET %s",
-                tuple(scope_params + [limit + 1, offset]))
+                tuple(list(scope_params) + [limit + 1, offset]))
             rows = cur.fetchall() or []
             items = [_contrib_item(r) for r in rows[:limit]]
             # 批次ε-3 R2：回填被问次数（None=算不出→前端自隐；随手动加载返回，不引入轮询）
@@ -861,8 +1308,15 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
                            identity: Optional[Identity] = Depends(current_identity)):
     """采纳贡献（幂等可恢复状态机）：pending→accepted/registering（原子认领+固定键），再物化入库。
 
-    可在采纳前修订 question/content/category_dept；改 category_dept 则按【新部门】重做写授权。
+    可在采纳前修订 question/content/归属；改归属则按【新归属】重做写授权。
     已采纳→幂等返回（补跑物化交给 retry-ingestion）；已驳回→409。
+
+    两轴（方案 M2/M4/M5）：
+      · 源侧管辖用 `_contrib_can_manage`（node 行只看后代集，legacy 行只看组码）；
+      · 目标侧 node 走 `authorize_upload_node` + `dept_dim` active 现查 ⇒ 源与目标**双端管辖**
+        （kb_admin 除外），对齐 `kb_console.py:4220` 的 D6：防「把贡献挪进别人子树」；
+      · 跨轴改归属（node 行改回组码分类）**不支持**，显式 400 —— 静默保留旧轴会让审核人
+        以为改成功了。
     """
     _enforce_rate_limit(request, identity, scope="aux")
     kb = _require_kb_console(identity)
@@ -878,10 +1332,12 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
         raise HTTPException(status_code=500, detail=f"采纳失败 (trace: {trace_id})")
     try:
         with conn.cursor() as cur:
+            axis = _contrib_axis_present(cur)
             cur.execute(
                 "SELECT review_status, ingestion_status, doc_id, upload_id, raw_key,"
                 " question, content, category_dept"
-                f" FROM {_op_db()}.kb_contribution WHERE contribution_id=%s FOR UPDATE", (cid,))
+                + (", category_dept_id" if axis else "")
+                + f" FROM {_op_db()}.kb_contribution WHERE contribution_id=%s FOR UPDATE", (cid,))
             row = cur.fetchone()
             if not row:
                 conn.rollback()
@@ -890,9 +1346,10 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
             ingestion_status = row[1] or "none"
             cur_doc_id, cur_upload_id, cur_raw_key = row[2], row[3], row[4]
             cur_q, cur_c, cur_dept = row[5], row[6], row[7]
-            # 采纳前必须能管理贡献【原始】所属部门（与 reject/retry 一致）——否则 A 部门管理员
-            # 可凭 cid 把 B 部门贡献改 category_dept 抢入 A 部门（authorize_upload 只校验目标部门）。
-            if not _kb_can_manage(kb, cur_dept or ""):
+            cur_dept_id = (row[8] if (axis and len(row) > 8) else None) or None
+            # 采纳前必须能管理贡献【原始】归属（与 reject/retry 一致）——否则 A 部门管理员
+            # 可凭 cid 把 B 部门贡献改归属抢入 A 部门（授权函数只校验目标侧）。
+            if not _contrib_can_manage(kb, cur_dept_id, cur_dept, cur=cur):
                 conn.rollback()
                 raise HTTPException(status_code=403, detail="无权审核该部门的贡献")
             if review_status == C.REVIEW_REJECTED:
@@ -912,10 +1369,22 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
             # 可修订 / 存量行可能带标记——防「先提交干净、采纳前改回」的绕过）。
             final_q = C.strip_img_markers(final_q).strip()
             final_c = C.strip_img_markers(final_c).strip()
+            # ── 最终归属（两轴互斥，绝不交叉推导）────────────────────────────
+            req_dept_id = int(req.category_dept_id or 0) or None
+            if req_dept_id is not None and not axis:
+                conn.rollback()
+                raise HTTPException(status_code=400,
+                                    detail="贡献归属节点通道未就绪（schema/067 未 apply）")
+            final_dept_id = req_dept_id if req_dept_id is not None else cur_dept_id
+            if final_dept_id is not None and req.category_dept:
+                conn.rollback()
+                raise HTTPException(status_code=400,
+                                    detail="该贡献归属组织节点，不支持在采纳时改回组码分类")
             # P0(2026-07-17)：必须净化——尾斜杠 'marketing/' 会通过 authorize_upload（其校验
             # 净化副本）却把原值编进 raw_key，权限段错位 → perm_from_raw_key 读回 public，
             # dept_admin 绕过 kb_admin 审批直发全员。授权/raw_key/落库全用同一净值。
-            final_dept = kb_authz.sanitize_owner_dept(req.category_dept or cur_dept or "")
+            final_dept = "" if final_dept_id is not None else \
+                kb_authz.sanitize_owner_dept(req.category_dept or cur_dept or "")
             verr = C.validate_contribution_text(final_q, final_c)
             if verr:
                 conn.rollback()
@@ -926,29 +1395,45 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
             if chosen_perm not in ("dept_internal", "public"):
                 conn.rollback()
                 raise HTTPException(status_code=400, detail="可见范围只能是 部门公开 或 全员公开")
-            # 按【最终】目标部门 + 选定可见范围做写授权（DB 现查的 kb；改部门即按新部门裁决）。
+            # 按【最终】目标归属 + 选定可见范围做写授权（DB 现查的 kb；改归属即按新归属裁决）。
             # P2-16（2026-07-04 拍板「kb_admin 只管入库」，取代 2026-06-29「public 直通」裁决）：
             # 不再忽略 requires_kb_admin_approval——dept_admin 采纳 public 时物化为
             # PENDING_APPROVAL 进 kb_admin 既有待审批队列（与自助上传同一纪律），放行后才入库；
             # kb_admin 自己采纳 public 的 decision 本就不带该标记 → 照旧直通（其即终审）。
-            decision = kb_authz.authorize_upload(kb, final_dept, chosen_perm)
+            if final_dept_id is not None:
+                # M5 第 2 处：节点可能在提交之后被停用 —— can_manage_doc 只判后代集、不判 active
+                _assert_node_active(cur, final_dept_id, status=403)
+                decision = kb_authz.authorize_upload_node(
+                    kb, final_dept_id, chosen_perm, descendants=_kb_managed_descendants(kb))
+                _target_label = f"节点 {final_dept_id}"
+            else:
+                decision = kb_authz.authorize_upload(kb, final_dept, chosen_perm)
+                _target_label = f"部门「{final_dept}」"
             if not decision.allowed:
                 conn.rollback()
-                raise HTTPException(status_code=403, detail=f"无权采纳到部门「{final_dept}」：{decision.reason}")
+                raise HTTPException(status_code=403,
+                                    detail=f"无权采纳到{_target_label}：{decision.reason}")
             requires_kb_approval = bool(decision.requires_kb_admin_approval)
-            # 一次性固定键（raw_key 把可见范围编码进路径段，防管线 stage-2 重解析升/降权）
+            # 一次性固定键（raw_key 把可见范围编码进路径段，防管线 stage-2 重解析升/降权）；
+            # node 归属的第 2 段走 node_storage_segment（防 stage-1 按路径段重派归属）。
             doc_id = cur_doc_id or kb_upload.new_doc_id()
             upload_id = cur_upload_id or kb_upload.new_ulid()
+            _seg = (kb_upload.node_storage_segment(final_dept_id)
+                    if final_dept_id is not None else final_dept)
             raw_key = cur_raw_key or kb_upload.build_raw_key(
-                final_dept, doc_id, upload_id, f"contribution-{cid}.md", permission_level=chosen_perm)
+                _seg, doc_id, upload_id, f"contribution-{cid}.md", permission_level=chosen_perm)
+            # 归属列**按轴分别写**：node 轴不碰 category_dept（M8 迁移行的组码留痕保持原样），
+            # legacy 轴不碰 category_dept_id（恒 NULL）。
+            _owner_set = ("category_dept_id=%s" if final_dept_id is not None else "category_dept=%s")
+            _owner_val = final_dept_id if final_dept_id is not None else final_dept
             cur.execute(
                 f"UPDATE {_op_db()}.kb_contribution SET review_status='accepted',"
                 " ingestion_status='registering', reviewed_by=%s, reviewed_at=NOW(),"
                 " review_note=%s, doc_id=%s, upload_id=%s, raw_key=%s,"
-                " question=%s, content=%s, category_dept=%s, normalized_question=%s, question_hash=%s"
+                f" question=%s, content=%s, {_owner_set}, normalized_question=%s, question_hash=%s"
                 " WHERE contribution_id=%s AND review_status='pending'",
                 (kb.user_id, (req.note or None), doc_id, upload_id, raw_key, final_q, final_c,
-                 final_dept, C.normalize_question(final_q), C.question_hash(final_q), cid))
+                 _owner_val, C.normalize_question(final_q), C.question_hash(final_q), cid))
             claimed = getattr(cur, "rowcount", 1)
         conn.commit()
         if not claimed:
@@ -962,6 +1447,7 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
                 ingestion_status=r2[1] or "registering",
                 state=C.contribution_state(r2[0], r2[1]), doc_id=r2[2], idempotent=True, ok=True)
         claim = dict(doc_id=doc_id, raw_key=raw_key, owner_dept=final_dept,
+                     owner_dept_id=final_dept_id,
                      question=final_q, content=final_c,
                      requires_kb_approval=requires_kb_approval)
     except HTTPException:
@@ -976,7 +1462,8 @@ def kb_contribution_accept(cid: str, req: KbContributionAcceptRequest, request: 
         cid, doc_id=claim["doc_id"], raw_key=claim["raw_key"], owner_dept=claim["owner_dept"],
         question=claim["question"], content=claim["content"],
         reviewer_id=kb.user_id, reviewer_name=kb.name or "", trace_id=trace_id,
-        requires_kb_admin_approval=claim["requires_kb_approval"])
+        requires_kb_admin_approval=claim["requires_kb_approval"],
+        owner_dept_id=claim["owner_dept_id"])
     # 批次ε-2：审核结果通知提交人（commit+物化之后；模块内 best-effort no-raise，绝不反噬主流程）
     from opensearch_pipeline.admin_notify import notify_contribution_result
     notify_contribution_result(
@@ -1007,14 +1494,17 @@ def kb_contribution_reject(cid: str, req: KbContributionRejectRequest, request: 
         raise HTTPException(status_code=500, detail=f"驳回失败 (trace: {trace_id})")
     try:
         with conn.cursor() as cur:
+            axis = _contrib_axis_present(cur)
             cur.execute("SELECT review_status, ingestion_status, doc_id, category_dept"
-                        f" FROM {_op_db()}.kb_contribution WHERE contribution_id=%s FOR UPDATE", (cid,))
+                        + (", category_dept_id" if axis else "")
+                        + f" FROM {_op_db()}.kb_contribution WHERE contribution_id=%s FOR UPDATE", (cid,))
             row = cur.fetchone()
             if not row:
                 conn.rollback()
                 raise HTTPException(status_code=404, detail="贡献不存在")
             review_status, ingestion_status, doc_id, dept = (row[0] or "pending"), (row[1] or "none"), row[2], (row[3] or "")
-            if not _kb_can_manage(kb, dept):
+            dept_id = (row[4] if (axis and len(row) > 4) else None) or None
+            if not _contrib_can_manage(kb, dept_id, dept, cur=cur):
                 conn.rollback()
                 raise HTTPException(status_code=403, detail="无权审核该部门的贡献")
             if review_status == C.REVIEW_REJECTED:
@@ -1064,18 +1554,25 @@ def kb_contribution_retry(cid: str, request: Request,
         raise HTTPException(status_code=500, detail=f"重试失败 (trace: {trace_id})")
     try:
         with conn.cursor() as cur:
+            axis = _contrib_axis_present(cur)
             cur.execute("SELECT review_status, ingestion_status, doc_id, raw_key, category_dept,"
                         " question, content"
-                        f" FROM {_op_db()}.kb_contribution WHERE contribution_id=%s FOR UPDATE", (cid,))
+                        + (", category_dept_id" if axis else "")
+                        + f" FROM {_op_db()}.kb_contribution WHERE contribution_id=%s FOR UPDATE", (cid,))
             row = cur.fetchone()
             if not row:
                 conn.rollback()
                 raise HTTPException(status_code=404, detail="贡献不存在")
             review_status, ingestion_status = (row[0] or "pending"), (row[1] or "none")
             doc_id, raw_key, dept, q, content = row[2], row[3], (row[4] or ""), row[5], row[6]
-            if not _kb_can_manage(kb, dept):
+            dept_id = (row[7] if (axis and len(row) > 7) else None) or None
+            if not _contrib_can_manage(kb, dept_id, dept, cur=cur):
                 conn.rollback()
                 raise HTTPException(status_code=403, detail="无权操作该部门的贡献")
+            if dept_id is not None:
+                # M5 第 3 处：与 accept 同款——节点可能在采纳之后被停用；在**锁内同一快照**上查，
+                # 比放到连接关闭后再查更强（不给中间态留窗口）。
+                _assert_node_active(cur, dept_id, status=403)
             if review_status != C.REVIEW_ACCEPTED:
                 conn.rollback()
                 raise HTTPException(status_code=400, detail="仅已采纳的贡献可重试入库")
@@ -1098,16 +1595,22 @@ def kb_contribution_retry(cid: str, request: Request,
     # kb_admin 续跑=其即终审→直通，dept_admin 续跑 public→仍进待审批）。裁决异常/被拒时
     # fail-closed 取「需审批」——宁可多过一道 kb_admin，绝不静默直通。已登记行（raw_key
     # 命中）物化幂等早退，该标记不生效，不会改写既有审批状态。
+    # Codex C2：本处此前**整条路径遗漏 node 轴** —— node 贡献续跑会走组码 authorize_upload
+    # 并按 dept（node 行恒空串）恒被拒 ⇒ fail-closed 成「永远待 kb_admin 审批」。
     try:
         _perm = kb_upload.perm_from_raw_key(raw_key)
-        _d = kb_authz.authorize_upload(kb, dept, _perm)
+        if dept_id is not None:
+            _d = kb_authz.authorize_upload_node(kb, dept_id, _perm,
+                                                descendants=_kb_managed_descendants(kb))
+        else:
+            _d = kb_authz.authorize_upload(kb, dept, _perm)
         _requires_approval = (not _d.allowed) or bool(_d.requires_kb_admin_approval)
     except Exception:  # noqa: BLE001 — 裁决不可用 → 保守转审批（fail-closed）
         _requires_approval = True
     ing, err = _finish_contribution_ingestion(
         cid, doc_id=doc_id, raw_key=raw_key, owner_dept=dept, question=q, content=content,
         reviewer_id=kb.user_id, reviewer_name=kb.name or "", trace_id=trace_id,
-        requires_kb_admin_approval=_requires_approval)
+        requires_kb_admin_approval=_requires_approval, owner_dept_id=dept_id)
     if ing == C.INGEST_REGISTERED:
         # 内容阶段 FAILED 的死链文档重新排队（谓词内锁死 FAILED，其余状态 no-op）
         _requeue_failed_doc(doc_id, trace_id=trace_id)

@@ -57,8 +57,12 @@ function reopen(c: ContributionItem) {
     : c.doc_badge === '已隔离'
       ? '原稿触发敏感信息隔离——请修改相关内容后再提交，原样重投会再次被隔离。'
       : '原稿未能入库，请修改完善后再提交。'
+  // 方案 M11：原归属按轴透传 —— node 行带 category_dept_id，legacy 行（该字段空）只带组码。
+  // 🔴 openModal 在 node 轴下会把「legacy 行的组码」**忽略掉**、回落 my-depts 默认项：
+  //    组码→dept_id 是一对多，从旧组码反推 node 归属 = 把 M8 明令禁止的推断性映射绕回前端。
   openModal({
-    question: c.question, content: c.content, dept: c.category_dept,
+    question: c.question, content: c.content,
+    dept: c.category_dept, deptId: c.category_dept_id ?? null,
     sourceMessageId: c.source_message_id || undefined,
     gapQuery: c.gap_query || undefined,
     warning,

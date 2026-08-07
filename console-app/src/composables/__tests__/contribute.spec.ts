@@ -771,3 +771,80 @@ describe('useContribute.loadHeroes 失败可见性', () => {
     expect(c.heroes.value.length).toBe(1)
   })
 })
+
+// ── 贡献域 node 轴（schema/067，方案 M9/M11）────────────────────────────────
+describe('提交端归属两轴 — my-depts / openModal / 提交载荷', () => {
+  it('loadMyDepts：available=false ⇒ 回落组码轴（不是"没有可选部门"）', async () => {
+    withSession()
+    stubFetch({ items: [{ dept_id: 930001, name: '三级班组' }], available: false })
+    const { loadMyDepts, myDepts, myDeptsReady, openModal, formDept, formDeptId } = useContribute()
+    await loadMyDepts()
+    expect(myDeptsReady.value).toBe(true)
+    expect(myDepts.value).toEqual([])
+    openModal({ dept: 'hr' })
+    expect(formDeptId.value).toBeNull()
+    expect(formDept.value).toBe('hr')     // 组码轴行为逐字节不变
+  })
+
+  it('node 轴：openModal 默认取 my-depts 第一项；原归属仍可选则沿用', async () => {
+    withSession()
+    stubFetch({ items: [{ dept_id: 930001, name: '三级班组' }, { dept_id: 930002, name: '另一班组' }] })
+    const { loadMyDepts, openModal, formDept, formDeptId } = useContribute()
+    await loadMyDepts()
+    openModal()
+    expect(formDeptId.value).toBe(930001)
+    expect(formDept.value).toBe('')
+    openModal({ deptId: 930002 })
+    expect(formDeptId.value).toBe(930002)
+  })
+
+  it('🔴 legacy rejected 行重开：绝不从旧组码反推 node 归属，回落 my-depts 默认项', async () => {
+    // 组码 → dept_id 是一对多（方案 M8/M11 明令）：若这里按 category_dept 猜一个 dept_id，
+    // 就把 M8 禁止的推断性映射从前端绕了回来。
+    withSession()
+    stubFetch({ items: [{ dept_id: 930001, name: '三级班组' }] })
+    const { loadMyDepts, openModal, formDeptId, formDept } = useContribute()
+    await loadMyDepts()
+    openModal({ question: '旧稿', content: '旧正文', dept: 'hr', deptId: null })
+    expect(formDeptId.value).toBe(930001)
+    expect(formDept.value).toBe('')
+  })
+
+  it('不在可选集里的原归属（管辖被收回/节点停用）同样回落默认项，不留死值', async () => {
+    withSession()
+    stubFetch({ items: [{ dept_id: 930001, name: '三级班组' }] })
+    const { loadMyDepts, openModal, formDeptId } = useContribute()
+    await loadMyDepts()
+    openModal({ deptId: 999999 })
+    expect(formDeptId.value).toBe(930001)
+  })
+
+  it('提交载荷两轴互斥：node 轴只发 category_dept_id，组码轴只发 category_dept', async () => {
+    withSession()
+    stubFetch({ items: [{ dept_id: 930001, name: '三级班组' }] })
+    const { loadMyDepts, openModal, formQuestion, formContent, submitContribution } = useContribute()
+    await loadMyDepts()
+    openModal()
+    formQuestion.value = '问题'; formContent.value = '答案'
+    const calls: any[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_u: string, init: any) => {
+      calls.push(JSON.parse(init.body))
+      return { ok: true, status: 200, json: async () => ({ items: [], has_more: false }), text: async () => '{}' }
+    }))
+    await submitContribution()
+    const body = calls[0]
+    expect(body.category_dept_id).toBe(930001)
+    expect('category_dept' in body).toBe(false)
+  })
+
+  it('GapList 的 g.dept 在 node 轴下不得决定归属（降为展示性建议）', async () => {
+    withSession()
+    stubFetch({ items: [{ dept_id: 930001, name: '三级班组' }] })
+    const { loadMyDepts, openModal, formDeptId, formDept } = useContribute()
+    await loadMyDepts()
+    // GapList.onAnswer 的等价调用：只带组码建议，不带 deptId
+    openModal({ question: '缺口问题', dept: 'production', gapQuery: '缺口问题' })
+    expect(formDeptId.value).toBe(930001)
+    expect(formDept.value).toBe('')
+  })
+})

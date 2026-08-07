@@ -37,6 +37,9 @@ const totalUnanswered = computed(() => gapsSummary.value?.unanswered ?? gaps.val
 const truncated = computed(() => totalUnanswered.value > gaps.value.length)
 
 function onAnswer(g: GapItem) {
+  // 🔴 方案 M11：`g.dept` 自 2026-08-07 起**降为展示性建议**——它是「提问部门/命中文档部门」
+  // 的组码推测，node 轴下绝不得用它决定归属（组码→dept_id 一对多）。openModal 在 node 轴
+  // 会忽略 dept 并回落 my-depts 默认项；这里照传只为组码轴保持原行为。
   openModal({ question: g.question, dept: g.dept, sourceMessageId: g.source_message_id, gapQuery: g.question })
 }
 

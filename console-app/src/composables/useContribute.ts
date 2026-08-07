@@ -46,6 +46,9 @@ export interface GapsSummary {
 }
 export interface ContributionItem {
   contribution_id: string; question: string; content: string; category_dept: string
+  // 归属组织节点（node 轴权威，schema/067）：null/undefined=组码轴历史行。
+  // 🔴 **绝不可**从 category_dept 反推本字段——组码→dept_id 是一对多（方案 M8/M11 明令）。
+  category_dept_id?: number | null
   author_id: string; author_name: string
   review_status: string; ingestion_status: string; state: string
   doc_id: string | null; review_note: string; created_at: string; reviewed_at: string | null
@@ -64,7 +67,11 @@ export interface ContributionItem {
 }
 // 采纳前修订（批次ε-1）：后端 KbContributionAcceptRequest 既有契约——缺省字段=保留原值，
 // 故只放【实际变更】的键，绝不传空串覆盖原文（后端 strip 后空文本会 400）。
-export interface ContributionRevision { question?: string; content?: string; category_dept?: string }
+export interface ContributionRevision {
+  question?: string; content?: string; category_dept?: string; category_dept_id?: number
+}
+/** 提交端可选归属节点（GET /api/kb/my-depts；Sam 裁决 F/G——极小只读面，无管辖字段） */
+export interface MyDeptItem { dept_id: number; name: string }
 export interface DeptScoreItem {
   rank: number; dept_id: number; dept_name: string; members: number; score: number
 }
@@ -103,11 +110,19 @@ const loadingGaps = ref(false)
 const loadErrors = ref<Record<string, string>>({})
 const inflight = ref<Set<string>>(new Set())
 
+// 提交端归属节点（node 轴，schema/067 + Sam 裁决 F/G）。三态与后端 available 对齐：
+//   myDeptsReady=false        → 还没问过后端（openModal 时按组码轴渲染，与改造前一致）
+//   myDeptsReady && !myDepts  → 后端说「算不出」（flag 关 / 未在册 / 快照不可用）→ 组码轴
+//   myDeptsReady && myDepts   → node 轴：1 个只读展示、多个下拉选
+const myDepts = ref<MyDeptItem[]>([])
+const myDeptsReady = ref(false)
+
 // 贡献弹窗
 const modalOpen = ref(false)
 const formQuestion = ref('')
 const formContent = ref('')
 const formDept = ref('')
+const formDeptId = ref<number | null>(null)
 const formSourceMsg = ref('')
 const formGapQuery = ref('')
 // 重投警示（ε-5 R1）：入库受阻行「修改重交」按成因带警示进弹窗（行内警示在弹窗打开后已离开视野）
@@ -276,18 +291,48 @@ async function loadHeroes() {
   }
 }
 
+/** 提交端可选归属节点（Sam 裁决 F）。**不复用 /api/kb/org-tree**：那个接口挂
+ *  `_require_kb_console`，employee 恒 403，且响应含管辖字段会泄露管理结构。
+ *  失败/不可用一律回落组码轴（现状可用），绝不把提交入口变成死路。 */
+async function loadMyDepts() {
+  const s = useSession()
+  if (import.meta.env.DEV && s.token === 'dev-preview') {
+    myDepts.value = []; myDeptsReady.value = true; return
+  }
+  try {
+    const r = await apiJson<{ items?: MyDeptItem[]; available?: boolean }>('/api/kb/my-depts', { auth: true })
+    myDepts.value = r?.available === false ? [] : (r.items || [])
+  } catch {
+    myDepts.value = []   // 404（未上线）/网络失败 → 组码轴，静默
+  } finally {
+    myDeptsReady.value = true
+  }
+}
+
 // ── 弹窗 / 提交 ──
 // 批次ε-2：prefill 扩展 content（被驳回「修改重交」带旧稿重开表单）；既有调用点（GapList 等）
 // 不传 content → 照旧空白起草，行为不变。
-function openModal(prefill?: { question?: string; content?: string; dept?: string; sourceMessageId?: string; gapQuery?: string; warning?: string }) {
+// 方案 M11：`deptId` = 重开时的**原 node 归属**。legacy 行（deptId 空）一律回落 my-depts
+// 默认项，🔴 **绝不从 prefill.dept 反推 node 归属**（组码→dept_id 一对多，反推会把 M8
+// 明令禁止的推断性映射从前端绕回来）。
+function openModal(prefill?: { question?: string; content?: string; dept?: string; deptId?: number | null; sourceMessageId?: string; gapQuery?: string; warning?: string }) {
   const s = useSession()
   formQuestion.value = prefill?.question || ''
   formContent.value = prefill?.content || ''
-  // 默认归属：缺口建议部门（若合法）→ 否则员工本部门 → 否则第一项
-  const own = s.identity?.aclGroups?.[0] || ''
-  const valid = (d: string) => CONTRIB_DEPT_OPTS.some((o) => o.id === d)
-  formDept.value = (prefill?.dept && valid(prefill.dept)) ? prefill.dept
-    : (valid(own) ? own : (CONTRIB_DEPT_OPTS[0]?.id || ''))
+  if (myDepts.value.length) {
+    // node 轴：原归属仍在可选集里就沿用，否则取默认（第一项）
+    const keep = prefill?.deptId != null
+      && myDepts.value.some((d) => d.dept_id === prefill.deptId)
+    formDeptId.value = keep ? (prefill!.deptId as number) : myDepts.value[0].dept_id
+    formDept.value = ''
+  } else {
+    // 组码轴：默认归属 = 缺口建议部门（若合法）→ 否则员工本部门 → 否则第一项
+    const own = s.identity?.aclGroups?.[0] || ''
+    const valid = (d: string) => CONTRIB_DEPT_OPTS.some((o) => o.id === d)
+    formDeptId.value = null
+    formDept.value = (prefill?.dept && valid(prefill.dept)) ? prefill.dept
+      : (valid(own) ? own : (CONTRIB_DEPT_OPTS[0]?.id || ''))
+  }
   formSourceMsg.value = prefill?.sourceMessageId || ''
   formGapQuery.value = prefill?.gapQuery || ''
   formWarning.value = prefill?.warning || ''
@@ -308,7 +353,12 @@ async function submitContribution(): Promise<boolean> {
       myContribs.value = [{ contribution_id: 'new', question: q, content: c, category_dept: formDept.value, author_id: 'preview', author_name: '设计预览', review_status: 'pending', ingestion_status: 'none', state: 'pending', doc_id: null, review_note: '', created_at: '刚刚', reviewed_at: null }, ...myContribs.value]
       submitOk.value = true; modalOpen.value = false; return true
     }
-    await apiJson('/api/kb/contributions', { method: 'POST', auth: true, body: JSON.stringify({ question: q, content: c, category_dept: formDept.value, source_message_id: formSourceMsg.value || null, gap_query: formGapQuery.value || null }) })
+    // 两轴互斥：node 归属只发 category_dept_id（组码留空——后端会写空串哨兵，
+    // 防组码残值命中旧组码管理员）；否则发 category_dept，与改造前逐字节一致。
+    const owner = formDeptId.value != null
+      ? { category_dept_id: formDeptId.value }
+      : { category_dept: formDept.value }
+    await apiJson('/api/kb/contributions', { method: 'POST', auth: true, body: JSON.stringify({ question: q, content: c, ...owner, source_message_id: formSourceMsg.value || null, gap_query: formGapQuery.value || null }) })
     submitOk.value = true; modalOpen.value = false
     await Promise.all([loadMine(), loadGaps()])
     return true
@@ -435,7 +485,8 @@ export function useContribute() {
   return {
     gaps, gapsSummary, gapsWindowDays, myContribs, pendingContribs, pendingHasMore, mineHasMore, mineLoadBusy, heroes, loadingGaps, loadErrors, isBusy,
     deptHeroes, myDeptHeroes, myDeptName,
-    modalOpen, formQuestion, formContent, formDept, formWarning, submitBusy, submitErr, submitOk,
+    modalOpen, formQuestion, formContent, formDept, formDeptId, formWarning, submitBusy, submitErr, submitOk,
+    myDepts, myDeptsReady, loadMyDepts,
     CONTRIB_DEPT_OPTS, canManage, reviewCount,
     loadGaps, toggleGapContext, loadMine, loadPending, loadHeroes,
     openModal, closeModal, submitContribution, acceptContribution, rejectContribution, retryContribution,
@@ -448,6 +499,7 @@ export function __resetContribute() {
   gaps.value = []; gapsSummary.value = null; gapsWindowDays.value = 30; dismissedGaps.value = []
   myContribs.value = []; pendingContribs.value = []; pendingHasMore.value = false; heroes.value = []
   loadingGaps.value = false; loadErrors.value = {}; inflight.value = new Set()
+  myDepts.value = []; myDeptsReady.value = false; formDeptId.value = null
   modalOpen.value = false; formQuestion.value = ''; formContent.value = ''; formDept.value = ''
   formSourceMsg.value = ''; formGapQuery.value = ''; formWarning.value = ''; submitBusy.value = false; submitErr.value = ''; submitOk.value = false
 }

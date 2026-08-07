@@ -108,6 +108,7 @@ MANIFEST="
 063_visibility_intent.sql knowledge
 064_content_binding.sql knowledge
 066_document_meta_owner_dept_nullable.sql knowledge
+067_contribution_node_axis.sql operation
 "
 
 db_of() { case "$1" in knowledge) echo fuling_knowledge ;; operation) echo fuling_operation ;; *) die "未知目标 '$1'";; esac; }

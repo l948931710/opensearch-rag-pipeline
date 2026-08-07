@@ -11,7 +11,7 @@ import HeroBoard from '@/components/contribute/HeroBoard.vue'
 
 // 知识贡献：看大家在搜什么、还有哪些问题没人回答 → 提交问答 → 部门管理员采纳后入库。
 // 员工 + 管理员通用（审核区仅管理员可见）。AppShell 仅在 ready 后渲染，故身份已解析。
-const { gapsSummary, canManage, openModal, loadGaps, loadMine, loadHeroes, loadPending } = useContribute()
+const { gapsSummary, canManage, openModal, loadGaps, loadMine, loadHeroes, loadPending, loadMyDepts } = useContribute()
 
 const s = computed(() => gapsSummary.value)
 
@@ -19,6 +19,9 @@ onMounted(() => {
   void loadGaps()
   void loadMine()
   void loadHeroes()
+  // 提交端归属节点（Sam 裁决 F）：在页面挂载时取一次——弹窗打开是同步的，等到那时再拉
+  // 会让首次「贡献知识」渲染成组码轴（node 轴静默失效）。不可用时静默回落组码轴。
+  void loadMyDepts()
   if (canManage.value) void loadPending()
 })
 </script>
