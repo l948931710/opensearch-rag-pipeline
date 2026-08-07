@@ -1320,8 +1320,6 @@ def _client_fusion_search(
     降级语义（与仓库 fail-open 惯例一致）：S/B 辅臂失败按空臂继续；D 主臂异常返回 None，
     调用方回落服务端混合检索。
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     from alibabacloud_ha3engine_vector.models import (
         QueryRequest, RankQuery, SearchRequest, SparseData, TextQuery,
     )
@@ -1377,17 +1375,31 @@ def _client_fusion_search(
             output_fields=output_fields,
         ))
 
+    # D3（2026-08-06）：三臂改用**进程级** fusion 池。默认 max_workers = AnyIO 令牌 × 3
+    # ⇒ 当前请求上限下不会排队，并发形态与改动前等价，只是线程被复用而非每请求新建。
+    # ⚠️ 绝不能对共享池 `shutdown`（会毒化整个进程），故这里没有 `with`。
+    # ⚠️ 饱和用 `submit_or_none` 而不是抛异常：下面那个 try 只包 `fut.result()`、**不包提交**，
+    #    靠异常会直接崩掉整条查询而不是走单臂降级（codex 2026-08-06 BLOCKER）。
+    from opensearch_pipeline import serving_pools as _sp
+
     arms: Dict[str, Optional[List[Dict[str, Any]]]] = {}
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ha3fusion") as ex:
-        futures = {"dense": ex.submit(_arm_dense), "bm25": ex.submit(_arm_bm25)}
-        if sparse_idx:
-            futures["sparse"] = ex.submit(_arm_sparse)
-        for name, fut in futures.items():
-            try:
-                arms[name] = _parse_ha3_response(fut.result())
-            except Exception as e:  # 单臂失败不破坏答案（graceful degradation）
-                arms[name] = None
-                logger.warning("Client fusion arm '%s' failed: %s", name, e)
+    _subs = [("dense", _arm_dense), ("bm25", _arm_bm25)]
+    if sparse_idx:
+        _subs.append(("sparse", _arm_sparse))
+    futures = {}
+    for _name, _fn in _subs:
+        _f = _sp.submit_or_none(_sp.FUSION, _fn)
+        if _f is None:
+            arms[_name] = None       # 饱和 = 该臂缺席，与单臂失败**同一条**降级路径
+            logger.warning("Client fusion arm '%s' 因池饱和跳过（降级为少臂融合）", _name)
+        else:
+            futures[_name] = _f
+    for name, fut in futures.items():
+        try:
+            arms[name] = _parse_ha3_response(fut.result())
+        except Exception as e:  # 单臂失败不破坏答案（graceful degradation）
+            arms[name] = None
+            logger.warning("Client fusion arm '%s' failed: %s", name, e)
 
     if arms.get("dense") is None:
         # 主臂异常（非空结果）：融合失去救盲行意义，回落服务端混合（fail-open）
@@ -2772,9 +2784,17 @@ def _multi_query_search(
             logger.warning("multi-query 子查询检索失败（忽略该路）: %r %s", q[:40], e)
             return None  # None=该路异常；[]=该路正常但无结果（语义不同，勿混）
 
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=min(4, len(queries))) as ex:
-        lists = list(ex.map(_one, enumerate(queries)))
+    # D3：改用进程级 fanout 池。⚠️ **必须按原始 index 回填**——`ex.map` 保证 `lists` 与
+    # queries 同序，而下面的交错合并依赖这个顺序；换成 as_completed 会静默打乱
+    # （codex 2026-08-06 BLOCKER）。饱和的那一路回落**同步**执行（等价于该路不并行，
+    # 不是该路消失），仍走 `_one` 自己的 except → None 语义。
+    from opensearch_pipeline import serving_pools as _sp
+
+    _idx_q = list(enumerate(queries))
+    _futs = [(i, _sp.submit_or_none(_sp.FANOUT, _one, iq)) for i, iq in enumerate(_idx_q)]
+    lists = [None] * len(_idx_q)
+    for i, f in _futs:
+        lists[i] = f.result() if f is not None else _one(_idx_q[i])
 
     n_errored = sum(1 for lst in lists if lst is None)
     lists = [lst or [] for lst in lists]
@@ -2885,16 +2905,18 @@ def retrieve_and_enrich(
     _primary_future = None
     if get_config().rag.multi_query_mode in ("auto", "llm"):
         from .query_decomposer import maybe_decompose
-        from concurrent.futures import ThreadPoolExecutor
+        from opensearch_pipeline import serving_pools as _sp
 
-        _px = ThreadPoolExecutor(max_workers=1)
-        try:
-            # lambda 体内按模块全局名解析 search_chunks（monkeypatch 兼容，不做 import 期快照）
-            _primary_future = _px.submit(
-                lambda: search_chunks(query, top_k=_fetch_k, user_dept=user_dept,
-                                      query_embedding=_emb, acl_ctx=acl_ctx))
-        finally:
-            _px.shutdown(wait=False)   # 不阻塞：future 照常完成，线程随后回收
+        # D3：改用进程级 prefetch 池。⚠️ **删掉了原先的 `_px.shutdown(wait=False)`** ——
+        # 那在每请求私有池上是"让线程自行回收"的正确写法，对**共享池**则会把整个进程的池
+        # 关掉（codex 2026-08-06 BLOCKER）。共享池的关闭点只有 api.py 的 lifespan 退出分支。
+        # ⚠️ prefetch 与 fanout **必须是两个池**：`_one(0)` 会在 fanout worker 里等这个
+        # primary future，同池就是自等待/死锁（codex 抓出的 P→P 环）。
+        # lambda 体内按模块全局名解析 search_chunks（monkeypatch 兼容，不做 import 期快照）
+        _primary_future = _sp.submit_or_none(
+            _sp.PREFETCH,
+            lambda: search_chunks(query, top_k=_fetch_k, user_dept=user_dept,
+                                  query_embedding=_emb, acl_ctx=acl_ctx))
         _sub_queries = maybe_decompose(query)
     if _sub_queries:
         chunks = _multi_query_search(
@@ -2946,18 +2968,18 @@ def retrieve_and_enrich(
         _pre_ids = _cosurface_top_doc_ids(chunks)
         if _pre_ids:
             try:
-                from concurrent.futures import ThreadPoolExecutor
+                from opensearch_pipeline import serving_pools as _sp
 
-                _cx = ThreadPoolExecutor(max_workers=1)
-                try:
-                    # ⚠️ acl_ctx 必须与串行路径同参（2026-07-31）：预取命中时其结果被**直接采用**
-                    # （下方仅比对 doc_ids 是否一致，不重算），漏传就变成"预取时没图、串行时有图"
-                    # 这种随并发时序漂移的 node 文档配图缺失。
-                    _cos_pref = (_pre_ids, _cx.submit(
-                        _fetch_cosurface_images, query, _pre_ids, user_dept, _emb,
-                        acl_ctx=acl_ctx))
-                finally:
-                    _cx.shutdown(wait=False)
+                # D3：改用进程级 prefetch 池；⚠️ **删掉了原先的 `_cx.shutdown(wait=False)`**
+                # （对共享池调用会毒化整个进程）。饱和 ⇒ `_cos_pref=None` ⇒ 走下方既有的
+                # 串行 cosurface 路径，与"预取起不来"完全同一条 fail-open 分支。
+                # ⚠️ acl_ctx 必须与串行路径同参（2026-07-31）：预取命中时其结果被**直接采用**
+                # （下方仅比对 doc_ids 是否一致，不重算），漏传就变成"预取时没图、串行时有图"
+                # 这种随并发时序漂移的 node 文档配图缺失。
+                _cf = _sp.submit_or_none(
+                    _sp.PREFETCH, _fetch_cosurface_images, query, _pre_ids, user_dept, _emb,
+                    acl_ctx=acl_ctx)
+                _cos_pref = (_pre_ids, _cf) if _cf is not None else None
             except Exception as e:   # noqa: BLE001 — 预取起不来 → 回退串行（fail-open）
                 logger.warning("cosurface 预取启动失败（回退串行查询）: %s", e)
                 _cos_pref = None

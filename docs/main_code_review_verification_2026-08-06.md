@@ -524,8 +524,47 @@ codex 与我独立同意：本批应只提供旋钮 + 每进程上限 + 指标�
 在拿到这些数据前，把 24/12 当"有依据的默认值"上线是拍脑袋；
 而「维持旧的每请求等效并发」又等于没限流、失去 D3 的意义。
 
-⇒ **D3 挂起，等 staging 压测数据。** 五条 BLOCKER 的修法已明确（见 codex 输出），
-不是设计不通，是**默认值缺证据**。
+#### D3 第一步已落地（Sam 2026-08-06 拍板：先落旋钮+指标+上限，默认不改行为）
+
+新增 `opensearch_pipeline/serving_pools.py`；`retriever.py` 的**四处 per-request 池全部归口**
+（`ThreadPoolExecutor` 在该文件已零残留）。
+
+**三个池，不是一个**——`fanout → {prefetch, fusion}`、`prefetch → fusion`，依赖单向无环。
+prefetch 必须独立于 fanout，否则 `_one(0)` 在 fanout worker 里等**同属一池**的 primary future
+= 自等待（codex BLOCKER 1）。
+
+五条 BLOCKER 的处置：
+
+| # | 处置 |
+|---|---|
+| 1 P→P 自等待 | 拆成三池；`test_fanout_task_can_wait_on_prefetch_future_without_deadlock` 行为反证 |
+| 2 提交侧异常绕过 fail-open | 用 `submit_or_none` 回 `None` 走既有降级，**不抛异常**；AST 锚钉死"必须用哪个 API" |
+| 3 无关闭点 | `api.py` lifespan 的 `yield` 加 `try/finally` → `shutdown_pools()`；retriever 内 `.shutdown(` 归零并加 AST 守卫 |
+| 4 `as_completed` 破坏顺序 | **不用** `as_completed`——按原始 index 回填，保住交错合并依赖的同序性 |
+| 5 permit 泄漏 | 提交失败立刻退还计数；任务 `finally` 里退还并**关闭**残留的 `_conn_scope.conn` |
+
+另：每次 submit `copy_context()`（长活 worker 不继承 ContextVar，request_id 会断）。
+
+**默认值刻意维持现状**：`max_workers` 默认 = AnyIO 令牌 × 每查询臂数
+（fusion ×3 / prefetch ×2 / fanout ×4）⇒ 当前请求上限下不排队；
+**准入闸 `RAG_POOL_ADMISSION` 默认关** ⇒ 永不拒绝。
+
+⚠️ **一处如实说明的行为差异**：`ThreadPoolExecutor` 的 worker 建了就不回收 ⇒
+一次尖峰后常驻线程数停在峰值，不再随请求消散。换来的是没有每请求的线程创建/销毁开销。
+**这条要在压测里量，别假装没有。**
+
+⚠️ **覆盖缺口，如实记**：「三臂全被拒 ⇒ 整条查询仍返回降级结果」的**端到端**行为测试**没写**
+（直驱 `_client_fusion_search` 要造 HA3 client/cfg/SparseData 一整套，真实饱和又易 flaky）。
+现由「`submit_or_none` 饱和回 None」的行为测试 + 「提交侧必须用 `submit_or_none`」的 AST 锚
+两条互补覆盖。我先写过一版端到端的，写成了 `... if False else None` 的**空转假测试，已删**。
+
+D4 共 15 条断言（`test_retrieval_checkout_budget.py` 4 + `test_serving_pools.py` 11）；
+变异反证：三池合一 / 去 TLS 清理 / 不传 ContextVar / fusion 改回 `submit` / 破坏 `_conn_scope` /
+新增自取连接消费点 —— 逐条打红，复原绿。
+
+⇒ **仍未做的是"定值"**：F/P 的实际上限与准入闸的开启，等 staging 压测。
+指标 `pool_stats()` 已就绪（`submitted/inflight/queued/rejected/completed/max_workers/admission/alive`），
+`rejected` **必须接告警**，否则饱和降级就是静默的。
 
 ### 批 D — 检索热路径（原始拆分，已被上面重新定型取代）
 

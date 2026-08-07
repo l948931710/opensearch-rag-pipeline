@@ -176,7 +176,17 @@ async def _lifespan(_app: FastAPI):
     # 明文=接线缺陷，production/staging fail-fast（未配 CA 维持 P0-02 告警拍板；
     # 探针 error 只告警）
     _rds_tls_startup_check()
-    yield
+    try:
+        yield
+    finally:
+        # D3（2026-08-06）：serving 侧子线程池是**进程级**的，请求路径上绝不允许 shutdown
+        # （对共享池调用会毒化整个进程）——关闭点只有这里。lifespan 原先 yield 后没有
+        # finally，加长活池而不加这一段就是留下不可控的常驻 worker（codex BLOCKER）。
+        try:
+            from opensearch_pipeline.serving_pools import shutdown_pools
+            shutdown_pools(wait=False)
+        except Exception:   # noqa: BLE001 — 退出清理绝不阻断关停
+            logger.warning("serving pool 关闭异常（忽略）", exc_info=True)
 
 
 def _rds_socket_of(conn):
