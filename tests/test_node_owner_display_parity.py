@@ -114,15 +114,28 @@ def test_审批历史_DTO_带归属键(field):
         "前端 `if (r.owner_dept)` 会让整段「归属」消失")
 
 
-def test_审批历史_access_与_upload_两段都解析节点名():
-    """contribution(贡献分类组码)/admin_grant(无文档作用域)有意不填;
-    另两段是文档归属轴,**必须**填,否则 799 篇 node 文档的审批历史没有归属。"""
+def test_审批历史_三段都解析节点名():
+    """access / upload(文档归属轴) + contribution(贡献分类轴,schema/067 起也有 node 形态)
+    三段都必须解析节点名;admin_grant 无任何归属作用域 ⇒ 唯一有意不填的一段。
+
+    2026-08-07 前本断言写的是「两段」——contribution 那时只有组码轴。067 之后仍按两段渲染,
+    结果是 node 贡献行只剩 M8 迁移留下的组码残值('hr')可显,指向一个**已经无权审**的部门。
+    """
     import inspect
 
     from opensearch_pipeline.routes import kb_access
 
     src = inspect.getsource(kb_access.kb_approval_history)
-    assert src.count("pending_nodes.append(") == 2, "access/upload 应各记一次待解析节点"
+    assert src.count("pending_nodes.append(") == 3, "access/upload/contribution 应各记一次待解析节点"
     assert "_kb_node_names(" in src, "没有批量解析节点现名"
-    assert src.count('kind="contribution"') == 1 and "category_dept 是**贡献分类**" in (
-        inspect.getsource(kb_access.KbApprovalHistoryItem)), "有意不填的理由必须留在 DTO 注释里"
+    assert 'kind="admin_grant"' in src and src.count("pending_nodes.append(") < 4, \
+        "admin_grant 无文档/分类作用域,不应有节点名解析"
+
+
+@pytest.mark.parametrize("field", ["category_dept_id", "owner_key", "owner_label"])
+def test_审批历史_DTO_带贡献_node_归属(field):
+    """node 贡献行的权威归属是 `category_dept_id`,展示口径必须跟着走(owner_key/label);
+    只回 `owner_dept`(=category_dept 残值)等于把一个错的部门写在历史里。"""
+    from opensearch_pipeline.routes.kb_access import KbApprovalHistoryItem
+
+    assert field in KbApprovalHistoryItem.model_fields

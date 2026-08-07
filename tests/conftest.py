@@ -207,6 +207,9 @@ _LOCAL_STACK_SERIAL_MODULES = {
     # 全是真实 DML，且与 test_pipeline 的**无 WHERE 整表清空**同表 —— 不进组就会被连坐清掉
     # 种子（症状是「断言看到 0 行」而非报错）。
     "test_contribution_node_axis_db.py",
+    # 审批历史 node 轴（2026-08-07，codex C2）：dept_dim/user_role/dept_admin_*_grant/
+    # document_meta/kb_access_request/kb_contribution 全是真实 DML，与上面同一批表族。
+    "test_approval_history_node_axis_db.py",
 }
 
 

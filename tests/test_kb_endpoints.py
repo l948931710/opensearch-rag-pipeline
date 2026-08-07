@@ -29,6 +29,13 @@ def _default_node_capability_absent(monkeypatch):
     # **逐字节相同**的 SQL/INSERT 列清单，本文件既有断言语义不变。
     # 需要覆盖绑定分支的用例请**显式**打成 True 并在桩行末尾自带 raw_version_id/content_binding_mode。
     monkeypatch.setattr(kb_console, "_kb_content_binding_columns", lambda cur: False)
+    # 同理钉死 schema/067 的贡献 node 轴探测（2026-08-07）：审批历史端点会为 dept_admin
+    # 的 contribution 段探一次 `kb_contribution.category_dept_id`，真探针同样多发一次
+    # information_schema 查询把桩序列整体错位。False ⇒ 组码谓词与改动前逐字节一致。
+    # node 轴行为由真库模块 tests/test_approval_history_node_axis_db.py 证（桩不跑 SQL
+    # 谓词 ⇒「node 行不被组码腿命中」在桩上恒真，是典型的桩抹平接口）。
+    from opensearch_pipeline.routes import contribution as _CT
+    monkeypatch.setattr(_CT, "_contrib_axis_present", lambda cur: False)
 
 
 def _skip_if_not_sim():
