@@ -434,6 +434,41 @@ fail-open/fail-closed 逐条锁死（node ACL 丢全部非 public / legacy 丢�
 
 **D4** 指标（并入 D0 的探针，落成常驻断言）。
 
+#### 🔴 D0 已跑（2026-08-06）：默认路径 **3 次**，不是 8 次
+
+探针 `scratch/retriever_checkout_probe_20260806.py`：`simulate_db=False` + `_get_db_conn`
+换计数桩（记线程名/调用者/连接对象 id/SQL），HA3 侧只桩客户端与解析，
+`search_chunks` 的三个 authority 策略与融合 executor **全部真跑**。
+
+| 路径 | checkout | 线程 | 分布 |
+|---|---:|---|---|
+| 默认纯文本 · 全链 | **3** | 全 MainThread | `_revalidate_main_hits` 1 + `_stitch_expand_conn` 1 + `_attach_doc_dates` 1 |
+| 含图命中 · 全链 | 3 | 全 MainThread | 同上 |
+| multi-query 开 · 全链 | 3 | 全 MainThread | 同上（见下方口径①） |
+| 仅 `retrieve_and_enrich` 段（桩掉 search_chunks） | 2（含图 3） | 全 MainThread | stitch/expand 1 + doc_date 1（+ 版本门 1） |
+
+⚠️ **口径与未覆盖面（不夸大）**：
+① multi-query 那行仍是 3 且全在 MainThread —— SIM 下 `maybe_decompose` 不产子查询，
+   **worker 线程分支没被真正走到**，"worker 上会各自 checkout" 仍是静态推断。
+② 探针命中全为 `public` ⇒ `_deny_revoked_cross_dept` / node-ACL 的候选集为空、未触发。
+   真实部门内查询应 **+1**（两者互斥）⇒ 现实默认约 **4**，含图再 +1 ⇒ **≈5** 封顶。
+③ 桩连接不量 SQL 往返延迟与 pool wait，只量**次数**。
+
+⇒ 现有 `_conn_scope` **已经把最大的一块合并掉了**（stitch+expand 两阶段共用 1 次）。
+D1 的剩余头寸 = **3~5 → 1~2，即每请求省 2~3 次 checkout**。
+
+#### 判据结论：D1 建议**不做**，D3/D4 保留
+
+- **D1 收益**：省 2~3 次 checkout/请求。**代价**：`_get_db_conn()` 每次显式 `begin()`
+  （`db.py:32-55`）⇒ 合并后整请求进同一事务边界（语义改动）；且 fail-closed 的
+  版本门与跨部门撤销从**独立故障**变成**同时故障**。收益不抵风险。
+- **D3 仍然成立且是本组真正的资源故事**：`api.py:139` 把 AnyIO 令牌调到 **120**，
+  而每个 `search_chunks` 新建 3-worker 融合池（`retriever.py:1381`，`config.py:268` 默认开）
+  ⇒ 理论上 **120 × 3 = 360** 个短生命周期子线程，且没有任何进程级总量闸。
+  这条与 checkout 无关，不受 D0 结果影响。
+- **D4 = 把这个探针变成常驻断言**：现在没有任何测试钉住"每请求 checkout 数"，
+  将来有人再加一个自取连接的消费点，无人会发现。
+
 #### 判据：D 值不值得做，取决于 D0 的数字
 
 若默认路径实测只有 2–3 次 checkout（互斥性使然，很可能），
