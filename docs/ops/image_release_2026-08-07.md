@@ -17,7 +17,9 @@
 | 上一版镜像基线 | `efac342`（2026-08-06 第六次发布，digest `sha256:4574d0a6…`） |
 | 发布路线 | CI 正式路线：push→build+smoke；ACR 促升=`image.yml` workflow_dispatch + `push_acr=true`，过 `acr-promotion` 审批门（Sam approve） |
 | 促升 run | 31213040000（workflow_dispatch，head `5b0b384`） |
-| ACR tag / digest | **待促升完成后回填** |
+| ACR tag | `fuling-registry.cn-hangzhou.cr.aliyuncs.com/fuling/rag-serving:5b0b384e48de` |
+| manifest digest | `sha256:eb73e1b015c38b667a0d84a9a297349b0b0266d3d9a02dd3c4ee0377b98af63d` |
+| 工件 attestation v2 | image_id `sha256:71aab838c708…` / tar `97de7ea37de3…` / lock `ca09de84df18…`（同 run 31213040000 逐字节，build 与 promotion 同 run 不重 build） |
 | 本地验证 | `make test` 4469 passed / 2 skipped、`make lint`、console `vue-tsc` exit 0 + vitest 531 passed + build 成功 |
 | CI（`5b0b384`） | CI 全绿（db-integration / baseline-freshness / test 3.10+3.11 / security 均 success） |
 | push 前自查 | 用仓库自己的 `pii_patterns.ENTITY_PATTERNS` 扫 4215 行新增：email 命中 5 条全为误报（`@router.get`/`@pytest.fixture` 被邮箱正则吃）、secret_like 1 条为测试桩（`token='t'` / `'dev-preview'` / `'e2e-fake-token'`）⇒ 真实命中 0 |
@@ -75,9 +77,9 @@
 - [x] 本地全门绿（`make test` / `make lint` / console typecheck+vitest+build）
 - [x] push（`c239fb7..5b0b384`），PII/密钥自查零真实命中
 - [x] CI 在 `5b0b384` 全绿
-- [ ] **ACR 促升**：run 31213040000 已触发，停在 `acr-promotion` 审批门 → **等 Sam approve**
-- [ ] tag / manifest digest 回填本文件
-- [ ] SAE 切镜像（Sam）
+- [x] **ACR 促升完成**（run 31213040000，`acr-promotion` 门已批）
+- [x] tag / manifest digest 已回填
+- [x] SAE 切镜像（Sam，2026-08-07）
 - [ ] 切后冒烟四联：`/api/version` git_commit=`5b0b384` / `/api/health` 200 / `/console/` 200 /
       `/api/kb/config` node_acl_grant=true
 - [ ] 本批专属验收（见 §5）
@@ -104,3 +106,10 @@
 
 - DW 摄取 zip 仍是另一条发布线（本次不含），现网资源位与仓库 HEAD 早有漂移，**引用前现查**。
 - `RAG_ACL_VERSION_AXIS` 保持默认关；翻 on 会触发不可逆的旧版本退役，不在本次范围。
+
+## 7. 后续增量（本次镜像**不含**）
+
+`7381811 fix(console): 「异常」筛选值收敛到单一来源` —— 发布后 Sam 现网报的第二形态
+（`已驳回 1` / `异常 1` 同物两名，切回「全部」又消失）。根因是待办条与台账 chip 有**两套
+存在条件**，新增 `anomalyFilterTarget` 作单一来源。**要到现网需再发一版镜像**
+（console 产物由镜像 builder 阶段自建，不是仓库工件）。
