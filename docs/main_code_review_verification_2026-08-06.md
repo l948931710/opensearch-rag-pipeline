@@ -626,8 +626,31 @@ in-VPC 检索耗时  p50=655ms  p95=1515ms  p99=2042ms  max=2935ms
 - 检索 p95 > 3s；
 - `pool_stats().rejected` 出现非零（当前配置下不该有）。
 
-指标 `pool_stats()` 已就绪；`rejected` **必须接告警**——上面①的第三条说明了为什么：
-没有它，召回塌方会以"延迟改善"的形式出现。
+#### 告警落点：**不是** ops_monitor，是 serving 进程内直告
+
+问过能不能接 `ops_monitor` 那个 node（`deploy/com.fuling.ops-monitor.plist` 的 launchd 作业）
+—— **接不了**：它的每个检查都是**对 RDS 发 SQL**（`queue_monitor.py:run_queue_aging_check`
+就是 `SELECT COUNT(*) FROM review_task ...`），而 `pool_stats().rejected` 在
+**SAE serving 进程的内存**里，跨进程读不到。
+
+三条可选路：
+
+| 路 | 做法 | 评价 |
+|---|---|---|
+| (a) serving 进程内直告 | 拒绝时直接 `send_ops_alert` | ✅ **选这条**——本仓**既有范式**：`rate_limiter.py:75-95` 的全局熔断触顶就是这么做的 |
+| (b) 落 RDS，ops_monitor 按现有模式 SQL 读 | 契合 ops_monitor 形态 | 要加写路径 + 表/列，且延迟一个轮询周期 |
+| (c) ops_monitor 走 HTTP 拉 `/api/kb/ops-metrics` | 复用现成端点 | 要给端点加字段、ops_monitor 首次做 HTTP 检查、笔记本要能访问 SAE |
+
+已实现 (a)：`serving_pools._dispatch_saturation_alert`，`severity=critical`、
+`dedup_key=pool-saturated:{kind}`（`alerting.py` 自带 60s per-key 限流）、
+异步 daemon 线程发送（热路径零阻塞）、发送失败 fail-open。
+告警文案直接写明"**后果是静默的：延迟指标反而变好，召回却降级**"，并给三条处置。
+
+⚠️ **真正的阻塞不在这**：`RAG_OPS_ALERT_WEBHOOK` **仍未配**（B7），所以今天这条告警会被
+`alerting._note_suppressed` 吞掉（memory 记着全机 38 条 CRITICAL 已被抑制）。
+本批已加测试保证"被吞不会连带打断查询"，但**要真收到告警仍需先配 webhook**。
+⚠️ 另：当前准入闸关着 ⇒ `rejected` 恒为 0 ⇒ 这条告警**今天不会有信号**。
+它的价值是"哪天开闸了别静默"。
 
 ### 批 D — 检索热路径（原始拆分，已被上面重新定型取代）
 

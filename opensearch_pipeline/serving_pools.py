@@ -164,6 +164,45 @@ class PoolSaturated(RuntimeError):
     """准入闸拒绝。**调用方必须显式处理**——绝不让它冒泡成整条查询失败。"""
 
 
+# tests 置 False：告警同步直调便于断言；生产恒 True（热路径零阻塞）。同 rate_limiter:72。
+_DISPATCH_ASYNC = True
+
+
+def _dispatch_saturation_alert(kind: str, inflight: int, queued: int, cap: int) -> None:
+    """池饱和 → OBS-4 运维告警。**这条不是锦上添花，是防静默事故的必需品。**
+
+    为什么：饱和降级会让延迟指标**变好看**——离线扫描实测 60 并发 / cap=24 时
+    89% 的臂被拒、多数查询拿到零臂回落服务端混合，p50 从 0.642s "降到" 0.058s。
+    **快是因为没干活。** 只盯 p50/p95 会把召回塌方读成性能改善，
+    所以拒绝必须自己喊出来，而不是等人去翻 `pool_stats()`。
+
+    ⚠️ 为什么不接 `ops_monitor`（那个 launchd 作业）：它的每个检查都是**对 RDS 发 SQL**
+    （见 `queue_monitor.py:run_queue_aging_check`），而本计数在 **serving 进程内存**里，
+    跨进程读不到。serving 进程内直接告警是本仓既有范式——`rate_limiter.py:75-95`
+    的全局熔断触顶就是这么做的。
+
+    fail-open：告警发不出去绝不影响限流主路径。`alerting.py` 自带 60s per-dedup_key 限流。
+    """
+    def _send() -> None:
+        try:
+            from opensearch_pipeline.alerting import send_ops_alert
+            send_ops_alert(
+                f"检索子线程池饱和：{kind}",
+                f"`{kind}` 池准入闸拒绝了新任务（inflight={inflight} queued={queued} cap={cap}）。\n\n"
+                "**后果是静默的**：被拒的臂不参与融合 ⇒ 该查询回落少臂/服务端混合，"
+                "延迟指标反而变好，召回却降级。\n\n"
+                f"- 若是正常增长 → 调高 `RAG_POOL_{kind.upper()}_WORKERS` / `_CAP`；\n"
+                "- 若是突发风暴 → 查上游（HA3/DashScope）是否变慢导致在飞堆积；\n"
+                "- 临时止血 → `RAG_POOL_ADMISSION=false` 关闸（回到不限流、只排队）。",
+                severity="critical", dedup_key=f"pool-saturated:{kind}")
+        except Exception:   # noqa: BLE001
+            logger.warning("池饱和告警发送失败（fail-open）", exc_info=True)
+    if _DISPATCH_ASYNC:
+        threading.Thread(target=_send, daemon=True, name=f"pool-alert-{kind}").start()
+    else:
+        _send()
+
+
 def submit(kind: str, fn: Callable, *args, **kwargs) -> Future:
     """提交任务；准入闸开且已满时抛 `PoolSaturated`（默认关 ⇒ 永不抛）。
 
@@ -178,14 +217,23 @@ def submit(kind: str, fn: Callable, *args, **kwargs) -> Future:
             return fn(*args, **kwargs)
     target = bound or fn
 
+    # ⚠️ 锁内只取快照，告警在**锁外**发 —— 发告警要建线程/走网络，在 _stats_lock 里做
+    # 会让所有并发提交跟着阻塞（这把锁在热路径上）。
+    snapshot = None
     with _stats_lock:
+        st = _stats[kind]
         if _admission_on():
-            st = _stats[kind]
-            if st["inflight"] + st["queued"] >= _admission_cap(kind):
+            cap = _admission_cap(kind)
+            if st["inflight"] + st["queued"] >= cap:
                 st["rejected"] += 1
-                raise PoolSaturated(f"{kind} 池已满（inflight={st['inflight']} queued={st['queued']}）")
-        _stats[kind]["queued"] += 1
-        _stats[kind]["submitted"] += 1
+                snapshot = (st["inflight"], st["queued"], cap)
+        if snapshot is None:
+            st["queued"] += 1
+            st["submitted"] += 1
+    if snapshot is not None:
+        _dispatch_saturation_alert(kind, *snapshot)
+        raise PoolSaturated(
+            f"{kind} 池已满（inflight={snapshot[0]} queued={snapshot[1]} cap={snapshot[2]}）")
     try:
         return get_pool(kind).submit(_wrap(kind, target, contextvars.copy_context()))
     except BaseException:

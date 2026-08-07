@@ -223,3 +223,69 @@ def test_fusion_submit_side_uses_submit_or_none_not_submit():
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
     assert "submit_or_none" in names, "融合三臂的提交侧必须用 submit_or_none（饱和回 None 走降级）"
     assert "submit" not in names, "不得用会抛 PoolSaturated 的 submit —— 那个 except 不包提交"
+
+
+# ── ⑦ 饱和必须自己喊出来（告警）────────────────────────────────────────────
+
+def test_saturation_fires_an_ops_alert(monkeypatch):
+    """🔴 饱和降级**必须告警**，因为它的表征是"延迟变好"。
+
+    离线扫描实测：60 并发 / cap=24 时 89% 的臂被拒、多数查询拿到零臂回落服务端混合，
+    p50 从 0.642s "降到" 0.058s —— **快是因为没干活**。只盯 p50/p95 会把召回塌方
+    读成性能改善，所以拒绝这件事必须主动喊，而不是等人去翻 `pool_stats()`。
+
+    ⚠️ 落点不是 `ops_monitor`（那个 launchd 作业）：它每个检查都是对 RDS 发 SQL，
+    而本计数在 serving 进程内存里，跨进程读不到。进程内直告是既有范式
+    （`rate_limiter._dispatch_cap_alert`）。
+    """
+    import os
+    sent = []
+    monkeypatch.setattr(sp, "_DISPATCH_ASYNC", False)     # 同步直调，便于断言
+    monkeypatch.setattr("opensearch_pipeline.alerting.send_ops_alert",
+                        lambda title, text, **kw: sent.append((title, kw.get("severity"),
+                                                               kw.get("dedup_key"))) or True)
+    os.environ["RAG_POOL_ADMISSION"] = "true"
+    os.environ["RAG_POOL_FUSION_CAP"] = "1"
+    os.environ["RAG_POOL_FUSION_WORKERS"] = "1"
+    gate = threading.Event()
+    try:
+        sp._reset_for_tests()
+        held = sp.submit(sp.FUSION, gate.wait)
+        assert sp.submit_or_none(sp.FUSION, lambda: 1) is None
+        assert len(sent) == 1, f"饱和没有告警：{sent}"
+        title, sev, key = sent[0]
+        assert sev == "critical" and key == "pool-saturated:fusion", (title, sev, key)
+        gate.set()
+        held.result(timeout=5)
+    finally:
+        gate.set()
+        for k in ("RAG_POOL_ADMISSION", "RAG_POOL_FUSION_CAP", "RAG_POOL_FUSION_WORKERS"):
+            os.environ.pop(k, None)
+
+
+def test_alert_failure_never_breaks_the_request_path():
+    """fail-open：告警发不出去（webhook 未配 / 网络挂）绝不影响限流主路径。
+
+    ⚠️ 现网 `RAG_OPS_ALERT_WEBHOOK` **未配**（B7），所以今天这条告警会被
+    `alerting._note_suppressed` 吞掉——本测试保证"被吞"不会连带打断查询。
+    """
+    import os
+    from unittest import mock
+    os.environ["RAG_POOL_ADMISSION"] = "true"
+    os.environ["RAG_POOL_FUSION_CAP"] = "1"
+    os.environ["RAG_POOL_FUSION_WORKERS"] = "1"
+    gate = threading.Event()
+    try:
+        sp._reset_for_tests()
+        with mock.patch.object(sp, "_DISPATCH_ASYNC", False), \
+             mock.patch("opensearch_pipeline.alerting.send_ops_alert",
+                        side_effect=RuntimeError("webhook down")):
+            held = sp.submit(sp.FUSION, gate.wait)
+            assert sp.submit_or_none(sp.FUSION, lambda: 1) is None   # 仍正常降级
+            assert sp.pool_stats()[sp.FUSION]["rejected"] == 1
+        gate.set()
+        held.result(timeout=5)
+    finally:
+        gate.set()
+        for k in ("RAG_POOL_ADMISSION", "RAG_POOL_FUSION_CAP", "RAG_POOL_FUSION_WORKERS"):
+            os.environ.pop(k, None)
