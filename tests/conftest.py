@@ -192,6 +192,12 @@ _LOCAL_STACK_SERIAL_MODULES = {
     # 2026-08-05：真连本地栈且 `DROP DATABASE` 固定库名（比无 WHERE DELETE 更烈——整库没了）。
     # 与同形态的 test_kb_badge_parity_db 一致处置；库名另加 pid 后缀做单边兜底（锁是双边协议）。
     "test_pagination_stability.py",
+    # 2026-08-06：退役期改归属→恢复→投影收敛（document_meta/document_version/chunk_meta/
+    # dept_dim 真实 DML）与 skip-gate prior-status 对照实验（document_version 真实 DML +
+    # 跑 node_build_canonical）。都按固定 doc_id 精确清理，但与 test_pipeline 的**无 WHERE
+    # 整表清空**同表 —— 不进组就会被它连坐清掉种子，症状是"断言看到 0 行"而非报错。
+    "test_retire_owner_change_convergence_db.py",
+    "test_skip_gate_prior_version_status_db.py",
 }
 
 
